@@ -114,18 +114,19 @@ use shared::schemas::{
     parse_sustainability_metric_type, parse_sustainability_mrv_output_kind,
     parse_sustainability_trend, place_marketplace_order_record, prepare_open_data_publication,
     publish_marketplace_listing_record, raise_collaboration_emergency_alert,
-    relay_collaboration_stream_frame, release_marketplace_inventory, reserve_marketplace_inventory,
-    resolve_content_permissions, resolve_localized_content, search_published_content,
-    soil_moisture_rejection_reason_for_error, soil_moisture_rejection_record,
-    start_collaboration_stream, transition_collaboration_emergency_alert,
-    transition_content_workflow, transition_marketplace_account_status,
-    transition_marketplace_fulfillment_status, transition_marketplace_order_status,
-    update_collaboration_presence, validate_field_boundary, weather_fetch_failure_record,
-    AnnotationGeometry, AnnotationRecord, BiodiversityProxyError, BiodiversityProxyRequest,
-    BiodiversityProxyResult, BiodiversityProxyStatus, BiomassEstimateError, BiomassEstimateRequest,
-    BiomassEstimateResult, CarbonEmissionFactor, CarbonFootprintComputeRequest,
-    CarbonFootprintError, CarbonFootprintInput, CarbonFootprintResult, CarbonFootprintStatus,
-    CollaborationAction, CollaborationActionAuthorizeRequest, CollaborationChannelCreateRequest,
+    record_collaboration_session, relay_collaboration_stream_frame, release_marketplace_inventory,
+    reserve_marketplace_inventory, resolve_content_permissions, resolve_localized_content,
+    search_published_content, soil_moisture_rejection_reason_for_error,
+    soil_moisture_rejection_record, start_collaboration_stream,
+    transition_collaboration_emergency_alert, transition_content_workflow,
+    transition_marketplace_account_status, transition_marketplace_fulfillment_status,
+    transition_marketplace_order_status, update_collaboration_presence, validate_field_boundary,
+    weather_fetch_failure_record, AnnotationGeometry, AnnotationRecord, BiodiversityProxyError,
+    BiodiversityProxyRequest, BiodiversityProxyResult, BiodiversityProxyStatus,
+    BiomassEstimateError, BiomassEstimateRequest, BiomassEstimateResult, CarbonEmissionFactor,
+    CarbonFootprintComputeRequest, CarbonFootprintError, CarbonFootprintInput,
+    CarbonFootprintResult, CarbonFootprintStatus, CollaborationAction,
+    CollaborationActionAuthorizeRequest, CollaborationChannelCreateRequest,
     CollaborationChannelRecord, CollaborationChannelThread, CollaborationEmergencyAlertAuditRecord,
     CollaborationEmergencyAlertCreateRequest, CollaborationEmergencyAlertRaiseResult,
     CollaborationEmergencyAlertRecord, CollaborationEmergencyAlertSource,
@@ -135,7 +136,9 @@ use shared::schemas::{
     CollaborationNotificationEventRequest, CollaborationNotificationRecord,
     CollaborationPermissionDecision, CollaborationPermissionResolveRequest,
     CollaborationPermissionSet, CollaborationPresenceRecord, CollaborationPresenceState,
-    CollaborationPresenceUpdateRequest, CollaborationStreamFrameRecord,
+    CollaborationPresenceUpdateRequest, CollaborationSessionEventKind,
+    CollaborationSessionEventRecord, CollaborationSessionRecord, CollaborationSessionRecordRequest,
+    CollaborationSessionReplay, CollaborationStreamFrameRecord,
     CollaborationStreamFrameRelayRequest, CollaborationStreamRelayResult,
     CollaborationStreamStartRequest, CollaborationStreamState,
     ContentCommunityContributionCreateRequest, ContentCommunityContributionRecord,
@@ -5847,6 +5850,59 @@ pub async fn transition_collaboration_emergency_alert_route(
     persist_collaboration_emergency_alert_transition(&state, &result).await?;
 
     Ok(Json(result))
+}
+
+pub async fn record_collaboration_session_route(
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<CollaborationSessionRecordRequest>,
+) -> AppResult<Json<CollaborationSessionReplay>> {
+    assert_collaboration_action_permission(
+        &state,
+        &request.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Post,
+        None,
+    )
+    .await?;
+    let replay = record_collaboration_session(
+        request,
+        format!("collab-session-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(collaboration_error)?;
+    persist_collaboration_session_replay(&state, &replay).await?;
+
+    Ok(Json(replay))
+}
+
+pub async fn replay_collaboration_session_route(
+    Path(session_id): Path<String>,
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<CollaborationSessionReplay>> {
+    let replay = load_collaboration_session_replay(&state, &session_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    if replay.session.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    assert_collaboration_action_permission(
+        &state,
+        &replay.session.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Join,
+        None,
+    )
+    .await?;
+
+    Ok(Json(replay))
 }
 
 pub async fn start_collaboration_stream_route(
@@ -17240,6 +17296,127 @@ fn parse_collaboration_presence_state(value: &str) -> AppResult<CollaborationPre
         "offline" => Ok(CollaborationPresenceState::Offline),
         _ => Err(AppError::BadRequest(format!(
             "unsupported collaboration presence state {value}"
+        ))),
+    }
+}
+
+async fn persist_collaboration_session_replay(
+    state: &AppState,
+    replay: &CollaborationSessionReplay,
+) -> AppResult<()> {
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+    sqlx::query(
+        r#"
+        INSERT INTO collab_sessions (
+            session_id, org_id, created_at, event_count, has_explicit_gap
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5)
+        "#,
+    )
+    .bind(&replay.session.session_id)
+    .bind(&replay.session.org_id)
+    .bind(&replay.session.created_at)
+    .bind(replay.session.event_count as i64)
+    .bind(if replay.session.has_explicit_gap {
+        1_i64
+    } else {
+        0_i64
+    })
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+
+    for event in &replay.events {
+        sqlx::query(
+            r#"
+            INSERT INTO collab_session_events (
+                event_id, session_id, org_id, kind, occurred_at, actor_id, subject_ref, note
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+        )
+        .bind(&event.event_id)
+        .bind(&event.session_id)
+        .bind(&event.org_id)
+        .bind(event.kind.as_str())
+        .bind(&event.occurred_at)
+        .bind(&event.actor_id)
+        .bind(&event.subject_ref)
+        .bind(&event.note)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::from)?;
+    }
+
+    tx.commit().await.map_err(Error::from)?;
+    Ok(())
+}
+
+async fn load_collaboration_session_replay(
+    state: &AppState,
+    session_id: &str,
+) -> AppResult<Option<CollaborationSessionReplay>> {
+    let row = sqlx::query(
+        r#"
+        SELECT session_id, org_id, created_at, event_count, has_explicit_gap
+        FROM collab_sessions
+        WHERE session_id = ?1
+        "#,
+    )
+    .bind(session_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let session = CollaborationSessionRecord {
+        session_id: row.get("session_id"),
+        org_id: row.get("org_id"),
+        created_at: row.get("created_at"),
+        event_count: row.get::<i64, _>("event_count") as u64,
+        has_explicit_gap: row.get::<i64, _>("has_explicit_gap") != 0,
+    };
+    let rows = sqlx::query(
+        r#"
+        SELECT event_id, session_id, org_id, kind, occurred_at, actor_id, subject_ref, note
+        FROM collab_session_events
+        WHERE session_id = ?1
+        ORDER BY occurred_at ASC, kind ASC, event_id ASC
+        "#,
+    )
+    .bind(session_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    let events = rows
+        .into_iter()
+        .map(|row| {
+            Ok(CollaborationSessionEventRecord {
+                event_id: row.get("event_id"),
+                session_id: row.get("session_id"),
+                org_id: row.get("org_id"),
+                kind: parse_collaboration_session_event_kind(&row.get::<String, _>("kind"))?,
+                occurred_at: row.get("occurred_at"),
+                actor_id: row.get("actor_id"),
+                subject_ref: row.get("subject_ref"),
+                note: row.get("note"),
+            })
+        })
+        .collect::<AppResult<Vec<_>>>()?;
+
+    Ok(Some(CollaborationSessionReplay { session, events }))
+}
+
+fn parse_collaboration_session_event_kind(value: &str) -> AppResult<CollaborationSessionEventKind> {
+    match value {
+        "stream_frame" => Ok(CollaborationSessionEventKind::StreamFrame),
+        "stream_gap" => Ok(CollaborationSessionEventKind::StreamGap),
+        "alert" => Ok(CollaborationSessionEventKind::Alert),
+        "mission_edit" => Ok(CollaborationSessionEventKind::MissionEdit),
+        "annotation" => Ok(CollaborationSessionEventKind::Annotation),
+        _ => Err(AppError::BadRequest(format!(
+            "unsupported collaboration session event kind {value}"
         ))),
     }
 }

@@ -8506,6 +8506,122 @@ async fn collaboration_emergency_alert_viewer_is_denied_without_writing() -> Res
 }
 
 #[tokio::test]
+async fn collaboration_session_records_replays_ordered_events_and_denies_cross_org() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let record = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/sessions?actor_org_id=org-alpha&actor_id=ops-1&role_refs=collab:member")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "session_id": "session-001",
+                        "org_id": "org-alpha",
+                        "events": [
+                            {
+                                "event_id": "event-alert",
+                                "kind": "alert",
+                                "occurred_at": "2026-06-13T15:00:03Z",
+                                "actor_id": "ops-1",
+                                "subject_ref": "alert:alert-001",
+                                "note": "alert raised"
+                            },
+                            {
+                                "event_id": "event-gap",
+                                "kind": "stream_gap",
+                                "occurred_at": "2026-06-13T15:00:02Z",
+                                "actor_id": "relay",
+                                "subject_ref": "stream:stream-001",
+                                "note": "dropped frame"
+                            },
+                            {
+                                "event_id": "event-frame",
+                                "kind": "stream_frame",
+                                "occurred_at": "2026-06-13T15:00:01Z",
+                                "actor_id": "camera:rgb-01",
+                                "subject_ref": "stream:stream-001:frame-001",
+                                "note": "frame relayed"
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(record.status(), StatusCode::OK);
+
+    let replay = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/sessions/session-001/replay?org_id=org-alpha&actor_org_id=org-alpha&actor_id=viewer-1&role_refs=collab:viewer")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(replay.status(), StatusCode::OK);
+    let body = to_bytes(replay.into_body(), 64 * 1024).await?;
+    let replay: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        replay
+            .pointer("/session/has_explicit_gap")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        replay
+            .pointer("/events/0/event_id")
+            .and_then(|value| value.as_str()),
+        Some("event-frame")
+    );
+    assert_eq!(
+        replay
+            .pointer("/events/1/kind")
+            .and_then(|value| value.as_str()),
+        Some("stream_gap")
+    );
+    assert_eq!(
+        replay
+            .pointer("/events/2/event_id")
+            .and_then(|value| value.as_str()),
+        Some("event-alert")
+    );
+
+    let cross_org = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/sessions/session-001/replay?org_id=org-alpha&actor_org_id=org-beta&actor_id=viewer-1&role_refs=collab:viewer")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(cross_org.status(), StatusCode::FORBIDDEN);
+
+    let event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM collab_session_events WHERE session_id = 'session-001'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(event_count, 3);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn fleet_health_component_registry_links_airframe_and_rejects_double_install() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;

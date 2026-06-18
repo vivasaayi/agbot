@@ -525,6 +525,14 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::transition_collaboration_emergency_alert_route),
         )
         .route(
+            "/api/collaboration/sessions",
+            post(routes::record_collaboration_session_route),
+        )
+        .route(
+            "/api/collaboration/sessions/:session_id/replay",
+            get(routes::replay_collaboration_session_route),
+        )
+        .route(
             "/api/collaboration/streams",
             post(routes::start_collaboration_stream_route),
         )

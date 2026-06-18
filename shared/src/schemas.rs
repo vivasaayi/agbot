@@ -14165,6 +14165,75 @@ pub struct CollaborationEmergencyAlertTransitionResult {
     pub audit: CollaborationEmergencyAlertAuditRecord,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationSessionEventKind {
+    StreamFrame,
+    StreamGap,
+    Alert,
+    MissionEdit,
+    Annotation,
+}
+
+impl CollaborationSessionEventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CollaborationSessionEventKind::StreamFrame => "stream_frame",
+            CollaborationSessionEventKind::StreamGap => "stream_gap",
+            CollaborationSessionEventKind::Alert => "alert",
+            CollaborationSessionEventKind::MissionEdit => "mission_edit",
+            CollaborationSessionEventKind::Annotation => "annotation",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationSessionEventInput {
+    #[serde(default)]
+    pub event_id: Option<String>,
+    pub kind: CollaborationSessionEventKind,
+    pub occurred_at: String,
+    pub actor_id: String,
+    pub subject_ref: String,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationSessionRecordRequest {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    pub org_id: String,
+    #[serde(default)]
+    pub events: Vec<CollaborationSessionEventInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationSessionRecord {
+    pub session_id: String,
+    pub org_id: String,
+    pub created_at: String,
+    pub event_count: u64,
+    pub has_explicit_gap: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationSessionEventRecord {
+    pub event_id: String,
+    pub session_id: String,
+    pub org_id: String,
+    pub kind: CollaborationSessionEventKind,
+    pub occurred_at: String,
+    pub actor_id: String,
+    pub subject_ref: String,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationSessionReplay {
+    pub session: CollaborationSessionRecord,
+    pub events: Vec<CollaborationSessionEventRecord>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollaborationPermissionResolveRequest {
     pub org_id: String,
@@ -14294,6 +14363,14 @@ pub enum CollaborationError {
         action: &'static str,
         from_state: &'static str,
     },
+    #[error("collaboration session_id cannot be empty")]
+    EmptySessionId,
+    #[error("collaboration session requires at least one event")]
+    EmptySessionEvents,
+    #[error("collaboration session event_id cannot be empty")]
+    EmptySessionEventId,
+    #[error("collaboration session event subject_ref cannot be empty")]
+    EmptySessionSubjectRef,
 }
 
 pub fn build_collaboration_channel(
@@ -14761,6 +14838,69 @@ pub fn transition_collaboration_emergency_alert(
         alert: updated,
         audit,
     })
+}
+
+pub fn record_collaboration_session(
+    request: CollaborationSessionRecordRequest,
+    generated_session_id: String,
+    created_at: String,
+) -> Result<CollaborationSessionReplay, CollaborationError> {
+    let session_id = normalize_collaboration_optional_text(request.session_id)
+        .or_else(|| normalize_collaboration_text(generated_session_id))
+        .ok_or(CollaborationError::EmptySessionId)?;
+    let org_id =
+        normalize_collaboration_text(request.org_id).ok_or(CollaborationError::EmptyOrgId)?;
+    let created_at =
+        normalize_collaboration_text(created_at).ok_or(CollaborationError::EmptyTimestamp)?;
+    if request.events.is_empty() {
+        return Err(CollaborationError::EmptySessionEvents);
+    }
+    let mut events = request
+        .events
+        .into_iter()
+        .enumerate()
+        .map(|(index, event)| {
+            let event_id = normalize_collaboration_optional_text(event.event_id)
+                .or_else(|| normalize_collaboration_text(format!("{session_id}:event-{index}")))
+                .ok_or(CollaborationError::EmptySessionEventId)?;
+            let occurred_at = normalize_collaboration_text(event.occurred_at)
+                .ok_or(CollaborationError::EmptyTimestamp)?;
+            let actor_id = normalize_collaboration_text(event.actor_id)
+                .ok_or(CollaborationError::EmptyActorId)?;
+            let subject_ref = normalize_collaboration_text(event.subject_ref)
+                .ok_or(CollaborationError::EmptySessionSubjectRef)?;
+            let note =
+                normalize_collaboration_text(event.note).ok_or(CollaborationError::EmptyBody)?;
+            Ok(CollaborationSessionEventRecord {
+                event_id,
+                session_id: session_id.clone(),
+                org_id: org_id.clone(),
+                kind: event.kind,
+                occurred_at,
+                actor_id,
+                subject_ref,
+                note,
+            })
+        })
+        .collect::<Result<Vec<_>, CollaborationError>>()?;
+    events.sort_by(|left, right| {
+        left.occurred_at
+            .cmp(&right.occurred_at)
+            .then_with(|| left.kind.as_str().cmp(right.kind.as_str()))
+            .then_with(|| left.event_id.cmp(&right.event_id))
+    });
+    let has_explicit_gap = events
+        .iter()
+        .any(|event| event.kind == CollaborationSessionEventKind::StreamGap);
+    let session = CollaborationSessionRecord {
+        session_id,
+        org_id,
+        created_at,
+        event_count: events.len() as u64,
+        has_explicit_gap,
+    };
+
+    Ok(CollaborationSessionReplay { session, events })
 }
 
 fn normalize_collaboration_members(
@@ -18127,12 +18267,12 @@ mod tests {
         normalize_weather_provider_forecast, place_marketplace_order_record,
         plan_tractor_swath_coverage, publish_marketplace_listing_record, query_drought_history,
         query_irrigation_history, query_weather_history, raise_collaboration_emergency_alert,
-        relay_collaboration_stream_frame, release_marketplace_inventory, report_water_use_savings,
-        reserve_marketplace_inventory, resolve_collaboration_permissions,
-        resolve_content_permissions, resolve_localized_content, resolve_weather_forecast_to_field,
-        route_weather_alert, run_tractor_straight_path_guidance, schedule_irrigation_plan,
-        search_published_content, sign_fleet_config_bundle, soil_moisture_rejection_record,
-        start_collaboration_stream, tractor_cross_track_error_m,
+        record_collaboration_session, relay_collaboration_stream_frame,
+        release_marketplace_inventory, report_water_use_savings, reserve_marketplace_inventory,
+        resolve_collaboration_permissions, resolve_content_permissions, resolve_localized_content,
+        resolve_weather_forecast_to_field, route_weather_alert, run_tractor_straight_path_guidance,
+        schedule_irrigation_plan, search_published_content, sign_fleet_config_bundle,
+        soil_moisture_rejection_record, start_collaboration_stream, tractor_cross_track_error_m,
         transition_collaboration_emergency_alert, transition_content_workflow,
         transition_marketplace_account_status, transition_marketplace_fulfillment_status,
         transition_marketplace_order_status, update_collaboration_presence,
@@ -18151,58 +18291,60 @@ mod tests {
         CollaborationError, CollaborationMessageCreateRequest,
         CollaborationNotificationEventRequest, CollaborationPermissionResolveRequest,
         CollaborationPresenceState, CollaborationPresenceUpdateRequest,
-        CollaborationStreamFrameRelayRequest, CollaborationStreamStartRequest,
-        CollaborationStreamState, ContentCommunityContributionCreateRequest,
-        ContentContributionModerationAction, ContentContributionModerationRequest,
-        ContentContributionStatus, ContentCreateRequest, ContentEngagementEventCreateRequest,
-        ContentEngagementEventRecord, ContentEngagementEventType, ContentError,
-        ContentLocaleVariantCreateRequest, ContentPermissionResolveRequest,
-        ContentPortalEmbedRequest, ContentRecord, ContentSearchDocument, ContentSearchRequest,
-        ContentStatus, ContentSuccessMetric, ContentSuccessStoryCreateRequest,
-        ContentSuccessStoryFields, ContentTagApplyRequest, ContentTaxonomyKind, ContentTaxonomyTag,
-        ContentType, ContentWorkflowAction, ContentWorkflowActorRole,
-        ContentWorkflowTransitionRequest, CropPlanRecord, DroughtAdvisoryLoopRequest,
-        DroughtAdvisoryLoopStatus, DroughtAlertRoutingRequest, DroughtBaselineTrendError,
-        DroughtBaselineTrendRequest, DroughtBaselineTrendStatus, DroughtEvidenceFusionError,
-        DroughtEvidenceFusionRequest, DroughtEvidenceFusionStatus, DroughtEvidenceInputStatus,
-        DroughtForecastRequest, DroughtForecastStatus, DroughtForecastUncertaintyBand,
-        DroughtHistoryEntry, DroughtHistoryEntryKind, DroughtHistoryError, DroughtHistoryQuery,
-        DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod, DroughtIndexType,
-        DroughtMitigationActionTarget, DroughtMitigationError, DroughtMitigationRequest,
-        DroughtMitigationStatus, DroughtReportError, DroughtReportRequest,
-        DroughtReportSectionKind, DroughtRiskBand, DroughtRiskScoreError, DroughtRiskScoreRequest,
-        DroughtRiskScoreStatus, DroughtRiskThresholds, DroughtStressEvidenceError,
-        DroughtStressEvidenceLayer, DroughtStressIndex, DroughtTrendDirection,
-        FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery, FarmFieldRegistry, FarmRecord,
-        FieldBoundary, FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord,
-        FleetConfigApplyStatus, FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState,
-        FleetHeartbeatEvaluation, FleetInventoryFilter, FleetNodeComponentHealth,
-        FleetNodeComponentStatus, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
-        FleetNodeHealthState, FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError,
-        FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
-        IrrigationEventRecord, IrrigationEventRequest, IrrigationHistoryQuery,
-        IrrigationScheduleRequest, IrrigationValveActionStatus, IrrigationValveDryRunRequest,
-        IrrigationValveDryRunStatus, IrrigationValveExecuteRequest, IrrigationValveExecutionStatus,
-        IrrigationValveSpec, MarketplaceAccountCreateRequest, MarketplaceAccountError,
-        MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplaceAvailabilityWindow,
-        MarketplaceCatalogCategory, MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest,
-        MarketplaceCatalogItemKind, MarketplaceDemandForecastRequest,
-        MarketplaceDemandForecastStatus, MarketplaceFulfillmentCreateRequest,
-        MarketplaceFulfillmentError, MarketplaceFulfillmentStatus, MarketplaceInventoryError,
-        MarketplaceInventoryUpsertRequest, MarketplaceListingError,
-        MarketplaceListingPublishRequest, MarketplaceListingStatus, MarketplaceOrderCreateRequest,
-        MarketplaceOrderError, MarketplaceOrderStatus, MarketplaceOrgReportRequest,
-        MarketplacePartyType, MarketplacePortalEntryError, MarketplaceRatingCreateRequest,
-        MarketplaceRatingError, MarketplaceReportPeriod, MarketplaceUnitOfMeasure,
-        MultispectralImage, OpenDataPublishError, OpenDataPublishRefusalReason,
-        OpenDataPublishRequest, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
-        RecommendationLifecycleRegistry, RecommendationPersistenceError, RecommendationPriority,
-        RecommendationRecord, RecommendationStatus, RecommendationStatusChangeType,
-        RemoteSensingMoistureIndex, RemoteSensingMoistureProxyError,
-        RemoteSensingMoistureProxyLayer, RemoteSensingMoistureZoneValue, ReportDeliverableRegistry,
-        ReportFormat, ReportPersistenceError, ReportRecord, ReportVisibility,
-        SceneFieldCoverageStatus, SceneLayerMetadataError, SceneLayerRecord, SceneRecord,
-        SeasonRecord, SoilCarbonEvidenceInput, SoilCarbonPracticeInput, SoilCarbonProxyRequest,
+        CollaborationSessionEventInput, CollaborationSessionEventKind,
+        CollaborationSessionRecordRequest, CollaborationStreamFrameRelayRequest,
+        CollaborationStreamStartRequest, CollaborationStreamState,
+        ContentCommunityContributionCreateRequest, ContentContributionModerationAction,
+        ContentContributionModerationRequest, ContentContributionStatus, ContentCreateRequest,
+        ContentEngagementEventCreateRequest, ContentEngagementEventRecord,
+        ContentEngagementEventType, ContentError, ContentLocaleVariantCreateRequest,
+        ContentPermissionResolveRequest, ContentPortalEmbedRequest, ContentRecord,
+        ContentSearchDocument, ContentSearchRequest, ContentStatus, ContentSuccessMetric,
+        ContentSuccessStoryCreateRequest, ContentSuccessStoryFields, ContentTagApplyRequest,
+        ContentTaxonomyKind, ContentTaxonomyTag, ContentType, ContentWorkflowAction,
+        ContentWorkflowActorRole, ContentWorkflowTransitionRequest, CropPlanRecord,
+        DroughtAdvisoryLoopRequest, DroughtAdvisoryLoopStatus, DroughtAlertRoutingRequest,
+        DroughtBaselineTrendError, DroughtBaselineTrendRequest, DroughtBaselineTrendStatus,
+        DroughtEvidenceFusionError, DroughtEvidenceFusionRequest, DroughtEvidenceFusionStatus,
+        DroughtEvidenceInputStatus, DroughtForecastRequest, DroughtForecastStatus,
+        DroughtForecastUncertaintyBand, DroughtHistoryEntry, DroughtHistoryEntryKind,
+        DroughtHistoryError, DroughtHistoryQuery, DroughtIndexComputeRequest, DroughtIndexError,
+        DroughtIndexPeriod, DroughtIndexType, DroughtMitigationActionTarget,
+        DroughtMitigationError, DroughtMitigationRequest, DroughtMitigationStatus,
+        DroughtReportError, DroughtReportRequest, DroughtReportSectionKind, DroughtRiskBand,
+        DroughtRiskScoreError, DroughtRiskScoreRequest, DroughtRiskScoreStatus,
+        DroughtRiskThresholds, DroughtStressEvidenceError, DroughtStressEvidenceLayer,
+        DroughtStressIndex, DroughtTrendDirection, FarmFieldEntityStatus, FarmFieldError,
+        FarmFieldListQuery, FarmFieldRegistry, FarmRecord, FieldBoundary,
+        FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord, FleetConfigApplyStatus,
+        FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
+        FleetInventoryFilter, FleetNodeComponentHealth, FleetNodeComponentStatus,
+        FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
+        FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
+        FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, IrrigationEventRecord,
+        IrrigationEventRequest, IrrigationHistoryQuery, IrrigationScheduleRequest,
+        IrrigationValveActionStatus, IrrigationValveDryRunRequest, IrrigationValveDryRunStatus,
+        IrrigationValveExecuteRequest, IrrigationValveExecutionStatus, IrrigationValveSpec,
+        MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountRecord,
+        MarketplaceAccountStatus, MarketplaceAvailabilityWindow, MarketplaceCatalogCategory,
+        MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind,
+        MarketplaceDemandForecastRequest, MarketplaceDemandForecastStatus,
+        MarketplaceFulfillmentCreateRequest, MarketplaceFulfillmentError,
+        MarketplaceFulfillmentStatus, MarketplaceInventoryError, MarketplaceInventoryUpsertRequest,
+        MarketplaceListingError, MarketplaceListingPublishRequest, MarketplaceListingStatus,
+        MarketplaceOrderCreateRequest, MarketplaceOrderError, MarketplaceOrderStatus,
+        MarketplaceOrgReportRequest, MarketplacePartyType, MarketplacePortalEntryError,
+        MarketplaceRatingCreateRequest, MarketplaceRatingError, MarketplaceReportPeriod,
+        MarketplaceUnitOfMeasure, MultispectralImage, OpenDataPublishError,
+        OpenDataPublishRefusalReason, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
+        RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
+        RecommendationPriority, RecommendationRecord, RecommendationStatus,
+        RecommendationStatusChangeType, RemoteSensingMoistureIndex,
+        RemoteSensingMoistureProxyError, RemoteSensingMoistureProxyLayer,
+        RemoteSensingMoistureZoneValue, ReportDeliverableRegistry, ReportFormat,
+        ReportPersistenceError, ReportRecord, ReportVisibility, SceneFieldCoverageStatus,
+        SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord,
+        SoilCarbonEvidenceInput, SoilCarbonPracticeInput, SoilCarbonProxyRequest,
         SoilCarbonProxyStatus, SoilMoistureQaFlag, SoilMoistureReadingError,
         SoilMoistureReadingRequest, SoilMoistureRejectionReason,
         SustainabilityBaselineCreateRequest, SustainabilityBaselineRecord,
@@ -22236,6 +22378,54 @@ mod tests {
             duplicate_resolve,
             CollaborationError::InvalidAlertTransition { .. }
         ));
+    }
+
+    #[test]
+    fn collaboration_session_replay_orders_events_and_preserves_gaps() {
+        let replay = record_collaboration_session(
+            CollaborationSessionRecordRequest {
+                session_id: Some("session-001".to_string()),
+                org_id: "org-alpha".to_string(),
+                events: vec![
+                    CollaborationSessionEventInput {
+                        event_id: Some("event-alert".to_string()),
+                        kind: CollaborationSessionEventKind::Alert,
+                        occurred_at: "2026-06-13T15:00:03Z".to_string(),
+                        actor_id: "ops-1".to_string(),
+                        subject_ref: "alert:alert-001".to_string(),
+                        note: "alert raised".to_string(),
+                    },
+                    CollaborationSessionEventInput {
+                        event_id: Some("event-gap".to_string()),
+                        kind: CollaborationSessionEventKind::StreamGap,
+                        occurred_at: "2026-06-13T15:00:02Z".to_string(),
+                        actor_id: "relay".to_string(),
+                        subject_ref: "stream:stream-001".to_string(),
+                        note: "dropped frame".to_string(),
+                    },
+                    CollaborationSessionEventInput {
+                        event_id: Some("event-frame".to_string()),
+                        kind: CollaborationSessionEventKind::StreamFrame,
+                        occurred_at: "2026-06-13T15:00:01Z".to_string(),
+                        actor_id: "camera:rgb-01".to_string(),
+                        subject_ref: "stream:stream-001:frame-001".to_string(),
+                        note: "frame relayed".to_string(),
+                    },
+                ],
+            },
+            "generated-session".to_string(),
+            "2026-06-13T15:00:00Z".to_string(),
+        )
+        .expect("session should record");
+
+        assert_eq!(replay.session.event_count, 3);
+        assert!(replay.session.has_explicit_gap);
+        assert_eq!(replay.events[0].event_id, "event-frame");
+        assert_eq!(
+            replay.events[1].kind,
+            CollaborationSessionEventKind::StreamGap
+        );
+        assert_eq!(replay.events[2].event_id, "event-alert");
     }
 
     #[test]
