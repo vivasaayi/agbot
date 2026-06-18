@@ -12449,6 +12449,172 @@ async fn crop_intelligence_inference_run_submit_status_and_result_roundtrip() ->
 }
 
 #[tokio::test]
+async fn crop_intelligence_inference_progress_streams_and_flags_stalls() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "crop-progress-scene";
+    seed_orthomosaic_publish_product(&ctx, scene_id, "orthomosaic").await?;
+    post_orthomosaic_publish_gate(&ctx, scene_id, "orthomosaic", "publishable").await?;
+
+    let submit = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/crop-intelligence/inference-runs")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "run_id": "crop-run-progress",
+                        "mosaic_ref": format!("{scene_id}:orthomosaic"),
+                        "field_id": "ortho-field-1",
+                        "season_id": "season-2026"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(submit.status(), StatusCode::OK);
+
+    for (tiles_done, observed_at) in [
+        (2_u64, "2026-06-13T15:01:00Z"),
+        (6_u64, "2026-06-13T15:02:00Z"),
+    ] {
+        let progress = ctx
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/crop-intelligence/inference-runs/crop-run-progress/progress")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "run_id": "ignored-client-run-id",
+                            "tiles_total": 10,
+                            "tiles_done": tiles_done,
+                            "stage": "tile_inference",
+                            "observed_at": observed_at
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should handle request");
+        assert_eq!(progress.status(), StatusCode::OK);
+    }
+
+    let listed = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/crop-intelligence/inference-runs/crop-run-progress/progress")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(listed.status(), StatusCode::OK);
+    let body = to_bytes(listed.into_body(), 64 * 1024).await?;
+    let stream: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        stream
+            .pointer("/events/0/tiles_done")
+            .and_then(|value| value.as_u64()),
+        Some(2)
+    );
+    assert_eq!(
+        stream
+            .pointer("/latest/coverage_fraction")
+            .and_then(|value| value.as_f64()),
+        Some(0.6)
+    );
+    assert_eq!(
+        stream
+            .pointer("/latest/stage")
+            .and_then(|value| value.as_str()),
+        Some("tile_inference")
+    );
+
+    let healthy = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/crop-intelligence/inference-runs/crop-run-progress/stall-check")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "detected_at": "2026-06-13T15:06:59Z",
+                        "stall_window_seconds": 300
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(healthy.status(), StatusCode::OK);
+    let body = to_bytes(healthy.into_body(), 64 * 1024).await?;
+    assert_eq!(String::from_utf8(body.to_vec())?, "null");
+
+    let stalled = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/crop-intelligence/inference-runs/crop-run-progress/stall-check")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "detected_at": "2026-06-13T15:07:00Z",
+                        "stall_window_seconds": 300
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(stalled.status(), StatusCode::OK);
+    let body = to_bytes(stalled.into_body(), 64 * 1024).await?;
+    let stalled: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        stalled.get("flagged").and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        stalled
+            .get("last_progress_at")
+            .and_then(|value| value.as_str()),
+        Some("2026-06-13T15:02:00Z")
+    );
+
+    let progress_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM crop_inference_progress WHERE run_id = 'crop-run-progress'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(progress_count, 2);
+    let stall_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM crop_inference_stall_events WHERE run_id = 'crop-run-progress' AND flagged = 1",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(stall_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn crop_intelligence_inference_run_rejects_unpublished_mosaic_without_writing() -> Result<()>
 {
     let tmp = TempDir::new()?;

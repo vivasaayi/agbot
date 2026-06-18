@@ -1846,6 +1846,39 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS crop_inference_progress (
+            progress_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            tiles_total INTEGER NOT NULL,
+            tiles_done INTEGER NOT NULL,
+            coverage_fraction REAL NOT NULL,
+            stage TEXT NOT NULL,
+            observed_at TEXT NOT NULL,
+            FOREIGN KEY(run_id) REFERENCES crop_inference_runs(run_id) ON DELETE CASCADE
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS crop_inference_stall_events (
+            stall_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            last_progress_at TEXT NOT NULL,
+            detected_at TEXT NOT NULL,
+            stall_window_seconds INTEGER NOT NULL,
+            flagged INTEGER NOT NULL,
+            FOREIGN KEY(run_id) REFERENCES crop_inference_runs(run_id) ON DELETE CASCADE
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS crop_detection_verifications (
             detection_id TEXT PRIMARY KEY,
             task TEXT NOT NULL,

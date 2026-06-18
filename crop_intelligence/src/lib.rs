@@ -147,6 +147,43 @@ pub struct InferenceRunRecord {
     pub updated_at: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InferenceRunProgressInput {
+    pub run_id: String,
+    pub tiles_total: u64,
+    pub tiles_done: u64,
+    pub stage: String,
+    pub observed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InferenceRunProgressRecord {
+    pub progress_id: String,
+    pub run_id: String,
+    pub tiles_total: u64,
+    pub tiles_done: u64,
+    pub coverage_fraction: f64,
+    pub stage: String,
+    pub observed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InferenceRunProgressStream {
+    pub run_id: String,
+    pub latest: Option<InferenceRunProgressRecord>,
+    pub events: Vec<InferenceRunProgressRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InferenceRunStallEvent {
+    pub stall_id: String,
+    pub run_id: String,
+    pub last_progress_at: String,
+    pub detected_at: String,
+    pub stall_window_seconds: u64,
+    pub flagged: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TiledInferenceInput {
     pub tile_id: String,
@@ -825,6 +862,24 @@ pub enum InferenceRunError {
         #[source]
         source: CropModelRegistryError,
     },
+    #[error("progress_id cannot be empty")]
+    EmptyProgressId,
+    #[error("progress stage cannot be empty")]
+    EmptyProgressStage,
+    #[error("progress observed_at cannot be empty")]
+    EmptyObservedAt,
+    #[error("tiles_total must be positive")]
+    InvalidTilesTotal,
+    #[error("tiles_done cannot exceed tiles_total")]
+    TilesDoneExceedsTotal,
+    #[error("progress timestamp is invalid: {timestamp}")]
+    InvalidProgressTimestamp { timestamp: String },
+    #[error("stall_id cannot be empty")]
+    EmptyStallId,
+    #[error("detected_at cannot be empty")]
+    EmptyDetectedAt,
+    #[error("stall window seconds must be positive")]
+    InvalidStallWindow,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -1243,6 +1298,91 @@ pub fn transition_inference_run_status(
     record.updated_at = updated_at;
 
     Ok(record)
+}
+
+pub fn build_inference_run_progress_record(
+    input: InferenceRunProgressInput,
+    generated_progress_id: String,
+) -> Result<InferenceRunProgressRecord, InferenceRunError> {
+    let progress_id =
+        normalize_run_text(generated_progress_id).ok_or(InferenceRunError::EmptyProgressId)?;
+    let run_id = normalize_run_text(input.run_id).ok_or(InferenceRunError::EmptyRunId)?;
+    let stage = normalize_run_text(input.stage).ok_or(InferenceRunError::EmptyProgressStage)?;
+    let observed_at =
+        normalize_run_text(input.observed_at).ok_or(InferenceRunError::EmptyObservedAt)?;
+    parse_progress_timestamp(&observed_at)?;
+    if input.tiles_total == 0 {
+        return Err(InferenceRunError::InvalidTilesTotal);
+    }
+    if input.tiles_done > input.tiles_total {
+        return Err(InferenceRunError::TilesDoneExceedsTotal);
+    }
+    Ok(InferenceRunProgressRecord {
+        progress_id,
+        run_id,
+        tiles_total: input.tiles_total,
+        tiles_done: input.tiles_done,
+        coverage_fraction: input.tiles_done as f64 / input.tiles_total as f64,
+        stage,
+        observed_at,
+    })
+}
+
+pub fn inference_run_progress_stream(
+    run_id: String,
+    mut events: Vec<InferenceRunProgressRecord>,
+) -> Result<InferenceRunProgressStream, InferenceRunError> {
+    let run_id = normalize_run_text(run_id).ok_or(InferenceRunError::EmptyRunId)?;
+    events.retain(|event| event.run_id == run_id);
+    events.sort_by(|left, right| {
+        left.observed_at
+            .cmp(&right.observed_at)
+            .then_with(|| left.progress_id.cmp(&right.progress_id))
+    });
+    let latest = events.last().cloned();
+    Ok(InferenceRunProgressStream {
+        run_id,
+        latest,
+        events,
+    })
+}
+
+pub fn detect_inference_run_stall(
+    latest: Option<&InferenceRunProgressRecord>,
+    run_id: String,
+    generated_stall_id: String,
+    detected_at: String,
+    stall_window_seconds: u64,
+) -> Result<Option<InferenceRunStallEvent>, InferenceRunError> {
+    let run_id = normalize_run_text(run_id).ok_or(InferenceRunError::EmptyRunId)?;
+    let stall_id = normalize_run_text(generated_stall_id).ok_or(InferenceRunError::EmptyStallId)?;
+    let detected_at = normalize_run_text(detected_at).ok_or(InferenceRunError::EmptyDetectedAt)?;
+    let detected_at_ts = parse_progress_timestamp(&detected_at)?;
+    if stall_window_seconds == 0 {
+        return Err(InferenceRunError::InvalidStallWindow);
+    }
+    let Some(latest) = latest else {
+        return Ok(None);
+    };
+    if latest.run_id != run_id {
+        return Ok(None);
+    }
+    let last_progress_at = parse_progress_timestamp(&latest.observed_at)?;
+    let elapsed_seconds = detected_at_ts
+        .signed_duration_since(last_progress_at)
+        .num_seconds();
+    if elapsed_seconds < stall_window_seconds as i64 {
+        return Ok(None);
+    }
+
+    Ok(Some(InferenceRunStallEvent {
+        stall_id,
+        run_id,
+        last_progress_at: latest.observed_at.clone(),
+        detected_at,
+        stall_window_seconds,
+        flagged: true,
+    }))
 }
 
 pub fn validate_inference_run_transition(
@@ -2394,6 +2534,16 @@ fn normalize_optional_run_text(value: Option<String>) -> Option<String> {
     value.and_then(normalize_run_text)
 }
 
+fn parse_progress_timestamp(
+    timestamp: &str,
+) -> Result<chrono::DateTime<chrono::FixedOffset>, InferenceRunError> {
+    chrono::DateTime::parse_from_rfc3339(timestamp).map_err(|_| {
+        InferenceRunError::InvalidProgressTimestamp {
+            timestamp: timestamp.to_string(),
+        }
+    })
+}
+
 fn validate_metrics(metrics: &serde_json::Value) -> Result<(), CropModelRegistryError> {
     match metrics.as_object() {
         Some(metrics) if !metrics.is_empty() => Ok(()),
@@ -3102,10 +3252,12 @@ fn density_per_ha(count: usize, area_m2: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_detection_verification, assemble_detection_finding, build_inference_run_record,
+        apply_detection_verification, assemble_detection_finding,
+        build_inference_run_progress_record, build_inference_run_record,
         build_model_version_record, build_training_dataset_manifest,
-        build_weed_spot_spray_prescription, estimate_growth_stage, evaluate_model_version,
-        run_canopy_cover, run_disease_lesion_detection, run_pest_detection, run_stand_count,
+        build_weed_spot_spray_prescription, detect_inference_run_stall, estimate_growth_stage,
+        evaluate_model_version, inference_run_progress_stream, run_canopy_cover,
+        run_disease_lesion_detection, run_pest_detection, run_stand_count,
         run_tiled_inference_pipeline, run_weed_mapping, transition_inference_run_status,
         validate_detection_finding_promotion, validate_model_reference, CanopyCoverConfig,
         CanopyCoverError, CanopyCoverTile, CropDetectionFindingError, CropDetectionFindingRequest,
@@ -3113,13 +3265,13 @@ mod tests {
         CropModelTask, DetectionVerificationState, DetectionZoneGeometry, DiseaseDetectionConfig,
         DiseaseDetectionError, DiseaseLesionCandidate, FindingPromotionError,
         FindingPromotionRequest, GrowthIndexObservation, GrowthStage, GrowthStageConfidence,
-        GrowthStageConfig, InferenceModelReference, InferenceRunError, InferenceRunStatus,
-        InferenceRunSubmissionRequest, LabeledTileRecord, ModelDriftSample, ModelEvaluationConfig,
-        ModelEvaluationObservation, ModelVersionRegistrationRequest, PestDetectionCandidate,
-        PestDetectionConfig, PestDetectionError, PlantCountConfig, PlantCountTile,
-        PlantCountZeroReason, TiledInferenceInput, TiledInferenceSkipReason, TrainingDatasetError,
-        TrainingDatasetManifest, TrainingDatasetSplit, TrainingDatasetSplitConfig,
-        WeedMappingConfig, WeedMappingError, WeedPrescriptionError,
+        GrowthStageConfig, InferenceModelReference, InferenceRunError, InferenceRunProgressInput,
+        InferenceRunStatus, InferenceRunSubmissionRequest, LabeledTileRecord, ModelDriftSample,
+        ModelEvaluationConfig, ModelEvaluationObservation, ModelVersionRegistrationRequest,
+        PestDetectionCandidate, PestDetectionConfig, PestDetectionError, PlantCountConfig,
+        PlantCountTile, PlantCountZeroReason, TiledInferenceInput, TiledInferenceSkipReason,
+        TrainingDatasetError, TrainingDatasetManifest, TrainingDatasetSplit,
+        TrainingDatasetSplitConfig, WeedMappingConfig, WeedMappingError, WeedPrescriptionError,
         WeedSpotSprayPrescriptionConfig, WeedZoneCandidate,
     };
     use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
@@ -3277,6 +3429,87 @@ mod tests {
             failed.failure_reason_code.as_deref(),
             Some("tile_decode_failed")
         );
+    }
+
+    #[test]
+    fn inference_run_progress_orders_stages_and_reports_coverage() {
+        let later = build_inference_run_progress_record(
+            InferenceRunProgressInput {
+                run_id: "run-progress-001".to_string(),
+                tiles_total: 10,
+                tiles_done: 6,
+                stage: "tile_inference".to_string(),
+                observed_at: "2026-06-13T15:02:00Z".to_string(),
+            },
+            "progress-002".to_string(),
+        )
+        .expect("later progress should build");
+        let earlier = build_inference_run_progress_record(
+            InferenceRunProgressInput {
+                run_id: "run-progress-001".to_string(),
+                tiles_total: 10,
+                tiles_done: 2,
+                stage: "tile_inference".to_string(),
+                observed_at: "2026-06-13T15:01:00Z".to_string(),
+            },
+            "progress-001".to_string(),
+        )
+        .expect("earlier progress should build");
+
+        let stream = inference_run_progress_stream(
+            "run-progress-001".to_string(),
+            vec![later.clone(), earlier],
+        )
+        .expect("progress stream should build");
+
+        assert_eq!(stream.events[0].progress_id, "progress-001");
+        assert_eq!(
+            stream
+                .latest
+                .as_ref()
+                .map(|event| event.progress_id.as_str()),
+            Some("progress-002")
+        );
+        assert_eq!(later.coverage_fraction, 0.6);
+    }
+
+    #[test]
+    fn inference_run_stall_is_flagged_after_progress_window() {
+        let latest = build_inference_run_progress_record(
+            InferenceRunProgressInput {
+                run_id: "run-stall-001".to_string(),
+                tiles_total: 10,
+                tiles_done: 4,
+                stage: "tile_inference".to_string(),
+                observed_at: "2026-06-13T15:00:00Z".to_string(),
+            },
+            "progress-stall-001".to_string(),
+        )
+        .expect("progress should build");
+
+        let healthy = detect_inference_run_stall(
+            Some(&latest),
+            "run-stall-001".to_string(),
+            "stall-healthy".to_string(),
+            "2026-06-13T15:04:59Z".to_string(),
+            300,
+        )
+        .expect("healthy stall check should run");
+        assert!(healthy.is_none());
+
+        let stalled = detect_inference_run_stall(
+            Some(&latest),
+            "run-stall-001".to_string(),
+            "stall-001".to_string(),
+            "2026-06-13T15:05:00Z".to_string(),
+            300,
+        )
+        .expect("stalled check should run")
+        .expect("stalled run should be flagged");
+
+        assert!(stalled.flagged);
+        assert_eq!(stalled.last_progress_at, "2026-06-13T15:00:00Z");
+        assert_eq!(stalled.stall_window_seconds, 300);
     }
 
     #[test]

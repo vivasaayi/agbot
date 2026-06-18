@@ -124,6 +124,15 @@ pub fn build_router(state: AppState) -> Router {
             put(routes::update_crop_inference_run_status),
         )
         .route(
+            "/api/crop-intelligence/inference-runs/:run_id/progress",
+            get(routes::list_crop_inference_run_progress)
+                .post(routes::record_crop_inference_run_progress),
+        )
+        .route(
+            "/api/crop-intelligence/inference-runs/:run_id/stall-check",
+            post(routes::check_crop_inference_run_stall),
+        )
+        .route(
             "/api/crop-intelligence/inference-runs/:run_id/result",
             get(routes::get_crop_inference_run_result),
         )

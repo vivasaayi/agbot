@@ -36,16 +36,18 @@ use copilot::{
     CopilotTurnRecord, CopilotTurnRole,
 };
 use crop_intelligence::{
-    apply_detection_verification, assemble_detection_finding, build_inference_run_record,
-    build_model_version_record, transition_inference_run_status,
+    apply_detection_verification, assemble_detection_finding, build_inference_run_progress_record,
+    build_inference_run_record, build_model_version_record, detect_inference_run_stall,
+    inference_run_progress_stream, transition_inference_run_status,
     validate_detection_finding_promotion, validate_model_reference, CropDetectionCorrectionLabel,
     CropDetectionFindingError, CropDetectionFindingRecord, CropDetectionFindingRequest,
     CropDetectionVerificationAction, CropDetectionVerificationError,
     CropDetectionVerificationRecord, CropDetectionVerificationRequest, CropModelRegistryError,
     CropModelTask, DetectionVerificationState, DetectionZoneGeometry, FindingPromotionDecision,
     FindingPromotionError, FindingPromotionRequest, InferenceModelReference, InferenceRunError,
-    InferenceRunRecord, InferenceRunStatus, InferenceRunSubmissionRequest, ModelGateResponse,
-    ModelVersionRecord, ModelVersionRegistrationRequest,
+    InferenceRunProgressInput, InferenceRunProgressRecord, InferenceRunProgressStream,
+    InferenceRunRecord, InferenceRunStallEvent, InferenceRunStatus, InferenceRunSubmissionRequest,
+    ModelGateResponse, ModelVersionRecord, ModelVersionRegistrationRequest,
 };
 use fleet_health::{
     accrue_component_duty, apply_rollout_control, build_component_duty_accruals,
@@ -1167,6 +1169,12 @@ pub struct UpdateCropInferenceRunStatusRequest {
     pub status: InferenceRunStatus,
     #[serde(default)]
     pub failure_reason_code: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CropInferenceStallCheckRequest {
+    pub detected_at: String,
+    pub stall_window_seconds: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -7572,6 +7580,62 @@ pub async fn update_crop_inference_run_status(
     update_crop_inference_run(&state, &updated).await?;
 
     Ok(Json(updated))
+}
+
+pub async fn record_crop_inference_run_progress(
+    Path(run_id): Path<String>,
+    State(state): State<AppState>,
+    Json(mut request): Json<InferenceRunProgressInput>,
+) -> AppResult<Json<InferenceRunProgressRecord>> {
+    if load_crop_inference_run(&state, &run_id).await?.is_none() {
+        return Err(AppError::NotFound);
+    }
+    request.run_id = run_id;
+    let progress =
+        build_inference_run_progress_record(request, format!("crop-progress-{}", Uuid::new_v4()))
+            .map_err(crop_inference_run_error)?;
+    insert_crop_inference_progress(&state, &progress).await?;
+
+    Ok(Json(progress))
+}
+
+pub async fn list_crop_inference_run_progress(
+    Path(run_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<InferenceRunProgressStream>> {
+    if load_crop_inference_run(&state, &run_id).await?.is_none() {
+        return Err(AppError::NotFound);
+    }
+    let events = load_crop_inference_progress(&state, &run_id).await?;
+    let stream = inference_run_progress_stream(run_id, events).map_err(crop_inference_run_error)?;
+
+    Ok(Json(stream))
+}
+
+pub async fn check_crop_inference_run_stall(
+    Path(run_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<CropInferenceStallCheckRequest>,
+) -> AppResult<Json<Option<InferenceRunStallEvent>>> {
+    if load_crop_inference_run(&state, &run_id).await?.is_none() {
+        return Err(AppError::NotFound);
+    }
+    let events = load_crop_inference_progress(&state, &run_id).await?;
+    let stream =
+        inference_run_progress_stream(run_id.clone(), events).map_err(crop_inference_run_error)?;
+    let stall = detect_inference_run_stall(
+        stream.latest.as_ref(),
+        run_id,
+        format!("crop-stall-{}", Uuid::new_v4()),
+        request.detected_at,
+        request.stall_window_seconds,
+    )
+    .map_err(crop_inference_run_error)?;
+    if let Some(stall) = stall.as_ref() {
+        insert_crop_inference_stall_event(&state, stall).await?;
+    }
+
+    Ok(Json(stall))
 }
 
 pub async fn verify_crop_detection(
@@ -18998,6 +19062,86 @@ async fn update_crop_inference_run(state: &AppState, record: &InferenceRunRecord
     .await
     .map_err(Error::from)?;
 
+    Ok(())
+}
+
+async fn insert_crop_inference_progress(
+    state: &AppState,
+    progress: &InferenceRunProgressRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO crop_inference_progress (
+            progress_id, run_id, tiles_total, tiles_done, coverage_fraction, stage, observed_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+    )
+    .bind(&progress.progress_id)
+    .bind(&progress.run_id)
+    .bind(progress.tiles_total as i64)
+    .bind(progress.tiles_done as i64)
+    .bind(progress.coverage_fraction)
+    .bind(&progress.stage)
+    .bind(&progress.observed_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    Ok(())
+}
+
+async fn load_crop_inference_progress(
+    state: &AppState,
+    run_id: &str,
+) -> AppResult<Vec<InferenceRunProgressRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT progress_id, run_id, tiles_total, tiles_done, coverage_fraction, stage, observed_at
+        FROM crop_inference_progress
+        WHERE run_id = ?1
+        ORDER BY observed_at ASC, progress_id ASC
+        "#,
+    )
+    .bind(run_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| InferenceRunProgressRecord {
+            progress_id: row.get("progress_id"),
+            run_id: row.get("run_id"),
+            tiles_total: row.get::<i64, _>("tiles_total") as u64,
+            tiles_done: row.get::<i64, _>("tiles_done") as u64,
+            coverage_fraction: row.get("coverage_fraction"),
+            stage: row.get("stage"),
+            observed_at: row.get("observed_at"),
+        })
+        .collect())
+}
+
+async fn insert_crop_inference_stall_event(
+    state: &AppState,
+    event: &InferenceRunStallEvent,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO crop_inference_stall_events (
+            stall_id, run_id, last_progress_at, detected_at, stall_window_seconds, flagged
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "#,
+    )
+    .bind(&event.stall_id)
+    .bind(&event.run_id)
+    .bind(&event.last_progress_at)
+    .bind(&event.detected_at)
+    .bind(event.stall_window_seconds as i64)
+    .bind(if event.flagged { 1_i64 } else { 0_i64 })
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
     Ok(())
 }
 
