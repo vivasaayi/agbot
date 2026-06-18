@@ -3,9 +3,9 @@
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
 - **Last implementation commit**: 83a77b4 (`batch-20260618100014`)
-- **Latest checkpoint commit**: b0dd22c
+- **Latest checkpoint commit**: f5b67cf
 - **Current batch**: none
-- **Completed feature rows**: 493 committed; 1 tests_passed; 2 skipped; 2 blocked; 0 pending in this run.
+- **Completed feature rows**: 494 committed; 0 tests_passed; 2 skipped; 2 blocked; 0 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch.
 
 ## Latest verification
@@ -199,7 +199,10 @@
 - `cargo test -p interop certification --lib` — pass
 - `cargo check -p interop` — pass
 - `32-14` — verified as round-trip fidelity certification suite for vector GeoJSON, raster GeoTIFF, prescription Shapefile, and TaskData, with named certification rows and explicit CRS-dropping regression failure
+- `cargo test -p post_processor index_trend --lib` — pass
+- `cargo check -p post_processor` — pass with existing warnings
+- `05-21` — stale tests-passed checkpoint row revalidated and normalized to committed with historical implementation commit `a9ca52b`
 
 ## Next action
 
-- Reassess roadmap checkpoint state; no pending feature rows remain apart from the carried `05-21` tests_passed row and blocked/skipped rows.
+- No pending, claimed, in-progress, or tests-passed feature rows remain; only blocked/skipped rows remain.
