@@ -113,10 +113,10 @@ use shared::schemas::{
     parse_sustainability_kpi_direction, parse_sustainability_kpi_status,
     parse_sustainability_metric_type, parse_sustainability_mrv_output_kind,
     parse_sustainability_trend, place_marketplace_order_record, prepare_open_data_publication,
-    publish_marketplace_listing_record, release_marketplace_inventory,
-    reserve_marketplace_inventory, resolve_content_permissions, resolve_localized_content,
-    search_published_content, soil_moisture_rejection_reason_for_error,
-    soil_moisture_rejection_record, transition_content_workflow,
+    publish_marketplace_listing_record, relay_collaboration_stream_frame,
+    release_marketplace_inventory, reserve_marketplace_inventory, resolve_content_permissions,
+    resolve_localized_content, search_published_content, soil_moisture_rejection_reason_for_error,
+    soil_moisture_rejection_record, start_collaboration_stream, transition_content_workflow,
     transition_marketplace_account_status, transition_marketplace_fulfillment_status,
     transition_marketplace_order_status, update_collaboration_presence, validate_field_boundary,
     weather_fetch_failure_record, AnnotationGeometry, AnnotationRecord, BiodiversityProxyError,
@@ -126,27 +126,30 @@ use shared::schemas::{
     CarbonFootprintResult, CarbonFootprintStatus, CollaborationAction,
     CollaborationActionAuthorizeRequest, CollaborationChannelCreateRequest,
     CollaborationChannelRecord, CollaborationChannelThread, CollaborationError,
-    CollaborationMessageCreateRequest, CollaborationMessageRecord,
+    CollaborationLiveStreamRecord, CollaborationMessageCreateRequest, CollaborationMessageRecord,
     CollaborationNotificationEventRequest, CollaborationNotificationRecord,
     CollaborationPermissionDecision, CollaborationPermissionResolveRequest,
     CollaborationPermissionSet, CollaborationPresenceRecord, CollaborationPresenceState,
-    CollaborationPresenceUpdateRequest, ContentCommunityContributionCreateRequest,
-    ContentCommunityContributionRecord, ContentContributionModerationAuditRecord,
-    ContentContributionModerationRequest, ContentContributionModerationResult,
-    ContentCreateRequest, ContentEditRequest, ContentEngagementEventCreateRequest,
-    ContentEngagementEventRecord, ContentEngagementSummary, ContentError,
-    ContentLocaleVariantCreateRequest, ContentLocaleVariantRecord, ContentLocalizedRecord,
-    ContentPermissionResolveRequest, ContentPermissionSet, ContentPortalEmbed,
-    ContentPortalEmbedItem, ContentPortalEmbedRequest, ContentRecord, ContentSearchDocument,
-    ContentSearchRequest, ContentSearchResult, ContentStatus, ContentSuccessStoryCreateRequest,
-    ContentSuccessStoryRecord, ContentTagApplyRequest, ContentTagRecord, ContentTaxonomyKind,
-    ContentType, ContentVersionRecord, ContentWorkflowAction, ContentWorkflowAuditRecord,
-    ContentWorkflowTransitionRequest, ContentWorkflowTransitionResult, DroughtIndexComputeRequest,
-    DroughtIndexError, DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType,
-    FarmFieldEntityStatus, FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary,
-    FieldBoundaryRecord, FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
-    FleetNodeKind, FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
-    GpsCoords, ImageMetadata, MarketplaceAccountCreateRequest, MarketplaceAccountError,
+    CollaborationPresenceUpdateRequest, CollaborationStreamFrameRecord,
+    CollaborationStreamFrameRelayRequest, CollaborationStreamRelayResult,
+    CollaborationStreamStartRequest, CollaborationStreamState,
+    ContentCommunityContributionCreateRequest, ContentCommunityContributionRecord,
+    ContentContributionModerationAuditRecord, ContentContributionModerationRequest,
+    ContentContributionModerationResult, ContentCreateRequest, ContentEditRequest,
+    ContentEngagementEventCreateRequest, ContentEngagementEventRecord, ContentEngagementSummary,
+    ContentError, ContentLocaleVariantCreateRequest, ContentLocaleVariantRecord,
+    ContentLocalizedRecord, ContentPermissionResolveRequest, ContentPermissionSet,
+    ContentPortalEmbed, ContentPortalEmbedItem, ContentPortalEmbedRequest, ContentRecord,
+    ContentSearchDocument, ContentSearchRequest, ContentSearchResult, ContentStatus,
+    ContentSuccessStoryCreateRequest, ContentSuccessStoryRecord, ContentTagApplyRequest,
+    ContentTagRecord, ContentTaxonomyKind, ContentType, ContentVersionRecord,
+    ContentWorkflowAction, ContentWorkflowAuditRecord, ContentWorkflowTransitionRequest,
+    ContentWorkflowTransitionResult, DroughtIndexComputeRequest, DroughtIndexError,
+    DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType, FarmFieldEntityStatus,
+    FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord,
+    FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind,
+    FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords,
+    ImageMetadata, MarketplaceAccountCreateRequest, MarketplaceAccountError,
     MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplaceCatalogCategory,
     MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind,
     MarketplaceCatalogItemRecord, MarketplaceDemandForecastError, MarketplaceDemandForecastRecord,
@@ -5761,6 +5764,97 @@ pub async fn create_collaboration_notifications(
     insert_collaboration_notifications(&state, &notifications).await?;
 
     Ok(Json(notifications))
+}
+
+pub async fn start_collaboration_stream_route(
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<CollaborationStreamStartRequest>,
+) -> AppResult<Json<CollaborationLiveStreamRecord>> {
+    assert_collaboration_action_permission(
+        &state,
+        &request.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Stream,
+        None,
+    )
+    .await?;
+    let stream = start_collaboration_stream(
+        request,
+        format!("collab-stream-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(collaboration_error)?;
+    insert_collaboration_stream(&state, &stream).await?;
+
+    Ok(Json(stream))
+}
+
+pub async fn relay_collaboration_stream_frame_route(
+    Path(stream_id): Path<String>,
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<CollaborationStreamFrameRelayRequest>,
+) -> AppResult<Json<CollaborationStreamRelayResult>> {
+    let stream = load_collaboration_stream(&state, &stream_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    if stream.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    assert_collaboration_action_permission(
+        &state,
+        &stream.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Stream,
+        None,
+    )
+    .await?;
+    let next_sequence = next_collaboration_stream_sequence(&state, &stream_id).await?;
+    let result = relay_collaboration_stream_frame(
+        &stream,
+        request,
+        format!("collab-frame-{}", Uuid::new_v4()),
+        next_sequence,
+    )
+    .map_err(collaboration_error)?;
+    persist_collaboration_stream_relay_result(&state, &result).await?;
+
+    Ok(Json(result))
+}
+
+pub async fn list_collaboration_stream_frames(
+    Path(stream_id): Path<String>,
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<CollaborationStreamFrameRecord>>> {
+    let stream = load_collaboration_stream(&state, &stream_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    if stream.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    assert_collaboration_action_permission(
+        &state,
+        &stream.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Join,
+        None,
+    )
+    .await?;
+    let frames = load_collaboration_stream_frames(&state, &stream_id).await?;
+
+    Ok(Json(frames))
 }
 
 pub async fn list_time_series_points(
@@ -17063,6 +17157,198 @@ fn parse_collaboration_presence_state(value: &str) -> AppResult<CollaborationPre
         "offline" => Ok(CollaborationPresenceState::Offline),
         _ => Err(AppError::BadRequest(format!(
             "unsupported collaboration presence state {value}"
+        ))),
+    }
+}
+
+async fn insert_collaboration_stream(
+    state: &AppState,
+    stream: &CollaborationLiveStreamRecord,
+) -> AppResult<()> {
+    let evidence_refs_json =
+        serde_json::to_string(&stream.evidence_refs).map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO collab_streams (
+            stream_id, org_id, mission_ref, source_ref, state, latency_budget_ms,
+            started_at, updated_at, evidence_refs_json
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )
+    .bind(&stream.stream_id)
+    .bind(&stream.org_id)
+    .bind(&stream.mission_ref)
+    .bind(&stream.source_ref)
+    .bind(stream.state.as_str())
+    .bind(stream.latency_budget_ms as i64)
+    .bind(&stream.started_at)
+    .bind(&stream.updated_at)
+    .bind(evidence_refs_json)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn persist_collaboration_stream_relay_result(
+    state: &AppState,
+    result: &CollaborationStreamRelayResult,
+) -> AppResult<()> {
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+    sqlx::query(
+        r#"
+        UPDATE collab_streams
+        SET state = ?1, updated_at = ?2
+        WHERE stream_id = ?3
+        "#,
+    )
+    .bind(result.stream.state.as_str())
+    .bind(&result.stream.updated_at)
+    .bind(&result.stream.stream_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+
+    if let Some(frame) = &result.frame {
+        sqlx::query(
+            r#"
+            INSERT INTO collab_stream_frames (
+                frame_id, stream_id, org_id, sequence, captured_at, relayed_at,
+                latency_ms, payload_ref, encoded_ref, relay_ref, view_ref, dropped
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            "#,
+        )
+        .bind(&frame.frame_id)
+        .bind(&frame.stream_id)
+        .bind(&frame.org_id)
+        .bind(frame.sequence as i64)
+        .bind(&frame.captured_at)
+        .bind(&frame.relayed_at)
+        .bind(frame.latency_ms as i64)
+        .bind(&frame.payload_ref)
+        .bind(&frame.encoded_ref)
+        .bind(&frame.relay_ref)
+        .bind(&frame.view_ref)
+        .bind(if frame.dropped { 1_i64 } else { 0_i64 })
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::from)?;
+    }
+
+    tx.commit().await.map_err(Error::from)?;
+    Ok(())
+}
+
+async fn load_collaboration_stream(
+    state: &AppState,
+    stream_id: &str,
+) -> AppResult<Option<CollaborationLiveStreamRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT stream_id, org_id, mission_ref, source_ref, state, latency_budget_ms,
+               started_at, updated_at, evidence_refs_json
+        FROM collab_streams
+        WHERE stream_id = ?1
+        "#,
+    )
+    .bind(stream_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_collaboration_stream(&row)).transpose()
+}
+
+async fn load_collaboration_stream_frames(
+    state: &AppState,
+    stream_id: &str,
+) -> AppResult<Vec<CollaborationStreamFrameRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT frame_id, stream_id, org_id, sequence, captured_at, relayed_at,
+               latency_ms, payload_ref, encoded_ref, relay_ref, view_ref, dropped
+        FROM collab_stream_frames
+        WHERE stream_id = ?1
+        ORDER BY sequence ASC
+        "#,
+    )
+    .bind(stream_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_collaboration_stream_frame(&row))
+        .collect()
+}
+
+async fn next_collaboration_stream_sequence(state: &AppState, stream_id: &str) -> AppResult<u64> {
+    let max_sequence: Option<i64> = sqlx::query_scalar(
+        r#"
+        SELECT MAX(sequence)
+        FROM collab_stream_frames
+        WHERE stream_id = ?1
+        "#,
+    )
+    .bind(stream_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    Ok(max_sequence.unwrap_or(0) as u64 + 1)
+}
+
+fn decode_collaboration_stream(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<CollaborationLiveStreamRecord> {
+    let evidence_refs = serde_json::from_str::<Vec<String>>(
+        &row.get::<String, _>("evidence_refs_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(Error::new(err).context("failed to decode stream evidence_refs_json"))
+    })?;
+    Ok(CollaborationLiveStreamRecord {
+        stream_id: row.get("stream_id"),
+        org_id: row.get("org_id"),
+        mission_ref: row.get("mission_ref"),
+        source_ref: row.get("source_ref"),
+        state: parse_collaboration_stream_state(&row.get::<String, _>("state"))?,
+        latency_budget_ms: row.get::<i64, _>("latency_budget_ms") as u64,
+        started_at: row.get("started_at"),
+        updated_at: row.get("updated_at"),
+        evidence_refs,
+    })
+}
+
+fn decode_collaboration_stream_frame(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<CollaborationStreamFrameRecord> {
+    Ok(CollaborationStreamFrameRecord {
+        frame_id: row.get("frame_id"),
+        stream_id: row.get("stream_id"),
+        org_id: row.get("org_id"),
+        sequence: row.get::<i64, _>("sequence") as u64,
+        captured_at: row.get("captured_at"),
+        relayed_at: row.get("relayed_at"),
+        latency_ms: row.get::<i64, _>("latency_ms") as u64,
+        payload_ref: row.get("payload_ref"),
+        encoded_ref: row.get("encoded_ref"),
+        relay_ref: row.get("relay_ref"),
+        view_ref: row.get("view_ref"),
+        dropped: row.get::<i64, _>("dropped") != 0,
+    })
+}
+
+fn parse_collaboration_stream_state(value: &str) -> AppResult<CollaborationStreamState> {
+    match value {
+        "starting" => Ok(CollaborationStreamState::Starting),
+        "live" => Ok(CollaborationStreamState::Live),
+        "reconnecting" => Ok(CollaborationStreamState::Reconnecting),
+        "ended" => Ok(CollaborationStreamState::Ended),
+        _ => Err(AppError::BadRequest(format!(
+            "unsupported collaboration stream state {value}"
         ))),
     }
 }

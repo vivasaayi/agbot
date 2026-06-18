@@ -517,6 +517,15 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::create_collaboration_notifications),
         )
         .route(
+            "/api/collaboration/streams",
+            post(routes::start_collaboration_stream_route),
+        )
+        .route(
+            "/api/collaboration/streams/:stream_id/frames",
+            get(routes::list_collaboration_stream_frames)
+                .post(routes::relay_collaboration_stream_frame_route),
+        )
+        .route(
             "/api/collaboration/permissions/resolve",
             get(routes::resolve_collaboration_permissions_route),
         )

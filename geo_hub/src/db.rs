@@ -1564,6 +1564,46 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS collab_streams (
+            stream_id TEXT PRIMARY KEY,
+            org_id TEXT NOT NULL,
+            mission_ref TEXT NOT NULL,
+            source_ref TEXT NOT NULL,
+            state TEXT NOT NULL,
+            latency_budget_ms INTEGER NOT NULL,
+            started_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            evidence_refs_json TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS collab_stream_frames (
+            frame_id TEXT PRIMARY KEY,
+            stream_id TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL,
+            captured_at TEXT NOT NULL,
+            relayed_at TEXT NOT NULL,
+            latency_ms INTEGER NOT NULL,
+            payload_ref TEXT NOT NULL,
+            encoded_ref TEXT NOT NULL,
+            relay_ref TEXT NOT NULL,
+            view_ref TEXT NOT NULL,
+            dropped INTEGER NOT NULL,
+            FOREIGN KEY(stream_id) REFERENCES collab_streams(stream_id) ON DELETE CASCADE
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS orthomosaic_frame_sets (
             frame_set_id TEXT PRIMARY KEY,
             scene_id TEXT NOT NULL,

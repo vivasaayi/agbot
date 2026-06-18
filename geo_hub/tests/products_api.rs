@@ -8096,6 +8096,205 @@ async fn collaboration_presence_expires_and_notifications_fan_out() -> Result<()
 }
 
 #[tokio::test]
+async fn collaboration_stream_relays_frames_reconnects_and_denies_cross_org_viewer() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let start = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/streams?actor_org_id=org-alpha&actor_id=operator-1&role_refs=collab:operator")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "stream_id": "stream-001",
+                        "org_id": "org-alpha",
+                        "mission_ref": "mission:mission-001",
+                        "source_ref": "camera:rgb-01",
+                        "latency_budget_ms": 500,
+                        "source_active": true
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(start.status(), StatusCode::OK);
+    let body = to_bytes(start.into_body(), 64 * 1024).await?;
+    let stream: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        stream.get("state").and_then(|value| value.as_str()),
+        Some("live")
+    );
+
+    let frame = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/streams/stream-001/frames?org_id=org-alpha&actor_org_id=org-alpha&actor_id=operator-1&role_refs=collab:operator")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "frame_id": "frame-001",
+                        "captured_at": "2026-06-13T15:00:00Z",
+                        "relayed_at": "2026-06-13T15:00:00.250Z",
+                        "payload_ref": "camera-frame:001",
+                        "dropped": false
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(frame.status(), StatusCode::OK);
+    let body = to_bytes(frame.into_body(), 64 * 1024).await?;
+    let frame: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        frame
+            .pointer("/stream/state")
+            .and_then(|value| value.as_str()),
+        Some("live")
+    );
+    assert_eq!(
+        frame
+            .pointer("/frame/latency_ms")
+            .and_then(|value| value.as_u64()),
+        Some(250)
+    );
+    assert_eq!(
+        frame
+            .pointer("/frame/view_ref")
+            .and_then(|value| value.as_str()),
+        Some("view:stream-001:1")
+    );
+
+    let frames = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/streams/stream-001/frames?org_id=org-alpha&actor_org_id=org-alpha&actor_id=viewer-1&role_refs=collab:viewer")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(frames.status(), StatusCode::OK);
+    let body = to_bytes(frames.into_body(), 64 * 1024).await?;
+    let frames: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(frames.len(), 1);
+
+    let dropped = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/streams/stream-001/frames?org_id=org-alpha&actor_org_id=org-alpha&actor_id=operator-1&role_refs=collab:operator")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "frame_id": "frame-002",
+                        "captured_at": "2026-06-13T15:00:01Z",
+                        "relayed_at": "2026-06-13T15:00:01.100Z",
+                        "payload_ref": "camera-frame:002",
+                        "dropped": true
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(dropped.status(), StatusCode::OK);
+    let body = to_bytes(dropped.into_body(), 64 * 1024).await?;
+    let dropped: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        dropped
+            .pointer("/stream/state")
+            .and_then(|value| value.as_str()),
+        Some("reconnecting")
+    );
+    assert!(dropped.get("frame").is_none());
+
+    let cross_org = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/streams/stream-001/frames?org_id=org-alpha&actor_org_id=org-beta&actor_id=viewer-1&role_refs=collab:viewer")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(cross_org.status(), StatusCode::FORBIDDEN);
+
+    let persisted_state: String =
+        sqlx::query_scalar("SELECT state FROM collab_streams WHERE stream_id = 'stream-001'")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(persisted_state, "reconnecting");
+    let persisted_frames: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM collab_stream_frames WHERE stream_id = 'stream-001'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(persisted_frames, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn collaboration_stream_rejects_unavailable_source_without_writing() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let start = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/streams?actor_org_id=org-alpha&actor_id=operator-1&role_refs=collab:operator")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "stream_id": "stream-missing-source",
+                        "org_id": "org-alpha",
+                        "mission_ref": "mission:mission-001",
+                        "source_ref": "camera:missing",
+                        "latency_budget_ms": 500,
+                        "source_active": false
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(start.status(), StatusCode::BAD_REQUEST);
+
+    let stream_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM collab_streams WHERE stream_id = 'stream-missing-source'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(stream_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn fleet_health_component_registry_links_airframe_and_rejects_double_install() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
