@@ -812,6 +812,80 @@ pub struct SoilAerialFusionEvaluation {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DriftRecalibrationAdvisoryConfig {
+    pub enabled: bool,
+    pub min_neighbor_delta: f64,
+    pub min_aerial_normalized_delta: f64,
+    pub method_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct DriftRecalibrationAdvisoryRequest {
+    #[serde(default)]
+    pub advisory_id: Option<String>,
+    #[serde(default)]
+    pub evaluated_at: String,
+    pub target_product: ZoneSoilProductSummary,
+    #[serde(default)]
+    pub neighbor_products: Vec<ZoneSoilProductSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aerial_fusion: Option<SoilAerialFusionSummary>,
+    pub config: DriftRecalibrationAdvisoryConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DriftRecalibrationAdvisoryStatus {
+    Raised,
+    NotRaised,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DriftRecalibrationAdvisoryReason {
+    FeatureDisabled,
+    MissingTargetValue,
+    StaleTarget,
+    MissingReference,
+    StaleReference,
+    DriftDetected,
+    NoDriftDetected,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DriftRecalibrationApprovalStatus {
+    PendingApproval,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DriftRecalibrationAdvisory {
+    pub advisory_id: String,
+    pub field_id: String,
+    pub zone_id: String,
+    pub evaluated_at: String,
+    pub status: DriftRecalibrationAdvisoryStatus,
+    pub reason_code: DriftRecalibrationAdvisoryReason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_value: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub neighbor_reference_value: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub neighbor_delta: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aerial_normalized_delta: Option<f64>,
+    pub uncertainty_lower: f64,
+    pub uncertainty_upper: f64,
+    pub uncertainty_reason: String,
+    pub evidence_refs: Vec<String>,
+    pub requires_approval: bool,
+    pub approval_status: DriftRecalibrationApprovalStatus,
+    pub recalibration_applied: bool,
+    pub method_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct IrrigationTriggerConfig {
     pub low_moisture_threshold: f64,
     pub max_freshness_age_seconds: u64,
@@ -1036,6 +1110,14 @@ pub enum SoilIotError {
     InvalidSoilAerialFusionConfig,
     #[error("soil-aerial fusion evidence_refs cannot contain empty values")]
     EmptySoilAerialFusionEvidenceRef,
+    #[error("drift advisory_id cannot be empty")]
+    EmptyDriftAdvisoryId,
+    #[error("drift advisory evaluated_at cannot be empty")]
+    EmptyDriftAdvisoryEvaluatedAt,
+    #[error("drift advisory method_version cannot be empty")]
+    EmptyDriftAdvisoryMethodVersion,
+    #[error("drift advisory config thresholds must be finite and non-negative")]
+    InvalidDriftAdvisoryConfig,
     #[error("irrigation trigger method_version cannot be empty")]
     EmptyIrrigationTriggerMethodVersion,
     #[error("irrigation trigger evidence_refs cannot contain empty values")]
@@ -2006,6 +2088,184 @@ pub fn evaluate_soil_aerial_fusion(
     })
 }
 
+pub fn evaluate_drift_recalibration_advisory(
+    request: DriftRecalibrationAdvisoryRequest,
+    generated_advisory_id: String,
+) -> Result<DriftRecalibrationAdvisory, SoilIotError> {
+    let advisory_id = match request.advisory_id {
+        Some(advisory_id) => {
+            normalize_required_text(advisory_id, SoilIotError::EmptyDriftAdvisoryId)?
+        }
+        None => normalize_required_text(generated_advisory_id, SoilIotError::EmptyDriftAdvisoryId)?,
+    };
+    let evaluated_at = normalize_required_text(
+        request.evaluated_at,
+        SoilIotError::EmptyDriftAdvisoryEvaluatedAt,
+    )?;
+    let method_version = normalize_required_text(
+        request.config.method_version,
+        SoilIotError::EmptyDriftAdvisoryMethodVersion,
+    )?;
+    if !request.config.min_neighbor_delta.is_finite()
+        || request.config.min_neighbor_delta < 0.0
+        || !request.config.min_aerial_normalized_delta.is_finite()
+        || request.config.min_aerial_normalized_delta < 0.0
+    {
+        return Err(SoilIotError::InvalidDriftAdvisoryConfig);
+    }
+
+    let target = request.target_product;
+    let field_id = normalize_required_text(target.field_id.clone(), SoilIotError::EmptyFieldId)?;
+    let zone_id = normalize_required_text(target.zone_id.clone(), SoilIotError::EmptyZoneId)?;
+    let target_value = target.mean_value;
+    let mut evidence_refs = BTreeSet::from([format!("soil-product:{}", target.product_id)]);
+    evidence_refs.extend(target.evidence_refs.clone());
+
+    if !request.config.enabled {
+        return Ok(drift_advisory_unavailable(
+            advisory_id,
+            field_id,
+            zone_id,
+            evaluated_at,
+            target_value,
+            DriftRecalibrationAdvisoryReason::FeatureDisabled,
+            evidence_refs,
+            method_version,
+        ));
+    }
+    if target.mean_value.is_none() {
+        return Ok(drift_advisory_unavailable(
+            advisory_id,
+            field_id,
+            zone_id,
+            evaluated_at,
+            target_value,
+            DriftRecalibrationAdvisoryReason::MissingTargetValue,
+            evidence_refs,
+            method_version,
+        ));
+    }
+    if target.freshness != ZoneSoilProductFreshness::Fresh {
+        return Ok(drift_advisory_unavailable(
+            advisory_id,
+            field_id,
+            zone_id,
+            evaluated_at,
+            target_value,
+            DriftRecalibrationAdvisoryReason::StaleTarget,
+            evidence_refs,
+            method_version,
+        ));
+    }
+
+    let mut stale_reference_seen = false;
+    let mut neighbor_values = Vec::new();
+    for neighbor in request.neighbor_products {
+        evidence_refs.insert(format!("soil-product:{}", neighbor.product_id));
+        evidence_refs.extend(neighbor.evidence_refs.clone());
+        if neighbor.field_id != field_id || neighbor.metric != target.metric {
+            continue;
+        }
+        if neighbor.freshness != ZoneSoilProductFreshness::Fresh {
+            stale_reference_seen = true;
+            continue;
+        }
+        if let Some(value) = neighbor.mean_value.filter(|value| value.is_finite()) {
+            neighbor_values.push(value);
+        }
+    }
+
+    let neighbor_reference_value = if neighbor_values.is_empty() {
+        None
+    } else {
+        Some(neighbor_values.iter().sum::<f64>() / neighbor_values.len() as f64)
+    };
+    let neighbor_delta =
+        neighbor_reference_value.map(|reference| target_value.unwrap() - reference);
+    let aerial_normalized_delta = request.aerial_fusion.as_ref().and_then(|fusion| {
+        evidence_refs.insert(format!("soil-aerial-fusion:{}", fusion.soil_product_id));
+        evidence_refs.extend(fusion.evidence_refs.clone());
+        if fusion.field_id == field_id && fusion.zone_id == zone_id {
+            Some(fusion.normalized_delta)
+        } else {
+            None
+        }
+    });
+
+    if neighbor_reference_value.is_none() && aerial_normalized_delta.is_none() {
+        let reason = if stale_reference_seen {
+            DriftRecalibrationAdvisoryReason::StaleReference
+        } else {
+            DriftRecalibrationAdvisoryReason::MissingReference
+        };
+        return Ok(drift_advisory_unavailable(
+            advisory_id,
+            field_id,
+            zone_id,
+            evaluated_at,
+            target_value,
+            reason,
+            evidence_refs,
+            method_version,
+        ));
+    }
+
+    let neighbor_drift = neighbor_delta
+        .map(|delta| delta.abs() >= request.config.min_neighbor_delta)
+        .unwrap_or(false);
+    let aerial_drift = aerial_normalized_delta
+        .map(|delta| delta.abs() >= request.config.min_aerial_normalized_delta)
+        .unwrap_or(false);
+    let drift_magnitude = neighbor_delta.map(f64::abs).unwrap_or(0.0).max(
+        aerial_normalized_delta
+            .map(|delta| delta.abs() * 100.0)
+            .unwrap_or(0.0),
+    );
+    let uncertainty_padding =
+        if neighbor_reference_value.is_some() && aerial_normalized_delta.is_some() {
+            drift_magnitude * 0.15
+        } else {
+            drift_magnitude * 0.30
+        };
+    let status = if neighbor_drift || aerial_drift {
+        DriftRecalibrationAdvisoryStatus::Raised
+    } else {
+        DriftRecalibrationAdvisoryStatus::NotRaised
+    };
+    let reason_code = if status == DriftRecalibrationAdvisoryStatus::Raised {
+        DriftRecalibrationAdvisoryReason::DriftDetected
+    } else {
+        DriftRecalibrationAdvisoryReason::NoDriftDetected
+    };
+
+    Ok(DriftRecalibrationAdvisory {
+        advisory_id,
+        field_id,
+        zone_id,
+        evaluated_at,
+        status,
+        reason_code,
+        target_value,
+        neighbor_reference_value,
+        neighbor_delta,
+        aerial_normalized_delta,
+        uncertainty_lower: (drift_magnitude - uncertainty_padding).max(0.0),
+        uncertainty_upper: drift_magnitude + uncertainty_padding,
+        uncertainty_reason: if neighbor_reference_value.is_some()
+            && aerial_normalized_delta.is_some()
+        {
+            "neighbor_and_aerial_reference".to_string()
+        } else {
+            "single_reference_source".to_string()
+        },
+        evidence_refs: evidence_refs.into_iter().collect(),
+        requires_approval: true,
+        approval_status: DriftRecalibrationApprovalStatus::PendingApproval,
+        recalibration_applied: false,
+        method_version,
+    })
+}
+
 pub fn evaluate_irrigation_trigger(
     product: ZoneSoilMoistureProduct,
     config: IrrigationTriggerConfig,
@@ -2390,6 +2650,38 @@ fn normalize_zone_soil_moisture_product(
     })
 }
 
+fn drift_advisory_unavailable(
+    advisory_id: String,
+    field_id: String,
+    zone_id: String,
+    evaluated_at: String,
+    target_value: Option<f64>,
+    reason_code: DriftRecalibrationAdvisoryReason,
+    evidence_refs: BTreeSet<String>,
+    method_version: String,
+) -> DriftRecalibrationAdvisory {
+    DriftRecalibrationAdvisory {
+        advisory_id,
+        field_id,
+        zone_id,
+        evaluated_at,
+        status: DriftRecalibrationAdvisoryStatus::Unavailable,
+        reason_code,
+        target_value,
+        neighbor_reference_value: None,
+        neighbor_delta: None,
+        aerial_normalized_delta: None,
+        uncertainty_lower: 0.0,
+        uncertainty_upper: 0.0,
+        uncertainty_reason: "unavailable_reference".to_string(),
+        evidence_refs: evidence_refs.into_iter().collect(),
+        requires_approval: true,
+        approval_status: DriftRecalibrationApprovalStatus::PendingApproval,
+        recalibration_applied: false,
+        method_version,
+    }
+}
+
 fn normalize_aerial_index_zone_product(
     product: AerialIndexZoneProduct,
 ) -> Result<AerialIndexZoneProduct, SoilIotError> {
@@ -2625,25 +2917,28 @@ mod tests {
     use super::{
         build_geolocated_soil_reading, build_soil_config_push_record, build_soil_device_record,
         build_zone_soil_product_summary, decode_gateway_payload, detect_stuck_sensor_window,
-        emit_sensor_health_alert_events, evaluate_irrigation_trigger,
-        evaluate_sensor_health_snapshot, evaluate_soil_aerial_fusion,
+        emit_sensor_health_alert_events, evaluate_drift_recalibration_advisory,
+        evaluate_irrigation_trigger, evaluate_sensor_health_snapshot, evaluate_soil_aerial_fusion,
         evaluate_soil_capture_freshness_coverage, export_soil_coverage_gaps,
         ingest_gateway_readings, reading_rejection_for_device, rederive_validated_series_evidence,
         transition_soil_config_push_status, transition_soil_device_status,
         validate_and_calibrate_reading, AerialIndexZoneProduct, CalibrationProfile,
-        GatewayIngestError, GatewayPayloadRejectionReason, GatewayReadingMetric,
-        GatewayReadingRecord, GeoJsonCoordinate, GeoPosition, IrrigationTriggerConfig,
-        IrrigationTriggerSuppressionReason, RawGatewayReading, ReadingGeolocationStatus,
-        ReadingQaFlag, ReadingQaReason, ReadingRejectionReason, RegisterSoilDeviceRequest,
-        SensorHealthEventKind, SensorHealthLinkStatus, SensorHealthMonitorState,
-        SensorHealthReasonCode, SensorHealthSnapshot, SensorHealthThresholds, SimulatedGateway,
-        SoilAerialFusionOutcome, SoilAerialFusionRefusalReason, SoilAerialFusionRequest,
-        SoilCaptureFreshnessConfig, SoilCaptureFreshnessCoverageReport,
-        SoilDeviceConfigPushRequest, SoilDeviceConfigPushStatus, SoilDeviceConfigPushStatusUpdate,
-        SoilDeviceFreshnessState, SoilDeviceStatus, SoilIotError, SoilSensorType,
-        SoilZoneCoverageRecord, SoilZoneGeometry, StuckSensorRail, StuckSensorWindowConfig,
-        ValidatedSoilReading, ValidationEvidenceRequest, ZoneSoilMoistureProduct,
-        ZoneSoilProductFreshness, ZoneSoilProductRequest, ZoneSoilProductSummary,
+        DriftRecalibrationAdvisoryConfig, DriftRecalibrationAdvisoryReason,
+        DriftRecalibrationAdvisoryRequest, DriftRecalibrationAdvisoryStatus,
+        DriftRecalibrationApprovalStatus, GatewayIngestError, GatewayPayloadRejectionReason,
+        GatewayReadingMetric, GatewayReadingRecord, GeoJsonCoordinate, GeoPosition,
+        IrrigationTriggerConfig, IrrigationTriggerSuppressionReason, RawGatewayReading,
+        ReadingGeolocationStatus, ReadingQaFlag, ReadingQaReason, ReadingRejectionReason,
+        RegisterSoilDeviceRequest, SensorHealthEventKind, SensorHealthLinkStatus,
+        SensorHealthMonitorState, SensorHealthReasonCode, SensorHealthSnapshot,
+        SensorHealthThresholds, SimulatedGateway, SoilAerialFusionOutcome,
+        SoilAerialFusionRefusalReason, SoilAerialFusionRequest, SoilCaptureFreshnessConfig,
+        SoilCaptureFreshnessCoverageReport, SoilDeviceConfigPushRequest,
+        SoilDeviceConfigPushStatus, SoilDeviceConfigPushStatusUpdate, SoilDeviceFreshnessState,
+        SoilDeviceStatus, SoilIotError, SoilSensorType, SoilZoneCoverageRecord, SoilZoneGeometry,
+        StuckSensorRail, StuckSensorWindowConfig, ValidatedSoilReading, ValidationEvidenceRequest,
+        ZoneSoilMoistureProduct, ZoneSoilProductFreshness, ZoneSoilProductRequest,
+        ZoneSoilProductSummary,
     };
     use alerting::{AlertEventBackbone, AlertSeverityHint};
     use timeseries::SeriesValue;
@@ -3678,6 +3973,158 @@ mod tests {
     }
 
     #[test]
+    fn drift_recalibration_advisory_raises_with_uncertainty_and_approval_gate() {
+        let fusion = evaluate_soil_aerial_fusion(fusion_request(
+            zone_soil_product_summary(Some(18.0), ZoneSoilProductFreshness::Fresh),
+            "EPSG:4326",
+            aerial_ndvi_product(
+                "field-001",
+                "zone-ne",
+                "EPSG:4326",
+                "2026-06-12T11:55:00Z",
+                0.72,
+            ),
+        ))
+        .expect("fusion should evaluate")
+        .summary
+        .expect("aligned fusion should summarize");
+
+        let advisory = evaluate_drift_recalibration_advisory(
+            DriftRecalibrationAdvisoryRequest {
+                advisory_id: Some("drift-adv-001".to_string()),
+                evaluated_at: "2026-06-12T12:05:00Z".to_string(),
+                target_product: zone_soil_product_summary(
+                    Some(18.0),
+                    ZoneSoilProductFreshness::Fresh,
+                ),
+                neighbor_products: vec![neighbor_zone_product(
+                    "zone-nw-product",
+                    "zone-nw",
+                    46.0,
+                    ZoneSoilProductFreshness::Fresh,
+                )],
+                aerial_fusion: Some(fusion),
+                config: drift_config(true),
+            },
+            "generated-drift".to_string(),
+        )
+        .expect("drift advisory should evaluate");
+
+        assert_eq!(advisory.status, DriftRecalibrationAdvisoryStatus::Raised);
+        assert_eq!(
+            advisory.reason_code,
+            DriftRecalibrationAdvisoryReason::DriftDetected
+        );
+        assert_eq!(advisory.neighbor_reference_value, Some(46.0));
+        assert_eq!(advisory.neighbor_delta, Some(-28.0));
+        assert_eq!(advisory.aerial_normalized_delta, Some(-0.54));
+        assert!(advisory.uncertainty_lower > 0.0);
+        assert!(advisory.uncertainty_upper > advisory.uncertainty_lower);
+        assert_eq!(advisory.uncertainty_reason, "neighbor_and_aerial_reference");
+        assert!(advisory.requires_approval);
+        assert_eq!(
+            advisory.approval_status,
+            DriftRecalibrationApprovalStatus::PendingApproval
+        );
+        assert!(!advisory.recalibration_applied);
+        assert!(advisory
+            .evidence_refs
+            .contains(&"soil-product:zone-soil-001".to_string()));
+        assert!(advisory
+            .evidence_refs
+            .contains(&"soil-product:zone-nw-product".to_string()));
+        assert!(advisory
+            .evidence_refs
+            .contains(&"imagery:ndvi-zone-001".to_string()));
+    }
+
+    #[test]
+    fn drift_recalibration_advisory_is_feature_gated_and_inert() {
+        let advisory = evaluate_drift_recalibration_advisory(
+            DriftRecalibrationAdvisoryRequest {
+                advisory_id: Some("drift-adv-disabled".to_string()),
+                evaluated_at: "2026-06-12T12:05:00Z".to_string(),
+                target_product: zone_soil_product_summary(
+                    Some(18.0),
+                    ZoneSoilProductFreshness::Fresh,
+                ),
+                neighbor_products: vec![neighbor_zone_product(
+                    "zone-nw-product",
+                    "zone-nw",
+                    46.0,
+                    ZoneSoilProductFreshness::Fresh,
+                )],
+                aerial_fusion: None,
+                config: drift_config(false),
+            },
+            "generated-drift".to_string(),
+        )
+        .expect("disabled feature should return unavailable advisory");
+
+        assert_eq!(
+            advisory.status,
+            DriftRecalibrationAdvisoryStatus::Unavailable
+        );
+        assert_eq!(
+            advisory.reason_code,
+            DriftRecalibrationAdvisoryReason::FeatureDisabled
+        );
+        assert!(!advisory.recalibration_applied);
+        assert!(advisory.requires_approval);
+    }
+
+    #[test]
+    fn drift_recalibration_advisory_is_unavailable_for_missing_or_stale_reference() {
+        let missing = evaluate_drift_recalibration_advisory(
+            DriftRecalibrationAdvisoryRequest {
+                advisory_id: Some("drift-adv-missing".to_string()),
+                evaluated_at: "2026-06-12T12:05:00Z".to_string(),
+                target_product: zone_soil_product_summary(
+                    Some(18.0),
+                    ZoneSoilProductFreshness::Fresh,
+                ),
+                neighbor_products: Vec::new(),
+                aerial_fusion: None,
+                config: drift_config(true),
+            },
+            "generated-drift".to_string(),
+        )
+        .expect("missing references should return unavailable advisory");
+        assert_eq!(
+            missing.reason_code,
+            DriftRecalibrationAdvisoryReason::MissingReference
+        );
+        assert!(!missing.recalibration_applied);
+
+        let stale = evaluate_drift_recalibration_advisory(
+            DriftRecalibrationAdvisoryRequest {
+                advisory_id: Some("drift-adv-stale".to_string()),
+                evaluated_at: "2026-06-12T12:05:00Z".to_string(),
+                target_product: zone_soil_product_summary(
+                    Some(18.0),
+                    ZoneSoilProductFreshness::Fresh,
+                ),
+                neighbor_products: vec![neighbor_zone_product(
+                    "zone-stale-product",
+                    "zone-stale",
+                    45.0,
+                    ZoneSoilProductFreshness::Stale,
+                )],
+                aerial_fusion: None,
+                config: drift_config(true),
+            },
+            "generated-drift".to_string(),
+        )
+        .expect("stale reference should return unavailable advisory");
+        assert_eq!(stale.status, DriftRecalibrationAdvisoryStatus::Unavailable);
+        assert_eq!(
+            stale.reason_code,
+            DriftRecalibrationAdvisoryReason::StaleReference
+        );
+        assert!(!stale.recalibration_applied);
+    }
+
+    #[test]
     fn irrigation_trigger_emits_domain16_payload_for_fresh_low_moisture() {
         let evaluation = evaluate_irrigation_trigger(
             zone_moisture_product(21.4, 120, vec![], vec!["soil-iot:reading-001"]),
@@ -4010,6 +4457,39 @@ mod tests {
             evidence_refs: vec!["soil-iot:payload-moisture-001".to_string()],
             excluded_payload_ids: Vec::new(),
             generated_at: "2026-06-12T12:00:00Z".to_string(),
+        }
+    }
+
+    fn neighbor_zone_product(
+        product_id: &str,
+        zone_id: &str,
+        mean_value: f64,
+        freshness: ZoneSoilProductFreshness,
+    ) -> ZoneSoilProductSummary {
+        ZoneSoilProductSummary {
+            product_id: product_id.to_string(),
+            field_id: "field-001".to_string(),
+            zone_id: zone_id.to_string(),
+            metric: GatewayReadingMetric::SoilMoisturePercent,
+            mean_value: Some(mean_value),
+            min_value: Some(mean_value),
+            max_value: Some(mean_value),
+            sample_count: 1,
+            freshness,
+            freshness_age_seconds: 120,
+            method_version: "soil-zone-product-v1".to_string(),
+            evidence_refs: vec![format!("soil-iot:{product_id}:payload")],
+            excluded_payload_ids: Vec::new(),
+            generated_at: "2026-06-12T12:00:00Z".to_string(),
+        }
+    }
+
+    fn drift_config(enabled: bool) -> DriftRecalibrationAdvisoryConfig {
+        DriftRecalibrationAdvisoryConfig {
+            enabled,
+            min_neighbor_delta: 10.0,
+            min_aerial_normalized_delta: 0.25,
+            method_version: "soil-drift-advisory-v1".to_string(),
         }
     }
 
