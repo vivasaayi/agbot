@@ -14095,6 +14095,133 @@ async fn compliance_authority_exports_share_and_revoke_bounded_links() -> Result
 }
 
 #[tokio::test]
+async fn compliance_regulation_assist_cites_records_and_refuses_authorization() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_compliance_field(&ctx, "field-north", "org-alpha").await?;
+    seed_compliance_export_records(&ctx).await?;
+
+    let summary_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/compliance/regulation-assist")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "assist_id": "assist-field-north",
+                        "intent": "summary",
+                        "org_id": "org-alpha",
+                        "field_id": "field-north",
+                        "generated_at": "2026-06-13T12:20:00Z",
+                        "mandatory_record_types": [
+                            "remote_id_log",
+                            "chemical_application",
+                            "operator_certification",
+                            "authorization_decision"
+                        ],
+                        "rule_citations": [
+                            {
+                                "rule_ref": "rule:faa:remote-id",
+                                "title": "FAA Remote ID flight log submission"
+                            },
+                            {
+                                "rule_ref": "rule:state:pesticide-application",
+                                "title": "State pesticide application filing"
+                            }
+                        ],
+                        "feature_enabled": true
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(summary_response.status(), StatusCode::OK);
+    let body = to_bytes(summary_response.into_body(), 128 * 1024).await?;
+    let assist: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        assist.get("assist_id").and_then(|value| value.as_str()),
+        Some("assist-field-north")
+    );
+    assert_eq!(
+        assist
+            .get("can_authorize")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        assist
+            .get("can_clear_violation")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+    assert!(assist
+        .get("source_record_refs")
+        .and_then(|value| value.as_array())
+        .expect("assist should cite source records")
+        .iter()
+        .any(|value| value == "compliance_record:remote-log-1@v1"));
+    assert!(assist
+        .get("rule_refs")
+        .and_then(|value| value.as_array())
+        .expect("assist should cite rules")
+        .iter()
+        .any(|value| value == "rule:faa:remote-id"));
+    assert!(assist
+        .get("summary")
+        .and_then(|value| value.as_str())
+        .expect("assist should summarize")
+        .contains("Deterministic gates remain authoritative"));
+
+    let denied = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/compliance/regulation-assist")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "assist_id": "assist-denied",
+                        "intent": "authorize_flight",
+                        "org_id": "org-alpha",
+                        "field_id": "field-north",
+                        "generated_at": "2026-06-13T12:25:00Z",
+                        "mandatory_record_types": [
+                            "remote_id_log",
+                            "chemical_application",
+                            "operator_certification",
+                            "authorization_decision"
+                        ],
+                        "rule_citations": [
+                            {
+                                "rule_ref": "rule:faa:remote-id",
+                                "title": "FAA Remote ID flight log submission"
+                            }
+                        ],
+                        "feature_enabled": true
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let body = to_bytes(denied.into_body(), 64 * 1024).await?;
+    let message = String::from_utf8(body.to_vec())?;
+    assert!(message.contains("use the deterministic gate"));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn compliance_airspace_zones_ingest_query_and_reject_invalid_crs() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;

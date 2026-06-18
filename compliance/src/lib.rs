@@ -724,6 +724,48 @@ pub struct ComplianceAuthorityShareArtifact {
     pub export: ComplianceAuthorityExportArtifact,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComplianceRegulationAssistIntent {
+    Summary,
+    DraftFilingText,
+    AuthorizeFlight,
+    ClearViolation,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComplianceRuleCitation {
+    pub rule_ref: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComplianceRegulationAssistRequest {
+    pub assist_id: String,
+    pub intent: ComplianceRegulationAssistIntent,
+    pub report: ComplianceAuditReport,
+    pub generated_at: String,
+    #[serde(default)]
+    pub rule_citations: Vec<ComplianceRuleCitation>,
+    pub feature_enabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ComplianceRegulationAssistOutput {
+    pub assist_id: String,
+    pub intent: ComplianceRegulationAssistIntent,
+    pub report_id: String,
+    pub generated_at: String,
+    pub summary: String,
+    pub draft_filing_text: String,
+    pub uncertainty_flag: bool,
+    pub uncertainty_reasons: Vec<String>,
+    pub source_record_refs: Vec<String>,
+    pub rule_refs: Vec<String>,
+    pub can_authorize: bool,
+    pub can_clear_violation: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ComplianceAuditReportError {
     EmptyReportId,
@@ -799,6 +841,26 @@ pub enum ComplianceAuthorityShareError {
     EmptyExpiresAt,
     #[error("revoked_at cannot be empty")]
     EmptyRevokedAt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ComplianceRegulationAssistError {
+    #[error("assist_id cannot be empty")]
+    EmptyAssistId,
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("rule citation ref cannot be empty")]
+    EmptyRuleRef,
+    #[error("rule citation title cannot be empty")]
+    EmptyRuleTitle,
+    #[error("regulation assist feature flag is disabled")]
+    FeatureDisabled,
+    #[error("regulation assist cannot authorize flights or clear violations; use the deterministic gate")]
+    DeterministicGateRequired,
+    #[error("regulation assist requires at least one rule citation")]
+    EmptyRuleCitations,
+    #[error("regulation assist requires source compliance records")]
+    EmptySourceRecords,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -1323,6 +1385,123 @@ pub fn revoke_compliance_authority_share(
         ComplianceAuthorityShareError::EmptyRevokedAt,
     )?);
     Ok(share)
+}
+
+pub fn build_compliance_regulation_assist(
+    request: ComplianceRegulationAssistRequest,
+) -> Result<ComplianceRegulationAssistOutput, ComplianceRegulationAssistError> {
+    if !request.feature_enabled {
+        return Err(ComplianceRegulationAssistError::FeatureDisabled);
+    }
+    match request.intent {
+        ComplianceRegulationAssistIntent::Summary
+        | ComplianceRegulationAssistIntent::DraftFilingText => {}
+        ComplianceRegulationAssistIntent::AuthorizeFlight
+        | ComplianceRegulationAssistIntent::ClearViolation => {
+            return Err(ComplianceRegulationAssistError::DeterministicGateRequired);
+        }
+    }
+
+    let assist_id = normalize_regulation_assist_text(
+        request.assist_id,
+        ComplianceRegulationAssistError::EmptyAssistId,
+    )?;
+    let generated_at = normalize_regulation_assist_text(
+        request.generated_at,
+        ComplianceRegulationAssistError::EmptyGeneratedAt,
+    )?;
+    if request.report.records.is_empty() {
+        return Err(ComplianceRegulationAssistError::EmptySourceRecords);
+    }
+    if request.rule_citations.is_empty() {
+        return Err(ComplianceRegulationAssistError::EmptyRuleCitations);
+    }
+
+    let mut rule_refs = Vec::new();
+    let mut rule_titles = Vec::new();
+    for citation in request.rule_citations {
+        let rule_ref = normalize_regulation_assist_text(
+            citation.rule_ref,
+            ComplianceRegulationAssistError::EmptyRuleRef,
+        )?;
+        let title = normalize_regulation_assist_text(
+            citation.title,
+            ComplianceRegulationAssistError::EmptyRuleTitle,
+        )?;
+        rule_refs.push(rule_ref);
+        rule_titles.push(title);
+    }
+    rule_refs.sort();
+    rule_refs.dedup();
+    rule_titles.sort();
+    rule_titles.dedup();
+
+    let mut source_record_refs = request
+        .report
+        .records
+        .iter()
+        .map(|record| format!("compliance_record:{}@v{}", record.record_id, record.version))
+        .collect::<Vec<_>>();
+    source_record_refs.sort();
+    source_record_refs.dedup();
+
+    let mut uncertainty_reasons = Vec::new();
+    for mandatory in [
+        ComplianceRecordType::RemoteIdLog,
+        ComplianceRecordType::ChemicalApplication,
+        ComplianceRecordType::OperatorCertification,
+        ComplianceRecordType::AuthorizationDecision,
+    ] {
+        if !request
+            .report
+            .record_type_counts
+            .contains_key(mandatory.as_str())
+        {
+            uncertainty_reasons.push(format!("missing_{}", mandatory.as_str()));
+        }
+    }
+    if rule_refs.is_empty() {
+        uncertainty_reasons.push("missing_rule_refs".to_string());
+    }
+    let uncertainty_flag = !uncertainty_reasons.is_empty();
+
+    let record_types = request
+        .report
+        .record_type_counts
+        .iter()
+        .map(|(record_type, count)| format!("{record_type}:{count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let summary = format!(
+        "Compliance report {} for org {} field {} includes {} records ({}) and cites {} provenance refs. Deterministic gates remain authoritative.",
+        request.report.report_id,
+        request.report.org_id,
+        request.report.field_id,
+        request.report.record_count,
+        record_types,
+        request.report.provenance_refs.len()
+    );
+    let draft_filing_text = format!(
+        "Draft filing for {}: submit records [{}] with rule citations [{}]. This draft does not authorize operations or clear violations.",
+        request.report.field_id,
+        source_record_refs.join(", "),
+        rule_titles.join("; ")
+    );
+
+    Ok(ComplianceRegulationAssistOutput {
+        assist_id,
+        intent: request.intent,
+        report_id: request.report.report_id,
+        generated_at,
+        summary,
+        draft_filing_text,
+        uncertainty_flag,
+        uncertainty_reasons,
+        source_record_refs,
+        rule_refs,
+        can_authorize: false,
+        can_clear_violation: false,
+    })
 }
 
 pub fn build_airspace_zone_record(
@@ -2301,6 +2480,18 @@ fn normalize_authority_share_text(
     }
 }
 
+fn normalize_regulation_assist_text(
+    value: String,
+    error: ComplianceRegulationAssistError,
+) -> Result<String, ComplianceRegulationAssistError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
 fn normalize_required_airspace_text(
     value: String,
     error: AirspaceZoneError,
@@ -2909,29 +3100,31 @@ mod tests {
         append_compliance_record_version, build_airspace_zone_record,
         build_compliance_audit_report, build_compliance_authority_export,
         build_compliance_authority_share, build_compliance_evidence_record,
-        build_initial_compliance_record, build_operator_certification_record,
-        check_operator_certification, compute_rei_phi_window, evaluate_compliance_record_deletion,
-        evaluate_compliance_record_storage, evaluate_entry_harvest_clearance,
-        evaluate_preflight_authorization, evaluate_spray_buffer_compliance,
-        refuse_compliance_evidence_overwrite, refuse_in_place_mutation,
-        revoke_compliance_authority_share, AirspaceCoordinate, AirspaceZoneClass,
-        AirspaceZoneError, AirspaceZoneIngestRequest, AppendComplianceRecordVersionRequest,
-        ApplicationGeometry, AuthorizationBlockReason, AuthorizationDecisionStatus,
-        CertificationBlockReason, CertificationStatus, ChemicalApplicationRecord,
-        ComplianceAlertScheduleRequest, ComplianceAlertSeverity, ComplianceAuditReportError,
-        ComplianceAuditReportRequest, ComplianceAuthorityExportError,
+        build_compliance_regulation_assist, build_initial_compliance_record,
+        build_operator_certification_record, check_operator_certification, compute_rei_phi_window,
+        evaluate_compliance_record_deletion, evaluate_compliance_record_storage,
+        evaluate_entry_harvest_clearance, evaluate_preflight_authorization,
+        evaluate_spray_buffer_compliance, refuse_compliance_evidence_overwrite,
+        refuse_in_place_mutation, revoke_compliance_authority_share, AirspaceCoordinate,
+        AirspaceZoneClass, AirspaceZoneError, AirspaceZoneIngestRequest,
+        AppendComplianceRecordVersionRequest, ApplicationGeometry, AuthorizationBlockReason,
+        AuthorizationDecisionStatus, CertificationBlockReason, CertificationStatus,
+        ChemicalApplicationRecord, ComplianceAlertScheduleRequest, ComplianceAlertSeverity,
+        ComplianceAuditReportError, ComplianceAuditReportRequest, ComplianceAuthorityExportError,
         ComplianceAuthorityExportRequest, ComplianceAuthorityFormat,
         ComplianceAuthorityShareRequest, ComplianceCheckKind, ComplianceDeadlineRecord,
         ComplianceEvidenceError, ComplianceEvidenceInput, ComplianceEvidenceRequest,
         CompliancePolicyBlockReason, CompliancePolicyDecisionStatus, ComplianceRecordError,
         ComplianceRecordPayload, ComplianceRecordSourceHealth, ComplianceRecordSourceStatus,
-        ComplianceRecordStoragePlan, ComplianceRecordType, ComplianceRetentionClass,
-        ComplianceRetentionPolicyRule, CreateComplianceRecordRequest, EntryHarvestAction,
-        EntryHarvestBlockReason, EntryHarvestDecisionStatus, IntervalWindowStatus,
-        OperatorCertificationRegistrationRequest, PreflightAirspaceStatus,
-        PreflightAuthorizationRequest, ProductLabelInterval, RemoteIdFlightLogRecord,
-        RemoteIdTrackPoint, SensitiveBufferFeature, SensitiveFeatureType, SprayBufferBlockReason,
-        SprayBufferComplianceError, SprayBufferDecisionStatus, TelemetryGapRecord,
+        ComplianceRecordStoragePlan, ComplianceRecordType, ComplianceRegulationAssistError,
+        ComplianceRegulationAssistIntent, ComplianceRegulationAssistRequest,
+        ComplianceRetentionClass, ComplianceRetentionPolicyRule, ComplianceRuleCitation,
+        CreateComplianceRecordRequest, EntryHarvestAction, EntryHarvestBlockReason,
+        EntryHarvestDecisionStatus, IntervalWindowStatus, OperatorCertificationRegistrationRequest,
+        PreflightAirspaceStatus, PreflightAuthorizationRequest, ProductLabelInterval,
+        RemoteIdFlightLogRecord, RemoteIdTrackPoint, SensitiveBufferFeature, SensitiveFeatureType,
+        SprayBufferBlockReason, SprayBufferComplianceError, SprayBufferDecisionStatus,
+        TelemetryGapRecord,
     };
 
     #[test]
@@ -4030,6 +4223,71 @@ mod tests {
         let revoked = revoke_compliance_authority_share(share, "2026-06-14T12:10:00Z".to_string())
             .expect("share should revoke with audit timestamp");
         assert_eq!(revoked.revoked_at.as_deref(), Some("2026-06-14T12:10:00Z"));
+    }
+
+    #[test]
+    fn regulation_assist_summarizes_records_with_citations_and_uncertainty() {
+        let output = build_compliance_regulation_assist(ComplianceRegulationAssistRequest {
+            assist_id: "assist-1".to_string(),
+            intent: ComplianceRegulationAssistIntent::Summary,
+            report: complete_audit_report(),
+            generated_at: "2026-06-13T12:20:00Z".to_string(),
+            rule_citations: vec![
+                ComplianceRuleCitation {
+                    rule_ref: "rule:faa:remote-id".to_string(),
+                    title: "FAA Remote ID flight log submission".to_string(),
+                },
+                ComplianceRuleCitation {
+                    rule_ref: "rule:state:pesticide-application".to_string(),
+                    title: "State pesticide application filing".to_string(),
+                },
+            ],
+            feature_enabled: true,
+        })
+        .expect("assist should summarize deterministic records");
+
+        assert_eq!(output.assist_id, "assist-1");
+        assert_eq!(output.report_id, "report-field-north");
+        assert!(!output.can_authorize);
+        assert!(!output.can_clear_violation);
+        assert!(output
+            .summary
+            .contains("Deterministic gates remain authoritative"));
+        assert!(output
+            .draft_filing_text
+            .contains("does not authorize operations or clear violations"));
+        assert!(output
+            .source_record_refs
+            .contains(&"compliance_record:remote-log-1@v1".to_string()));
+        assert!(output.rule_refs.contains(&"rule:faa:remote-id".to_string()));
+        assert!(
+            output.uncertainty_flag,
+            "minimal report lacks all default mandatory record classes"
+        );
+        assert!(output
+            .uncertainty_reasons
+            .contains(&"missing_operator_certification".to_string()));
+    }
+
+    #[test]
+    fn regulation_assist_refuses_authorization_or_clearance_attempts() {
+        let error = build_compliance_regulation_assist(ComplianceRegulationAssistRequest {
+            assist_id: "assist-denied".to_string(),
+            intent: ComplianceRegulationAssistIntent::AuthorizeFlight,
+            report: complete_audit_report(),
+            generated_at: "2026-06-13T12:20:00Z".to_string(),
+            rule_citations: vec![ComplianceRuleCitation {
+                rule_ref: "rule:faa:remote-id".to_string(),
+                title: "FAA Remote ID flight log submission".to_string(),
+            }],
+            feature_enabled: true,
+        })
+        .expect_err("assist must not authorize flights");
+
+        assert_eq!(
+            error,
+            ComplianceRegulationAssistError::DeterministicGateRequired
+        );
     }
 
     fn complete_audit_report() -> super::ComplianceAuditReport {

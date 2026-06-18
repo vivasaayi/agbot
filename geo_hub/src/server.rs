@@ -189,6 +189,10 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::revoke_compliance_authority_share_route),
         )
         .route(
+            "/api/compliance/regulation-assist",
+            post(routes::run_compliance_regulation_assist),
+        )
+        .route(
             "/api/compliance/records/:record_id/versions",
             post(routes::append_compliance_record_version_route),
         )

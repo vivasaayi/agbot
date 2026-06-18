@@ -24,14 +24,17 @@ use axum::{
 use compliance::{
     airspace_zone_contains_point, airspace_zone_is_effective_at, append_compliance_record_version,
     build_airspace_zone_record, build_compliance_audit_report, build_compliance_authority_export,
-    build_compliance_authority_share, build_initial_compliance_record, refuse_in_place_mutation,
-    revoke_compliance_authority_share, AirspaceCoordinate, AirspaceZoneClass, AirspaceZoneError,
-    AirspaceZoneIngestRequest, AirspaceZoneRecord, AppendComplianceRecordVersionRequest,
-    ComplianceAuditReport, ComplianceAuditReportError, ComplianceAuditReportRequest,
-    ComplianceAuthorityExportArtifact, ComplianceAuthorityExportError,
-    ComplianceAuthorityExportRequest, ComplianceAuthorityFormat, ComplianceAuthorityShareArtifact,
-    ComplianceAuthorityShareError, ComplianceAuthorityShareRequest, ComplianceRecord,
-    ComplianceRecordError, ComplianceRecordPayload, ComplianceRecordType, ComplianceRetentionClass,
+    build_compliance_authority_share, build_compliance_regulation_assist,
+    build_initial_compliance_record, refuse_in_place_mutation, revoke_compliance_authority_share,
+    AirspaceCoordinate, AirspaceZoneClass, AirspaceZoneError, AirspaceZoneIngestRequest,
+    AirspaceZoneRecord, AppendComplianceRecordVersionRequest, ComplianceAuditReport,
+    ComplianceAuditReportError, ComplianceAuditReportRequest, ComplianceAuthorityExportArtifact,
+    ComplianceAuthorityExportError, ComplianceAuthorityExportRequest, ComplianceAuthorityFormat,
+    ComplianceAuthorityShareArtifact, ComplianceAuthorityShareError,
+    ComplianceAuthorityShareRequest, ComplianceRecord, ComplianceRecordError,
+    ComplianceRecordPayload, ComplianceRecordType, ComplianceRegulationAssistError,
+    ComplianceRegulationAssistIntent, ComplianceRegulationAssistOutput,
+    ComplianceRegulationAssistRequest, ComplianceRetentionClass, ComplianceRuleCitation,
     CreateComplianceRecordRequest,
 };
 use copilot::{
@@ -1276,6 +1279,25 @@ pub struct ComplianceAuthorityShareRevokeRequest {
     pub actor: Option<String>,
     #[serde(default)]
     pub revoked_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ComplianceRegulationAssistApiRequest {
+    pub intent: ComplianceRegulationAssistIntent,
+    #[serde(default)]
+    pub assist_id: Option<String>,
+    #[serde(default)]
+    pub org_id: String,
+    #[serde(default)]
+    pub field_id: String,
+    #[serde(default)]
+    pub generated_at: Option<String>,
+    #[serde(default)]
+    pub mandatory_record_types: Vec<ComplianceRecordType>,
+    #[serde(default)]
+    pub rule_citations: Vec<ComplianceRuleCitation>,
+    #[serde(default)]
+    pub feature_enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -8009,6 +8031,46 @@ pub async fn revoke_compliance_authority_share_route(
     Ok(Json(revoked))
 }
 
+pub async fn run_compliance_regulation_assist(
+    State(state): State<AppState>,
+    Json(request): Json<ComplianceRegulationAssistApiRequest>,
+) -> AppResult<Json<ComplianceRegulationAssistOutput>> {
+    let records =
+        load_compliance_records_for_report(&state, &request.org_id, &request.field_id).await?;
+    let mandatory_record_types = if request.mandatory_record_types.is_empty() {
+        default_compliance_report_mandatory_types()
+    } else {
+        request.mandatory_record_types
+    };
+    let generated_at = request
+        .generated_at
+        .unwrap_or_else(current_record_timestamp);
+    let report = build_compliance_audit_report(ComplianceAuditReportRequest {
+        report_id: format!("compliance-assist-report-{}", Uuid::new_v4()),
+        org_id: request.org_id,
+        field_id: request.field_id,
+        generated_at: generated_at.clone(),
+        records,
+        mandatory_record_types,
+    })
+    .map_err(compliance_audit_report_error)?;
+
+    let output = build_compliance_regulation_assist(ComplianceRegulationAssistRequest {
+        assist_id: request
+            .assist_id
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| format!("compliance-assist-{}", Uuid::new_v4())),
+        intent: request.intent,
+        report,
+        generated_at,
+        rule_citations: request.rule_citations,
+        feature_enabled: request.feature_enabled,
+    })
+    .map_err(compliance_regulation_assist_error)?;
+
+    Ok(Json(output))
+}
+
 pub async fn ingest_airspace_zone(
     State(state): State<AppState>,
     Json(request): Json<AirspaceZoneIngestRequest>,
@@ -11579,6 +11641,18 @@ fn compliance_authority_export_error(error: ComplianceAuthorityExportError) -> A
 
 fn compliance_authority_share_error(error: ComplianceAuthorityShareError) -> AppError {
     AppError::BadRequest(error.to_string())
+}
+
+fn compliance_regulation_assist_error(error: ComplianceRegulationAssistError) -> AppError {
+    if matches!(
+        error,
+        ComplianceRegulationAssistError::DeterministicGateRequired
+            | ComplianceRegulationAssistError::FeatureDisabled
+    ) {
+        AppError::Forbidden(error.to_string())
+    } else {
+        AppError::BadRequest(error.to_string())
+    }
 }
 
 fn parse_compliance_record_type(value: String) -> AppResult<ComplianceRecordType> {
