@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: 4f09f86 (`batch-20260618043000`)
-- **Latest checkpoint commit**: e47b888
+- **Last implementation commit**: 07dd186 (`batch-20260618051500`)
+- **Latest checkpoint commit**: 0691c57
 - **Current batch**: none
-- **Completed feature rows**: 483 committed; 1 tests_passed; 2 skipped; 2 blocked; 10 pending in this run.
+- **Completed feature rows**: 484 committed; 1 tests_passed; 2 skipped; 2 blocked; 9 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch.
 
 ## Latest verification
@@ -156,7 +156,14 @@
 - `cargo check -p compliance` — pass
 - `cargo check -p geo_hub` — pass
 - `24-14` — committed as evidence-gated regulation-summary assist with deterministic source-record/rule citations, uncertainty flags, feature gating, non-authorizing output flags, and explicit refusal to authorize flights or clear violations
+- `cargo fmt` — pass
+- `cargo test -p fleet_health ground_vehicle --lib` — pass
+- `cargo test -p geo_hub --test products_api fleet_health_ingests_tractor_health` — pass
+- `cargo test -p geo_hub --test products_api fleet_health_` — pass
+- `cargo check -p fleet_health` — pass
+- `cargo check -p geo_hub` — pass
+- `25-11` — committed as tractor/ground-vehicle fleet-health integration with shared component/verdict/readiness/dashboard contracts, tractor existence validation, persisted component registry rows, overdue-service field-ops blocking, and ground-vehicle ingestion event evidence
 
 ## Next action
 
-- Select and claim the next pending roadmap feature after `24-14` evidence-gated compliance regulation assist.
+- Select and claim the next pending roadmap feature after `25-11` tractor fleet-health integration.
