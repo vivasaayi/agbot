@@ -461,6 +461,84 @@ pub struct ApprovedCopilotRecommendation {
     pub recommendation: RecommendationRecord,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CopilotProactiveChangeSeverity {
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProactiveClosedLoopAdvisoryRequest {
+    pub advisory_id: String,
+    pub conversation_id: String,
+    pub turn_id: String,
+    pub org_id: String,
+    pub field_id: String,
+    pub scene_id: String,
+    pub zone_ref: String,
+    pub author_user_id: String,
+    pub change_event_id: String,
+    pub change_event_summary: String,
+    pub severity: CopilotProactiveChangeSeverity,
+    pub event_evidence_ids: Vec<String>,
+    pub retrieved_evidence: Vec<EvidenceIndexEntry>,
+    pub action_category: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    pub created_at: String,
+    pub interface_version: String,
+    pub audit_ledger_ref: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProactiveClosedLoopAdvisorySkipReason {
+    SeverityBelowHigh,
+    UnresolvedEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProactiveClosedLoopAdvisory {
+    pub advisory_id: String,
+    pub change_event_id: String,
+    pub severity: CopilotProactiveChangeSeverity,
+    pub answer: GroundedCopilotAnswer,
+    pub draft_action: CopilotRecommendationDraft,
+    pub audit: CopilotTurnAuditRecord,
+    pub requires_human_approval: bool,
+    pub action_executed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProactiveClosedLoopAdvisoryResult {
+    pub surfaced: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advisory: Option<ProactiveClosedLoopAdvisory>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<ProactiveClosedLoopAdvisorySkipReason>,
+    pub action_executed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum ProactiveClosedLoopAdvisoryError {
+    #[error("advisory_id cannot be empty")]
+    EmptyAdvisoryId,
+    #[error("change_event_id cannot be empty")]
+    EmptyChangeEventId,
+    #[error("change_event_summary cannot be empty")]
+    EmptyChangeEventSummary,
+    #[error("proactive advisory requires at least one event evidence id")]
+    EmptyEventEvidenceIds,
+    #[error(transparent)]
+    Draft(#[from] CopilotRecommendationDraftError),
+    #[error(transparent)]
+    Audit(#[from] CopilotAuditError),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CopilotRecommendationDraftError {
     #[error("draft_id cannot be empty")]
@@ -1125,6 +1203,123 @@ pub fn approve_recommendation_draft(
     })
 }
 
+pub fn surface_proactive_closed_loop_advisory(
+    sink: &mut impl CopilotAuditSink,
+    request: ProactiveClosedLoopAdvisoryRequest,
+) -> Result<ProactiveClosedLoopAdvisoryResult, ProactiveClosedLoopAdvisoryError> {
+    let advisory_id = normalize_proactive_text(
+        request.advisory_id,
+        ProactiveClosedLoopAdvisoryError::EmptyAdvisoryId,
+    )?;
+    let change_event_id = normalize_proactive_text(
+        request.change_event_id,
+        ProactiveClosedLoopAdvisoryError::EmptyChangeEventId,
+    )?;
+    let change_event_summary = normalize_proactive_text(
+        request.change_event_summary,
+        ProactiveClosedLoopAdvisoryError::EmptyChangeEventSummary,
+    )?;
+    let event_evidence_ids = normalize_proactive_citations(request.event_evidence_ids)?;
+
+    if !is_high_severity_change(request.severity) {
+        return Ok(ProactiveClosedLoopAdvisoryResult {
+            surfaced: false,
+            advisory: None,
+            skip_reason: Some(ProactiveClosedLoopAdvisorySkipReason::SeverityBelowHigh),
+            action_executed: false,
+        });
+    }
+
+    let evidence_by_id = request
+        .retrieved_evidence
+        .iter()
+        .filter_map(|entry| normalize_text(entry.evidence_id.clone()).map(|id| (id, entry)))
+        .collect::<BTreeMap<_, _>>();
+    let resolved_evidence = event_evidence_ids
+        .iter()
+        .filter_map(|evidence_id| {
+            evidence_by_id.get(evidence_id).and_then(|entry| {
+                normalize_text(entry.ledger_ref.clone())?;
+                Some((*entry).clone())
+            })
+        })
+        .collect::<Vec<_>>();
+    if resolved_evidence.len() != event_evidence_ids.len() {
+        return Ok(ProactiveClosedLoopAdvisoryResult {
+            surfaced: false,
+            advisory: None,
+            skip_reason: Some(ProactiveClosedLoopAdvisorySkipReason::UnresolvedEvidence),
+            action_executed: false,
+        });
+    }
+
+    let answer = GroundedCopilotAnswer {
+        text: format!(
+            "Proactive advisory for change event {change_event_id}: {change_event_summary}"
+        ),
+        claims: resolved_evidence
+            .iter()
+            .map(|entry| CopilotAnswerClaim {
+                text: format!("Change evidence {}: {}", entry.evidence_id, entry.summary),
+                cited_evidence_ids: vec![entry.evidence_id.clone()],
+            })
+            .collect(),
+        cited_evidence_ids: event_evidence_ids.clone(),
+        confidence: 0.84,
+        model_provider: "deterministic".to_string(),
+        model_id: "copilot-proactive-closed-loop-advisory".to_string(),
+        model_version: "v1".to_string(),
+    };
+    let draft_action = draft_recommendation_from_answer(CopilotRecommendationDraftRequest {
+        draft_id: format!("draft:{advisory_id}"),
+        org_id: request.org_id,
+        field_id: request.field_id.clone(),
+        scene_id: request.scene_id,
+        author_user_id: request.author_user_id,
+        title: request.title,
+        note: request.note,
+        action_category: request.action_category,
+        priority: RecommendationPriority::High,
+        zone_ref: request.zone_ref,
+        answer: answer.clone(),
+        created_at: request.created_at.clone(),
+    })?;
+    let turn = GroundedCopilotTurn {
+        refused: false,
+        refusal: None,
+        answer: Some(answer.clone()),
+    };
+    let audited = finalize_audited_turn(
+        sink,
+        CopilotTurnAuditRequest {
+            conversation_id: request.conversation_id,
+            turn_id: request.turn_id,
+            field_id: request.field_id,
+            question: format!("proactive closed-loop advisory for {change_event_id}"),
+            turn,
+            interface_version: request.interface_version,
+            ts: request.created_at,
+            ledger_ref: request.audit_ledger_ref,
+        },
+    )?;
+
+    Ok(ProactiveClosedLoopAdvisoryResult {
+        surfaced: true,
+        advisory: Some(ProactiveClosedLoopAdvisory {
+            advisory_id,
+            change_event_id,
+            severity: request.severity,
+            answer,
+            draft_action,
+            audit: audited.audit,
+            requires_human_approval: true,
+            action_executed: false,
+        }),
+        skip_reason: None,
+        action_executed: false,
+    })
+}
+
 pub fn start_copilot_conversation(
     request: CopilotConversationStartRequest,
     generated_conversation_id: String,
@@ -1644,6 +1839,13 @@ fn normalize_draft_text(
     normalize_text(value).ok_or(error)
 }
 
+fn normalize_proactive_text(
+    value: String,
+    error: ProactiveClosedLoopAdvisoryError,
+) -> Result<String, ProactiveClosedLoopAdvisoryError> {
+    normalize_text(value).ok_or(error)
+}
+
 fn normalize_conversation_text(value: String) -> Option<String> {
     normalize_text(value)
 }
@@ -1673,6 +1875,29 @@ fn normalize_draft_citations(
     } else {
         Ok(cited_evidence_ids)
     }
+}
+
+fn normalize_proactive_citations(
+    values: Vec<String>,
+) -> Result<Vec<String>, ProactiveClosedLoopAdvisoryError> {
+    let cited_evidence_ids = values
+        .into_iter()
+        .filter_map(normalize_text)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if cited_evidence_ids.is_empty() {
+        Err(ProactiveClosedLoopAdvisoryError::EmptyEventEvidenceIds)
+    } else {
+        Ok(cited_evidence_ids)
+    }
+}
+
+fn is_high_severity_change(severity: CopilotProactiveChangeSeverity) -> bool {
+    matches!(
+        severity,
+        CopilotProactiveChangeSeverity::High | CopilotProactiveChangeSeverity::Critical
+    )
 }
 
 fn normalize_fixture(
@@ -1725,18 +1950,21 @@ mod tests {
         build_evidence_retrieval_index, create_copilot_turn, draft_recommendation_from_answer,
         explain_zone_finding_change, export_copilot_answer_with_citations, finalize_audited_turn,
         post_check_grounded_answer, resolve_copilot_field_context, start_copilot_conversation,
-        CopilotAnswer, CopilotAnswerClaim, CopilotAnswerExportError, CopilotAnswerExportRequest,
-        CopilotAnswerRequest, CopilotAuditError, CopilotAuditSink, CopilotConfidenceLevel,
-        CopilotContextError, CopilotContextUpdateRequest, CopilotConversationError,
-        CopilotConversationStartRequest, CopilotExplanationError, CopilotExplanationRequest,
-        CopilotFieldContext, CopilotGroundingError, CopilotIndexError, CopilotModel,
-        CopilotModelError, CopilotRecommendationApproval, CopilotRecommendationDraftError,
-        CopilotRecommendationDraftRequest, CopilotRecommendationDraftStatus, CopilotRefusalReason,
-        CopilotTurnAuditRecord, CopilotTurnAuditRequest, CopilotTurnCreateRequest, CopilotTurnRole,
+        surface_proactive_closed_loop_advisory, CopilotAnswer, CopilotAnswerClaim,
+        CopilotAnswerExportError, CopilotAnswerExportRequest, CopilotAnswerRequest,
+        CopilotAuditError, CopilotAuditSink, CopilotConfidenceLevel, CopilotContextError,
+        CopilotContextUpdateRequest, CopilotConversationError, CopilotConversationStartRequest,
+        CopilotExplanationError, CopilotExplanationRequest, CopilotFieldContext,
+        CopilotGroundingError, CopilotIndexError, CopilotModel, CopilotModelError,
+        CopilotProactiveChangeSeverity, CopilotRecommendationApproval,
+        CopilotRecommendationDraftError, CopilotRecommendationDraftRequest,
+        CopilotRecommendationDraftStatus, CopilotRefusalReason, CopilotTurnAuditRecord,
+        CopilotTurnAuditRequest, CopilotTurnCreateRequest, CopilotTurnRole,
         DeterministicAnswerFixture, DeterministicCopilotModel, EvidenceCandidate,
         EvidenceFreshnessRecord, EvidenceFreshnessStatus, EvidenceIndexEntry, EvidenceKind,
         EvidenceRejectionReason, GroundedCopilotAnswer, GroundedCopilotQuestionRequest,
-        LedgerEvidenceResolver, UnavailableCopilotModel, UncertaintyReasonCode,
+        LedgerEvidenceResolver, ProactiveClosedLoopAdvisoryRequest,
+        ProactiveClosedLoopAdvisorySkipReason, UnavailableCopilotModel, UncertaintyReasonCode,
     };
     use shared::schemas::{RecommendationLifecycleRegistry, RecommendationPriority};
 
@@ -2693,6 +2921,84 @@ mod tests {
         assert_eq!(error, CopilotRecommendationDraftError::NoCitedEvidence);
     }
 
+    #[test]
+    fn proactive_closed_loop_advisory_surfaces_cited_draft_and_audit_for_high_severity_change() {
+        let mut sink = RecordingAuditSink::default();
+
+        let result = surface_proactive_closed_loop_advisory(
+            &mut sink,
+            proactive_request(vec![retrieved_evidence("change-evidence-001")]),
+        )
+        .expect("high-severity event should produce proactive advisory");
+
+        assert!(result.surfaced);
+        assert!(!result.action_executed);
+        let advisory = result.advisory.expect("advisory should be surfaced");
+        assert_eq!(advisory.advisory_id, "proactive-001");
+        assert_eq!(advisory.change_event_id, "domain28-change-001");
+        assert_eq!(
+            advisory.answer.cited_evidence_ids,
+            vec!["change-evidence-001"]
+        );
+        assert_eq!(
+            advisory.draft_action.status,
+            CopilotRecommendationDraftStatus::Draft
+        );
+        assert_eq!(
+            advisory.draft_action.cited_evidence_ids,
+            vec!["change-evidence-001"]
+        );
+        assert!(advisory.requires_human_approval);
+        assert!(!advisory.action_executed);
+        assert_eq!(sink.records.len(), 1);
+        assert_eq!(advisory.audit.ledger_ref, "ledger:30:copilot:proactive-001");
+        assert_eq!(
+            advisory.audit.cited_evidence_ids,
+            vec!["change-evidence-001"]
+        );
+    }
+
+    #[test]
+    fn proactive_closed_loop_advisory_draft_is_inert_without_approval() {
+        let mut sink = RecordingAuditSink::default();
+        let registry = RecommendationLifecycleRegistry::default();
+
+        let result = surface_proactive_closed_loop_advisory(
+            &mut sink,
+            proactive_request(vec![retrieved_evidence("change-evidence-001")]),
+        )
+        .expect("high-severity event should produce proactive advisory");
+        let advisory = result.advisory.expect("advisory should be surfaced");
+
+        assert_eq!(
+            advisory.draft_action.status,
+            CopilotRecommendationDraftStatus::Draft
+        );
+        assert!(registry.recommendations_for_org("org-a").is_empty());
+        assert!(!result.action_executed);
+        assert!(!advisory.action_executed);
+    }
+
+    #[test]
+    fn proactive_closed_loop_advisory_skips_unresolved_evidence_without_claim_or_action() {
+        let mut sink = RecordingAuditSink::default();
+        let mut unresolved = retrieved_evidence("change-evidence-001");
+        unresolved.ledger_ref = " ".to_string();
+
+        let result =
+            surface_proactive_closed_loop_advisory(&mut sink, proactive_request(vec![unresolved]))
+                .expect("unresolved evidence should skip without surfacing");
+
+        assert!(!result.surfaced);
+        assert!(result.advisory.is_none());
+        assert_eq!(
+            result.skip_reason,
+            Some(ProactiveClosedLoopAdvisorySkipReason::UnresolvedEvidence)
+        );
+        assert!(!result.action_executed);
+        assert!(sink.records.is_empty());
+    }
+
     fn retrieved_evidence(evidence_id: &str) -> EvidenceIndexEntry {
         retrieved_evidence_for_field(evidence_id, "field-001")
     }
@@ -2706,6 +3012,32 @@ mod tests {
             zone_ref: Some("zone-ne".to_string()),
             ledger_ref: format!("ledger:30:{evidence_id}"),
             summary: "NDVI in the northeast zone dropped below threshold.".to_string(),
+        }
+    }
+
+    fn proactive_request(
+        retrieved_evidence: Vec<EvidenceIndexEntry>,
+    ) -> ProactiveClosedLoopAdvisoryRequest {
+        ProactiveClosedLoopAdvisoryRequest {
+            advisory_id: "proactive-001".to_string(),
+            conversation_id: "conversation-001".to_string(),
+            turn_id: "turn-proactive-001".to_string(),
+            org_id: "org-a".to_string(),
+            field_id: "field-001".to_string(),
+            scene_id: "scene-2026-06-12".to_string(),
+            zone_ref: "zone-ne".to_string(),
+            author_user_id: "copilot".to_string(),
+            change_event_id: "domain28-change-001".to_string(),
+            change_event_summary: "NDVI dropped sharply in the northeast zone.".to_string(),
+            severity: CopilotProactiveChangeSeverity::High,
+            event_evidence_ids: vec!["change-evidence-001".to_string()],
+            retrieved_evidence,
+            action_category: "scouting".to_string(),
+            title: "Review high-severity crop change".to_string(),
+            note: Some("Drafted from a cited domain 28 change event.".to_string()),
+            created_at: "2026-06-12T14:00:00Z".to_string(),
+            interface_version: "copilot-interface-v1".to_string(),
+            audit_ledger_ref: "ledger:30:copilot:proactive-001".to_string(),
         }
     }
 
