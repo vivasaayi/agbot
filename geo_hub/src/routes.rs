@@ -113,20 +113,25 @@ use shared::schemas::{
     parse_sustainability_kpi_direction, parse_sustainability_kpi_status,
     parse_sustainability_metric_type, parse_sustainability_mrv_output_kind,
     parse_sustainability_trend, place_marketplace_order_record, prepare_open_data_publication,
-    publish_marketplace_listing_record, relay_collaboration_stream_frame,
-    release_marketplace_inventory, reserve_marketplace_inventory, resolve_content_permissions,
-    resolve_localized_content, search_published_content, soil_moisture_rejection_reason_for_error,
-    soil_moisture_rejection_record, start_collaboration_stream, transition_content_workflow,
-    transition_marketplace_account_status, transition_marketplace_fulfillment_status,
-    transition_marketplace_order_status, update_collaboration_presence, validate_field_boundary,
-    weather_fetch_failure_record, AnnotationGeometry, AnnotationRecord, BiodiversityProxyError,
-    BiodiversityProxyRequest, BiodiversityProxyResult, BiodiversityProxyStatus,
-    BiomassEstimateError, BiomassEstimateRequest, BiomassEstimateResult, CarbonEmissionFactor,
-    CarbonFootprintComputeRequest, CarbonFootprintError, CarbonFootprintInput,
-    CarbonFootprintResult, CarbonFootprintStatus, CollaborationAction,
-    CollaborationActionAuthorizeRequest, CollaborationChannelCreateRequest,
-    CollaborationChannelRecord, CollaborationChannelThread, CollaborationError,
-    CollaborationLiveStreamRecord, CollaborationMessageCreateRequest, CollaborationMessageRecord,
+    publish_marketplace_listing_record, raise_collaboration_emergency_alert,
+    relay_collaboration_stream_frame, release_marketplace_inventory, reserve_marketplace_inventory,
+    resolve_content_permissions, resolve_localized_content, search_published_content,
+    soil_moisture_rejection_reason_for_error, soil_moisture_rejection_record,
+    start_collaboration_stream, transition_collaboration_emergency_alert,
+    transition_content_workflow, transition_marketplace_account_status,
+    transition_marketplace_fulfillment_status, transition_marketplace_order_status,
+    update_collaboration_presence, validate_field_boundary, weather_fetch_failure_record,
+    AnnotationGeometry, AnnotationRecord, BiodiversityProxyError, BiodiversityProxyRequest,
+    BiodiversityProxyResult, BiodiversityProxyStatus, BiomassEstimateError, BiomassEstimateRequest,
+    BiomassEstimateResult, CarbonEmissionFactor, CarbonFootprintComputeRequest,
+    CarbonFootprintError, CarbonFootprintInput, CarbonFootprintResult, CarbonFootprintStatus,
+    CollaborationAction, CollaborationActionAuthorizeRequest, CollaborationChannelCreateRequest,
+    CollaborationChannelRecord, CollaborationChannelThread, CollaborationEmergencyAlertAuditRecord,
+    CollaborationEmergencyAlertCreateRequest, CollaborationEmergencyAlertRaiseResult,
+    CollaborationEmergencyAlertRecord, CollaborationEmergencyAlertSource,
+    CollaborationEmergencyAlertState, CollaborationEmergencyAlertTransitionRequest,
+    CollaborationEmergencyAlertTransitionResult, CollaborationError, CollaborationLiveStreamRecord,
+    CollaborationMessageCreateRequest, CollaborationMessageRecord,
     CollaborationNotificationEventRequest, CollaborationNotificationRecord,
     CollaborationPermissionDecision, CollaborationPermissionResolveRequest,
     CollaborationPermissionSet, CollaborationPresenceRecord, CollaborationPresenceState,
@@ -5764,6 +5769,84 @@ pub async fn create_collaboration_notifications(
     insert_collaboration_notifications(&state, &notifications).await?;
 
     Ok(Json(notifications))
+}
+
+pub async fn raise_collaboration_emergency_alert_route(
+    Path(channel_id): Path<String>,
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<CollaborationEmergencyAlertCreateRequest>,
+) -> AppResult<Json<CollaborationEmergencyAlertRaiseResult>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let actor_id = normalize_optional_text(query.actor_id.clone())
+        .ok_or_else(|| collaboration_error(CollaborationError::EmptyActorId))?;
+    let channel = load_collaboration_channel(&state, &channel_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(format!("collaboration channel {channel_id} does not exist"))
+        })?;
+    if channel.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    assert_collaboration_action_permission(
+        &state,
+        &channel.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Alert,
+        Some(&channel.channel_id),
+    )
+    .await?;
+    let result = raise_collaboration_emergency_alert(
+        &channel,
+        request,
+        format!("collab-alert-{}", Uuid::new_v4()),
+        format!("collab-alert-audit-{}", Uuid::new_v4()),
+        actor_id,
+        current_record_timestamp(),
+    )
+    .map_err(collaboration_error)?;
+    persist_collaboration_emergency_alert_raise(&state, &result).await?;
+
+    Ok(Json(result))
+}
+
+pub async fn transition_collaboration_emergency_alert_route(
+    Path(alert_id): Path<String>,
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<CollaborationEmergencyAlertTransitionRequest>,
+) -> AppResult<Json<CollaborationEmergencyAlertTransitionResult>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let alert = load_collaboration_emergency_alert(&state, &alert_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if alert.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    assert_collaboration_action_permission(
+        &state,
+        &alert.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Alert,
+        Some(&alert.channel_id),
+    )
+    .await?;
+    let result = transition_collaboration_emergency_alert(
+        &alert,
+        request,
+        format!("collab-alert-audit-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(collaboration_error)?;
+    persist_collaboration_emergency_alert_transition(&state, &result).await?;
+
+    Ok(Json(result))
 }
 
 pub async fn start_collaboration_stream_route(
@@ -17157,6 +17240,179 @@ fn parse_collaboration_presence_state(value: &str) -> AppResult<CollaborationPre
         "offline" => Ok(CollaborationPresenceState::Offline),
         _ => Err(AppError::BadRequest(format!(
             "unsupported collaboration presence state {value}"
+        ))),
+    }
+}
+
+async fn persist_collaboration_emergency_alert_raise(
+    state: &AppState,
+    result: &CollaborationEmergencyAlertRaiseResult,
+) -> AppResult<()> {
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+    insert_collaboration_emergency_alert_query(&mut tx, &result.alert).await?;
+    for delivery in &result.deliveries {
+        sqlx::query(
+            r#"
+            INSERT INTO collab_alert_deliveries (
+                delivery_id, alert_id, org_id, channel_id, recipient_account_id,
+                delivery_state, retry_count, last_attempt_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+            "#,
+        )
+        .bind(&delivery.delivery_id)
+        .bind(&delivery.alert_id)
+        .bind(&delivery.org_id)
+        .bind(&delivery.channel_id)
+        .bind(&delivery.recipient_account_id)
+        .bind(delivery.delivery_state.as_str())
+        .bind(delivery.retry_count as i64)
+        .bind(&delivery.last_attempt_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(Error::from)?;
+    }
+    insert_collaboration_emergency_alert_audit_query(&mut tx, &result.audit).await?;
+    tx.commit().await.map_err(Error::from)?;
+    Ok(())
+}
+
+async fn persist_collaboration_emergency_alert_transition(
+    state: &AppState,
+    result: &CollaborationEmergencyAlertTransitionResult,
+) -> AppResult<()> {
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+    sqlx::query(
+        r#"
+        UPDATE collab_emergency_alerts
+        SET state = ?1, updated_at = ?2
+        WHERE alert_id = ?3
+        "#,
+    )
+    .bind(result.alert.state.as_str())
+    .bind(&result.alert.updated_at)
+    .bind(&result.alert.alert_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+    insert_collaboration_emergency_alert_audit_query(&mut tx, &result.audit).await?;
+    tx.commit().await.map_err(Error::from)?;
+    Ok(())
+}
+
+async fn insert_collaboration_emergency_alert_query(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    alert: &CollaborationEmergencyAlertRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO collab_emergency_alerts (
+            alert_id, org_id, channel_id, source, severity, trigger_ref,
+            body, state, raised_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "#,
+    )
+    .bind(&alert.alert_id)
+    .bind(&alert.org_id)
+    .bind(&alert.channel_id)
+    .bind(alert.source.as_str())
+    .bind(&alert.severity)
+    .bind(&alert.trigger_ref)
+    .bind(&alert.body)
+    .bind(alert.state.as_str())
+    .bind(&alert.raised_at)
+    .bind(&alert.updated_at)
+    .execute(&mut **tx)
+    .await
+    .map_err(Error::from)?;
+    Ok(())
+}
+
+async fn insert_collaboration_emergency_alert_audit_query(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    audit: &CollaborationEmergencyAlertAuditRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO collab_alert_audits (
+            audit_id, alert_id, action, actor_id, from_state, to_state, occurred_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "#,
+    )
+    .bind(&audit.audit_id)
+    .bind(&audit.alert_id)
+    .bind(&audit.action)
+    .bind(&audit.actor_id)
+    .bind(audit.from_state.as_str())
+    .bind(audit.to_state.as_str())
+    .bind(&audit.occurred_at)
+    .execute(&mut **tx)
+    .await
+    .map_err(Error::from)?;
+    Ok(())
+}
+
+async fn load_collaboration_emergency_alert(
+    state: &AppState,
+    alert_id: &str,
+) -> AppResult<Option<CollaborationEmergencyAlertRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT alert_id, org_id, channel_id, source, severity, trigger_ref,
+               body, state, raised_at, updated_at
+        FROM collab_emergency_alerts
+        WHERE alert_id = ?1
+        "#,
+    )
+    .bind(alert_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_collaboration_emergency_alert(&row))
+        .transpose()
+}
+
+fn decode_collaboration_emergency_alert(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<CollaborationEmergencyAlertRecord> {
+    Ok(CollaborationEmergencyAlertRecord {
+        alert_id: row.get("alert_id"),
+        org_id: row.get("org_id"),
+        channel_id: row.get("channel_id"),
+        source: parse_collaboration_emergency_alert_source(&row.get::<String, _>("source"))?,
+        severity: row.get("severity"),
+        trigger_ref: row.get("trigger_ref"),
+        body: row.get("body"),
+        state: parse_collaboration_emergency_alert_state(&row.get::<String, _>("state"))?,
+        raised_at: row.get("raised_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+fn parse_collaboration_emergency_alert_source(
+    value: &str,
+) -> AppResult<CollaborationEmergencyAlertSource> {
+    match value {
+        "01" => Ok(CollaborationEmergencyAlertSource::Safety01),
+        "12" => Ok(CollaborationEmergencyAlertSource::Fleet12),
+        _ => Err(AppError::BadRequest(format!(
+            "unsupported collaboration emergency alert source {value}"
+        ))),
+    }
+}
+
+fn parse_collaboration_emergency_alert_state(
+    value: &str,
+) -> AppResult<CollaborationEmergencyAlertState> {
+    match value {
+        "raised" => Ok(CollaborationEmergencyAlertState::Raised),
+        "acknowledged" => Ok(CollaborationEmergencyAlertState::Acknowledged),
+        "resolved" => Ok(CollaborationEmergencyAlertState::Resolved),
+        _ => Err(AppError::BadRequest(format!(
+            "unsupported collaboration emergency alert state {value}"
         ))),
     }
 }

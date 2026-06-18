@@ -14031,6 +14031,140 @@ pub struct CollaborationStreamRelayResult {
     pub frame: Option<CollaborationStreamFrameRecord>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationEmergencyAlertSource {
+    Safety01,
+    Fleet12,
+}
+
+impl CollaborationEmergencyAlertSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CollaborationEmergencyAlertSource::Safety01 => "01",
+            CollaborationEmergencyAlertSource::Fleet12 => "12",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationEmergencyAlertState {
+    Raised,
+    Acknowledged,
+    Resolved,
+}
+
+impl CollaborationEmergencyAlertState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CollaborationEmergencyAlertState::Raised => "raised",
+            CollaborationEmergencyAlertState::Acknowledged => "acknowledged",
+            CollaborationEmergencyAlertState::Resolved => "resolved",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationEmergencyAlertAction {
+    Acknowledge,
+    Resolve,
+}
+
+impl CollaborationEmergencyAlertAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CollaborationEmergencyAlertAction::Acknowledge => "acknowledge",
+            CollaborationEmergencyAlertAction::Resolve => "resolve",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollaborationAlertDeliveryState {
+    Delivered,
+    RetryPending,
+}
+
+impl CollaborationAlertDeliveryState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CollaborationAlertDeliveryState::Delivered => "delivered",
+            CollaborationAlertDeliveryState::RetryPending => "retry_pending",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationEmergencyAlertCreateRequest {
+    #[serde(default)]
+    pub alert_id: Option<String>,
+    pub source: CollaborationEmergencyAlertSource,
+    pub severity: String,
+    pub trigger_ref: String,
+    pub body: String,
+    #[serde(default)]
+    pub failed_recipient_account_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationEmergencyAlertRecord {
+    pub alert_id: String,
+    pub org_id: String,
+    pub channel_id: String,
+    pub source: CollaborationEmergencyAlertSource,
+    pub severity: String,
+    pub trigger_ref: String,
+    pub body: String,
+    pub state: CollaborationEmergencyAlertState,
+    pub raised_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationAlertDeliveryRecord {
+    pub delivery_id: String,
+    pub alert_id: String,
+    pub org_id: String,
+    pub channel_id: String,
+    pub recipient_account_id: String,
+    pub delivery_state: CollaborationAlertDeliveryState,
+    pub retry_count: u64,
+    pub last_attempt_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationEmergencyAlertAuditRecord {
+    pub audit_id: String,
+    pub alert_id: String,
+    pub action: String,
+    pub actor_id: String,
+    pub from_state: CollaborationEmergencyAlertState,
+    pub to_state: CollaborationEmergencyAlertState,
+    pub occurred_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationEmergencyAlertRaiseResult {
+    pub alert: CollaborationEmergencyAlertRecord,
+    pub deliveries: Vec<CollaborationAlertDeliveryRecord>,
+    pub audit: CollaborationEmergencyAlertAuditRecord,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationEmergencyAlertTransitionRequest {
+    pub action: CollaborationEmergencyAlertAction,
+    pub actor_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationEmergencyAlertTransitionResult {
+    pub alert: CollaborationEmergencyAlertRecord,
+    pub audit: CollaborationEmergencyAlertAuditRecord,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CollaborationPermissionResolveRequest {
     pub org_id: String,
@@ -14147,6 +14281,19 @@ pub enum CollaborationError {
     InvalidLatencyBudget,
     #[error("collaboration frame relay time precedes capture time")]
     InvalidFrameTiming,
+    #[error("collaboration alert severity cannot be empty")]
+    EmptyAlertSeverity,
+    #[error("collaboration alert trigger_ref cannot be empty")]
+    EmptyAlertTriggerRef,
+    #[error("collaboration alert_id cannot be empty")]
+    EmptyAlertId,
+    #[error("collaboration alert audit_id cannot be empty")]
+    EmptyAlertAuditId,
+    #[error("collaboration alert action {action} cannot transition {from_state}")]
+    InvalidAlertTransition {
+        action: &'static str,
+        from_state: &'static str,
+    },
 }
 
 pub fn build_collaboration_channel(
@@ -14485,6 +14632,134 @@ pub fn relay_collaboration_stream_frame(
     Ok(CollaborationStreamRelayResult {
         stream: updated_stream,
         frame: Some(frame),
+    })
+}
+
+pub fn raise_collaboration_emergency_alert(
+    channel: &CollaborationChannelRecord,
+    request: CollaborationEmergencyAlertCreateRequest,
+    generated_alert_id: String,
+    generated_audit_id: String,
+    actor_id: String,
+    raised_at: String,
+) -> Result<CollaborationEmergencyAlertRaiseResult, CollaborationError> {
+    let alert_id = normalize_collaboration_optional_text(request.alert_id)
+        .or_else(|| normalize_collaboration_text(generated_alert_id))
+        .ok_or(CollaborationError::EmptyAlertId)?;
+    let audit_id = normalize_collaboration_text(generated_audit_id)
+        .ok_or(CollaborationError::EmptyAlertAuditId)?;
+    let actor_id =
+        normalize_collaboration_text(actor_id).ok_or(CollaborationError::EmptyActorId)?;
+    let severity = normalize_collaboration_text(request.severity)
+        .ok_or(CollaborationError::EmptyAlertSeverity)?;
+    let trigger_ref = normalize_collaboration_text(request.trigger_ref)
+        .ok_or(CollaborationError::EmptyAlertTriggerRef)?;
+    let body = normalize_collaboration_text(request.body).ok_or(CollaborationError::EmptyBody)?;
+    let raised_at =
+        normalize_collaboration_text(raised_at).ok_or(CollaborationError::EmptyTimestamp)?;
+    let failed_recipients = request
+        .failed_recipient_account_ids
+        .into_iter()
+        .filter_map(normalize_collaboration_text)
+        .collect::<BTreeSet<_>>();
+    let alert = CollaborationEmergencyAlertRecord {
+        alert_id: alert_id.clone(),
+        org_id: channel.org_id.clone(),
+        channel_id: channel.channel_id.clone(),
+        source: request.source,
+        severity,
+        trigger_ref,
+        body,
+        state: CollaborationEmergencyAlertState::Raised,
+        raised_at: raised_at.clone(),
+        updated_at: raised_at.clone(),
+    };
+    let deliveries = channel
+        .member_account_ids
+        .iter()
+        .map(|recipient| {
+            let failed = failed_recipients.contains(recipient);
+            CollaborationAlertDeliveryRecord {
+                delivery_id: format!("{alert_id}:{recipient}"),
+                alert_id: alert_id.clone(),
+                org_id: channel.org_id.clone(),
+                channel_id: channel.channel_id.clone(),
+                recipient_account_id: recipient.clone(),
+                delivery_state: if failed {
+                    CollaborationAlertDeliveryState::RetryPending
+                } else {
+                    CollaborationAlertDeliveryState::Delivered
+                },
+                retry_count: if failed { 1 } else { 0 },
+                last_attempt_at: raised_at.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let audit = CollaborationEmergencyAlertAuditRecord {
+        audit_id,
+        alert_id,
+        action: "raise".to_string(),
+        actor_id,
+        from_state: CollaborationEmergencyAlertState::Raised,
+        to_state: CollaborationEmergencyAlertState::Raised,
+        occurred_at: raised_at,
+    };
+
+    Ok(CollaborationEmergencyAlertRaiseResult {
+        alert,
+        deliveries,
+        audit,
+    })
+}
+
+pub fn transition_collaboration_emergency_alert(
+    alert: &CollaborationEmergencyAlertRecord,
+    request: CollaborationEmergencyAlertTransitionRequest,
+    generated_audit_id: String,
+    occurred_at: String,
+) -> Result<CollaborationEmergencyAlertTransitionResult, CollaborationError> {
+    let audit_id = normalize_collaboration_text(generated_audit_id)
+        .ok_or(CollaborationError::EmptyAlertAuditId)?;
+    let actor_id =
+        normalize_collaboration_text(request.actor_id).ok_or(CollaborationError::EmptyActorId)?;
+    let occurred_at =
+        normalize_collaboration_text(occurred_at).ok_or(CollaborationError::EmptyTimestamp)?;
+    let to_state = match request.action {
+        CollaborationEmergencyAlertAction::Acknowledge => {
+            if alert.state != CollaborationEmergencyAlertState::Raised {
+                return Err(CollaborationError::InvalidAlertTransition {
+                    action: request.action.as_str(),
+                    from_state: alert.state.as_str(),
+                });
+            }
+            CollaborationEmergencyAlertState::Acknowledged
+        }
+        CollaborationEmergencyAlertAction::Resolve => {
+            if alert.state == CollaborationEmergencyAlertState::Resolved {
+                return Err(CollaborationError::InvalidAlertTransition {
+                    action: request.action.as_str(),
+                    from_state: alert.state.as_str(),
+                });
+            }
+            CollaborationEmergencyAlertState::Resolved
+        }
+    };
+    let mut updated = alert.clone();
+    updated.state = to_state;
+    updated.updated_at = occurred_at.clone();
+    let audit = CollaborationEmergencyAlertAuditRecord {
+        audit_id,
+        alert_id: alert.alert_id.clone(),
+        action: request.action.as_str().to_string(),
+        actor_id,
+        from_state: alert.state,
+        to_state,
+        occurred_at,
+    };
+
+    Ok(CollaborationEmergencyAlertTransitionResult {
+        alert: updated,
+        audit,
     })
 }
 
@@ -17851,24 +18126,28 @@ mod tests {
         map_zone_water_need, marketplace_inventory_available, moderate_community_contribution,
         normalize_weather_provider_forecast, place_marketplace_order_record,
         plan_tractor_swath_coverage, publish_marketplace_listing_record, query_drought_history,
-        query_irrigation_history, query_weather_history, relay_collaboration_stream_frame,
-        release_marketplace_inventory, report_water_use_savings, reserve_marketplace_inventory,
-        resolve_collaboration_permissions, resolve_content_permissions, resolve_localized_content,
-        resolve_weather_forecast_to_field, route_weather_alert, run_tractor_straight_path_guidance,
-        schedule_irrigation_plan, search_published_content, sign_fleet_config_bundle,
-        soil_moisture_rejection_record, start_collaboration_stream, tractor_cross_track_error_m,
-        transition_content_workflow, transition_marketplace_account_status,
-        transition_marketplace_fulfillment_status, transition_marketplace_order_status,
-        update_collaboration_presence, validate_field_boundary,
-        validate_water_weather_input_contract, verify_and_apply_fleet_config_bundle,
-        verify_weather_forecast_accuracy, weather_fetch_failure_record,
-        zone_water_need_insufficient, AccessAnomalySignal, AccessAnomalyThresholds,
-        AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry, AnnotationChangeType,
-        AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord,
-        BiodiversityImageryLayer, BiodiversityProxyRequest, BiodiversityProxyStatus,
-        BiomassEstimateError, BiomassEstimateRequest, BiomassLayerInput, CarbonEmissionFactor,
-        CarbonFootprintComputeRequest, CarbonFootprintFactorSet, CarbonFootprintInput,
-        CarbonFootprintInputKind, CarbonFootprintStatus, CollaborationChannelCreateRequest,
+        query_irrigation_history, query_weather_history, raise_collaboration_emergency_alert,
+        relay_collaboration_stream_frame, release_marketplace_inventory, report_water_use_savings,
+        reserve_marketplace_inventory, resolve_collaboration_permissions,
+        resolve_content_permissions, resolve_localized_content, resolve_weather_forecast_to_field,
+        route_weather_alert, run_tractor_straight_path_guidance, schedule_irrigation_plan,
+        search_published_content, sign_fleet_config_bundle, soil_moisture_rejection_record,
+        start_collaboration_stream, tractor_cross_track_error_m,
+        transition_collaboration_emergency_alert, transition_content_workflow,
+        transition_marketplace_account_status, transition_marketplace_fulfillment_status,
+        transition_marketplace_order_status, update_collaboration_presence,
+        validate_field_boundary, validate_water_weather_input_contract,
+        verify_and_apply_fleet_config_bundle, verify_weather_forecast_accuracy,
+        weather_fetch_failure_record, zone_water_need_insufficient, AccessAnomalySignal,
+        AccessAnomalyThresholds, AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry,
+        AnnotationChangeType, AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord,
+        AuditedAnnotationRecord, BiodiversityImageryLayer, BiodiversityProxyRequest,
+        BiodiversityProxyStatus, BiomassEstimateError, BiomassEstimateRequest, BiomassLayerInput,
+        CarbonEmissionFactor, CarbonFootprintComputeRequest, CarbonFootprintFactorSet,
+        CarbonFootprintInput, CarbonFootprintInputKind, CarbonFootprintStatus,
+        CollaborationChannelCreateRequest, CollaborationEmergencyAlertAction,
+        CollaborationEmergencyAlertCreateRequest, CollaborationEmergencyAlertSource,
+        CollaborationEmergencyAlertState, CollaborationEmergencyAlertTransitionRequest,
         CollaborationError, CollaborationMessageCreateRequest,
         CollaborationNotificationEventRequest, CollaborationPermissionResolveRequest,
         CollaborationPresenceState, CollaborationPresenceUpdateRequest,
@@ -21869,6 +22148,94 @@ mod tests {
         )
         .expect_err("inactive source should not start");
         assert_eq!(unavailable, CollaborationError::StreamSourceUnavailable);
+    }
+
+    #[test]
+    fn collaboration_emergency_alert_fans_out_and_transitions_with_audit() {
+        let channel = build_collaboration_channel(
+            CollaborationChannelCreateRequest {
+                channel_id: Some("channel-alerts".to_string()),
+                org_id: "org-alpha".to_string(),
+                field_ref: "field:field-alpha".to_string(),
+                member_account_ids: vec!["ops-1".to_string(), "grower-1".to_string()],
+            },
+            "generated-channel".to_string(),
+            "2026-06-13T15:00:00Z".to_string(),
+        )
+        .expect("channel should normalize");
+        let raised = raise_collaboration_emergency_alert(
+            &channel,
+            CollaborationEmergencyAlertCreateRequest {
+                alert_id: Some("alert-001".to_string()),
+                source: CollaborationEmergencyAlertSource::Safety01,
+                severity: "critical".to_string(),
+                trigger_ref: "01:geofence:breach-001".to_string(),
+                body: "Geofence breach".to_string(),
+                failed_recipient_account_ids: vec!["grower-1".to_string()],
+            },
+            "generated-alert".to_string(),
+            "generated-audit".to_string(),
+            "ops-1".to_string(),
+            "2026-06-13T15:00:00Z".to_string(),
+        )
+        .expect("alert should raise");
+        assert_eq!(raised.alert.state, CollaborationEmergencyAlertState::Raised);
+        assert_eq!(raised.deliveries.len(), 2);
+        assert!(raised.deliveries.iter().any(|delivery| {
+            delivery.recipient_account_id == "grower-1"
+                && delivery.delivery_state.as_str() == "retry_pending"
+                && delivery.retry_count == 1
+        }));
+        assert_eq!(raised.audit.actor_id, "ops-1");
+
+        let acknowledged = transition_collaboration_emergency_alert(
+            &raised.alert,
+            CollaborationEmergencyAlertTransitionRequest {
+                action: CollaborationEmergencyAlertAction::Acknowledge,
+                actor_id: "ops-2".to_string(),
+            },
+            "audit-ack".to_string(),
+            "2026-06-13T15:01:00Z".to_string(),
+        )
+        .expect("raised alert should acknowledge");
+        assert_eq!(
+            acknowledged.alert.state,
+            CollaborationEmergencyAlertState::Acknowledged
+        );
+        assert_eq!(
+            acknowledged.audit.from_state,
+            CollaborationEmergencyAlertState::Raised
+        );
+
+        let resolved = transition_collaboration_emergency_alert(
+            &acknowledged.alert,
+            CollaborationEmergencyAlertTransitionRequest {
+                action: CollaborationEmergencyAlertAction::Resolve,
+                actor_id: "ops-2".to_string(),
+            },
+            "audit-resolve".to_string(),
+            "2026-06-13T15:02:00Z".to_string(),
+        )
+        .expect("acknowledged alert should resolve");
+        assert_eq!(
+            resolved.alert.state,
+            CollaborationEmergencyAlertState::Resolved
+        );
+
+        let duplicate_resolve = transition_collaboration_emergency_alert(
+            &resolved.alert,
+            CollaborationEmergencyAlertTransitionRequest {
+                action: CollaborationEmergencyAlertAction::Resolve,
+                actor_id: "ops-2".to_string(),
+            },
+            "audit-duplicate".to_string(),
+            "2026-06-13T15:03:00Z".to_string(),
+        )
+        .expect_err("resolved alert should not resolve again");
+        assert!(matches!(
+            duplicate_resolve,
+            CollaborationError::InvalidAlertTransition { .. }
+        ));
     }
 
     #[test]

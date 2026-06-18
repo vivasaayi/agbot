@@ -517,6 +517,14 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::create_collaboration_notifications),
         )
         .route(
+            "/api/collaboration/channels/:channel_id/emergency-alerts",
+            post(routes::raise_collaboration_emergency_alert_route),
+        )
+        .route(
+            "/api/collaboration/emergency-alerts/:alert_id",
+            post(routes::transition_collaboration_emergency_alert_route),
+        )
+        .route(
             "/api/collaboration/streams",
             post(routes::start_collaboration_stream_route),
         )

@@ -8295,6 +8295,217 @@ async fn collaboration_stream_rejects_unavailable_source_without_writing() -> Re
 }
 
 #[tokio::test]
+async fn collaboration_emergency_alert_fans_out_transitions_and_audits() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_sustainability_field(&ctx, "farm-collab", "field-collab", "season-2026").await?;
+
+    let create = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/channels")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "channel_id": "channel-alerts",
+                        "org_id": "org-alpha",
+                        "field_ref": "field:field-collab",
+                        "member_account_ids": ["ops-1", "grower-1"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let raise = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/channels/channel-alerts/emergency-alerts?org_id=org-alpha&actor_org_id=org-alpha&actor_id=ops-1&role_refs=collab:operator")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "alert_id": "alert-001",
+                        "source": "safety01",
+                        "severity": "critical",
+                        "trigger_ref": "01:geofence:breach-001",
+                        "body": "Geofence breach",
+                        "failed_recipient_account_ids": ["grower-1"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(raise.status(), StatusCode::OK);
+    let body = to_bytes(raise.into_body(), 64 * 1024).await?;
+    let raise: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        raise
+            .pointer("/alert/state")
+            .and_then(|value| value.as_str()),
+        Some("raised")
+    );
+    assert_eq!(
+        raise
+            .pointer("/deliveries")
+            .and_then(|value| value.as_array())
+            .map(Vec::len),
+        Some(2)
+    );
+    assert!(raise
+        .pointer("/deliveries")
+        .and_then(|value| value.as_array())
+        .expect("deliveries should be array")
+        .iter()
+        .any(|delivery| {
+            delivery
+                .get("recipient_account_id")
+                .and_then(|value| value.as_str())
+                == Some("grower-1")
+                && delivery
+                    .get("delivery_state")
+                    .and_then(|value| value.as_str())
+                    == Some("retry_pending")
+                && delivery.get("retry_count").and_then(|value| value.as_u64()) == Some(1)
+        }));
+
+    let acknowledge = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/emergency-alerts/alert-001?org_id=org-alpha&actor_org_id=org-alpha&actor_id=ops-2&role_refs=collab:operator")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "action": "acknowledge",
+                        "actor_id": "ops-2"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(acknowledge.status(), StatusCode::OK);
+
+    let resolve = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/emergency-alerts/alert-001?org_id=org-alpha&actor_org_id=org-alpha&actor_id=ops-2&role_refs=collab:operator")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "action": "resolve",
+                        "actor_id": "ops-2"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(resolve.status(), StatusCode::OK);
+
+    let state: String = sqlx::query_scalar(
+        "SELECT state FROM collab_emergency_alerts WHERE alert_id = 'alert-001'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(state, "resolved");
+    let audit_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM collab_alert_audits WHERE alert_id = 'alert-001'")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(audit_count, 3);
+    let retry_pending_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM collab_alert_deliveries WHERE alert_id = 'alert-001' AND delivery_state = 'retry_pending' AND retry_count = 1",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(retry_pending_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn collaboration_emergency_alert_viewer_is_denied_without_writing() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_sustainability_field(&ctx, "farm-collab", "field-collab", "season-2026").await?;
+
+    let create = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/channels")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "channel_id": "channel-alert-denied",
+                        "org_id": "org-alpha",
+                        "field_ref": "field:field-collab",
+                        "member_account_ids": ["viewer-1"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let raise = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/channels/channel-alert-denied/emergency-alerts?org_id=org-alpha&actor_org_id=org-alpha&actor_id=viewer-1&role_refs=collab:viewer")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "alert_id": "alert-denied",
+                        "source": "fleet12",
+                        "severity": "warning",
+                        "trigger_ref": "12:fleet:battery-low",
+                        "body": "Battery low"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(raise.status(), StatusCode::FORBIDDEN);
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM collab_emergency_alerts WHERE alert_id = 'alert-denied'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn fleet_health_component_registry_links_airframe_and_rejects_double_install() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
