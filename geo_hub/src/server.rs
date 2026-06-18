@@ -542,6 +542,18 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::collaboration_operator_console_feed_route),
         )
         .route(
+            "/api/collaboration/portal/feed",
+            get(routes::collaboration_portal_feed_route),
+        )
+        .route(
+            "/api/collaboration/portal/streams/:stream_id",
+            get(routes::collaboration_portal_stream_route),
+        )
+        .route(
+            "/api/collaboration/portal/alerts/:alert_id",
+            get(routes::collaboration_portal_alert_route),
+        )
+        .route(
             "/api/collaboration/mission-plans",
             post(routes::create_collaboration_mission_plan_route),
         )

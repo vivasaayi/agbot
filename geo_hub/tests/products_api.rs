@@ -9123,6 +9123,156 @@ async fn collaboration_operator_console_feed_scopes_streams_alerts_and_ended_sta
 }
 
 #[tokio::test]
+async fn collaboration_portal_feed_is_read_only_and_denies_foreign_direct_hits() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    for (stream_id, org_id) in [
+        ("stream-portal-alpha", "org-alpha"),
+        ("stream-portal-beta", "org-beta"),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO collab_streams (
+                stream_id, org_id, mission_ref, source_ref, state, latency_budget_ms,
+                started_at, updated_at, evidence_refs_json
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+        )
+        .bind(stream_id)
+        .bind(org_id)
+        .bind(format!("mission:{stream_id}"))
+        .bind("camera:rgb-01")
+        .bind("live")
+        .bind(500_i64)
+        .bind("2026-06-13T15:00:00Z")
+        .bind("2026-06-13T15:01:00Z")
+        .bind(json!([format!("collab:stream:{stream_id}")]).to_string())
+        .execute(&ctx.pool)
+        .await?;
+    }
+    for (alert_id, org_id) in [
+        ("alert-portal-alpha", "org-alpha"),
+        ("alert-portal-beta", "org-beta"),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO collab_emergency_alerts (
+                alert_id, org_id, channel_id, source, severity, trigger_ref,
+                body, state, raised_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+        )
+        .bind(alert_id)
+        .bind(org_id)
+        .bind("channel-portal")
+        .bind("12")
+        .bind("warning")
+        .bind("12:battery")
+        .bind("Battery warning")
+        .bind("raised")
+        .bind("2026-06-13T15:01:00Z")
+        .bind("2026-06-13T15:01:00Z")
+        .execute(&ctx.pool)
+        .await?;
+    }
+
+    let feed = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/portal/feed?org_id=org-alpha&actor_org_id=org-alpha&actor_id=member-1&role_refs=collab:member")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(feed.status(), StatusCode::OK);
+    let body = to_bytes(feed.into_body(), 64 * 1024).await?;
+    let feed: serde_json::Value = serde_json::from_slice(&body)?;
+    let streams = feed
+        .get("streams")
+        .and_then(|value| value.as_array())
+        .expect("streams should be array");
+    assert_eq!(streams.len(), 1);
+    assert_eq!(
+        streams[0].get("stream_id").and_then(|value| value.as_str()),
+        Some("stream-portal-alpha")
+    );
+    let alerts = feed
+        .get("active_alerts")
+        .and_then(|value| value.as_array())
+        .expect("active alerts should be array");
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(
+        alerts[0].get("alert_id").and_then(|value| value.as_str()),
+        Some("alert-portal-alpha")
+    );
+
+    let stream = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/portal/streams/stream-portal-alpha?org_id=org-alpha&actor_org_id=org-alpha&actor_id=member-1&role_refs=collab:member")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(stream.status(), StatusCode::OK);
+
+    let foreign_stream = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/portal/streams/stream-portal-beta?org_id=org-alpha&actor_org_id=org-alpha&actor_id=member-1&role_refs=collab:member")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(foreign_stream.status(), StatusCode::NOT_FOUND);
+
+    let foreign_alert = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/portal/alerts/alert-portal-beta?org_id=org-alpha&actor_org_id=org-alpha&actor_id=member-1&role_refs=collab:member")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(foreign_alert.status(), StatusCode::NOT_FOUND);
+
+    let denied = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/portal/feed?org_id=org-alpha&actor_org_id=org-beta&actor_id=member-foreign&role_refs=collab:member")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn collaboration_mission_edit_conflicts_and_dispatch_guardrails() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;

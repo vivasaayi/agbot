@@ -142,8 +142,8 @@ use shared::schemas::{
     CollaborationMissionWaypoint, CollaborationMissionWaypointEditRequest,
     CollaborationNotificationEventRequest, CollaborationNotificationRecord,
     CollaborationOperatorConsoleFeed, CollaborationPermissionDecision,
-    CollaborationPermissionResolveRequest, CollaborationPermissionSet, CollaborationPresenceRecord,
-    CollaborationPresenceState, CollaborationPresenceUpdateRequest,
+    CollaborationPermissionResolveRequest, CollaborationPermissionSet, CollaborationPortalFeed,
+    CollaborationPresenceRecord, CollaborationPresenceState, CollaborationPresenceUpdateRequest,
     CollaborationSessionAnnotationLinkRecord, CollaborationSessionAnnotationLinkRequest,
     CollaborationSessionAnnotationRecord, CollaborationSessionEventKind,
     CollaborationSessionEventRecord, CollaborationSessionRecord, CollaborationSessionRecordRequest,
@@ -6048,6 +6048,89 @@ pub async fn collaboration_operator_console_feed_route(
     .map_err(collaboration_error)?;
 
     Ok(Json(feed))
+}
+
+pub async fn collaboration_portal_feed_route(
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<CollaborationPortalFeed>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    assert_collaboration_action_permission(
+        &state,
+        &org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Join,
+        None,
+    )
+    .await?;
+    let streams = load_collaboration_operator_console_streams(&state, &org_id).await?;
+    let alerts = load_collaboration_operator_console_active_alerts(&state, &org_id).await?;
+    let feed = build_collaboration_operator_console_feed(
+        org_id,
+        streams,
+        alerts,
+        current_record_timestamp(),
+    )
+    .map_err(collaboration_error)?;
+
+    Ok(Json(feed))
+}
+
+pub async fn collaboration_portal_stream_route(
+    Path(stream_id): Path<String>,
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<CollaborationLiveStreamRecord>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    assert_collaboration_action_permission(
+        &state,
+        &org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Join,
+        None,
+    )
+    .await?;
+    let stream = load_collaboration_stream(&state, &stream_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if stream.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(stream))
+}
+
+pub async fn collaboration_portal_alert_route(
+    Path(alert_id): Path<String>,
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<CollaborationEmergencyAlertRecord>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    assert_collaboration_action_permission(
+        &state,
+        &org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Join,
+        None,
+    )
+    .await?;
+    let alert = load_collaboration_emergency_alert(&state, &alert_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if alert.org_id != org_id || alert.state == CollaborationEmergencyAlertState::Resolved {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(Json(alert))
 }
 
 pub async fn create_collaboration_mission_plan_route(

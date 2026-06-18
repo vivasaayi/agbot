@@ -14271,6 +14271,8 @@ pub struct CollaborationOperatorConsoleFeed {
     pub generated_at: String,
 }
 
+pub type CollaborationPortalFeed = CollaborationOperatorConsoleFeed;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CollaborationMissionWaypoint {
     pub waypoint_id: String,
