@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
@@ -297,6 +297,73 @@ pub struct AlertDedupResult {
     pub summaries: Vec<AlertDedupSummary>,
     pub suppressed_count: usize,
     pub bypassed_alert_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdaptiveAggregationAdvisoryConfig {
+    pub enabled: bool,
+    pub min_history_alerts: usize,
+    pub flapping_occurrence_threshold: usize,
+    pub storm_subject_threshold: usize,
+    pub method_version: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct AdaptiveAggregationAdvisoryRequest {
+    #[serde(default)]
+    pub advisory_id: Option<String>,
+    #[serde(default)]
+    pub evaluated_at: String,
+    #[serde(default)]
+    pub fired_alerts: Vec<FiredAlertRecord>,
+    #[serde(default)]
+    pub dedup_summaries: Vec<AlertDedupSummary>,
+    pub config: AdaptiveAggregationAdvisoryConfig,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdaptiveAggregationAdvisoryStatus {
+    Raised,
+    NotRaised,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdaptiveAggregationAdvisoryReason {
+    FeatureDisabled,
+    InsufficientHistory,
+    FlappingSource,
+    EmergingStorm,
+    NoStormPattern,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AdaptiveAggregationApprovalStatus {
+    PendingApproval,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AdaptiveAggregationAdvisory {
+    pub advisory_id: String,
+    pub evaluated_at: String,
+    pub status: AdaptiveAggregationAdvisoryStatus,
+    pub reason_code: AdaptiveAggregationAdvisoryReason,
+    pub recommendation: Option<String>,
+    pub observed_alert_count: usize,
+    pub max_occurrence_count: usize,
+    pub affected_subject_count: usize,
+    pub uncertainty_lower: f64,
+    pub uncertainty_upper: f64,
+    pub uncertainty_reason: String,
+    pub evidence_refs: Vec<String>,
+    pub requires_approval: bool,
+    pub approval_status: AdaptiveAggregationApprovalStatus,
+    pub auto_suppression_applied: bool,
+    pub critical_alerts_auto_suppressed: bool,
+    pub method_version: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -705,6 +772,14 @@ pub enum AlertingError {
     InvalidSeverityEvidence,
     #[error("dedup window requires non-empty window_start <= window_end")]
     InvalidDedupWindow,
+    #[error("adaptive aggregation advisory_id cannot be empty")]
+    EmptyAdaptiveAggregationAdvisoryId,
+    #[error("adaptive aggregation evaluated_at cannot be empty")]
+    EmptyAdaptiveAggregationEvaluatedAt,
+    #[error("adaptive aggregation method_version cannot be empty")]
+    EmptyAdaptiveAggregationMethodVersion,
+    #[error("adaptive aggregation thresholds must be greater than zero")]
+    InvalidAdaptiveAggregationConfig,
     #[error("retry policy requires max_attempts > 0 and bounded positive backoff")]
     InvalidRetryPolicy,
     #[error("invalid alert severity {0}")]
@@ -1301,6 +1376,158 @@ pub fn deduplicate_alert_stream(
     }
 
     Ok(result)
+}
+
+pub fn evaluate_adaptive_aggregation_advisory(
+    request: AdaptiveAggregationAdvisoryRequest,
+    generated_advisory_id: String,
+) -> Result<AdaptiveAggregationAdvisory, AlertingError> {
+    let advisory_id = normalize_optional_text(request.advisory_id)
+        .or_else(|| normalize_optional_text(Some(generated_advisory_id)))
+        .ok_or(AlertingError::EmptyAdaptiveAggregationAdvisoryId)?;
+    let evaluated_at = normalize_required_text(
+        request.evaluated_at,
+        AlertingError::EmptyAdaptiveAggregationEvaluatedAt,
+    )?;
+    let method_version = normalize_required_text(
+        request.config.method_version,
+        AlertingError::EmptyAdaptiveAggregationMethodVersion,
+    )?;
+    if request.config.min_history_alerts == 0
+        || request.config.flapping_occurrence_threshold == 0
+        || request.config.storm_subject_threshold == 0
+    {
+        return Err(AlertingError::InvalidAdaptiveAggregationConfig);
+    }
+
+    let fired_alerts = request
+        .fired_alerts
+        .into_iter()
+        .map(normalize_fired_alert_record)
+        .collect::<Result<Vec<_>, _>>()?;
+    let observed_alert_count = fired_alerts.len();
+    let mut evidence_refs = alert_history_evidence_refs(&fired_alerts);
+    for summary in &request.dedup_summaries {
+        evidence_refs.insert(format!("dedup-key:{}", summary.dedup_key.stable_key()));
+        evidence_refs.insert(format!("surfaced-alert:{}", summary.surfaced_alert_id));
+        for alert_id in &summary.suppressed_alert_ids {
+            evidence_refs.insert(format!("suppressed-alert:{alert_id}"));
+        }
+    }
+
+    if !request.config.enabled {
+        return Ok(adaptive_advisory_result(
+            advisory_id,
+            evaluated_at,
+            AdaptiveAggregationAdvisoryStatus::Unavailable,
+            AdaptiveAggregationAdvisoryReason::FeatureDisabled,
+            None,
+            observed_alert_count,
+            0,
+            0,
+            0.0,
+            0.0,
+            "feature_disabled",
+            evidence_refs,
+            method_version,
+        ));
+    }
+    if observed_alert_count < request.config.min_history_alerts
+        || request.dedup_summaries.is_empty()
+    {
+        return Ok(adaptive_advisory_result(
+            advisory_id,
+            evaluated_at,
+            AdaptiveAggregationAdvisoryStatus::Unavailable,
+            AdaptiveAggregationAdvisoryReason::InsufficientHistory,
+            None,
+            observed_alert_count,
+            0,
+            0,
+            0.0,
+            0.0,
+            "insufficient_history",
+            evidence_refs,
+            method_version,
+        ));
+    }
+
+    let max_occurrence_count = request
+        .dedup_summaries
+        .iter()
+        .map(|summary| summary.occurrence_count)
+        .max()
+        .unwrap_or(0);
+    let affected_subject_count = request
+        .dedup_summaries
+        .iter()
+        .map(|summary| summary.dedup_key.subject_ref.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+    let flapping = max_occurrence_count >= request.config.flapping_occurrence_threshold;
+    let storm = affected_subject_count >= request.config.storm_subject_threshold
+        && request
+            .dedup_summaries
+            .iter()
+            .filter(|summary| summary.occurrence_count > 1)
+            .count()
+            >= request.config.storm_subject_threshold;
+    let signal_strength = if flapping {
+        max_occurrence_count as f64 / request.config.flapping_occurrence_threshold as f64
+    } else if storm {
+        affected_subject_count as f64 / request.config.storm_subject_threshold as f64
+    } else {
+        0.0
+    };
+    let uncertainty_padding = if observed_alert_count >= request.config.min_history_alerts * 2 {
+        0.10
+    } else {
+        0.25
+    };
+
+    if flapping || storm {
+        let reason_code = if flapping {
+            AdaptiveAggregationAdvisoryReason::FlappingSource
+        } else {
+            AdaptiveAggregationAdvisoryReason::EmergingStorm
+        };
+        let recommendation = if flapping {
+            "Review aggregation window and source health for repeated alerts before changing suppression rules."
+        } else {
+            "Review storm aggregation thresholds across affected subjects before changing routing rules."
+        };
+        return Ok(adaptive_advisory_result(
+            advisory_id,
+            evaluated_at,
+            AdaptiveAggregationAdvisoryStatus::Raised,
+            reason_code,
+            Some(recommendation.to_string()),
+            observed_alert_count,
+            max_occurrence_count,
+            affected_subject_count,
+            (signal_strength - uncertainty_padding).max(0.0),
+            signal_strength + uncertainty_padding,
+            "dedup_history_signal",
+            evidence_refs,
+            method_version,
+        ));
+    }
+
+    Ok(adaptive_advisory_result(
+        advisory_id,
+        evaluated_at,
+        AdaptiveAggregationAdvisoryStatus::NotRaised,
+        AdaptiveAggregationAdvisoryReason::NoStormPattern,
+        None,
+        observed_alert_count,
+        max_occurrence_count,
+        affected_subject_count,
+        0.0,
+        uncertainty_padding,
+        "below_advisory_threshold",
+        evidence_refs,
+        method_version,
+    ))
 }
 
 pub fn route_alert_to_recipients(
@@ -2415,6 +2642,53 @@ fn aggregation_summary_text(summary: &AlertDedupSummary) -> String {
     )
 }
 
+fn alert_history_evidence_refs(alerts: &[FiredAlertRecord]) -> BTreeSet<String> {
+    alerts
+        .iter()
+        .flat_map(|alert| {
+            std::iter::once(format!("alert-history:{}", alert.alert_id))
+                .chain(alert.evidence_refs.iter().cloned())
+        })
+        .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn adaptive_advisory_result(
+    advisory_id: String,
+    evaluated_at: String,
+    status: AdaptiveAggregationAdvisoryStatus,
+    reason_code: AdaptiveAggregationAdvisoryReason,
+    recommendation: Option<String>,
+    observed_alert_count: usize,
+    max_occurrence_count: usize,
+    affected_subject_count: usize,
+    uncertainty_lower: f64,
+    uncertainty_upper: f64,
+    uncertainty_reason: &str,
+    evidence_refs: BTreeSet<String>,
+    method_version: String,
+) -> AdaptiveAggregationAdvisory {
+    AdaptiveAggregationAdvisory {
+        advisory_id,
+        evaluated_at,
+        status,
+        reason_code,
+        recommendation,
+        observed_alert_count,
+        max_occurrence_count,
+        affected_subject_count,
+        uncertainty_lower,
+        uncertainty_upper,
+        uncertainty_reason: uncertainty_reason.to_string(),
+        evidence_refs: evidence_refs.into_iter().collect(),
+        requires_approval: true,
+        approval_status: AdaptiveAggregationApprovalStatus::PendingApproval,
+        auto_suppression_applied: false,
+        critical_alerts_auto_suppressed: false,
+        method_version,
+    }
+}
+
 fn validate_alert_rule_record(rule: &AlertRuleRecord) -> Result<(), AlertingError> {
     normalize_required_text(rule.rule_id.clone(), AlertingError::EmptyRuleId)?;
     if rule.version == 0 {
@@ -2473,11 +2747,14 @@ mod tests {
         acknowledge_alert, alert_channels_from_strings, auto_resolve_alert,
         build_alert_rule_record, build_alert_rule_subscription, classify_alert_severity,
         compute_alert_dedup_key, deduplicate_alert_stream, deliver_alert,
-        deliver_alert_multi_channel, evaluate_alert_preference, evaluate_alert_rules,
-        evaluate_managed_alert_rules, evaluate_no_ack_escalation, filter_alert_history,
-        open_alert_lifecycle, render_alert_message_template, resolve_alert,
-        route_alert_to_recipients, run_tracked_delivery, transition_alert_rule_status,
-        version_alert_rule_record, AlertChannel, AlertDedupWindow, AlertEscalationPolicy,
+        deliver_alert_multi_channel, evaluate_adaptive_aggregation_advisory,
+        evaluate_alert_preference, evaluate_alert_rules, evaluate_managed_alert_rules,
+        evaluate_no_ack_escalation, filter_alert_history, open_alert_lifecycle,
+        render_alert_message_template, resolve_alert, route_alert_to_recipients,
+        run_tracked_delivery, transition_alert_rule_status, version_alert_rule_record,
+        AdaptiveAggregationAdvisoryConfig, AdaptiveAggregationAdvisoryReason,
+        AdaptiveAggregationAdvisoryRequest, AdaptiveAggregationAdvisoryStatus,
+        AdaptiveAggregationApprovalStatus, AlertChannel, AlertDedupWindow, AlertEscalationPolicy,
         AlertEvent, AlertEventBackbone, AlertHistoryQuery, AlertLifecycleRecord,
         AlertLifecycleState, AlertMessageTemplate, AlertQuietHours, AlertRecipient,
         AlertRoutingRule, AlertRule, AlertRuleCreateRequest, AlertRuleStatus,
@@ -3036,6 +3313,161 @@ mod tests {
         assert_eq!(result.surfaced_alerts[1].alert_id, "alert-critical-bypass");
         assert_eq!(result.suppressed_count, 1);
         assert_eq!(result.bypassed_alert_ids, vec!["alert-critical-bypass"]);
+    }
+
+    #[test]
+    fn adaptive_aggregation_advisory_flags_flapping_source_with_uncertainty() {
+        let alerts = (0..6)
+            .map(|index| {
+                fired_alert(
+                    &format!("alert-flap-{index:03}"),
+                    "27-soil-iot-sensor-network",
+                    Some("field-alpha"),
+                    AlertSeverityHint::Warning,
+                    &format!("2026-06-12T10:0{index}:00Z"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let dedup = deduplicate_alert_stream(&alerts, dedup_window())
+            .expect("flapping stream should deduplicate");
+
+        let advisory = evaluate_adaptive_aggregation_advisory(
+            AdaptiveAggregationAdvisoryRequest {
+                advisory_id: Some("adaptive-adv-001".to_string()),
+                evaluated_at: "2026-06-12T10:10:00Z".to_string(),
+                fired_alerts: alerts,
+                dedup_summaries: dedup.summaries,
+                config: adaptive_config(true),
+            },
+            "generated-advisory".to_string(),
+        )
+        .expect("adaptive advisory should evaluate");
+
+        assert_eq!(advisory.status, AdaptiveAggregationAdvisoryStatus::Raised);
+        assert_eq!(
+            advisory.reason_code,
+            AdaptiveAggregationAdvisoryReason::FlappingSource
+        );
+        assert_eq!(advisory.observed_alert_count, 6);
+        assert_eq!(advisory.max_occurrence_count, 6);
+        assert!(advisory.uncertainty_lower > 0.0);
+        assert!(advisory.uncertainty_upper > advisory.uncertainty_lower);
+        assert!(advisory
+            .recommendation
+            .as_deref()
+            .is_some_and(|text| text.contains("Review aggregation window")));
+        assert!(advisory.requires_approval);
+        assert_eq!(
+            advisory.approval_status,
+            AdaptiveAggregationApprovalStatus::PendingApproval
+        );
+        assert!(!advisory.auto_suppression_applied);
+        assert!(!advisory.critical_alerts_auto_suppressed);
+        assert!(advisory
+            .evidence_refs
+            .contains(&"alert-history:alert-flap-000".to_string()));
+        assert!(advisory
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence.starts_with("dedup-key:")));
+    }
+
+    #[test]
+    fn adaptive_aggregation_advisory_is_gated_until_history_exists() {
+        let disabled = evaluate_adaptive_aggregation_advisory(
+            AdaptiveAggregationAdvisoryRequest {
+                advisory_id: Some("adaptive-disabled".to_string()),
+                evaluated_at: "2026-06-12T10:10:00Z".to_string(),
+                fired_alerts: vec![fired_alert(
+                    "alert-disabled-001",
+                    "27-soil-iot-sensor-network",
+                    Some("field-alpha"),
+                    AlertSeverityHint::Warning,
+                    "2026-06-12T10:00:00Z",
+                )],
+                dedup_summaries: Vec::new(),
+                config: adaptive_config(false),
+            },
+            "generated-advisory".to_string(),
+        )
+        .expect("disabled advisory should be unavailable");
+        assert_eq!(
+            disabled.reason_code,
+            AdaptiveAggregationAdvisoryReason::FeatureDisabled
+        );
+        assert!(!disabled.auto_suppression_applied);
+
+        let insufficient = evaluate_adaptive_aggregation_advisory(
+            AdaptiveAggregationAdvisoryRequest {
+                advisory_id: Some("adaptive-insufficient".to_string()),
+                evaluated_at: "2026-06-12T10:10:00Z".to_string(),
+                fired_alerts: vec![fired_alert(
+                    "alert-short-history",
+                    "27-soil-iot-sensor-network",
+                    Some("field-alpha"),
+                    AlertSeverityHint::Warning,
+                    "2026-06-12T10:00:00Z",
+                )],
+                dedup_summaries: Vec::new(),
+                config: adaptive_config(true),
+            },
+            "generated-advisory".to_string(),
+        )
+        .expect("insufficient history should be unavailable");
+        assert_eq!(
+            insufficient.status,
+            AdaptiveAggregationAdvisoryStatus::Unavailable
+        );
+        assert_eq!(
+            insufficient.reason_code,
+            AdaptiveAggregationAdvisoryReason::InsufficientHistory
+        );
+        assert!(!insufficient.auto_suppression_applied);
+    }
+
+    #[test]
+    fn adaptive_aggregation_advisory_never_auto_suppresses_critical_alerts() {
+        let alerts = vec![
+            fired_alert(
+                "alert-critical-001",
+                "27-soil-iot-sensor-network",
+                Some("field-alpha"),
+                AlertSeverityHint::Critical,
+                "2026-06-12T10:00:00Z",
+            ),
+            fired_alert(
+                "alert-critical-002",
+                "27-soil-iot-sensor-network",
+                Some("field-alpha"),
+                AlertSeverityHint::Critical,
+                "2026-06-12T10:01:00Z",
+            ),
+            fired_alert(
+                "alert-critical-003",
+                "27-soil-iot-sensor-network",
+                Some("field-alpha"),
+                AlertSeverityHint::Critical,
+                "2026-06-12T10:02:00Z",
+            ),
+        ];
+        let dedup = deduplicate_alert_stream(&alerts, dedup_window())
+            .expect("critical stream should evaluate dedup");
+
+        let advisory = evaluate_adaptive_aggregation_advisory(
+            AdaptiveAggregationAdvisoryRequest {
+                advisory_id: Some("adaptive-critical".to_string()),
+                evaluated_at: "2026-06-12T10:10:00Z".to_string(),
+                fired_alerts: alerts,
+                dedup_summaries: dedup.summaries,
+                config: adaptive_config(true),
+            },
+            "generated-advisory".to_string(),
+        )
+        .expect("critical history should still evaluate advisory");
+
+        assert!(!advisory.auto_suppression_applied);
+        assert!(!advisory.critical_alerts_auto_suppressed);
+        assert!(advisory.requires_approval);
     }
 
     #[test]
@@ -3846,6 +4278,16 @@ mod tests {
         AlertDedupWindow {
             window_start: "2026-06-12T10:00:00Z".to_string(),
             window_end: "2026-06-12T10:59:59Z".to_string(),
+        }
+    }
+
+    fn adaptive_config(enabled: bool) -> AdaptiveAggregationAdvisoryConfig {
+        AdaptiveAggregationAdvisoryConfig {
+            enabled,
+            min_history_alerts: 3,
+            flapping_occurrence_threshold: 4,
+            storm_subject_threshold: 3,
+            method_version: "adaptive-aggregation-v1".to_string(),
         }
     }
 
