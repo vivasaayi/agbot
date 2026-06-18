@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: b75efd3 (`batch-20260618011242`)
-- **Latest checkpoint commit**: d03adfc
+- **Last implementation commit**: 1b1a8ee (`batch-20260618012830`)
+- **Latest checkpoint commit**: 903d995
 - **Current batch**: none
-- **Completed feature rows**: 475 committed; 1 tests_passed; 2 skipped; 2 blocked; 18 pending in this run.
+- **Completed feature rows**: 476 committed; 1 tests_passed; 2 skipped; 2 blocked; 17 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch.
 
 ## Latest verification
@@ -104,7 +104,13 @@
 - `cargo test -p geo_hub --test products_api collaboration_` — pass
 - `cargo check -p geo_hub` — pass
 - `21-07` — committed as collaborative mission planning with optimistic waypoint version checks, accepted edit persistence, stale edit rejection audits, dispatch guardrail evidence for geofence/altitude/battery/abort path, blocked dispatch audit persistence, and viewer dispatch denial before dispatch audit writes
+- `cargo fmt` — pass
+- `cargo test -p shared collaboration_session_annotation_link_scopes_visibility_and_recovery --lib` — pass
+- `cargo test -p geo_hub --test products_api collaboration_remote_expert_annotation` — pass
+- `cargo test -p geo_hub --test products_api collaboration_` — pass
+- `cargo check -p geo_hub` — pass
+- `21-08` — committed as remote-expert live-scene annotation through the canonical `08` annotation store, with session/org visibility links, expert attribution, non-ended stream validation, replay event recovery for lost connections, and viewer denial without annotation/session mutation
 
 ## Next action
 
-- Select and claim the next pending feature `21-08` for remote-expert sessions.
+- Select and claim the next pending feature `21-09` for operator-console integration.
