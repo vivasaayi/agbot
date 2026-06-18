@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: 38f731a (`batch-20260618064000`)
-- **Latest checkpoint commit**: f32359b
+- **Last implementation commit**: 444496c (`batch-20260618071500`)
+- **Latest checkpoint commit**: 24c5282
 - **Current batch**: none
-- **Completed feature rows**: 486 committed; 1 tests_passed; 2 skipped; 2 blocked; 7 pending in this run.
+- **Completed feature rows**: 487 committed; 1 tests_passed; 2 skipped; 2 blocked; 6 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch.
 
 ## Latest verification
@@ -171,7 +171,11 @@
 - `cargo test -p copilot proactive_closed_loop --lib` — pass
 - `cargo check -p copilot` — pass
 - `26-12` — verified as proactive closed-loop copilot advisory with high-severity change-event evidence resolution, cited deterministic advisory text, audit-sink write before surfacing, approval-gated draft action, unresolved-evidence skip, and no action execution without approval
+- `cargo fmt` — pass
+- `cargo test -p soil_iot coverage_gap --lib` — pass
+- `cargo check -p soil_iot` — pass
+- `27-14` — verified as soil IoT network coverage gap exports with per-zone coverage summaries, zero-fresh-device CSV/GeoJSON gap artifacts, CRS-preserving polygons, valid empty fully-covered exports, and missing-gap-geometry refusal
 
 ## Next action
 
-- Select and claim the next pending roadmap feature after `26-12` proactive copilot advisory.
+- Select and claim the next pending roadmap feature after `27-14` soil IoT coverage gap exports.
