@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: 1818fc6 (`batch-20260618030000`)
-- **Latest checkpoint commit**: c9a037d
+- **Last implementation commit**: a7fcf63 (`batch-20260618034000`)
+- **Latest checkpoint commit**: 95d3c5a
 - **Current batch**: none
-- **Completed feature rows**: 481 committed; 1 tests_passed; 2 skipped; 2 blocked; 12 pending in this run.
+- **Completed feature rows**: 482 committed; 1 tests_passed; 2 skipped; 2 blocked; 11 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch.
 
 ## Latest verification
@@ -141,7 +141,14 @@
 - `cargo check -p crop_intelligence` — pass
 - `cargo check -p geo_hub` — pass
 - `23-16` — committed as advisory, approval-gated crop closed-loop proposals with bounded re-fly areas, treatment prescription references, cited verified finding evidence, persisted create/get API, unverified/low-confidence refusal, and no mission or tractor dispatch side effects
+- `cargo fmt` — pass
+- `cargo test -p compliance authority --lib` — pass
+- `cargo test -p geo_hub --test products_api compliance_authority` — pass
+- `cargo test -p geo_hub --test products_api compliance_` — pass
+- `cargo check -p compliance` — pass
+- `cargo check -p geo_hub` — pass
+- `24-13` — committed as per-authority compliance export/share with FAA Remote ID and state pesticide adapters, validated record-set filtering, residency/retention metadata, persisted bounded share links, revoked-link denial, and share create/access/revoke audit rows
 
 ## Next action
 
-- Select and claim the next pending roadmap feature after `23-16` advisory crop closed-loop proposals.
+- Select and claim the next pending roadmap feature after `24-13` per-authority compliance export sharing.
