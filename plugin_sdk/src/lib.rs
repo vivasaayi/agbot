@@ -99,6 +99,40 @@ pub struct ScaffoldedPlugin {
     pub files: BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginRegistryEntry {
+    pub registry_id: String,
+    pub source_uri: String,
+    pub manifest: RawPluginManifest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginRegistryCatalogEntry {
+    pub registry_id: String,
+    pub plugin_id: String,
+    pub name: String,
+    pub version: String,
+    pub kind: String,
+    pub host_api_version: String,
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginCapabilityReview {
+    pub plugin_id: String,
+    pub declared_capabilities: Vec<String>,
+    pub requires_explicit_enable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginRegistryInstallRecord {
+    pub registry_id: String,
+    pub source_uri: String,
+    pub registration: PluginRegistrationRecord,
+    pub capability_review: PluginCapabilityReview,
+    pub download_authorized: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PluginScaffoldError {
     #[error("unknown extension-point kind: {kind}")]
@@ -650,6 +684,18 @@ pub enum PluginRegistrationError {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PluginRegistryInstallError {
+    #[error("registry entry {registry_id} has an empty source uri")]
+    EmptySourceUri { registry_id: String },
+    #[error("registry entry {registry_id} failed local plugin validation")]
+    RegistrationRejected {
+        registry_id: String,
+        download_authorized: bool,
+        source: PluginRegistrationError,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PluginLifecycleError {
     #[error("unknown plugin: {plugin_id}")]
     UnknownPlugin { plugin_id: String },
@@ -750,6 +796,72 @@ impl PluginHost {
 
     pub fn list_plugins(&self) -> Vec<PluginRegistrationRecord> {
         self.registrations.values().cloned().collect()
+    }
+
+    pub fn browse_registry(
+        &self,
+        entries: &[PluginRegistryEntry],
+    ) -> Vec<PluginRegistryCatalogEntry> {
+        entries
+            .iter()
+            .map(|entry| PluginRegistryCatalogEntry {
+                registry_id: entry.registry_id.clone(),
+                plugin_id: entry.manifest.plugin_id.clone(),
+                name: entry.manifest.name.clone(),
+                version: entry.manifest.version.clone(),
+                kind: entry.manifest.kind.clone(),
+                host_api_version: entry.manifest.host_api_version.clone(),
+                capabilities: entry.manifest.capabilities.clone(),
+            })
+            .collect()
+    }
+
+    pub fn install_registry_entry(
+        &mut self,
+        entry: PluginRegistryEntry,
+    ) -> Result<PluginRegistryInstallRecord, PluginRegistryInstallError> {
+        let registry_id = normalize_optional_text(entry.registry_id)
+            .unwrap_or_else(|| "unknown-registry-entry".to_string());
+        let source_uri = normalize_optional_text(entry.source_uri).ok_or_else(|| {
+            PluginRegistryInstallError::EmptySourceUri {
+                registry_id: registry_id.clone(),
+            }
+        })?;
+        let manifest = validate_manifest(entry.manifest.clone()).map_err(|source| {
+            PluginRegistryInstallError::RegistrationRejected {
+                registry_id: registry_id.clone(),
+                download_authorized: false,
+                source,
+            }
+        })?;
+        enforce_host_api_compatibility(&manifest, &self.host_api_versions).map_err(|source| {
+            PluginRegistryInstallError::RegistrationRejected {
+                registry_id: registry_id.clone(),
+                download_authorized: false,
+                source,
+            }
+        })?;
+
+        let capability_review = PluginCapabilityReview {
+            plugin_id: manifest.plugin_id.clone(),
+            declared_capabilities: manifest.capabilities.clone(),
+            requires_explicit_enable: true,
+        };
+        let registration = self.register_plugin(entry.manifest).map_err(|source| {
+            PluginRegistryInstallError::RegistrationRejected {
+                registry_id: registry_id.clone(),
+                download_authorized: false,
+                source,
+            }
+        })?;
+
+        Ok(PluginRegistryInstallRecord {
+            registry_id,
+            source_uri,
+            registration,
+            capability_review,
+            download_authorized: true,
+        })
     }
 
     pub fn transition_plugin_status(
@@ -1855,7 +1967,8 @@ mod tests {
         ManifestField, ManifestRejectionReason, MapLayerInvocationError, MapLayerRenderRequest,
         PluginExecutionLimits, PluginExecutionPlan, PluginHost, PluginLifecycleStatus,
         PluginLifecycleTransitionRequest, PluginManifestBuilder, PluginRegistrationError,
-        PluginScaffoldError, PluginScaffoldRequest, RawPluginManifest, ReportTemplateRenderRequest,
+        PluginRegistryEntry, PluginRegistryInstallError, PluginScaffoldError,
+        PluginScaffoldRequest, RawPluginManifest, ReportTemplateRenderRequest,
         SandboxExecutionStatus, SandboxTerminationReason, SpectralBandOperand,
         SpectralIndexFormula, SpectralIndexInvocationError, SpectralIndexPluginSpec,
         SpectralIndexScene,
@@ -2701,6 +2814,89 @@ mod tests {
         assert!(host.list_plugins().is_empty());
     }
 
+    #[test]
+    fn registry_browse_exposes_manifest_version_and_capabilities() {
+        let host = PluginHost::default();
+        let entries = vec![registry_entry(
+            "agbot-registry/custom-ndvi",
+            "registry://plugins/custom-ndvi-1.2.3.tar.zst",
+            custom_index_manifest(),
+        )];
+
+        let catalog = host.browse_registry(&entries);
+
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].registry_id, "agbot-registry/custom-ndvi");
+        assert_eq!(catalog[0].plugin_id, "plugin.custom_ndvi");
+        assert_eq!(catalog[0].version, "1.2.3");
+        assert_eq!(catalog[0].kind, "index");
+        assert_eq!(
+            catalog[0].capabilities,
+            vec!["read:scene".to_string(), "write:product".to_string()]
+        );
+    }
+
+    #[test]
+    fn compatible_registry_entry_installs_registered_pending_explicit_enable() {
+        let mut host = PluginHost::with_supported_host_api_range("2026.1", "2026.3")
+            .expect("range should be valid");
+        let mut manifest = read_scene_manifest();
+        manifest.host_api_version = "2026.3".to_string();
+
+        let install = host
+            .install_registry_entry(registry_entry(
+                "agbot-registry/scene-reader",
+                "registry://plugins/scene-reader-1.0.0.tar.zst",
+                manifest,
+            ))
+            .expect("compatible registry entry should install");
+
+        assert!(install.download_authorized);
+        assert_eq!(install.registration.plugin_id, "plugin.scene_reader");
+        assert_eq!(install.registration.host_api_version, "2026.3");
+        assert_eq!(
+            install.registration.status,
+            PluginLifecycleStatus::Registered
+        );
+        assert_eq!(
+            install.capability_review.declared_capabilities,
+            vec!["read:scene".to_string()]
+        );
+        assert!(install.capability_review.requires_explicit_enable);
+        assert_eq!(host.list_plugins(), vec![install.registration]);
+    }
+
+    #[test]
+    fn incompatible_registry_entry_is_refused_before_registration_or_download() {
+        let mut host = PluginHost::with_supported_host_api_range("2026.1", "2026.3")
+            .expect("range should be valid");
+        let mut manifest = read_scene_manifest();
+        manifest.host_api_version = "2025.9".to_string();
+
+        let error = host
+            .install_registry_entry(registry_entry(
+                "agbot-registry/scene-reader-old",
+                "registry://plugins/scene-reader-0.8.0.tar.zst",
+                manifest,
+            ))
+            .expect_err("incompatible registry entry should be refused locally");
+
+        assert_eq!(
+            error,
+            PluginRegistryInstallError::RegistrationRejected {
+                registry_id: "agbot-registry/scene-reader-old".to_string(),
+                download_authorized: false,
+                source: PluginRegistrationError::UnsupportedHostApiVersion {
+                    plugin_id: "plugin.scene_reader".to_string(),
+                    host_api_version: "2025.9".to_string(),
+                    supported_min: "2026.1".to_string(),
+                    supported_max: "2026.3".to_string(),
+                },
+            }
+        );
+        assert!(host.list_plugins().is_empty());
+    }
+
     fn custom_index_manifest() -> RawPluginManifest {
         RawPluginManifest {
             plugin_id: "plugin.custom_ndvi".to_string(),
@@ -2782,6 +2978,18 @@ mod tests {
             host_api_version: "2026.1".to_string(),
             capabilities: vec!["read:payload".to_string(), "write:layer".to_string()],
             entrypoint: "geojson_adapter::adapt".to_string(),
+        }
+    }
+
+    fn registry_entry(
+        registry_id: &str,
+        source_uri: &str,
+        manifest: RawPluginManifest,
+    ) -> PluginRegistryEntry {
+        PluginRegistryEntry {
+            registry_id: registry_id.to_string(),
+            source_uri: source_uri.to_string(),
+            manifest,
         }
     }
 
