@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: d2b5556 (`batch-20260618014430`)
-- **Latest checkpoint commit**: c68ec38
+- **Last implementation commit**: e1311f4 (`batch-20260618015600`)
+- **Latest checkpoint commit**: 9829e24
 - **Current batch**: none
-- **Completed feature rows**: 477 committed; 1 tests_passed; 2 skipped; 2 blocked; 16 pending in this run.
+- **Completed feature rows**: 478 committed; 1 tests_passed; 2 skipped; 2 blocked; 15 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch.
 
 ## Latest verification
@@ -116,7 +116,12 @@
 - `cargo test -p geo_hub --test products_api collaboration_` — pass
 - `cargo check -p geo_hub` — pass
 - `21-09` — committed as operator-console collaboration feed with org-scoped streams, active raised/acknowledged alerts, foreign stream/alert exclusion, cross-org permission denial, and ended streams surfaced as `ended` rather than stale live
+- `cargo fmt` — pass
+- `cargo test -p geo_hub --test products_api collaboration_portal_feed` — pass
+- `cargo test -p geo_hub --test products_api collaboration_` — pass
+- `cargo check -p geo_hub` — pass
+- `21-10` — committed as read-only grower portal collaboration feed with member-scoped stream/alert visibility, direct same-org stream access, direct foreign stream/alert 404 non-leakage, and cross-org feed denial
 
 ## Next action
 
-- Select and claim the next pending feature `21-10` for portal integration.
+- Select and claim the next pending roadmap feature.
