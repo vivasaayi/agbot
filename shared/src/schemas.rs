@@ -14234,6 +14234,35 @@ pub struct CollaborationSessionReplay {
     pub events: Vec<CollaborationSessionEventRecord>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationSessionAnnotationLinkRequest {
+    pub session_id: String,
+    pub org_id: String,
+    pub scene_id: String,
+    pub annotation_id: String,
+    pub actor_id: String,
+    pub connection_active: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationSessionAnnotationLinkRecord {
+    pub link_id: String,
+    pub session_id: String,
+    pub org_id: String,
+    pub scene_id: String,
+    pub annotation_id: String,
+    pub actor_id: String,
+    pub visible: bool,
+    pub recoverable: bool,
+    pub occurred_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CollaborationSessionAnnotationRecord {
+    pub link: CollaborationSessionAnnotationLinkRecord,
+    pub annotation: AnnotationRecord,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CollaborationMissionWaypoint {
     pub waypoint_id: String,
@@ -14475,6 +14504,12 @@ pub enum CollaborationError {
     EmptySessionEventId,
     #[error("collaboration session event subject_ref cannot be empty")]
     EmptySessionSubjectRef,
+    #[error("collaboration session annotation link_id cannot be empty")]
+    EmptySessionAnnotationLinkId,
+    #[error("collaboration session annotation scene_id cannot be empty")]
+    EmptySessionAnnotationSceneId,
+    #[error("collaboration session annotation annotation_id cannot be empty")]
+    EmptySessionAnnotationId,
     #[error("collaboration mission plan_id cannot be empty")]
     EmptyMissionPlanId,
     #[error("collaboration mission waypoint_id cannot be empty")]
@@ -15022,6 +15057,39 @@ pub fn record_collaboration_session(
     };
 
     Ok(CollaborationSessionReplay { session, events })
+}
+
+pub fn link_collaboration_session_annotation(
+    request: CollaborationSessionAnnotationLinkRequest,
+    generated_link_id: String,
+    occurred_at: String,
+) -> Result<CollaborationSessionAnnotationLinkRecord, CollaborationError> {
+    let link_id = normalize_collaboration_text(generated_link_id)
+        .ok_or(CollaborationError::EmptySessionAnnotationLinkId)?;
+    let session_id = normalize_collaboration_text(request.session_id)
+        .ok_or(CollaborationError::EmptySessionId)?;
+    let org_id =
+        normalize_collaboration_text(request.org_id).ok_or(CollaborationError::EmptyOrgId)?;
+    let scene_id = normalize_collaboration_text(request.scene_id)
+        .ok_or(CollaborationError::EmptySessionAnnotationSceneId)?;
+    let annotation_id = normalize_collaboration_text(request.annotation_id)
+        .ok_or(CollaborationError::EmptySessionAnnotationId)?;
+    let actor_id =
+        normalize_collaboration_text(request.actor_id).ok_or(CollaborationError::EmptyActorId)?;
+    let occurred_at =
+        normalize_collaboration_text(occurred_at).ok_or(CollaborationError::EmptyTimestamp)?;
+
+    Ok(CollaborationSessionAnnotationLinkRecord {
+        link_id,
+        session_id,
+        org_id,
+        scene_id,
+        annotation_id,
+        actor_id,
+        visible: true,
+        recoverable: !request.connection_active,
+        occurred_at,
+    })
 }
 
 pub fn create_collaboration_mission_plan(
@@ -18555,7 +18623,8 @@ mod tests {
         execute_tractor_prescription, expire_lapsed_collaboration_presence, forecast_drought_risk,
         fulfill_marketplace_inventory, fuse_drought_evidence, ingest_drought_stress_evidence,
         ingest_remote_sensing_moisture_proxy_layer, ingest_weather_sensor_stream,
-        map_zone_water_need, marketplace_inventory_available, moderate_community_contribution,
+        link_collaboration_session_annotation, map_zone_water_need,
+        marketplace_inventory_available, moderate_community_contribution,
         normalize_weather_provider_forecast, place_marketplace_order_record,
         plan_tractor_swath_coverage, publish_marketplace_listing_record, query_drought_history,
         query_irrigation_history, query_weather_history, raise_collaboration_emergency_alert,
@@ -18586,60 +18655,60 @@ mod tests {
         CollaborationMissionWaypoint, CollaborationMissionWaypointEditRequest,
         CollaborationNotificationEventRequest, CollaborationPermissionResolveRequest,
         CollaborationPresenceState, CollaborationPresenceUpdateRequest,
-        CollaborationSessionEventInput, CollaborationSessionEventKind,
-        CollaborationSessionRecordRequest, CollaborationStreamFrameRelayRequest,
-        CollaborationStreamStartRequest, CollaborationStreamState,
-        ContentCommunityContributionCreateRequest, ContentContributionModerationAction,
-        ContentContributionModerationRequest, ContentContributionStatus, ContentCreateRequest,
-        ContentEngagementEventCreateRequest, ContentEngagementEventRecord,
-        ContentEngagementEventType, ContentError, ContentLocaleVariantCreateRequest,
-        ContentPermissionResolveRequest, ContentPortalEmbedRequest, ContentRecord,
-        ContentSearchDocument, ContentSearchRequest, ContentStatus, ContentSuccessMetric,
-        ContentSuccessStoryCreateRequest, ContentSuccessStoryFields, ContentTagApplyRequest,
-        ContentTaxonomyKind, ContentTaxonomyTag, ContentType, ContentWorkflowAction,
-        ContentWorkflowActorRole, ContentWorkflowTransitionRequest, CropPlanRecord,
-        DroughtAdvisoryLoopRequest, DroughtAdvisoryLoopStatus, DroughtAlertRoutingRequest,
-        DroughtBaselineTrendError, DroughtBaselineTrendRequest, DroughtBaselineTrendStatus,
-        DroughtEvidenceFusionError, DroughtEvidenceFusionRequest, DroughtEvidenceFusionStatus,
-        DroughtEvidenceInputStatus, DroughtForecastRequest, DroughtForecastStatus,
-        DroughtForecastUncertaintyBand, DroughtHistoryEntry, DroughtHistoryEntryKind,
-        DroughtHistoryError, DroughtHistoryQuery, DroughtIndexComputeRequest, DroughtIndexError,
-        DroughtIndexPeriod, DroughtIndexType, DroughtMitigationActionTarget,
-        DroughtMitigationError, DroughtMitigationRequest, DroughtMitigationStatus,
-        DroughtReportError, DroughtReportRequest, DroughtReportSectionKind, DroughtRiskBand,
-        DroughtRiskScoreError, DroughtRiskScoreRequest, DroughtRiskScoreStatus,
-        DroughtRiskThresholds, DroughtStressEvidenceError, DroughtStressEvidenceLayer,
-        DroughtStressIndex, DroughtTrendDirection, FarmFieldEntityStatus, FarmFieldError,
-        FarmFieldListQuery, FarmFieldRegistry, FarmRecord, FieldBoundary,
-        FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord, FleetConfigApplyStatus,
-        FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
-        FleetInventoryFilter, FleetNodeComponentHealth, FleetNodeComponentStatus,
-        FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
-        FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
-        FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, IrrigationEventRecord,
-        IrrigationEventRequest, IrrigationHistoryQuery, IrrigationScheduleRequest,
-        IrrigationValveActionStatus, IrrigationValveDryRunRequest, IrrigationValveDryRunStatus,
-        IrrigationValveExecuteRequest, IrrigationValveExecutionStatus, IrrigationValveSpec,
-        MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountRecord,
-        MarketplaceAccountStatus, MarketplaceAvailabilityWindow, MarketplaceCatalogCategory,
-        MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind,
-        MarketplaceDemandForecastRequest, MarketplaceDemandForecastStatus,
-        MarketplaceFulfillmentCreateRequest, MarketplaceFulfillmentError,
-        MarketplaceFulfillmentStatus, MarketplaceInventoryError, MarketplaceInventoryUpsertRequest,
-        MarketplaceListingError, MarketplaceListingPublishRequest, MarketplaceListingStatus,
-        MarketplaceOrderCreateRequest, MarketplaceOrderError, MarketplaceOrderStatus,
-        MarketplaceOrgReportRequest, MarketplacePartyType, MarketplacePortalEntryError,
-        MarketplaceRatingCreateRequest, MarketplaceRatingError, MarketplaceReportPeriod,
-        MarketplaceUnitOfMeasure, MultispectralImage, OpenDataPublishError,
-        OpenDataPublishRefusalReason, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
-        RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
-        RecommendationPriority, RecommendationRecord, RecommendationStatus,
-        RecommendationStatusChangeType, RemoteSensingMoistureIndex,
-        RemoteSensingMoistureProxyError, RemoteSensingMoistureProxyLayer,
-        RemoteSensingMoistureZoneValue, ReportDeliverableRegistry, ReportFormat,
-        ReportPersistenceError, ReportRecord, ReportVisibility, SceneFieldCoverageStatus,
-        SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord,
-        SoilCarbonEvidenceInput, SoilCarbonPracticeInput, SoilCarbonProxyRequest,
+        CollaborationSessionAnnotationLinkRequest, CollaborationSessionEventInput,
+        CollaborationSessionEventKind, CollaborationSessionRecordRequest,
+        CollaborationStreamFrameRelayRequest, CollaborationStreamStartRequest,
+        CollaborationStreamState, ContentCommunityContributionCreateRequest,
+        ContentContributionModerationAction, ContentContributionModerationRequest,
+        ContentContributionStatus, ContentCreateRequest, ContentEngagementEventCreateRequest,
+        ContentEngagementEventRecord, ContentEngagementEventType, ContentError,
+        ContentLocaleVariantCreateRequest, ContentPermissionResolveRequest,
+        ContentPortalEmbedRequest, ContentRecord, ContentSearchDocument, ContentSearchRequest,
+        ContentStatus, ContentSuccessMetric, ContentSuccessStoryCreateRequest,
+        ContentSuccessStoryFields, ContentTagApplyRequest, ContentTaxonomyKind, ContentTaxonomyTag,
+        ContentType, ContentWorkflowAction, ContentWorkflowActorRole,
+        ContentWorkflowTransitionRequest, CropPlanRecord, DroughtAdvisoryLoopRequest,
+        DroughtAdvisoryLoopStatus, DroughtAlertRoutingRequest, DroughtBaselineTrendError,
+        DroughtBaselineTrendRequest, DroughtBaselineTrendStatus, DroughtEvidenceFusionError,
+        DroughtEvidenceFusionRequest, DroughtEvidenceFusionStatus, DroughtEvidenceInputStatus,
+        DroughtForecastRequest, DroughtForecastStatus, DroughtForecastUncertaintyBand,
+        DroughtHistoryEntry, DroughtHistoryEntryKind, DroughtHistoryError, DroughtHistoryQuery,
+        DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod, DroughtIndexType,
+        DroughtMitigationActionTarget, DroughtMitigationError, DroughtMitigationRequest,
+        DroughtMitigationStatus, DroughtReportError, DroughtReportRequest,
+        DroughtReportSectionKind, DroughtRiskBand, DroughtRiskScoreError, DroughtRiskScoreRequest,
+        DroughtRiskScoreStatus, DroughtRiskThresholds, DroughtStressEvidenceError,
+        DroughtStressEvidenceLayer, DroughtStressIndex, DroughtTrendDirection,
+        FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery, FarmFieldRegistry, FarmRecord,
+        FieldBoundary, FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord,
+        FleetConfigApplyStatus, FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState,
+        FleetHeartbeatEvaluation, FleetInventoryFilter, FleetNodeComponentHealth,
+        FleetNodeComponentStatus, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
+        FleetNodeHealthState, FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError,
+        FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
+        IrrigationEventRecord, IrrigationEventRequest, IrrigationHistoryQuery,
+        IrrigationScheduleRequest, IrrigationValveActionStatus, IrrigationValveDryRunRequest,
+        IrrigationValveDryRunStatus, IrrigationValveExecuteRequest, IrrigationValveExecutionStatus,
+        IrrigationValveSpec, MarketplaceAccountCreateRequest, MarketplaceAccountError,
+        MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplaceAvailabilityWindow,
+        MarketplaceCatalogCategory, MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest,
+        MarketplaceCatalogItemKind, MarketplaceDemandForecastRequest,
+        MarketplaceDemandForecastStatus, MarketplaceFulfillmentCreateRequest,
+        MarketplaceFulfillmentError, MarketplaceFulfillmentStatus, MarketplaceInventoryError,
+        MarketplaceInventoryUpsertRequest, MarketplaceListingError,
+        MarketplaceListingPublishRequest, MarketplaceListingStatus, MarketplaceOrderCreateRequest,
+        MarketplaceOrderError, MarketplaceOrderStatus, MarketplaceOrgReportRequest,
+        MarketplacePartyType, MarketplacePortalEntryError, MarketplaceRatingCreateRequest,
+        MarketplaceRatingError, MarketplaceReportPeriod, MarketplaceUnitOfMeasure,
+        MultispectralImage, OpenDataPublishError, OpenDataPublishRefusalReason,
+        OpenDataPublishRequest, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
+        RecommendationLifecycleRegistry, RecommendationPersistenceError, RecommendationPriority,
+        RecommendationRecord, RecommendationStatus, RecommendationStatusChangeType,
+        RemoteSensingMoistureIndex, RemoteSensingMoistureProxyError,
+        RemoteSensingMoistureProxyLayer, RemoteSensingMoistureZoneValue, ReportDeliverableRegistry,
+        ReportFormat, ReportPersistenceError, ReportRecord, ReportVisibility,
+        SceneFieldCoverageStatus, SceneLayerMetadataError, SceneLayerRecord, SceneRecord,
+        SeasonRecord, SoilCarbonEvidenceInput, SoilCarbonPracticeInput, SoilCarbonProxyRequest,
         SoilCarbonProxyStatus, SoilMoistureQaFlag, SoilMoistureReadingError,
         SoilMoistureReadingRequest, SoilMoistureRejectionReason,
         SustainabilityBaselineCreateRequest, SustainabilityBaselineRecord,
@@ -22721,6 +22790,31 @@ mod tests {
             CollaborationSessionEventKind::StreamGap
         );
         assert_eq!(replay.events[2].event_id, "event-alert");
+    }
+
+    #[test]
+    fn collaboration_session_annotation_link_scopes_visibility_and_recovery() {
+        let link = link_collaboration_session_annotation(
+            CollaborationSessionAnnotationLinkRequest {
+                session_id: "session-001".to_string(),
+                org_id: "org-alpha".to_string(),
+                scene_id: "scene-live-001".to_string(),
+                annotation_id: "annotation-001".to_string(),
+                actor_id: "expert-1".to_string(),
+                connection_active: false,
+            },
+            "session-annotation-link-001".to_string(),
+            "2026-06-13T15:05:00Z".to_string(),
+        )
+        .expect("session annotation link should build");
+
+        assert_eq!(link.session_id, "session-001");
+        assert_eq!(link.org_id, "org-alpha");
+        assert_eq!(link.scene_id, "scene-live-001");
+        assert_eq!(link.annotation_id, "annotation-001");
+        assert_eq!(link.actor_id, "expert-1");
+        assert!(link.visible);
+        assert!(link.recoverable);
     }
 
     #[test]

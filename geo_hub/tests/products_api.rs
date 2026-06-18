@@ -8622,6 +8622,351 @@ async fn collaboration_session_records_replays_ordered_events_and_denies_cross_o
 }
 
 #[tokio::test]
+async fn collaboration_remote_expert_annotation_persists_and_recovers_after_disconnect(
+) -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "expert-live-scene-001";
+    let scene_dir = tmp.path().join("expert-live-scene-001");
+    std::fs::create_dir_all(&scene_dir)?;
+    insert_scene_with_spatial_ref(
+        &ctx,
+        scene_id,
+        &scene_dir,
+        json!({
+            "georeferenced": true,
+            "crs": "EPSG:4326",
+            "bbox": {
+                "min_lon": -96.7,
+                "min_lat": 41.1,
+                "max_lon": -96.2,
+                "max_lat": 41.4
+            },
+            "geo_transform": [-96.7, 0.05, 0.0, 41.4, 0.0, -0.05],
+            "resolution": {
+                "x": 0.05,
+                "y": 0.05
+            }
+        }),
+    )
+    .await?;
+
+    let session = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/sessions?actor_org_id=org-alpha&actor_id=ops-1&role_refs=collab:member")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "session_id": "session-expert-001",
+                        "org_id": "org-alpha",
+                        "events": [
+                            {
+                                "event_id": "event-start",
+                                "kind": "stream_frame",
+                                "occurred_at": "2026-06-13T15:00:00Z",
+                                "actor_id": "camera:rgb-01",
+                                "subject_ref": "stream:stream-expert-001:frame-001",
+                                "note": "session started"
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(session.status(), StatusCode::OK);
+
+    let stream = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/streams?actor_org_id=org-alpha&actor_id=operator-1&role_refs=collab:operator")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "stream_id": "stream-expert-001",
+                        "org_id": "org-alpha",
+                        "mission_ref": "mission:mission-001",
+                        "source_ref": "camera:rgb-01",
+                        "latency_budget_ms": 500,
+                        "source_active": true
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(stream.status(), StatusCode::OK);
+
+    let create = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/sessions/session-expert-001/annotations?org_id=org-alpha&actor_org_id=org-alpha&actor_id=expert-1&role_refs=collab:expert")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "actor_id": "expert-1",
+                        "scene_id": scene_id,
+                        "stream_id": "stream-expert-001",
+                        "connection_active": false,
+                        "annotation": {
+                            "annotation_id": "expert-ann-001",
+                            "label": "Live stress area",
+                            "severity": "high",
+                            "geometry": {
+                                "type": "point",
+                                "coordinate": {
+                                    "longitude": -96.45,
+                                    "latitude": 41.25
+                                }
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create.status(), StatusCode::OK);
+    let body = to_bytes(create.into_body(), 64 * 1024).await?;
+    let created: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        created
+            .pointer("/annotation/author")
+            .and_then(|value| value.as_str()),
+        Some("expert-1")
+    );
+    assert_eq!(
+        created
+            .pointer("/link/recoverable")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+
+    let list = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/sessions/session-expert-001/annotations?org_id=org-alpha&actor_org_id=org-alpha&actor_id=team-1&role_refs=collab:member")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list.status(), StatusCode::OK);
+    let body = to_bytes(list.into_body(), 64 * 1024).await?;
+    let annotations: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(annotations.len(), 1);
+    assert_eq!(
+        annotations[0]
+            .pointer("/annotation/annotation_id")
+            .and_then(|value| value.as_str()),
+        Some("expert-ann-001")
+    );
+
+    let stored_author: String =
+        sqlx::query_scalar("SELECT author FROM annotations WHERE annotation_id = 'expert-ann-001'")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(stored_author, "expert-1");
+    let recoverable: i64 = sqlx::query_scalar(
+        "SELECT recoverable FROM collab_session_annotations WHERE annotation_id = 'expert-ann-001'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(recoverable, 1);
+    let replay = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/sessions/session-expert-001/replay?org_id=org-alpha&actor_org_id=org-alpha&actor_id=team-1&role_refs=collab:member")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(replay.status(), StatusCode::OK);
+    let body = to_bytes(replay.into_body(), 64 * 1024).await?;
+    let replay: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        replay
+            .pointer("/session/event_count")
+            .and_then(|value| value.as_u64()),
+        Some(2)
+    );
+    assert!(replay
+        .pointer("/events")
+        .and_then(|value| value.as_array())
+        .expect("events should be array")
+        .iter()
+        .any(
+            |event| event.get("kind").and_then(|value| value.as_str()) == Some("annotation")
+                && event.get("note").and_then(|value| value.as_str())
+                    == Some("connection_lost_annotation_persisted")
+        ));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn collaboration_remote_expert_annotation_viewer_denied_without_session_mutation(
+) -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let scene_id = "expert-live-scene-denied";
+    let scene_dir = tmp.path().join("expert-live-scene-denied");
+    std::fs::create_dir_all(&scene_dir)?;
+    insert_scene_with_spatial_ref(
+        &ctx,
+        scene_id,
+        &scene_dir,
+        json!({
+            "georeferenced": true,
+            "crs": "EPSG:4326",
+            "bbox": {
+                "min_lon": -96.7,
+                "min_lat": 41.1,
+                "max_lon": -96.2,
+                "max_lat": 41.4
+            },
+            "geo_transform": [-96.7, 0.05, 0.0, 41.4, 0.0, -0.05],
+            "resolution": {
+                "x": 0.05,
+                "y": 0.05
+            }
+        }),
+    )
+    .await?;
+
+    let session = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/sessions?actor_org_id=org-alpha&actor_id=ops-1&role_refs=collab:member")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "session_id": "session-expert-denied",
+                        "org_id": "org-alpha",
+                        "events": [
+                            {
+                                "event_id": "event-start-denied",
+                                "kind": "stream_frame",
+                                "occurred_at": "2026-06-13T15:00:00Z",
+                                "actor_id": "camera:rgb-01",
+                                "subject_ref": "stream:stream-expert-denied:frame-001",
+                                "note": "session started"
+                            }
+                        ]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(session.status(), StatusCode::OK);
+
+    let stream = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/streams?actor_org_id=org-alpha&actor_id=operator-1&role_refs=collab:operator")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "stream_id": "stream-expert-denied",
+                        "org_id": "org-alpha",
+                        "mission_ref": "mission:mission-001",
+                        "source_ref": "camera:rgb-01",
+                        "latency_budget_ms": 500,
+                        "source_active": true
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(stream.status(), StatusCode::OK);
+
+    let denied = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/sessions/session-expert-denied/annotations?org_id=org-alpha&actor_org_id=org-alpha&actor_id=viewer-1&role_refs=collab:viewer")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "actor_id": "viewer-1",
+                        "scene_id": scene_id,
+                        "stream_id": "stream-expert-denied",
+                        "annotation": {
+                            "annotation_id": "expert-ann-denied",
+                            "label": "Should not persist",
+                            "geometry": {
+                                "type": "point",
+                                "coordinate": {
+                                    "longitude": -96.45,
+                                    "latitude": 41.25
+                                }
+                            }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let annotation_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM annotations WHERE annotation_id = 'expert-ann-denied'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(annotation_count, 0);
+    let link_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM collab_session_annotations WHERE session_id = 'session-expert-denied'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(link_count, 0);
+    let event_count: i64 = sqlx::query_scalar(
+        "SELECT event_count FROM collab_sessions WHERE session_id = 'session-expert-denied'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(event_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn collaboration_mission_edit_conflicts_and_dispatch_guardrails() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;

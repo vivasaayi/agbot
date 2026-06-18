@@ -1690,6 +1690,27 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS collab_session_annotations (
+            link_id TEXT PRIMARY KEY,
+            session_id TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            scene_id TEXT NOT NULL,
+            annotation_id TEXT NOT NULL,
+            actor_id TEXT NOT NULL,
+            visible INTEGER NOT NULL,
+            recoverable INTEGER NOT NULL,
+            occurred_at TEXT NOT NULL,
+            UNIQUE(session_id, annotation_id),
+            FOREIGN KEY(session_id) REFERENCES collab_sessions(session_id) ON DELETE CASCADE,
+            FOREIGN KEY(annotation_id) REFERENCES annotations(annotation_id) ON DELETE CASCADE
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS collab_mission_plans (
             plan_id TEXT PRIMARY KEY,
             org_id TEXT NOT NULL,

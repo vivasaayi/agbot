@@ -101,13 +101,14 @@ use shared::schemas::{
     create_success_story_content, create_sustainability_baseline, create_sustainability_mrv_trail,
     create_versioned_content, estimate_biomass, evaluate_collaboration_mission_dispatch,
     expire_lapsed_collaboration_presence, fulfill_marketplace_inventory,
-    moderate_community_contribution, normalize_weather_provider_forecast,
-    parse_biodiversity_proxy_status, parse_carbon_footprint_status,
-    parse_content_contribution_status, parse_content_engagement_event_type, parse_content_status,
-    parse_content_type, parse_drought_index_type, parse_marketplace_account_status,
-    parse_marketplace_catalog_category, parse_marketplace_catalog_item_kind,
-    parse_marketplace_demand_forecast_status, parse_marketplace_fulfillment_status,
-    parse_marketplace_listing_status, parse_marketplace_order_status, parse_marketplace_party_type,
+    link_collaboration_session_annotation, moderate_community_contribution,
+    normalize_weather_provider_forecast, parse_biodiversity_proxy_status,
+    parse_carbon_footprint_status, parse_content_contribution_status,
+    parse_content_engagement_event_type, parse_content_status, parse_content_type,
+    parse_drought_index_type, parse_marketplace_account_status, parse_marketplace_catalog_category,
+    parse_marketplace_catalog_item_kind, parse_marketplace_demand_forecast_status,
+    parse_marketplace_fulfillment_status, parse_marketplace_listing_status,
+    parse_marketplace_order_status, parse_marketplace_party_type,
     parse_marketplace_unit_of_measure, parse_soil_carbon_proxy_status, parse_soil_moisture_qa_flag,
     parse_soil_moisture_rejection_reason, parse_sustainability_comparison_status,
     parse_sustainability_kpi_direction, parse_sustainability_kpi_status,
@@ -141,9 +142,10 @@ use shared::schemas::{
     CollaborationNotificationEventRequest, CollaborationNotificationRecord,
     CollaborationPermissionDecision, CollaborationPermissionResolveRequest,
     CollaborationPermissionSet, CollaborationPresenceRecord, CollaborationPresenceState,
-    CollaborationPresenceUpdateRequest, CollaborationSessionEventKind,
-    CollaborationSessionEventRecord, CollaborationSessionRecord, CollaborationSessionRecordRequest,
-    CollaborationSessionReplay, CollaborationStreamFrameRecord,
+    CollaborationPresenceUpdateRequest, CollaborationSessionAnnotationLinkRecord,
+    CollaborationSessionAnnotationLinkRequest, CollaborationSessionAnnotationRecord,
+    CollaborationSessionEventKind, CollaborationSessionEventRecord, CollaborationSessionRecord,
+    CollaborationSessionRecordRequest, CollaborationSessionReplay, CollaborationStreamFrameRecord,
     CollaborationStreamFrameRelayRequest, CollaborationStreamRelayResult,
     CollaborationStreamStartRequest, CollaborationStreamState,
     ContentCommunityContributionCreateRequest, ContentCommunityContributionRecord,
@@ -222,6 +224,10 @@ use uuid::Uuid;
 const TILE_SIZE: u32 = 256;
 const DEFAULT_LAYER_STALE_AFTER_DAYS: i64 = 14;
 const MOBILE_APP_HTML: &str = include_str!("mobile_app.html");
+
+fn default_connection_active() -> bool {
+    true
+}
 
 #[derive(Debug, Serialize)]
 pub struct SceneSummary {
@@ -504,6 +510,16 @@ pub struct CreateAnnotationRequest {
     pub note: Option<String>,
     pub severity: Option<String>,
     pub geometry: AnnotationGeometry,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CollaborationSessionAnnotationCreateRequest {
+    pub actor_id: String,
+    pub scene_id: String,
+    pub stream_id: String,
+    #[serde(default = "default_connection_active")]
+    pub connection_active: bool,
+    pub annotation: CreateAnnotationRequest,
 }
 
 #[derive(Debug, Deserialize)]
@@ -5908,6 +5924,99 @@ pub async fn replay_collaboration_session_route(
     .await?;
 
     Ok(Json(replay))
+}
+
+pub async fn create_collaboration_session_annotation_route(
+    Path(session_id): Path<String>,
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+    Json(mut request): Json<CollaborationSessionAnnotationCreateRequest>,
+) -> AppResult<Json<CollaborationSessionAnnotationRecord>> {
+    let replay = load_collaboration_session_replay(&state, &session_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    if replay.session.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    assert_collaboration_action_permission(
+        &state,
+        &replay.session.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Annotate,
+        None,
+    )
+    .await?;
+    if !scene_exists(&state, &request.scene_id).await? {
+        return Err(AppError::NotFound);
+    }
+    let stream = load_collaboration_stream(&state, &request.stream_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if stream.org_id != replay.session.org_id {
+        return Err(AppError::NotFound);
+    }
+    if stream.state == CollaborationStreamState::Ended {
+        return Err(AppError::BadRequest(
+            "collaboration stream is not active".to_string(),
+        ));
+    }
+
+    request.annotation.author = Some(request.actor_id.clone());
+    let generated_link_id = format!("collab-session-annotation-{}", Uuid::new_v4());
+    request.annotation.audit_id = Some(generated_link_id.clone());
+    let annotation = build_annotation_record(&state, &request.scene_id, request.annotation).await?;
+    let link = link_collaboration_session_annotation(
+        CollaborationSessionAnnotationLinkRequest {
+            session_id,
+            org_id: replay.session.org_id,
+            scene_id: annotation.scene_id.clone(),
+            annotation_id: annotation.annotation_id.clone(),
+            actor_id: request.actor_id,
+            connection_active: request.connection_active,
+        },
+        generated_link_id,
+        annotation.created_at.clone(),
+    )
+    .map_err(collaboration_error)?;
+    persist_collaboration_session_annotation(&state, &link, &annotation).await?;
+
+    Ok(Json(CollaborationSessionAnnotationRecord {
+        link,
+        annotation,
+    }))
+}
+
+pub async fn list_collaboration_session_annotations_route(
+    Path(session_id): Path<String>,
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<CollaborationSessionAnnotationRecord>>> {
+    let replay = load_collaboration_session_replay(&state, &session_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    if replay.session.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    assert_collaboration_action_permission(
+        &state,
+        &replay.session.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Join,
+        None,
+    )
+    .await?;
+
+    Ok(Json(
+        load_collaboration_session_annotations(&state, &session_id, &org_id).await?,
+    ))
 }
 
 pub async fn create_collaboration_mission_plan_route(
@@ -17521,6 +17630,154 @@ fn parse_collaboration_session_event_kind(value: &str) -> AppResult<Collaboratio
         _ => Err(AppError::BadRequest(format!(
             "unsupported collaboration session event kind {value}"
         ))),
+    }
+}
+
+async fn persist_collaboration_session_annotation(
+    state: &AppState,
+    link: &CollaborationSessionAnnotationLinkRecord,
+    annotation: &AnnotationRecord,
+) -> AppResult<()> {
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+    sqlx::query(
+        r#"
+        INSERT INTO annotations (
+            annotation_id, scene_id, field_id, author, crs, audit_id, label, note, severity,
+            geometry_json, created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        "#,
+    )
+    .bind(&annotation.annotation_id)
+    .bind(&annotation.scene_id)
+    .bind(&annotation.field_id)
+    .bind(&annotation.author)
+    .bind(&annotation.crs)
+    .bind(&annotation.audit_id)
+    .bind(&annotation.label)
+    .bind(&annotation.note)
+    .bind(&annotation.severity)
+    .bind(serde_json::to_string(&annotation.geometry).map_err(|err| AppError::Anyhow(err.into()))?)
+    .bind(&annotation.created_at)
+    .bind(&annotation.updated_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO collab_session_annotations (
+            link_id, session_id, org_id, scene_id, annotation_id, actor_id,
+            visible, recoverable, occurred_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )
+    .bind(&link.link_id)
+    .bind(&link.session_id)
+    .bind(&link.org_id)
+    .bind(&link.scene_id)
+    .bind(&link.annotation_id)
+    .bind(&link.actor_id)
+    .bind(if link.visible { 1_i64 } else { 0_i64 })
+    .bind(if link.recoverable { 1_i64 } else { 0_i64 })
+    .bind(&link.occurred_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO collab_session_events (
+            event_id, session_id, org_id, kind, occurred_at, actor_id, subject_ref, note
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(format!("{}:event", link.link_id))
+    .bind(&link.session_id)
+    .bind(&link.org_id)
+    .bind(CollaborationSessionEventKind::Annotation.as_str())
+    .bind(&link.occurred_at)
+    .bind(&link.actor_id)
+    .bind(format!("annotation:{}", link.annotation_id))
+    .bind(if link.recoverable {
+        "connection_lost_annotation_persisted"
+    } else {
+        "annotation_persisted"
+    })
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+
+    sqlx::query(
+        r#"
+        UPDATE collab_sessions
+        SET event_count = event_count + 1,
+            has_explicit_gap = CASE WHEN ?1 = 1 THEN 1 ELSE has_explicit_gap END
+        WHERE session_id = ?2
+        "#,
+    )
+    .bind(if link.recoverable { 1_i64 } else { 0_i64 })
+    .bind(&link.session_id)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+
+    tx.commit().await.map_err(Error::from)?;
+    Ok(())
+}
+
+async fn load_collaboration_session_annotations(
+    state: &AppState,
+    session_id: &str,
+    org_id: &str,
+) -> AppResult<Vec<CollaborationSessionAnnotationRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            csa.link_id, csa.session_id, csa.org_id, csa.scene_id AS link_scene_id,
+            csa.annotation_id AS link_annotation_id, csa.actor_id, csa.visible,
+            csa.recoverable, csa.occurred_at,
+            a.annotation_id, a.scene_id, a.field_id, a.author, a.crs, a.audit_id,
+            a.label, a.note, a.severity, a.geometry_json, a.created_at, a.updated_at
+        FROM collab_session_annotations csa
+        INNER JOIN annotations a ON a.annotation_id = csa.annotation_id
+        WHERE csa.session_id = ?1
+          AND csa.org_id = ?2
+          AND csa.visible = 1
+        ORDER BY csa.occurred_at ASC, csa.link_id ASC
+        "#,
+    )
+    .bind(session_id)
+    .bind(org_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| {
+            Ok(CollaborationSessionAnnotationRecord {
+                link: decode_collaboration_session_annotation_link(&row),
+                annotation: decode_annotation_record(&row)?,
+            })
+        })
+        .collect()
+}
+
+fn decode_collaboration_session_annotation_link(
+    row: &sqlx::sqlite::SqliteRow,
+) -> CollaborationSessionAnnotationLinkRecord {
+    CollaborationSessionAnnotationLinkRecord {
+        link_id: row.get("link_id"),
+        session_id: row.get("session_id"),
+        org_id: row.get("org_id"),
+        scene_id: row.get("link_scene_id"),
+        annotation_id: row.get("link_annotation_id"),
+        actor_id: row.get("actor_id"),
+        visible: row.get::<i64, _>("visible") != 0,
+        recoverable: row.get::<i64, _>("recoverable") != 0,
+        occurred_at: row.get("occurred_at"),
     }
 }
 
