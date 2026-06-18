@@ -7789,6 +7789,193 @@ async fn collaboration_message_rejects_missing_channel_without_writing() -> Resu
 }
 
 #[tokio::test]
+async fn collaboration_permissions_resolve_operator_and_cross_org_scope() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let operator = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/permissions/resolve?org_id=org-alpha&actor_org_id=org-alpha&role_refs=collab:operator")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(operator.status(), StatusCode::OK);
+    let body = to_bytes(operator.into_body(), 64 * 1024).await?;
+    let operator: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        operator.get("can_stream").and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        operator
+            .get("can_dispatch")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+
+    let cross_org = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/permissions/resolve?org_id=org-alpha&actor_org_id=org-beta&role_refs=collab:operator")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(cross_org.status(), StatusCode::OK);
+    let body = to_bytes(cross_org.into_body(), 64 * 1024).await?;
+    let cross_org: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        cross_org
+            .get("can_dispatch")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        cross_org
+            .get("can_stream")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn collaboration_viewer_stream_and_dispatch_are_denied_and_audited() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    for action in ["stream", "dispatch"] {
+        let response = ctx
+            .app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/collaboration/actions/authorize")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "org_id": "org-alpha",
+                            "actor_org_id": "org-alpha",
+                            "actor_id": "viewer-1",
+                            "role_refs": ["collab:viewer"],
+                            "action": action,
+                            "channel_id": "channel-001"
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request should build"),
+            )
+            .await
+            .expect("router should handle request");
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    let denied_count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM collab_permission_audits
+        WHERE org_id = 'org-alpha'
+          AND actor_id = 'viewer-1'
+          AND allowed = 0
+          AND reason_code = 'role_not_permitted'
+          AND action IN ('stream', 'dispatch')
+        "#,
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(denied_count, 2);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn collaboration_viewer_post_is_denied_and_does_not_write_message() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_sustainability_field(&ctx, "farm-collab", "field-collab", "season-2026").await?;
+
+    let create = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/channels")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "channel_id": "channel-viewer-denied",
+                        "org_id": "org-alpha",
+                        "field_ref": "field:field-collab",
+                        "member_account_ids": ["viewer-1"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create.status(), StatusCode::OK);
+
+    let post = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/channels/channel-viewer-denied/messages?org_id=org-alpha&actor_org_id=org-alpha&actor_id=viewer-1&role_refs=collab:viewer")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "message_id": "message-viewer-denied",
+                        "author_id": "viewer-1",
+                        "body": "I should not post with viewer-only rights"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(post.status(), StatusCode::FORBIDDEN);
+
+    let message_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM collab_messages WHERE message_id = 'message-viewer-denied'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(message_count, 0);
+
+    let audit_count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*)
+        FROM collab_permission_audits
+        WHERE actor_id = 'viewer-1'
+          AND action = 'post'
+          AND permission = 'can_post'
+          AND allowed = 0
+        "#,
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(audit_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn fleet_health_component_registry_links_airframe_and_rejects_double_install() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;

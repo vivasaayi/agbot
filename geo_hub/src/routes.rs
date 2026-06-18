@@ -86,26 +86,27 @@ use shared::plugin_extensions::ExtensionPointKind;
 use shared::schemas::{
     aggregate_content_engagement, aggregate_marketplace_ratings, append_content_version,
     apply_content_taxonomy_tags, assemble_marketplace_org_report, assert_raster_spatial_ref,
-    bind_fleet_node_identity, bounds_coverage_fraction, bounds_from_points,
-    build_collaboration_channel, build_collaboration_message, build_content_portal_embed,
-    build_marketplace_account_record, build_marketplace_catalog_item_record,
-    build_marketplace_inventory_record, build_marketplace_portal_entry,
-    build_soil_moisture_reading, build_sustainability_certification_evidence_pack,
-    build_sustainability_record, build_tractor_record, close_marketplace_listing_record,
-    compare_sustainability_baseline, compute_biodiversity_proxy, compute_carbon_footprint,
-    compute_drought_index, compute_marketplace_demand_forecast, compute_soil_carbon_proxy,
-    compute_sustainability_kpi, content_portal_embed_item, create_community_contribution,
-    create_content_engagement_event, create_content_locale_variant,
-    create_marketplace_fulfillment_record, create_marketplace_rating_record,
-    create_success_story_content, create_sustainability_baseline, create_sustainability_mrv_trail,
-    create_versioned_content, estimate_biomass, fulfill_marketplace_inventory,
-    moderate_community_contribution, normalize_weather_provider_forecast,
-    parse_biodiversity_proxy_status, parse_carbon_footprint_status,
-    parse_content_contribution_status, parse_content_engagement_event_type, parse_content_status,
-    parse_content_type, parse_drought_index_type, parse_marketplace_account_status,
-    parse_marketplace_catalog_category, parse_marketplace_catalog_item_kind,
-    parse_marketplace_demand_forecast_status, parse_marketplace_fulfillment_status,
-    parse_marketplace_listing_status, parse_marketplace_order_status, parse_marketplace_party_type,
+    authorize_collaboration_action, bind_fleet_node_identity, bounds_coverage_fraction,
+    bounds_from_points, build_collaboration_channel, build_collaboration_message,
+    build_content_portal_embed, build_marketplace_account_record,
+    build_marketplace_catalog_item_record, build_marketplace_inventory_record,
+    build_marketplace_portal_entry, build_soil_moisture_reading,
+    build_sustainability_certification_evidence_pack, build_sustainability_record,
+    build_tractor_record, close_marketplace_listing_record, compare_sustainability_baseline,
+    compute_biodiversity_proxy, compute_carbon_footprint, compute_drought_index,
+    compute_marketplace_demand_forecast, compute_soil_carbon_proxy, compute_sustainability_kpi,
+    content_portal_embed_item, create_community_contribution, create_content_engagement_event,
+    create_content_locale_variant, create_marketplace_fulfillment_record,
+    create_marketplace_rating_record, create_success_story_content, create_sustainability_baseline,
+    create_sustainability_mrv_trail, create_versioned_content, estimate_biomass,
+    fulfill_marketplace_inventory, moderate_community_contribution,
+    normalize_weather_provider_forecast, parse_biodiversity_proxy_status,
+    parse_carbon_footprint_status, parse_content_contribution_status,
+    parse_content_engagement_event_type, parse_content_status, parse_content_type,
+    parse_drought_index_type, parse_marketplace_account_status, parse_marketplace_catalog_category,
+    parse_marketplace_catalog_item_kind, parse_marketplace_demand_forecast_status,
+    parse_marketplace_fulfillment_status, parse_marketplace_listing_status,
+    parse_marketplace_order_status, parse_marketplace_party_type,
     parse_marketplace_unit_of_measure, parse_soil_carbon_proxy_status, parse_soil_moisture_qa_flag,
     parse_soil_moisture_rejection_reason, parse_sustainability_comparison_status,
     parse_sustainability_kpi_direction, parse_sustainability_kpi_status,
@@ -121,8 +122,10 @@ use shared::schemas::{
     BiodiversityProxyResult, BiodiversityProxyStatus, BiomassEstimateError, BiomassEstimateRequest,
     BiomassEstimateResult, CarbonEmissionFactor, CarbonFootprintComputeRequest,
     CarbonFootprintError, CarbonFootprintInput, CarbonFootprintResult, CarbonFootprintStatus,
-    CollaborationChannelCreateRequest, CollaborationChannelRecord, CollaborationChannelThread,
-    CollaborationError, CollaborationMessageCreateRequest, CollaborationMessageRecord,
+    CollaborationAction, CollaborationActionAuthorizeRequest, CollaborationChannelCreateRequest,
+    CollaborationChannelRecord, CollaborationChannelThread, CollaborationError,
+    CollaborationMessageCreateRequest, CollaborationMessageRecord, CollaborationPermissionDecision,
+    CollaborationPermissionResolveRequest, CollaborationPermissionSet,
     ContentCommunityContributionCreateRequest, ContentCommunityContributionRecord,
     ContentContributionModerationAuditRecord, ContentContributionModerationRequest,
     ContentContributionModerationResult, ContentCreateRequest, ContentEditRequest,
@@ -969,6 +972,18 @@ pub struct CollaborationChannelListQuery {
 #[derive(Debug, Clone, Deserialize)]
 pub struct CollaborationScopeQuery {
     pub org_id: Option<String>,
+    pub actor_org_id: Option<String>,
+    pub actor_id: Option<String>,
+    #[serde(default)]
+    pub role_refs: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CollaborationPermissionQuery {
+    pub org_id: String,
+    pub actor_org_id: String,
+    #[serde(default)]
+    pub role_refs: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -5516,6 +5531,50 @@ pub async fn create_collaboration_channel(
     Ok(Json(channel))
 }
 
+pub async fn resolve_collaboration_permissions_route(
+    Query(query): Query<CollaborationPermissionQuery>,
+) -> AppResult<Json<CollaborationPermissionSet>> {
+    let permissions =
+        shared::schemas::resolve_collaboration_permissions(CollaborationPermissionResolveRequest {
+            org_id: query.org_id,
+            actor_org_id: query.actor_org_id,
+            role_refs: parse_role_refs(query.role_refs),
+        })
+        .map_err(collaboration_error)?;
+
+    Ok(Json(permissions))
+}
+
+pub async fn authorize_collaboration_action_route(
+    State(state): State<AppState>,
+    Json(request): Json<CollaborationActionAuthorizeRequest>,
+) -> AppResult<Json<CollaborationPermissionDecision>> {
+    let actor_id = normalize_optional_text(Some(request.actor_id.clone()))
+        .ok_or_else(|| collaboration_error(CollaborationError::EmptyActorId))?;
+    let channel_id = normalize_optional_text(request.channel_id.clone());
+    let decision = authorize_collaboration_action(
+        CollaborationPermissionResolveRequest {
+            org_id: request.org_id,
+            actor_org_id: request.actor_org_id,
+            role_refs: request.role_refs,
+        },
+        request.action,
+    )
+    .map_err(collaboration_error)?;
+    insert_collaboration_permission_audit(&state, &decision, &actor_id, channel_id.as_deref())
+        .await?;
+    if !decision.allowed {
+        return Err(AppError::Forbidden(
+            CollaborationError::AccessDenied {
+                permission: decision.action.permission_name(),
+            }
+            .to_string(),
+        ));
+    }
+
+    Ok(Json(decision))
+}
+
 pub async fn list_collaboration_channels(
     Query(query): Query<CollaborationChannelListQuery>,
     State(state): State<AppState>,
@@ -5578,6 +5637,16 @@ pub async fn post_collaboration_message(
     if channel.org_id != org_id {
         return Err(AppError::NotFound);
     }
+    assert_collaboration_action_permission(
+        &state,
+        &channel.org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Post,
+        Some(&channel.channel_id),
+    )
+    .await?;
     let message = build_collaboration_message(
         request,
         Some(&channel),
@@ -10536,7 +10605,11 @@ fn content_error(error: ContentError) -> AppError {
 }
 
 fn collaboration_error(error: CollaborationError) -> AppError {
-    AppError::BadRequest(error.to_string())
+    if matches!(error, CollaborationError::AccessDenied { .. }) {
+        AppError::Forbidden(error.to_string())
+    } else {
+        AppError::BadRequest(error.to_string())
+    }
 }
 
 fn parse_soil_sensor_type(value: String) -> AppResult<SoilSensorType> {
@@ -15990,6 +16063,44 @@ fn parse_role_refs(value: Option<String>) -> Vec<String> {
         .collect()
 }
 
+async fn assert_collaboration_action_permission(
+    state: &AppState,
+    org_id: &str,
+    actor_org_id: Option<String>,
+    actor_id: Option<String>,
+    role_refs: Option<String>,
+    action: CollaborationAction,
+    channel_id: Option<&str>,
+) -> AppResult<()> {
+    let Some(actor_org_id) = normalize_optional_text(actor_org_id) else {
+        return Ok(());
+    };
+    let Some(role_refs) = role_refs else {
+        return Ok(());
+    };
+    let actor_id = normalize_optional_text(actor_id).unwrap_or_else(|| "unknown".to_string());
+    let decision = authorize_collaboration_action(
+        CollaborationPermissionResolveRequest {
+            org_id: org_id.to_string(),
+            actor_org_id,
+            role_refs: parse_role_refs(Some(role_refs)),
+        },
+        action,
+    )
+    .map_err(collaboration_error)?;
+    insert_collaboration_permission_audit(state, &decision, &actor_id, channel_id).await?;
+    if decision.allowed {
+        return Ok(());
+    }
+
+    Err(AppError::Forbidden(
+        CollaborationError::AccessDenied {
+            permission: decision.action.permission_name(),
+        }
+        .to_string(),
+    ))
+}
+
 async fn insert_content_item_with_version(
     state: &AppState,
     content: &ContentRecord,
@@ -16701,6 +16812,38 @@ async fn insert_collaboration_message(
     .map_err(Error::from)?;
 
     tx.commit().await.map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn insert_collaboration_permission_audit(
+    state: &AppState,
+    decision: &CollaborationPermissionDecision,
+    actor_id: &str,
+    channel_id: Option<&str>,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO collab_permission_audits (
+            audit_id, org_id, actor_org_id, actor_id, action, permission,
+            allowed, reason_code, channel_id, occurred_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        "#,
+    )
+    .bind(format!("collab-permission-audit-{}", Uuid::new_v4()))
+    .bind(&decision.permissions.org_id)
+    .bind(&decision.permissions.actor_org_id)
+    .bind(actor_id)
+    .bind(format!("{:?}", decision.action).to_ascii_lowercase())
+    .bind(decision.action.permission_name())
+    .bind(if decision.allowed { 1_i64 } else { 0_i64 })
+    .bind(&decision.reason_code)
+    .bind(channel_id)
+    .bind(current_record_timestamp())
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
 
     Ok(())
 }

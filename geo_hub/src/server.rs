@@ -508,6 +508,14 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::post_collaboration_message),
         )
         .route(
+            "/api/collaboration/permissions/resolve",
+            get(routes::resolve_collaboration_permissions_route),
+        )
+        .route(
+            "/api/collaboration/actions/authorize",
+            post(routes::authorize_collaboration_action_route),
+        )
+        .route(
             "/api/time-series/points",
             get(routes::list_time_series_points),
         )
