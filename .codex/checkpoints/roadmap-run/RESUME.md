@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: 1b1a8ee (`batch-20260618012830`)
-- **Latest checkpoint commit**: 903d995
+- **Last implementation commit**: d2b5556 (`batch-20260618014430`)
+- **Latest checkpoint commit**: c68ec38
 - **Current batch**: none
-- **Completed feature rows**: 476 committed; 1 tests_passed; 2 skipped; 2 blocked; 17 pending in this run.
+- **Completed feature rows**: 477 committed; 1 tests_passed; 2 skipped; 2 blocked; 16 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch.
 
 ## Latest verification
@@ -110,7 +110,13 @@
 - `cargo test -p geo_hub --test products_api collaboration_` — pass
 - `cargo check -p geo_hub` — pass
 - `21-08` — committed as remote-expert live-scene annotation through the canonical `08` annotation store, with session/org visibility links, expert attribution, non-ended stream validation, replay event recovery for lost connections, and viewer denial without annotation/session mutation
+- `cargo fmt` — pass
+- `cargo test -p shared collaboration_operator_console_feed_filters_org_and_preserves_stream_state --lib` — pass
+- `cargo test -p geo_hub --test products_api collaboration_operator_console_feed` — pass
+- `cargo test -p geo_hub --test products_api collaboration_` — pass
+- `cargo check -p geo_hub` — pass
+- `21-09` — committed as operator-console collaboration feed with org-scoped streams, active raised/acknowledged alerts, foreign stream/alert exclusion, cross-org permission denial, and ended streams surfaced as `ended` rather than stale live
 
 ## Next action
 
-- Select and claim the next pending feature `21-09` for operator-console integration.
+- Select and claim the next pending feature `21-10` for portal integration.
