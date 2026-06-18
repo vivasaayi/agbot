@@ -54,6 +54,12 @@ pub struct InteropExtent {
     pub max_y: f64,
 }
 
+impl InteropExtent {
+    pub fn area(self) -> f64 {
+        (self.max_x - self.min_x).abs() * (self.max_y - self.min_y).abs()
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct InteropCoordinate {
     pub x: f64,
@@ -504,6 +510,64 @@ pub struct TrimbleBoundaryImportReport {
     pub imported: Vec<FieldBoundaryImportReport>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlatformMigrationEndpointError {
+    pub message: String,
+}
+
+impl PlatformMigrationEndpointError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
+}
+
+pub trait PlatformMigrationSource {
+    fn pull_boundary_imports(
+        &mut self,
+    ) -> Result<Vec<FieldBoundaryImportRequest>, PlatformMigrationEndpointError>;
+
+    fn pull_prescriptions(
+        &mut self,
+    ) -> Result<Vec<PrescriptionShapefileRequest>, PlatformMigrationEndpointError>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformMigrationItemKind {
+    Boundary,
+    Prescription,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlatformMigrationUnmigratedItem {
+    pub item_ref: String,
+    pub kind: PlatformMigrationItemKind,
+    pub reason: InteropRejectionReason,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlatformMigrationReconciliation {
+    pub source_boundary_count: usize,
+    pub imported_boundary_count: usize,
+    pub source_prescription_count: usize,
+    pub imported_prescription_count: usize,
+    pub source_area: f64,
+    pub imported_area: f64,
+    pub source_crs: Vec<String>,
+    pub imported_crs: Vec<String>,
+    pub discrepancy: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PlatformMigrationReport {
+    pub boundaries: Vec<FieldBoundaryImportReport>,
+    pub prescriptions: Vec<PrescriptionShapefileReport>,
+    pub unmigrated: Vec<PlatformMigrationUnmigratedItem>,
+    pub reconciliation: PlatformMigrationReconciliation,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JohnDeereBoundary {
     pub remote_field_id: String,
@@ -674,6 +738,12 @@ pub enum TrimbleConnectorError {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum PlatformMigrationError {
+    EndpointFailed { message: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum InteropRejectionReason {
     ParseError,
     MissingCrs,
@@ -707,6 +777,9 @@ pub enum InteropRejectionReason {
     },
     TrimbleConnector {
         reason: TrimbleConnectorError,
+    },
+    PlatformMigration {
+        reason: PlatformMigrationError,
     },
 }
 
@@ -1540,6 +1613,96 @@ pub fn import_trimble_boundaries(
             message: error.message,
         }))
     }
+}
+
+pub fn migrate_platform_round_trip(
+    source: &mut impl PlatformMigrationSource,
+) -> Result<PlatformMigrationReport, InteropError> {
+    let boundary_requests = source.pull_boundary_imports().map_err(|error| {
+        platform_migration_rejected(PlatformMigrationError::EndpointFailed {
+            message: error.message,
+        })
+    })?;
+    let prescription_requests = source.pull_prescriptions().map_err(|error| {
+        platform_migration_rejected(PlatformMigrationError::EndpointFailed {
+            message: error.message,
+        })
+    })?;
+
+    let mut boundaries = Vec::new();
+    let mut prescriptions = Vec::new();
+    let mut unmigrated = Vec::new();
+    let mut source_area = 0.0;
+    let mut imported_area = 0.0;
+    let mut source_crs = BTreeSet::new();
+    let mut imported_crs = BTreeSet::new();
+
+    for request in boundary_requests.iter().cloned() {
+        let item_ref = normalized_filename(request.payload.filename.clone());
+        match import_field_boundary(request) {
+            Ok(report) => {
+                let area = report.field.area_ha.unwrap_or(0.0);
+                source_area += area;
+                imported_area += area;
+                source_crs.insert(report.source_crs.clone());
+                imported_crs.insert(report.target_crs.clone());
+                boundaries.push(report);
+            }
+            Err(error) => {
+                unmigrated.push(platform_unmigrated_item(
+                    item_ref,
+                    PlatformMigrationItemKind::Boundary,
+                    error,
+                ));
+            }
+        }
+    }
+
+    for request in prescription_requests.iter().cloned() {
+        let item_ref = normalized_filename(request.prescription_id.clone());
+        match export_prescription_shapefile(request) {
+            Ok(report) => {
+                let area = report.extent.area();
+                source_area += area;
+                imported_area += area;
+                source_crs.insert(report.field_crs.clone());
+                imported_crs.insert(report.field_crs.clone());
+                prescriptions.push(report);
+            }
+            Err(error) => {
+                unmigrated.push(platform_unmigrated_item(
+                    item_ref,
+                    PlatformMigrationItemKind::Prescription,
+                    error,
+                ));
+            }
+        }
+    }
+
+    let discrepancy = !unmigrated.is_empty()
+        || boundary_requests.len() != boundaries.len()
+        || prescription_requests.len() != prescriptions.len()
+        || (source_area - imported_area).abs() > GEOMETRY_EPSILON
+        || source_crs != imported_crs;
+    let imported_boundary_count = boundaries.len();
+    let imported_prescription_count = prescriptions.len();
+
+    Ok(PlatformMigrationReport {
+        boundaries,
+        prescriptions,
+        unmigrated,
+        reconciliation: PlatformMigrationReconciliation {
+            source_boundary_count: boundary_requests.len(),
+            imported_boundary_count,
+            source_prescription_count: prescription_requests.len(),
+            imported_prescription_count,
+            source_area,
+            imported_area,
+            source_crs: source_crs.into_iter().collect(),
+            imported_crs: imported_crs.into_iter().collect(),
+            discrepancy,
+        },
+    })
 }
 
 fn export_geojson(imported: &InteropImportResult) -> Result<Vec<u8>, InteropError> {
@@ -3066,6 +3229,26 @@ fn trimble_rejected(reason: TrimbleConnectorError) -> InteropError {
     )
 }
 
+fn platform_migration_rejected(reason: PlatformMigrationError) -> InteropError {
+    rejected(
+        "platform-migration",
+        InteropRejectionReason::PlatformMigration { reason },
+    )
+}
+
+fn platform_unmigrated_item(
+    item_ref: String,
+    kind: PlatformMigrationItemKind,
+    error: InteropError,
+) -> PlatformMigrationUnmigratedItem {
+    let InteropError::Rejected { reason, .. } = error;
+    PlatformMigrationUnmigratedItem {
+        item_ref,
+        kind,
+        reason,
+    }
+}
+
 fn parse_geojson_and_reproject(
     filename: &str,
     bytes: &[u8],
@@ -3382,11 +3565,12 @@ mod tests {
     use super::{
         emit_import_lineage, export_findings_geojson, export_findings_shapefile,
         export_prescription_shapefile, export_prescription_taskdata, export_raster_geotiff,
-        import_field_boundary, import_trimble_boundaries, pull_john_deere_boundaries,
-        push_climate_fieldview_prescription, push_john_deere_prescription, record_import_rejection,
-        reopen_raster_geotiff, round_trip_vector_layer, validate_and_reproject_import,
-        validate_geopackage_layers, validate_taskdata_xml, BulkFieldBoundaryImportRequest,
-        BulkImportRowStatus, ClimateFieldViewConnectorEndpoint, ClimateFieldViewConnectorError,
+        import_field_boundary, import_trimble_boundaries, migrate_platform_round_trip,
+        pull_john_deere_boundaries, push_climate_fieldview_prescription,
+        push_john_deere_prescription, record_import_rejection, reopen_raster_geotiff,
+        round_trip_vector_layer, validate_and_reproject_import, validate_geopackage_layers,
+        validate_taskdata_xml, BulkFieldBoundaryImportRequest, BulkImportRowStatus,
+        ClimateFieldViewConnectorEndpoint, ClimateFieldViewConnectorError,
         ClimateFieldViewEndpointError, ClimateFieldViewPrescriptionPushRequest,
         ClimateFieldViewRemoteReceipt, ClimateFieldViewRetryPolicy, ClimateFieldViewUploadPayload,
         CrsTransform, FieldBoundaryImportRequest, FieldBoundaryRejectionReason,
@@ -3394,7 +3578,8 @@ mod tests {
         ImportPayload, ImportRejectionAuditRequest, InteropCoordinate, InteropError, InteropExtent,
         InteropRejectionReason, JohnDeereBoundary, JohnDeereConnectorEndpoint,
         JohnDeereConnectorError, JohnDeereEndpointError, JohnDeerePrescriptionPushRequest,
-        JohnDeereRetryPolicy, JohnDeereUploadPayload, PrescriptionField,
+        JohnDeereRetryPolicy, JohnDeereUploadPayload, PlatformMigrationEndpointError,
+        PlatformMigrationItemKind, PlatformMigrationSource, PrescriptionField,
         PrescriptionRejectionReason, PrescriptionShapefileRequest, PrescriptionZone, RasterProduct,
         RemotePrescriptionReceipt, ReprojectedGeometry, TrimbleBoundary,
         TrimbleBoundaryImportRequest, TrimbleConnectorEndpoint, TrimbleConnectorError,
@@ -4517,6 +4702,68 @@ mod tests {
         assert_eq!(endpoint.backoffs, vec![75]);
     }
 
+    #[test]
+    fn platform_migration_reconciles_imported_boundaries_and_prescriptions() {
+        let mut source = FakeMigrationSource::new()
+            .with_boundary(field_boundary_import_request(
+                "field-alpha",
+                "field-alpha-boundary.geojson",
+                valid_geojson("EPSG:4326").as_bytes().to_vec(),
+            ))
+            .with_prescription(john_deere_prescription_request());
+
+        let report = migrate_platform_round_trip(&mut source).expect("migration should reconcile");
+
+        assert_eq!(source.boundary_pulls, 1);
+        assert_eq!(source.prescription_pulls, 1);
+        assert_eq!(report.boundaries.len(), 1);
+        assert_eq!(report.prescriptions.len(), 1);
+        assert!(report.unmigrated.is_empty());
+        assert_eq!(report.reconciliation.source_boundary_count, 1);
+        assert_eq!(report.reconciliation.imported_boundary_count, 1);
+        assert_eq!(report.reconciliation.source_prescription_count, 1);
+        assert_eq!(report.reconciliation.imported_prescription_count, 1);
+        assert_eq!(report.reconciliation.source_crs, vec!["EPSG:4326"]);
+        assert_eq!(report.reconciliation.imported_crs, vec!["EPSG:4326"]);
+        assert!(
+            (report.reconciliation.source_area - report.reconciliation.imported_area).abs()
+                <= super::GEOMETRY_EPSILON
+        );
+        assert!(!report.reconciliation.discrepancy);
+    }
+
+    #[test]
+    fn platform_migration_flags_invalid_items_as_unmigrated() {
+        let mut source = FakeMigrationSource::new()
+            .with_boundary(field_boundary_import_request(
+                "field-bowtie",
+                "bowtie-boundary.geojson",
+                bowtie_geojson("EPSG:4326").as_bytes().to_vec(),
+            ))
+            .with_prescription(john_deere_prescription_request());
+
+        let report = migrate_platform_round_trip(&mut source)
+            .expect("migration should continue after invalid item");
+
+        assert_eq!(report.boundaries.len(), 0);
+        assert_eq!(report.prescriptions.len(), 1);
+        assert_eq!(report.unmigrated.len(), 1);
+        assert_eq!(report.unmigrated[0].item_ref, "bowtie-boundary.geojson");
+        assert_eq!(
+            report.unmigrated[0].kind,
+            PlatformMigrationItemKind::Boundary
+        );
+        assert_eq!(
+            report.unmigrated[0].reason,
+            InteropRejectionReason::InvalidFieldBoundary {
+                reason: FieldBoundaryRejectionReason::SelfIntersection
+            }
+        );
+        assert_eq!(report.reconciliation.source_boundary_count, 1);
+        assert_eq!(report.reconciliation.imported_boundary_count, 0);
+        assert!(report.reconciliation.discrepancy);
+    }
+
     #[derive(Default)]
     struct FakeJohnDeereEndpoint {
         push_results: Vec<Result<RemotePrescriptionReceipt, JohnDeereEndpointError>>,
@@ -4644,6 +4891,46 @@ mod tests {
 
         fn wait_backoff(&mut self, millis: u64) {
             self.backoffs.push(millis);
+        }
+    }
+
+    #[derive(Default)]
+    struct FakeMigrationSource {
+        boundaries: Vec<FieldBoundaryImportRequest>,
+        prescriptions: Vec<PrescriptionShapefileRequest>,
+        boundary_pulls: usize,
+        prescription_pulls: usize,
+    }
+
+    impl FakeMigrationSource {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn with_boundary(mut self, boundary: FieldBoundaryImportRequest) -> Self {
+            self.boundaries.push(boundary);
+            self
+        }
+
+        fn with_prescription(mut self, prescription: PrescriptionShapefileRequest) -> Self {
+            self.prescriptions.push(prescription);
+            self
+        }
+    }
+
+    impl PlatformMigrationSource for FakeMigrationSource {
+        fn pull_boundary_imports(
+            &mut self,
+        ) -> Result<Vec<FieldBoundaryImportRequest>, PlatformMigrationEndpointError> {
+            self.boundary_pulls += 1;
+            Ok(self.boundaries.clone())
+        }
+
+        fn pull_prescriptions(
+            &mut self,
+        ) -> Result<Vec<PrescriptionShapefileRequest>, PlatformMigrationEndpointError> {
+            self.prescription_pulls += 1;
+            Ok(self.prescriptions.clone())
         }
     }
 
