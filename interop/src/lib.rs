@@ -443,6 +443,67 @@ pub struct ClimateFieldViewPrescriptionPushReport {
     pub unit_code: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrimbleRetryPolicy {
+    pub max_attempts: usize,
+    #[serde(default)]
+    pub backoff_millis: Vec<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrimbleBoundaryImportRequest {
+    pub farm_id: Option<String>,
+    pub org_id: String,
+    pub owner: String,
+    pub target_crs: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrimbleBoundary {
+    pub remote_boundary_id: String,
+    pub field_id: String,
+    pub name: String,
+    pub crs: String,
+    pub coordinate_unit: String,
+    pub boundary: Vec<InteropCoordinate>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrimbleEndpointError {
+    pub message: String,
+    pub timed_out: bool,
+}
+
+impl TrimbleEndpointError {
+    pub fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            timed_out: false,
+        }
+    }
+
+    pub fn timeout(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            timed_out: true,
+        }
+    }
+}
+
+pub trait TrimbleConnectorEndpoint {
+    fn pull_boundaries(&mut self) -> Result<Vec<TrimbleBoundary>, TrimbleEndpointError>;
+
+    fn wait_backoff(&mut self, _millis: u64) {}
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrimbleBoundaryImportReport {
+    pub attempts: usize,
+    pub backoff_millis: Vec<u64>,
+    pub imported: Vec<FieldBoundaryImportReport>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JohnDeereBoundary {
     pub remote_field_id: String,
@@ -586,6 +647,33 @@ pub enum ClimateFieldViewConnectorError {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum TrimbleConnectorError {
+    EmptyFieldId,
+    EmptyRemoteBoundaryId,
+    EndpointFailed {
+        attempts: usize,
+        message: String,
+    },
+    EndpointTimeout {
+        attempts: usize,
+        message: String,
+    },
+    UnsupportedBoundaryCrs {
+        remote_boundary_id: String,
+        crs: String,
+    },
+    UnsupportedBoundaryUnit {
+        remote_boundary_id: String,
+        unit: String,
+        crs: String,
+    },
+    InvalidBoundaryGeometry {
+        remote_boundary_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum InteropRejectionReason {
     ParseError,
     MissingCrs,
@@ -616,6 +704,9 @@ pub enum InteropRejectionReason {
     },
     ClimateFieldViewConnector {
         reason: ClimateFieldViewConnectorError,
+    },
+    TrimbleConnector {
+        reason: TrimbleConnectorError,
     },
 }
 
@@ -1404,6 +1495,53 @@ pub fn pull_john_deere_boundaries(
     Ok(JohnDeereBoundaryPullReport { boundaries: mapped })
 }
 
+pub fn import_trimble_boundaries(
+    endpoint: &mut impl TrimbleConnectorEndpoint,
+    request: TrimbleBoundaryImportRequest,
+    retry_policy: TrimbleRetryPolicy,
+) -> Result<TrimbleBoundaryImportReport, InteropError> {
+    let max_attempts = retry_policy.max_attempts.max(1);
+    let mut backoff_millis = Vec::new();
+    let mut last_error = None::<TrimbleEndpointError>;
+
+    for attempt in 1..=max_attempts {
+        match endpoint.pull_boundaries() {
+            Ok(boundaries) => {
+                let mut imported = Vec::with_capacity(boundaries.len());
+                for boundary in boundaries {
+                    imported.push(import_trimble_boundary(boundary, &request)?);
+                }
+                return Ok(TrimbleBoundaryImportReport {
+                    attempts: attempt,
+                    backoff_millis,
+                    imported,
+                });
+            }
+            Err(error) => {
+                last_error = Some(error);
+                if attempt < max_attempts {
+                    let backoff = trimble_backoff_for_attempt(&retry_policy, attempt);
+                    endpoint.wait_backoff(backoff);
+                    backoff_millis.push(backoff);
+                }
+            }
+        }
+    }
+
+    let error = last_error.unwrap_or_else(|| TrimbleEndpointError::new("endpoint failed"));
+    if error.timed_out {
+        Err(trimble_rejected(TrimbleConnectorError::EndpointTimeout {
+            attempts: max_attempts,
+            message: error.message,
+        }))
+    } else {
+        Err(trimble_rejected(TrimbleConnectorError::EndpointFailed {
+            attempts: max_attempts,
+            message: error.message,
+        }))
+    }
+}
+
 fn export_geojson(imported: &InteropImportResult) -> Result<Vec<u8>, InteropError> {
     let features = imported
         .features
@@ -1739,6 +1877,15 @@ fn fieldview_backoff_for_attempt(policy: &ClimateFieldViewRetryPolicy, attempt: 
         .unwrap_or(0)
 }
 
+fn trimble_backoff_for_attempt(policy: &TrimbleRetryPolicy, attempt: usize) -> u64 {
+    policy
+        .backoff_millis
+        .get(attempt.saturating_sub(1))
+        .copied()
+        .or_else(|| policy.backoff_millis.last().copied())
+        .unwrap_or(0)
+}
+
 fn validate_john_deere_prescription_crs(crs: &str) -> Result<(), InteropError> {
     if matches!(crs, WGS84 | WEB_MERCATOR) {
         return Ok(());
@@ -1839,6 +1986,118 @@ fn map_john_deere_boundary(
         feature_count: 1,
         boundary: ring,
     })
+}
+
+fn import_trimble_boundary(
+    boundary: TrimbleBoundary,
+    request: &TrimbleBoundaryImportRequest,
+) -> Result<FieldBoundaryImportReport, InteropError> {
+    let remote_boundary_id = normalize_prescription_text(&boundary.remote_boundary_id)
+        .ok_or_else(|| trimble_rejected(TrimbleConnectorError::EmptyRemoteBoundaryId))?;
+    let field_id = normalize_prescription_text(&boundary.field_id)
+        .ok_or_else(|| trimble_rejected(TrimbleConnectorError::EmptyFieldId))?;
+    let source_crs = normalize_crs(&boundary.crs).ok_or_else(|| {
+        trimble_rejected(TrimbleConnectorError::UnsupportedBoundaryCrs {
+            remote_boundary_id: remote_boundary_id.clone(),
+            crs: boundary.crs.clone(),
+        })
+    })?;
+    let target_crs = normalize_crs(&request.target_crs).ok_or_else(|| {
+        trimble_rejected(TrimbleConnectorError::UnsupportedBoundaryCrs {
+            remote_boundary_id: remote_boundary_id.clone(),
+            crs: request.target_crs.clone(),
+        })
+    })?;
+    if !matches!(source_crs.as_str(), WGS84 | WEB_MERCATOR) || source_crs != target_crs {
+        return Err(trimble_rejected(
+            TrimbleConnectorError::UnsupportedBoundaryCrs {
+                remote_boundary_id,
+                crs: boundary.crs,
+            },
+        ));
+    }
+    validate_trimble_boundary_unit(&remote_boundary_id, &source_crs, &boundary.coordinate_unit)?;
+
+    let ring = normalize_prescription_ring(&boundary.boundary).ok_or_else(|| {
+        trimble_rejected(TrimbleConnectorError::InvalidBoundaryGeometry {
+            remote_boundary_id: remote_boundary_id.clone(),
+        })
+    })?;
+    if polygon_area(&ring) <= GEOMETRY_EPSILON || ring_self_intersects_coordinates(&ring) {
+        return Err(trimble_rejected(
+            TrimbleConnectorError::InvalidBoundaryGeometry {
+                remote_boundary_id: remote_boundary_id.clone(),
+            },
+        ));
+    }
+    let field_boundary = FieldBoundary {
+        coordinates: ring
+            .iter()
+            .map(|coordinate| GeoPoint {
+                longitude: coordinate.x,
+                latitude: coordinate.y,
+            })
+            .collect(),
+        crs: Some(target_crs.clone()),
+    };
+    let validated = validate_field_boundary(&field_boundary).map_err(|_| {
+        trimble_rejected(TrimbleConnectorError::InvalidBoundaryGeometry {
+            remote_boundary_id: remote_boundary_id.clone(),
+        })
+    })?;
+    let source_filename = format!("trimble:{remote_boundary_id}");
+    let field = FieldRecord {
+        farm_id: request.farm_id.clone(),
+        field_id,
+        org_id: request.org_id.clone(),
+        owner: request.owner.clone(),
+        name: normalize_prescription_text(&boundary.name).unwrap_or_else(|| "<unnamed>".to_string()),
+        area_ha: Some(validated.area_ha),
+        crop: None,
+        season: None,
+        notes: Some(format!(
+            "imported from Trimble {remote_boundary_id}; source_crs={source_crs}; target_crs={target_crs}; unit={}",
+            boundary.coordinate_unit
+        )),
+        boundary: validated.boundary,
+        extent: validated.extent,
+        status: FarmFieldEntityStatus::Active,
+        created_at: request.created_at.clone(),
+        updated_at: request.created_at.clone(),
+    };
+
+    Ok(FieldBoundaryImportReport {
+        field,
+        format: ImportFormat::GeoJson,
+        source_filename,
+        source_crs,
+        target_crs,
+        feature_count: 1,
+    })
+}
+
+fn validate_trimble_boundary_unit(
+    remote_boundary_id: &str,
+    crs: &str,
+    unit: &str,
+) -> Result<(), InteropError> {
+    let unit = normalize_prescription_text(unit).unwrap_or_default();
+    let valid = match crs {
+        WGS84 => matches!(unit.as_str(), "degree" | "degrees"),
+        WEB_MERCATOR => matches!(unit.as_str(), "meter" | "meters" | "metre" | "metres"),
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(trimble_rejected(
+            TrimbleConnectorError::UnsupportedBoundaryUnit {
+                remote_boundary_id: remote_boundary_id.to_string(),
+                unit,
+                crs: crs.to_string(),
+            },
+        ))
+    }
 }
 
 fn normalize_prescription_zone(
@@ -2800,6 +3059,13 @@ fn climate_fieldview_rejected(reason: ClimateFieldViewConnectorError) -> Interop
     )
 }
 
+fn trimble_rejected(reason: TrimbleConnectorError) -> InteropError {
+    rejected(
+        "trimble",
+        InteropRejectionReason::TrimbleConnector { reason },
+    )
+}
+
 fn parse_geojson_and_reproject(
     filename: &str,
     bytes: &[u8],
@@ -3116,11 +3382,11 @@ mod tests {
     use super::{
         emit_import_lineage, export_findings_geojson, export_findings_shapefile,
         export_prescription_shapefile, export_prescription_taskdata, export_raster_geotiff,
-        import_field_boundary, pull_john_deere_boundaries, push_climate_fieldview_prescription,
-        push_john_deere_prescription, record_import_rejection, reopen_raster_geotiff,
-        round_trip_vector_layer, validate_and_reproject_import, validate_geopackage_layers,
-        validate_taskdata_xml, BulkFieldBoundaryImportRequest, BulkImportRowStatus,
-        ClimateFieldViewConnectorEndpoint, ClimateFieldViewConnectorError,
+        import_field_boundary, import_trimble_boundaries, pull_john_deere_boundaries,
+        push_climate_fieldview_prescription, push_john_deere_prescription, record_import_rejection,
+        reopen_raster_geotiff, round_trip_vector_layer, validate_and_reproject_import,
+        validate_geopackage_layers, validate_taskdata_xml, BulkFieldBoundaryImportRequest,
+        BulkImportRowStatus, ClimateFieldViewConnectorEndpoint, ClimateFieldViewConnectorError,
         ClimateFieldViewEndpointError, ClimateFieldViewPrescriptionPushRequest,
         ClimateFieldViewRemoteReceipt, ClimateFieldViewRetryPolicy, ClimateFieldViewUploadPayload,
         CrsTransform, FieldBoundaryImportRequest, FieldBoundaryRejectionReason,
@@ -3130,7 +3396,9 @@ mod tests {
         JohnDeereConnectorError, JohnDeereEndpointError, JohnDeerePrescriptionPushRequest,
         JohnDeereRetryPolicy, JohnDeereUploadPayload, PrescriptionField,
         PrescriptionRejectionReason, PrescriptionShapefileRequest, PrescriptionZone, RasterProduct,
-        RemotePrescriptionReceipt, ReprojectedGeometry,
+        RemotePrescriptionReceipt, ReprojectedGeometry, TrimbleBoundary,
+        TrimbleBoundaryImportRequest, TrimbleConnectorEndpoint, TrimbleConnectorError,
+        TrimbleEndpointError, TrimbleRetryPolicy,
     };
     use provenance::{ActorIdentity, ActorKind, AuditLedger, AuditOutcome, LineageLedger};
     use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
@@ -4183,6 +4451,72 @@ mod tests {
         assert!(endpoint.uploads.is_empty());
     }
 
+    #[test]
+    fn trimble_connector_imports_boundary_with_valid_crs_and_units() {
+        let mut endpoint = FakeTrimbleEndpoint::new().with_boundary(trimble_boundary());
+
+        let report = import_trimble_boundaries(
+            &mut endpoint,
+            trimble_import_request(),
+            TrimbleRetryPolicy {
+                max_attempts: 2,
+                backoff_millis: vec![100],
+            },
+        )
+        .expect("valid Trimble boundary should import");
+
+        assert_eq!(report.attempts, 1);
+        assert!(report.backoff_millis.is_empty());
+        assert_eq!(endpoint.pull_attempts, 1);
+        assert_eq!(report.imported.len(), 1);
+        let imported = &report.imported[0];
+        assert_eq!(imported.source_filename, "trimble:trimble-boundary-alpha");
+        assert_eq!(imported.source_crs, "EPSG:4326");
+        assert_eq!(imported.target_crs, "EPSG:4326");
+        assert_eq!(imported.field.field_id, "field-alpha");
+        assert_eq!(imported.field.org_id, "org-alpha");
+        assert_eq!(imported.field.boundary.crs.as_deref(), Some("EPSG:4326"));
+        assert!(imported.field.area_ha.expect("area should be computed") > 0.0);
+        assert!(imported
+            .field
+            .notes
+            .as_deref()
+            .expect("notes should cite Trimble")
+            .contains("unit=degree"));
+    }
+
+    #[test]
+    fn trimble_connector_retries_timeout_and_surfaces_without_half_import() {
+        let mut endpoint = FakeTrimbleEndpoint::new()
+            .with_timeout("request timed out")
+            .with_timeout("request timed out again");
+
+        let error = import_trimble_boundaries(
+            &mut endpoint,
+            trimble_import_request(),
+            TrimbleRetryPolicy {
+                max_attempts: 2,
+                backoff_millis: vec![75],
+            },
+        )
+        .expect_err("exhausted Trimble timeout should surface");
+
+        assert_eq!(
+            error,
+            InteropError::Rejected {
+                filename: "trimble".to_string(),
+                reason: InteropRejectionReason::TrimbleConnector {
+                    reason: TrimbleConnectorError::EndpointTimeout {
+                        attempts: 2,
+                        message: "request timed out again".to_string(),
+                    }
+                }
+            }
+        );
+        assert_eq!(endpoint.pull_attempts, 2);
+        assert_eq!(endpoint.backoffs, vec![75]);
+    }
+
     #[derive(Default)]
     struct FakeJohnDeereEndpoint {
         push_results: Vec<Result<RemotePrescriptionReceipt, JohnDeereEndpointError>>,
@@ -4275,6 +4609,44 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct FakeTrimbleEndpoint {
+        pull_results: Vec<Result<Vec<TrimbleBoundary>, TrimbleEndpointError>>,
+        pull_attempts: usize,
+        backoffs: Vec<u64>,
+    }
+
+    impl FakeTrimbleEndpoint {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn with_boundary(mut self, boundary: TrimbleBoundary) -> Self {
+            self.pull_results.push(Ok(vec![boundary]));
+            self
+        }
+
+        fn with_timeout(mut self, message: &str) -> Self {
+            self.pull_results
+                .push(Err(TrimbleEndpointError::timeout(message)));
+            self
+        }
+    }
+
+    impl TrimbleConnectorEndpoint for FakeTrimbleEndpoint {
+        fn pull_boundaries(&mut self) -> Result<Vec<TrimbleBoundary>, TrimbleEndpointError> {
+            self.pull_attempts += 1;
+            if self.pull_results.is_empty() {
+                return Err(TrimbleEndpointError::new("no fake response configured"));
+            }
+            self.pull_results.remove(0)
+        }
+
+        fn wait_backoff(&mut self, millis: u64) {
+            self.backoffs.push(millis);
+        }
+    }
+
     fn prescription_request() -> PrescriptionShapefileRequest {
         PrescriptionShapefileRequest {
             prescription_id: "rx-alpha-2026".to_string(),
@@ -4326,6 +4698,27 @@ mod tests {
                     unit: "kg_ha".to_string(),
                 },
             ],
+        }
+    }
+
+    fn trimble_import_request() -> TrimbleBoundaryImportRequest {
+        TrimbleBoundaryImportRequest {
+            farm_id: Some("farm-alpha".to_string()),
+            org_id: "org-alpha".to_string(),
+            owner: "owner-alpha".to_string(),
+            target_crs: "EPSG:4326".to_string(),
+            created_at: "2026-06-12T15:00:00Z".to_string(),
+        }
+    }
+
+    fn trimble_boundary() -> TrimbleBoundary {
+        TrimbleBoundary {
+            remote_boundary_id: "trimble-boundary-alpha".to_string(),
+            field_id: "field-alpha".to_string(),
+            name: "North Block".to_string(),
+            crs: "EPSG:4326".to_string(),
+            coordinate_unit: "degree".to_string(),
+            boundary: rectangle(-121.0, 39.0, -120.99, 39.01),
         }
     }
 
