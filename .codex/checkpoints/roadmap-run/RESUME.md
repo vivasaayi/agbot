@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: e86d92c (`batch-20260618083500`)
-- **Latest checkpoint commit**: c4ef457
+- **Last implementation commit**: e3571c7 (`batch-20260618091431`)
+- **Latest checkpoint commit**: 4492ec8
 - **Current batch**: none
-- **Completed feature rows**: 489 committed; 1 tests_passed; 2 skipped; 2 blocked; 4 pending in this run.
+- **Completed feature rows**: 490 committed; 1 tests_passed; 2 skipped; 2 blocked; 3 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch.
 
 ## Latest verification
@@ -183,7 +183,11 @@
 - `cargo test -p alerting adaptive_aggregation --lib` — pass
 - `cargo check -p alerting` — pass
 - `29-16` — verified as adaptive alert aggregation advisory with recorded alert history and dedup evidence, flapping/storm signal thresholds, uncertainty bounds, feature/history gating, pending approval, and no automatic suppression of critical alerts
+- `cargo fmt` — pass
+- `cargo test -p plugin_sdk registry --lib` — pass
+- `cargo check -p plugin_sdk` — pass
+- `31-14` — verified as plugin registry browse/install with manifest version/capability catalog metadata, local manifest validation, host API re-check before registration/download authorization, disabled-by-default registration, explicit capability review, and incompatible-entry refusal without registration
 
 ## Next action
 
-- Select and claim the next pending roadmap feature after `29-16` adaptive alert aggregation advisory.
+- Select and claim the next pending roadmap feature after `31-14` plugin registry install.
