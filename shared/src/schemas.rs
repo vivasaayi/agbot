@@ -12486,6 +12486,7 @@ pub enum ContentType {
     Article,
     Guide,
     Post,
+    SuccessStory,
 }
 
 impl ContentType {
@@ -12494,6 +12495,7 @@ impl ContentType {
             ContentType::Article => "article",
             ContentType::Guide => "guide",
             ContentType::Post => "post",
+            ContentType::SuccessStory => "success_story",
         }
     }
 }
@@ -12544,6 +12546,34 @@ pub struct ContentEditRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentSuccessMetric {
+    pub metric: String,
+    pub value: String,
+    pub unit: String,
+    pub evidence_ref: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentSuccessStoryFields {
+    pub grower: String,
+    pub crop: String,
+    pub region: String,
+    pub outcome_summary: String,
+    #[serde(default)]
+    pub metrics: Vec<ContentSuccessMetric>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentSuccessStoryCreateRequest {
+    #[serde(default)]
+    pub content_id: Option<String>,
+    pub author_id: String,
+    pub org_id: String,
+    pub body: String,
+    pub fields: ContentSuccessStoryFields,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentRecord {
     pub content_id: String,
     pub content_type: ContentType,
@@ -12567,6 +12597,23 @@ pub struct ContentVersionRecord {
 pub struct VersionedContentRecord {
     pub content: ContentRecord,
     pub versions: Vec<ContentVersionRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentSuccessStoryRecord {
+    pub content_id: String,
+    pub grower: String,
+    pub crop: String,
+    pub region: String,
+    pub outcome_summary: String,
+    pub metrics: Vec<ContentSuccessMetric>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionedSuccessStoryContentRecord {
+    pub content: ContentRecord,
+    pub versions: Vec<ContentVersionRecord>,
+    pub success_story: ContentSuccessStoryRecord,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -12848,6 +12895,10 @@ pub enum ContentError {
     EmptyEngagementPeriod,
     #[error("content engagement event type {value} is unsupported")]
     UnsupportedEngagementEventType { value: String },
+    #[error("success story {field} cannot be empty")]
+    EmptySuccessStoryField { field: &'static str },
+    #[error("success story requires at least one metric")]
+    EmptySuccessStoryMetrics,
 }
 
 pub fn create_versioned_content(
@@ -12906,6 +12957,37 @@ pub fn append_content_version(
     };
 
     Ok((updated, version))
+}
+
+pub fn create_success_story_content(
+    request: ContentSuccessStoryCreateRequest,
+    generated_content_id: String,
+    generated_version_id: String,
+    created_at: String,
+) -> Result<
+    (
+        ContentRecord,
+        ContentVersionRecord,
+        ContentSuccessStoryRecord,
+    ),
+    ContentError,
+> {
+    let (content, version) = create_versioned_content(
+        ContentCreateRequest {
+            content_id: request.content_id,
+            content_type: ContentType::SuccessStory,
+            author_id: request.author_id,
+            org_id: request.org_id,
+            body: request.body,
+            status: None,
+        },
+        generated_content_id,
+        generated_version_id,
+        created_at,
+    )?;
+    let success_story = validate_success_story_fields(content.content_id.clone(), request.fields)?;
+
+    Ok((content, version, success_story))
 }
 
 pub fn transition_content_workflow(
@@ -13330,6 +13412,7 @@ pub fn parse_content_type(value: &str) -> Result<ContentType, ContentError> {
         "article" => Ok(ContentType::Article),
         "guide" => Ok(ContentType::Guide),
         "post" => Ok(ContentType::Post),
+        "success_story" => Ok(ContentType::SuccessStory),
         _ => Err(ContentError::UnsupportedContentType {
             value: value.to_string(),
         }),
@@ -13369,6 +13452,60 @@ fn normalize_content_optional_text(value: Option<String>) -> Option<String> {
 fn normalize_content_text(value: String) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+fn validate_success_story_fields(
+    content_id: String,
+    fields: ContentSuccessStoryFields,
+) -> Result<ContentSuccessStoryRecord, ContentError> {
+    let grower = normalize_content_text(fields.grower)
+        .ok_or(ContentError::EmptySuccessStoryField { field: "grower" })?;
+    let crop = normalize_content_text(fields.crop)
+        .ok_or(ContentError::EmptySuccessStoryField { field: "crop" })?;
+    let region = normalize_content_text(fields.region)
+        .ok_or(ContentError::EmptySuccessStoryField { field: "region" })?;
+    let outcome_summary = normalize_content_text(fields.outcome_summary).ok_or(
+        ContentError::EmptySuccessStoryField {
+            field: "outcome_summary",
+        },
+    )?;
+    let metrics = fields
+        .metrics
+        .into_iter()
+        .map(|metric| {
+            Ok(ContentSuccessMetric {
+                metric: normalize_content_text(metric.metric)
+                    .ok_or(ContentError::EmptySuccessStoryField { field: "metric" })?,
+                value: normalize_content_text(metric.value).ok_or(
+                    ContentError::EmptySuccessStoryField {
+                        field: "metric_value",
+                    },
+                )?,
+                unit: normalize_content_text(metric.unit).ok_or(
+                    ContentError::EmptySuccessStoryField {
+                        field: "metric_unit",
+                    },
+                )?,
+                evidence_ref: normalize_content_text(metric.evidence_ref).ok_or(
+                    ContentError::EmptySuccessStoryField {
+                        field: "metric_evidence_ref",
+                    },
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>, ContentError>>()?;
+    if metrics.is_empty() {
+        return Err(ContentError::EmptySuccessStoryMetrics);
+    }
+
+    Ok(ContentSuccessStoryRecord {
+        content_id,
+        grower,
+        crop,
+        region,
+        outcome_summary,
+        metrics,
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -16829,7 +16966,8 @@ mod tests {
         compute_water_evapotranspiration, compute_weather_growing_degree_day,
         compute_weather_reference_et, create_content_engagement_event,
         create_marketplace_fulfillment_record, create_marketplace_rating_record,
-        create_sustainability_baseline, create_sustainability_mrv_trail, create_versioned_content,
+        create_success_story_content, create_sustainability_baseline,
+        create_sustainability_mrv_trail, create_versioned_content,
         deconflict_tractor_swath_reservations, derive_drought_mitigation_recommendation,
         detect_tractor_obstacle, dry_run_fleet_config_bundle, dry_run_irrigation_valve_plan,
         estimate_biomass, evaluate_access_anomaly_advisories, evaluate_and_route_drought_alerts,
@@ -16863,7 +17001,8 @@ mod tests {
         ContentEngagementEventCreateRequest, ContentEngagementEventRecord,
         ContentEngagementEventType, ContentError, ContentPermissionResolveRequest,
         ContentPortalEmbedRequest, ContentRecord, ContentSearchDocument, ContentSearchRequest,
-        ContentStatus, ContentTagApplyRequest, ContentTaxonomyKind, ContentTaxonomyTag,
+        ContentStatus, ContentSuccessMetric, ContentSuccessStoryCreateRequest,
+        ContentSuccessStoryFields, ContentTagApplyRequest, ContentTaxonomyKind, ContentTaxonomyTag,
         ContentType, ContentWorkflowAction, ContentWorkflowActorRole,
         ContentWorkflowTransitionRequest, CropPlanRecord, DroughtAdvisoryLoopRequest,
         DroughtAdvisoryLoopStatus, DroughtAlertRoutingRequest, DroughtBaselineTrendError,
@@ -19663,6 +19802,43 @@ mod tests {
     }
 
     #[test]
+    fn success_story_content_validates_structured_fields() {
+        let (content, version, story) = create_success_story_content(
+            success_story_create_request(true),
+            "generated-success-story".to_string(),
+            "version-success-001".to_string(),
+            "2026-06-17T06:51:00Z".to_string(),
+        )
+        .expect("success story should create");
+
+        assert_eq!(content.content_type, ContentType::SuccessStory);
+        assert_eq!(content.status, ContentStatus::Draft);
+        assert_eq!(version.body, "Cover crops increased soil organic matter.");
+        assert_eq!(story.content_id, "success-story-001");
+        assert_eq!(story.crop, "corn");
+        assert_eq!(story.metrics.len(), 1);
+        assert_eq!(story.metrics[0].evidence_ref, "kpi:soil-organic-matter");
+    }
+
+    #[test]
+    fn success_story_content_rejects_missing_required_fields() {
+        let error = create_success_story_content(
+            success_story_create_request(false),
+            "generated-success-story".to_string(),
+            "version-success-001".to_string(),
+            "2026-06-17T06:51:00Z".to_string(),
+        )
+        .expect_err("missing success-story outcome should reject");
+
+        assert_eq!(
+            error,
+            ContentError::EmptySuccessStoryField {
+                field: "outcome_summary"
+            }
+        );
+    }
+
+    #[test]
     fn content_workflow_submits_for_review_and_editor_publishes_with_audit() {
         let (content, _) = create_versioned_content(
             content_create_request(),
@@ -20133,6 +20309,31 @@ mod tests {
             org_id: "org-alpha".to_string(),
             body: "First draft".to_string(),
             status: None,
+        }
+    }
+
+    fn success_story_create_request(include_required: bool) -> ContentSuccessStoryCreateRequest {
+        ContentSuccessStoryCreateRequest {
+            content_id: Some("success-story-001".to_string()),
+            author_id: "author-001".to_string(),
+            org_id: "org-alpha".to_string(),
+            body: "Cover crops increased soil organic matter.".to_string(),
+            fields: ContentSuccessStoryFields {
+                grower: "North Ridge Farm".to_string(),
+                crop: "corn".to_string(),
+                region: "midwest".to_string(),
+                outcome_summary: if include_required {
+                    "Soil organic matter improved after cover crop adoption.".to_string()
+                } else {
+                    " ".to_string()
+                },
+                metrics: vec![ContentSuccessMetric {
+                    metric: "soil organic matter".to_string(),
+                    value: "+0.4".to_string(),
+                    unit: "percentage_points".to_string(),
+                    evidence_ref: "kpi:soil-organic-matter".to_string(),
+                }],
+            },
         }
     }
 

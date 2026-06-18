@@ -96,14 +96,14 @@ use shared::schemas::{
     compute_drought_index, compute_marketplace_demand_forecast, compute_soil_carbon_proxy,
     compute_sustainability_kpi, content_portal_embed_item, create_content_engagement_event,
     create_marketplace_fulfillment_record, create_marketplace_rating_record,
-    create_sustainability_baseline, create_sustainability_mrv_trail, create_versioned_content,
-    estimate_biomass, fulfill_marketplace_inventory, normalize_weather_provider_forecast,
-    parse_biodiversity_proxy_status, parse_carbon_footprint_status,
-    parse_content_engagement_event_type, parse_content_status, parse_content_type,
-    parse_drought_index_type, parse_marketplace_account_status, parse_marketplace_catalog_category,
-    parse_marketplace_catalog_item_kind, parse_marketplace_demand_forecast_status,
-    parse_marketplace_fulfillment_status, parse_marketplace_listing_status,
-    parse_marketplace_order_status, parse_marketplace_party_type,
+    create_success_story_content, create_sustainability_baseline, create_sustainability_mrv_trail,
+    create_versioned_content, estimate_biomass, fulfill_marketplace_inventory,
+    normalize_weather_provider_forecast, parse_biodiversity_proxy_status,
+    parse_carbon_footprint_status, parse_content_engagement_event_type, parse_content_status,
+    parse_content_type, parse_drought_index_type, parse_marketplace_account_status,
+    parse_marketplace_catalog_category, parse_marketplace_catalog_item_kind,
+    parse_marketplace_demand_forecast_status, parse_marketplace_fulfillment_status,
+    parse_marketplace_listing_status, parse_marketplace_order_status, parse_marketplace_party_type,
     parse_marketplace_unit_of_measure, parse_soil_carbon_proxy_status, parse_soil_moisture_qa_flag,
     parse_soil_moisture_rejection_reason, parse_sustainability_comparison_status,
     parse_sustainability_kpi_direction, parse_sustainability_kpi_status,
@@ -125,15 +125,15 @@ use shared::schemas::{
     ContentEngagementEventRecord, ContentEngagementSummary, ContentError,
     ContentPermissionResolveRequest, ContentPermissionSet, ContentPortalEmbed,
     ContentPortalEmbedItem, ContentPortalEmbedRequest, ContentRecord, ContentSearchDocument,
-    ContentSearchRequest, ContentSearchResult, ContentStatus, ContentTagApplyRequest,
-    ContentTagRecord, ContentTaxonomyKind, ContentType, ContentVersionRecord,
-    ContentWorkflowAction, ContentWorkflowAuditRecord, ContentWorkflowTransitionRequest,
-    ContentWorkflowTransitionResult, DroughtIndexComputeRequest, DroughtIndexError,
-    DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType, FarmFieldEntityStatus,
-    FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord,
-    FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind,
-    FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords,
-    ImageMetadata, MarketplaceAccountCreateRequest, MarketplaceAccountError,
+    ContentSearchRequest, ContentSearchResult, ContentStatus, ContentSuccessStoryCreateRequest,
+    ContentSuccessStoryRecord, ContentTagApplyRequest, ContentTagRecord, ContentTaxonomyKind,
+    ContentType, ContentVersionRecord, ContentWorkflowAction, ContentWorkflowAuditRecord,
+    ContentWorkflowTransitionRequest, ContentWorkflowTransitionResult, DroughtIndexComputeRequest,
+    DroughtIndexError, DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType,
+    FarmFieldEntityStatus, FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary,
+    FieldBoundaryRecord, FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
+    FleetNodeKind, FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
+    GpsCoords, ImageMetadata, MarketplaceAccountCreateRequest, MarketplaceAccountError,
     MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplaceCatalogCategory,
     MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind,
     MarketplaceCatalogItemRecord, MarketplaceDemandForecastError, MarketplaceDemandForecastRecord,
@@ -165,9 +165,10 @@ use shared::schemas::{
     SustainabilityRecordLinkage, TractorCommandAuditDecision, TractorCommandAuditRecord,
     TractorCommandRejection, TractorCommandRejectionReason, TractorImplementRef,
     TractorLifecycleStatus, TractorMotionCommandRequest, TractorRecord, TractorRegistrationRequest,
-    TractorRegistryError, VersionedContentRecord, WeatherFetchFailureRecord, WeatherForecastRecord,
-    WeatherForecastVariables, WeatherIngestError, WeatherProviderForecastPoint,
-    WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER, GEO_EXTENT_ASSERTION_TOLERANCE,
+    TractorRegistryError, VersionedContentRecord, VersionedSuccessStoryContentRecord,
+    WeatherFetchFailureRecord, WeatherForecastRecord, WeatherForecastVariables, WeatherIngestError,
+    WeatherProviderForecastPoint, WeatherProviderForecastResponse, DEFAULT_RECORD_OWNER,
+    GEO_EXTENT_ASSERTION_TOLERANCE,
 };
 use soil_iot::{
     build_geolocated_soil_reading, build_soil_config_push_record, build_soil_device_record,
@@ -5043,6 +5044,26 @@ pub async fn create_content_item(
     }))
 }
 
+pub async fn create_success_story_item(
+    State(state): State<AppState>,
+    Json(request): Json<ContentSuccessStoryCreateRequest>,
+) -> AppResult<Json<VersionedSuccessStoryContentRecord>> {
+    let (content, version, success_story) = create_success_story_content(
+        request,
+        format!("content-{}", Uuid::new_v4()),
+        format!("content-version-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(content_error)?;
+    insert_success_story_item_with_version(&state, &content, &version, &success_story).await?;
+
+    Ok(Json(VersionedSuccessStoryContentRecord {
+        content,
+        versions: vec![version],
+        success_story,
+    }))
+}
+
 pub async fn append_content_item_version(
     Path(content_id): Path<String>,
     Query(query): Query<ContentItemScopeQuery>,
@@ -5304,6 +5325,30 @@ pub async fn get_content_item(
         .await?
         .ok_or(AppError::NotFound)
         .map(Json)
+}
+
+pub async fn get_success_story_item(
+    Path(content_id): Path<String>,
+    Query(query): Query<ContentItemScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<VersionedSuccessStoryContentRecord>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let versioned = load_versioned_content(&state, &content_id, &org_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if versioned.content.content_type != ContentType::SuccessStory {
+        return Err(AppError::NotFound);
+    }
+    let success_story = load_success_story_record(&state, &content_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    Ok(Json(VersionedSuccessStoryContentRecord {
+        content: versioned.content,
+        versions: versioned.versions,
+        success_story,
+    }))
 }
 
 pub async fn list_content_items(
@@ -12368,6 +12413,25 @@ fn decode_content_version_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<Con
     })
 }
 
+fn decode_success_story_record(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<ContentSuccessStoryRecord> {
+    let metrics = serde_json::from_str::<Vec<shared::schemas::ContentSuccessMetric>>(
+        &row.get::<String, _>("metrics_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(Error::new(err).context("failed to decode success story metrics_json"))
+    })?;
+    Ok(ContentSuccessStoryRecord {
+        content_id: row.get("content_id"),
+        grower: row.get("grower"),
+        crop: row.get("crop"),
+        region: row.get("region"),
+        outcome_summary: row.get("outcome_summary"),
+        metrics,
+    })
+}
+
 fn decode_content_engagement_event_record(
     row: &sqlx::sqlite::SqliteRow,
 ) -> AppResult<ContentEngagementEventRecord> {
@@ -15812,6 +15876,58 @@ async fn insert_content_item_with_version(
     Ok(())
 }
 
+async fn insert_success_story_item_with_version(
+    state: &AppState,
+    content: &ContentRecord,
+    version: &ContentVersionRecord,
+    success_story: &ContentSuccessStoryRecord,
+) -> AppResult<()> {
+    let metrics_json = serde_json::to_string(&success_story.metrics)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    let mut tx = state.pool.begin().await.map_err(Error::from)?;
+    sqlx::query(
+        r#"
+        INSERT INTO cms_contents (
+            content_id, content_type, author_id, org_id, status, current_version,
+            created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "#,
+    )
+    .bind(&content.content_id)
+    .bind(content.content_type.as_str())
+    .bind(&content.author_id)
+    .bind(&content.org_id)
+    .bind(content.status.as_str())
+    .bind(&content.current_version)
+    .bind(&content.created_at)
+    .bind(&content.updated_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+    insert_content_version_in_tx(&mut tx, version).await?;
+    sqlx::query(
+        r#"
+        INSERT INTO cms_success_stories (
+            content_id, grower, crop, region, outcome_summary, metrics_json
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        "#,
+    )
+    .bind(&success_story.content_id)
+    .bind(&success_story.grower)
+    .bind(&success_story.crop)
+    .bind(&success_story.region)
+    .bind(&success_story.outcome_summary)
+    .bind(metrics_json)
+    .execute(&mut *tx)
+    .await
+    .map_err(Error::from)?;
+    tx.commit().await.map_err(Error::from)?;
+
+    Ok(())
+}
+
 async fn append_content_version_record(
     state: &AppState,
     content: &ContentRecord,
@@ -16059,6 +16175,25 @@ async fn load_versioned_content(
     let versions = load_content_versions(state, content_id).await?;
 
     Ok(Some(VersionedContentRecord { content, versions }))
+}
+
+async fn load_success_story_record(
+    state: &AppState,
+    content_id: &str,
+) -> AppResult<Option<ContentSuccessStoryRecord>> {
+    let row = sqlx::query(
+        r#"
+        SELECT content_id, grower, crop, region, outcome_summary, metrics_json
+        FROM cms_success_stories
+        WHERE content_id = ?1
+        "#,
+    )
+    .bind(content_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_success_story_record(&row)).transpose()
 }
 
 async fn load_content_search_documents(

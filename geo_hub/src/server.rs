@@ -434,6 +434,14 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::list_content_items).post(routes::create_content_item),
         )
         .route(
+            "/api/content/success-stories",
+            post(routes::create_success_story_item),
+        )
+        .route(
+            "/api/content/success-stories/:content_id",
+            get(routes::get_success_story_item),
+        )
+        .route(
             "/api/content/items/:content_id",
             get(routes::get_content_item),
         )

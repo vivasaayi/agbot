@@ -7070,6 +7070,199 @@ async fn content_engagement_no_activity_persists_zero_summary() -> Result<()> {
 }
 
 #[tokio::test]
+async fn content_success_story_persists_and_reuses_search_and_embed() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let create = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/success-stories")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "content_id": "success-story-001",
+                        "author_id": "author-001",
+                        "org_id": "org-alpha",
+                        "body": "Cover crops increased soil organic matter for corn.",
+                        "fields": {
+                            "grower": "North Ridge Farm",
+                            "crop": "corn",
+                            "region": "midwest",
+                            "outcome_summary": "Soil organic matter improved after cover crop adoption.",
+                            "metrics": [{
+                                "metric": "soil organic matter",
+                                "value": "+0.4",
+                                "unit": "percentage_points",
+                                "evidence_ref": "kpi:soil-organic-matter"
+                            }]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create.status(), StatusCode::OK);
+    let body = to_bytes(create.into_body(), 64 * 1024).await?;
+    let created: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        created
+            .pointer("/content/content_type")
+            .and_then(|value| value.as_str()),
+        Some("success_story")
+    );
+    assert_eq!(
+        created
+            .pointer("/success_story/crop")
+            .and_then(|value| value.as_str()),
+        Some("corn")
+    );
+
+    let fetched = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/success-stories/success-story-001?org_id=org-alpha")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(fetched.status(), StatusCode::OK);
+    let body = to_bytes(fetched.into_body(), 64 * 1024).await?;
+    let fetched: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        fetched
+            .pointer("/success_story/metrics/0/evidence_ref")
+            .and_then(|value| value.as_str()),
+        Some("kpi:soil-organic-matter")
+    );
+
+    publish_content_fixture(&ctx, "success-story-001", "org-alpha").await?;
+
+    let search = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/search?org_id=org-alpha&q=soil%20organic")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(search.status(), StatusCode::OK);
+    let body = to_bytes(search.into_body(), 64 * 1024).await?;
+    let results: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0]
+            .get("content_id")
+            .and_then(|value| value.as_str()),
+        Some("success-story-001")
+    );
+    assert_eq!(
+        results[0]
+            .get("content_type")
+            .and_then(|value| value.as_str()),
+        Some("success_story")
+    );
+
+    let embed = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/portal/knowledge-base?org_id=org-alpha&actor_org_id=org-alpha&role_refs=cms:viewer")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(embed.status(), StatusCode::OK);
+    let body = to_bytes(embed.into_body(), 64 * 1024).await?;
+    let embed: serde_json::Value = serde_json::from_slice(&body)?;
+    let items = embed
+        .get("items")
+        .and_then(|value| value.as_array())
+        .expect("embed should include items");
+    assert_eq!(items.len(), 1);
+    assert_eq!(
+        items[0]
+            .get("content_type")
+            .and_then(|value| value.as_str()),
+        Some("success_story")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_success_story_rejects_missing_structured_field_without_writing() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let create = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/success-stories")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "content_id": "success-story-invalid",
+                        "author_id": "author-001",
+                        "org_id": "org-alpha",
+                        "body": "Incomplete success story.",
+                        "fields": {
+                            "grower": "North Ridge Farm",
+                            "crop": "corn",
+                            "region": "midwest",
+                            "outcome_summary": " ",
+                            "metrics": [{
+                                "metric": "soil organic matter",
+                                "value": "+0.4",
+                                "unit": "percentage_points",
+                                "evidence_ref": "kpi:soil-organic-matter"
+                            }]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create.status(), StatusCode::BAD_REQUEST);
+
+    let content_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM cms_contents WHERE content_id = ?1")
+            .bind("success-story-invalid")
+            .fetch_one(&ctx.pool)
+            .await?;
+    let story_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM cms_success_stories WHERE content_id = ?1")
+            .bind("success-story-invalid")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(content_count, 0);
+    assert_eq!(story_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn collaboration_channels_create_post_list_and_deny_cross_org_read() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
