@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: 0264184 (`batch-20260618022730`)
-- **Latest checkpoint commit**: b58674a
+- **Last implementation commit**: 1818fc6 (`batch-20260618030000`)
+- **Latest checkpoint commit**: c9a037d
 - **Current batch**: none
-- **Completed feature rows**: 480 committed; 1 tests_passed; 2 skipped; 2 blocked; 13 pending in this run.
+- **Completed feature rows**: 481 committed; 1 tests_passed; 2 skipped; 2 blocked; 12 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch.
 
 ## Latest verification
@@ -133,7 +133,15 @@
 - `cargo check -p crop_intelligence` — pass
 - `cargo check -p geo_hub` — pass
 - `23-04` — committed as crop inference run progress observability with timestamped tile progress, coverage fractions, persisted progress streams, stall detection after the configured no-progress window, and API coverage for non-stalled and flagged stalled runs
+- `cargo fmt` — pass
+- `cargo test -p crop_intelligence closed_loop --lib` — pass
+- `cargo test -p crop_intelligence proposal --lib` — pass
+- `cargo test -p geo_hub --test products_api crop_intelligence_closed_loop` — pass
+- `cargo test -p geo_hub --test products_api crop_intelligence_` — pass
+- `cargo check -p crop_intelligence` — pass
+- `cargo check -p geo_hub` — pass
+- `23-16` — committed as advisory, approval-gated crop closed-loop proposals with bounded re-fly areas, treatment prescription references, cited verified finding evidence, persisted create/get API, unverified/low-confidence refusal, and no mission or tractor dispatch side effects
 
 ## Next action
 
-- Select and claim the next pending roadmap feature after `23-04` crop inference progress observability.
+- Select and claim the next pending roadmap feature after `23-16` advisory crop closed-loop proposals.
