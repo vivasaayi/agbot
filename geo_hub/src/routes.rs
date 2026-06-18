@@ -88,7 +88,8 @@ use shared::schemas::{
     apply_collaboration_mission_edit, apply_content_taxonomy_tags, assemble_marketplace_org_report,
     assert_raster_spatial_ref, authorize_collaboration_action, bind_fleet_node_identity,
     bounds_coverage_fraction, bounds_from_points, build_collaboration_channel,
-    build_collaboration_message, build_collaboration_notifications, build_content_portal_embed,
+    build_collaboration_message, build_collaboration_notifications,
+    build_collaboration_operator_console_feed, build_content_portal_embed,
     build_marketplace_account_record, build_marketplace_catalog_item_record,
     build_marketplace_inventory_record, build_marketplace_portal_entry,
     build_soil_moisture_reading, build_sustainability_certification_evidence_pack,
@@ -140,12 +141,13 @@ use shared::schemas::{
     CollaborationMissionPlanCreateRequest, CollaborationMissionPlanRecord,
     CollaborationMissionWaypoint, CollaborationMissionWaypointEditRequest,
     CollaborationNotificationEventRequest, CollaborationNotificationRecord,
-    CollaborationPermissionDecision, CollaborationPermissionResolveRequest,
-    CollaborationPermissionSet, CollaborationPresenceRecord, CollaborationPresenceState,
-    CollaborationPresenceUpdateRequest, CollaborationSessionAnnotationLinkRecord,
-    CollaborationSessionAnnotationLinkRequest, CollaborationSessionAnnotationRecord,
-    CollaborationSessionEventKind, CollaborationSessionEventRecord, CollaborationSessionRecord,
-    CollaborationSessionRecordRequest, CollaborationSessionReplay, CollaborationStreamFrameRecord,
+    CollaborationOperatorConsoleFeed, CollaborationPermissionDecision,
+    CollaborationPermissionResolveRequest, CollaborationPermissionSet, CollaborationPresenceRecord,
+    CollaborationPresenceState, CollaborationPresenceUpdateRequest,
+    CollaborationSessionAnnotationLinkRecord, CollaborationSessionAnnotationLinkRequest,
+    CollaborationSessionAnnotationRecord, CollaborationSessionEventKind,
+    CollaborationSessionEventRecord, CollaborationSessionRecord, CollaborationSessionRecordRequest,
+    CollaborationSessionReplay, CollaborationStreamFrameRecord,
     CollaborationStreamFrameRelayRequest, CollaborationStreamRelayResult,
     CollaborationStreamStartRequest, CollaborationStreamState,
     ContentCommunityContributionCreateRequest, ContentCommunityContributionRecord,
@@ -6017,6 +6019,35 @@ pub async fn list_collaboration_session_annotations_route(
     Ok(Json(
         load_collaboration_session_annotations(&state, &session_id, &org_id).await?,
     ))
+}
+
+pub async fn collaboration_operator_console_feed_route(
+    Query(query): Query<CollaborationScopeQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<CollaborationOperatorConsoleFeed>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    assert_collaboration_action_permission(
+        &state,
+        &org_id,
+        query.actor_org_id,
+        query.actor_id,
+        query.role_refs,
+        CollaborationAction::Stream,
+        None,
+    )
+    .await?;
+    let streams = load_collaboration_operator_console_streams(&state, &org_id).await?;
+    let alerts = load_collaboration_operator_console_active_alerts(&state, &org_id).await?;
+    let feed = build_collaboration_operator_console_feed(
+        org_id,
+        streams,
+        alerts,
+        current_record_timestamp(),
+    )
+    .map_err(collaboration_error)?;
+
+    Ok(Json(feed))
 }
 
 pub async fn create_collaboration_mission_plan_route(
@@ -17779,6 +17810,53 @@ fn decode_collaboration_session_annotation_link(
         recoverable: row.get::<i64, _>("recoverable") != 0,
         occurred_at: row.get("occurred_at"),
     }
+}
+
+async fn load_collaboration_operator_console_streams(
+    state: &AppState,
+    org_id: &str,
+) -> AppResult<Vec<CollaborationLiveStreamRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT stream_id, org_id, mission_ref, source_ref, state, latency_budget_ms,
+               started_at, updated_at, evidence_refs_json
+        FROM collab_streams
+        WHERE org_id = ?1
+        ORDER BY updated_at DESC, stream_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_collaboration_stream(&row))
+        .collect()
+}
+
+async fn load_collaboration_operator_console_active_alerts(
+    state: &AppState,
+    org_id: &str,
+) -> AppResult<Vec<CollaborationEmergencyAlertRecord>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT alert_id, org_id, channel_id, source, severity, trigger_ref,
+               body, state, raised_at, updated_at
+        FROM collab_emergency_alerts
+        WHERE org_id = ?1
+          AND state IN ('raised', 'acknowledged')
+        ORDER BY updated_at DESC, alert_id ASC
+        "#,
+    )
+    .bind(org_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    rows.into_iter()
+        .map(|row| decode_collaboration_emergency_alert(&row))
+        .collect()
 }
 
 async fn upsert_collaboration_mission_plan(

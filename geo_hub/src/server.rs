@@ -538,6 +538,10 @@ pub fn build_router(state: AppState) -> Router {
                 .post(routes::create_collaboration_session_annotation_route),
         )
         .route(
+            "/api/collaboration/operator-console/feed",
+            get(routes::collaboration_operator_console_feed_route),
+        )
+        .route(
             "/api/collaboration/mission-plans",
             post(routes::create_collaboration_mission_plan_route),
         )

@@ -14263,6 +14263,14 @@ pub struct CollaborationSessionAnnotationRecord {
     pub annotation: AnnotationRecord,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CollaborationOperatorConsoleFeed {
+    pub org_id: String,
+    pub streams: Vec<CollaborationLiveStreamRecord>,
+    pub active_alerts: Vec<CollaborationEmergencyAlertRecord>,
+    pub generated_at: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CollaborationMissionWaypoint {
     pub waypoint_id: String,
@@ -15089,6 +15097,36 @@ pub fn link_collaboration_session_annotation(
         visible: true,
         recoverable: !request.connection_active,
         occurred_at,
+    })
+}
+
+pub fn build_collaboration_operator_console_feed(
+    org_id: String,
+    streams: Vec<CollaborationLiveStreamRecord>,
+    alerts: Vec<CollaborationEmergencyAlertRecord>,
+    generated_at: String,
+) -> Result<CollaborationOperatorConsoleFeed, CollaborationError> {
+    let org_id = normalize_collaboration_text(org_id).ok_or(CollaborationError::EmptyOrgId)?;
+    let generated_at =
+        normalize_collaboration_text(generated_at).ok_or(CollaborationError::EmptyTimestamp)?;
+    let mut streams = streams
+        .into_iter()
+        .filter(|stream| stream.org_id == org_id)
+        .collect::<Vec<_>>();
+    streams.sort_by(|left, right| left.stream_id.cmp(&right.stream_id));
+    let mut active_alerts = alerts
+        .into_iter()
+        .filter(|alert| {
+            alert.org_id == org_id && alert.state != CollaborationEmergencyAlertState::Resolved
+        })
+        .collect::<Vec<_>>();
+    active_alerts.sort_by(|left, right| left.alert_id.cmp(&right.alert_id));
+
+    Ok(CollaborationOperatorConsoleFeed {
+        org_id,
+        streams,
+        active_alerts,
+        generated_at,
     })
 }
 
@@ -18597,21 +18635,22 @@ mod tests {
         apply_tractor_implement_command, assemble_drought_report, assemble_marketplace_org_report,
         assert_flight_operation_allowed, assert_raster_spatial_ref, bind_fleet_node_identity,
         bounds_from_points, build_collaboration_channel, build_collaboration_message,
-        build_collaboration_notifications, build_content_portal_embed,
-        build_fleet_version_inventory, build_marketplace_account_record,
-        build_marketplace_inventory_record, build_marketplace_portal_entry,
-        build_soil_moisture_reading, build_sustainability_certification_evidence_pack,
-        build_sustainability_record, build_tractor_field_ops_replay,
-        build_tractor_field_ops_session_log, close_marketplace_listing_record,
-        compare_sustainability_baseline, compute_biodiversity_proxy, compute_carbon_footprint,
-        compute_drought_baseline_trend, compute_drought_index, compute_drought_risk_score,
-        compute_marketplace_demand_forecast, compute_soil_carbon_proxy, compute_sustainability_kpi,
-        compute_water_evapotranspiration, compute_weather_growing_degree_day,
-        compute_weather_reference_et, create_collaboration_mission_plan,
-        create_community_contribution, create_content_engagement_event,
-        create_content_locale_variant, create_marketplace_fulfillment_record,
-        create_marketplace_rating_record, create_success_story_content,
-        create_sustainability_baseline, create_sustainability_mrv_trail, create_versioned_content,
+        build_collaboration_notifications, build_collaboration_operator_console_feed,
+        build_content_portal_embed, build_fleet_version_inventory,
+        build_marketplace_account_record, build_marketplace_inventory_record,
+        build_marketplace_portal_entry, build_soil_moisture_reading,
+        build_sustainability_certification_evidence_pack, build_sustainability_record,
+        build_tractor_field_ops_replay, build_tractor_field_ops_session_log,
+        close_marketplace_listing_record, compare_sustainability_baseline,
+        compute_biodiversity_proxy, compute_carbon_footprint, compute_drought_baseline_trend,
+        compute_drought_index, compute_drought_risk_score, compute_marketplace_demand_forecast,
+        compute_soil_carbon_proxy, compute_sustainability_kpi, compute_water_evapotranspiration,
+        compute_weather_growing_degree_day, compute_weather_reference_et,
+        create_collaboration_mission_plan, create_community_contribution,
+        create_content_engagement_event, create_content_locale_variant,
+        create_marketplace_fulfillment_record, create_marketplace_rating_record,
+        create_success_story_content, create_sustainability_baseline,
+        create_sustainability_mrv_trail, create_versioned_content,
         deconflict_tractor_swath_reservations, derive_drought_mitigation_recommendation,
         detect_tractor_obstacle, dry_run_fleet_config_bundle, dry_run_irrigation_valve_plan,
         estimate_biomass, evaluate_access_anomaly_advisories, evaluate_and_route_drought_alerts,
@@ -18647,9 +18686,10 @@ mod tests {
         CarbonEmissionFactor, CarbonFootprintComputeRequest, CarbonFootprintFactorSet,
         CarbonFootprintInput, CarbonFootprintInputKind, CarbonFootprintStatus,
         CollaborationChannelCreateRequest, CollaborationEmergencyAlertAction,
-        CollaborationEmergencyAlertCreateRequest, CollaborationEmergencyAlertSource,
-        CollaborationEmergencyAlertState, CollaborationEmergencyAlertTransitionRequest,
-        CollaborationError, CollaborationMessageCreateRequest,
+        CollaborationEmergencyAlertCreateRequest, CollaborationEmergencyAlertRecord,
+        CollaborationEmergencyAlertSource, CollaborationEmergencyAlertState,
+        CollaborationEmergencyAlertTransitionRequest, CollaborationError,
+        CollaborationLiveStreamRecord, CollaborationMessageCreateRequest,
         CollaborationMissionDispatchGuardrails, CollaborationMissionDispatchRequest,
         CollaborationMissionEditDecision, CollaborationMissionPlanCreateRequest,
         CollaborationMissionWaypoint, CollaborationMissionWaypointEditRequest,
@@ -22815,6 +22855,72 @@ mod tests {
         assert_eq!(link.actor_id, "expert-1");
         assert!(link.visible);
         assert!(link.recoverable);
+    }
+
+    #[test]
+    fn collaboration_operator_console_feed_filters_org_and_preserves_stream_state() {
+        let feed = build_collaboration_operator_console_feed(
+            "org-alpha".to_string(),
+            vec![
+                CollaborationLiveStreamRecord {
+                    stream_id: "stream-ended".to_string(),
+                    org_id: "org-alpha".to_string(),
+                    mission_ref: "mission:ended".to_string(),
+                    source_ref: "camera:rgb-01".to_string(),
+                    state: CollaborationStreamState::Ended,
+                    latency_budget_ms: 500,
+                    started_at: "2026-06-13T15:00:00Z".to_string(),
+                    updated_at: "2026-06-13T15:02:00Z".to_string(),
+                    evidence_refs: vec!["collab:stream:stream-ended".to_string()],
+                },
+                CollaborationLiveStreamRecord {
+                    stream_id: "stream-foreign".to_string(),
+                    org_id: "org-beta".to_string(),
+                    mission_ref: "mission:foreign".to_string(),
+                    source_ref: "camera:rgb-02".to_string(),
+                    state: CollaborationStreamState::Live,
+                    latency_budget_ms: 500,
+                    started_at: "2026-06-13T15:00:00Z".to_string(),
+                    updated_at: "2026-06-13T15:01:00Z".to_string(),
+                    evidence_refs: vec!["collab:stream:stream-foreign".to_string()],
+                },
+            ],
+            vec![
+                CollaborationEmergencyAlertRecord {
+                    alert_id: "alert-active".to_string(),
+                    org_id: "org-alpha".to_string(),
+                    channel_id: "channel-ops".to_string(),
+                    source: CollaborationEmergencyAlertSource::Safety01,
+                    severity: "critical".to_string(),
+                    trigger_ref: "01:geofence".to_string(),
+                    body: "Geofence breach".to_string(),
+                    state: CollaborationEmergencyAlertState::Raised,
+                    raised_at: "2026-06-13T15:01:00Z".to_string(),
+                    updated_at: "2026-06-13T15:01:00Z".to_string(),
+                },
+                CollaborationEmergencyAlertRecord {
+                    alert_id: "alert-resolved".to_string(),
+                    org_id: "org-alpha".to_string(),
+                    channel_id: "channel-ops".to_string(),
+                    source: CollaborationEmergencyAlertSource::Fleet12,
+                    severity: "warning".to_string(),
+                    trigger_ref: "12:battery".to_string(),
+                    body: "Battery recovered".to_string(),
+                    state: CollaborationEmergencyAlertState::Resolved,
+                    raised_at: "2026-06-13T15:01:00Z".to_string(),
+                    updated_at: "2026-06-13T15:03:00Z".to_string(),
+                },
+            ],
+            "2026-06-13T15:04:00Z".to_string(),
+        )
+        .expect("operator console feed should build");
+
+        assert_eq!(feed.org_id, "org-alpha");
+        assert_eq!(feed.streams.len(), 1);
+        assert_eq!(feed.streams[0].stream_id, "stream-ended");
+        assert_eq!(feed.streams[0].state, CollaborationStreamState::Ended);
+        assert_eq!(feed.active_alerts.len(), 1);
+        assert_eq!(feed.active_alerts[0].alert_id, "alert-active");
     }
 
     #[test]

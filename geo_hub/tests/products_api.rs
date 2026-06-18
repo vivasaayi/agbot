@@ -8967,6 +8967,162 @@ async fn collaboration_remote_expert_annotation_viewer_denied_without_session_mu
 }
 
 #[tokio::test]
+async fn collaboration_operator_console_feed_scopes_streams_alerts_and_ended_state() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let live = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/collaboration/streams?actor_org_id=org-alpha&actor_id=operator-1&role_refs=collab:operator")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "stream_id": "stream-console-live",
+                        "org_id": "org-alpha",
+                        "mission_ref": "mission:console-live",
+                        "source_ref": "camera:rgb-01",
+                        "latency_budget_ms": 500,
+                        "source_active": true
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(live.status(), StatusCode::OK);
+
+    sqlx::query(
+        r#"
+        INSERT INTO collab_streams (
+            stream_id, org_id, mission_ref, source_ref, state, latency_budget_ms,
+            started_at, updated_at, evidence_refs_json
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )
+    .bind("stream-console-ended")
+    .bind("org-alpha")
+    .bind("mission:console-ended")
+    .bind("camera:rgb-02")
+    .bind("ended")
+    .bind(500_i64)
+    .bind("2026-06-13T15:00:00Z")
+    .bind("2026-06-13T15:02:00Z")
+    .bind(json!(["collab:stream:stream-console-ended"]).to_string())
+    .execute(&ctx.pool)
+    .await?;
+    sqlx::query(
+        r#"
+        INSERT INTO collab_streams (
+            stream_id, org_id, mission_ref, source_ref, state, latency_budget_ms,
+            started_at, updated_at, evidence_refs_json
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "#,
+    )
+    .bind("stream-console-foreign")
+    .bind("org-beta")
+    .bind("mission:console-foreign")
+    .bind("camera:rgb-03")
+    .bind("live")
+    .bind(500_i64)
+    .bind("2026-06-13T15:00:00Z")
+    .bind("2026-06-13T15:01:00Z")
+    .bind(json!(["collab:stream:stream-console-foreign"]).to_string())
+    .execute(&ctx.pool)
+    .await?;
+    for (alert_id, org_id, state) in [
+        ("alert-console-active", "org-alpha", "raised"),
+        ("alert-console-resolved", "org-alpha", "resolved"),
+        ("alert-console-foreign", "org-beta", "raised"),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO collab_emergency_alerts (
+                alert_id, org_id, channel_id, source, severity, trigger_ref,
+                body, state, raised_at, updated_at
+            )
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "#,
+        )
+        .bind(alert_id)
+        .bind(org_id)
+        .bind("channel-console")
+        .bind("01")
+        .bind("critical")
+        .bind("01:geofence")
+        .bind("Geofence breach")
+        .bind(state)
+        .bind("2026-06-13T15:01:00Z")
+        .bind("2026-06-13T15:01:00Z")
+        .execute(&ctx.pool)
+        .await?;
+    }
+
+    let feed = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/operator-console/feed?org_id=org-alpha&actor_org_id=org-alpha&actor_id=operator-1&role_refs=collab:operator")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(feed.status(), StatusCode::OK);
+    let body = to_bytes(feed.into_body(), 64 * 1024).await?;
+    let feed: serde_json::Value = serde_json::from_slice(&body)?;
+    let streams = feed
+        .get("streams")
+        .and_then(|value| value.as_array())
+        .expect("streams should be array");
+    assert_eq!(streams.len(), 2);
+    assert!(streams.iter().any(|stream| {
+        stream.get("stream_id").and_then(|value| value.as_str()) == Some("stream-console-live")
+            && stream.get("state").and_then(|value| value.as_str()) == Some("live")
+    }));
+    assert!(streams.iter().any(|stream| {
+        stream.get("stream_id").and_then(|value| value.as_str()) == Some("stream-console-ended")
+            && stream.get("state").and_then(|value| value.as_str()) == Some("ended")
+    }));
+    assert!(!streams.iter().any(|stream| {
+        stream.get("stream_id").and_then(|value| value.as_str()) == Some("stream-console-foreign")
+    }));
+    let alerts = feed
+        .get("active_alerts")
+        .and_then(|value| value.as_array())
+        .expect("active alerts should be array");
+    assert_eq!(alerts.len(), 1);
+    assert_eq!(
+        alerts[0].get("alert_id").and_then(|value| value.as_str()),
+        Some("alert-console-active")
+    );
+
+    let cross_org = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/collaboration/operator-console/feed?org_id=org-alpha&actor_org_id=org-beta&actor_id=operator-foreign&role_refs=collab:operator")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(cross_org.status(), StatusCode::FORBIDDEN);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn collaboration_mission_edit_conflicts_and_dispatch_guardrails() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;
