@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: 07dd186 (`batch-20260618051500`)
-- **Latest checkpoint commit**: 0691c57
+- **Last implementation commit**: 68c5cab (`batch-20260618060000`)
+- **Latest checkpoint commit**: df0fb75
 - **Current batch**: none
-- **Completed feature rows**: 484 committed; 1 tests_passed; 2 skipped; 2 blocked; 9 pending in this run.
+- **Completed feature rows**: 485 committed; 1 tests_passed; 2 skipped; 2 blocked; 8 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch.
 
 ## Latest verification
@@ -163,7 +163,11 @@
 - `cargo check -p fleet_health` — pass
 - `cargo check -p geo_hub` — pass
 - `25-11` — committed as tractor/ground-vehicle fleet-health integration with shared component/verdict/readiness/dashboard contracts, tractor existence validation, persisted component registry rows, overdue-service field-ops blocking, and ground-vehicle ingestion event evidence
+- `cargo fmt` — pass
+- `cargo test -p fleet_health predictive_maintenance_schedule --lib` — pass
+- `cargo check -p fleet_health` — pass
+- `25-13` — verified as predictive maintenance scheduling with RUL-range service windows, uncertainty summary/evidence, required FLEET-TECH approval, work-order opening on approval, and explicit no-dispatch/no-verdict-clearance safety gates
 
 ## Next action
 
-- Select and claim the next pending roadmap feature after `25-11` tractor fleet-health integration.
+- Select and claim the next pending roadmap feature after `25-13` predictive maintenance scheduling.
