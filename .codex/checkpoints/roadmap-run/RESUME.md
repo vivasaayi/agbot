@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: 444496c (`batch-20260618071500`)
-- **Latest checkpoint commit**: 24c5282
+- **Last implementation commit**: e53e9a4 (`batch-20260618080000`)
+- **Latest checkpoint commit**: c20c138
 - **Current batch**: none
-- **Completed feature rows**: 487 committed; 1 tests_passed; 2 skipped; 2 blocked; 6 pending in this run.
+- **Completed feature rows**: 488 committed; 1 tests_passed; 2 skipped; 2 blocked; 5 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch.
 
 ## Latest verification
@@ -175,7 +175,11 @@
 - `cargo test -p soil_iot coverage_gap --lib` — pass
 - `cargo check -p soil_iot` — pass
 - `27-14` — verified as soil IoT network coverage gap exports with per-zone coverage summaries, zero-fresh-device CSV/GeoJSON gap artifacts, CRS-preserving polygons, valid empty fully-covered exports, and missing-gap-geometry refusal
+- `cargo fmt` — pass
+- `cargo test -p soil_iot drift_recalibration --lib` — pass
+- `cargo check -p soil_iot` — pass
+- `27-15` — verified as soil IoT drift/recalibration advisory with feature gating, fresh validated target and neighbor/aerial reference requirements, uncertainty bounds, cited soil/fusion evidence, pending approval, and no automatic recalibration
 
 ## Next action
 
-- Select and claim the next pending roadmap feature after `27-14` soil IoT coverage gap exports.
+- Select and claim the next pending roadmap feature after `27-15` soil IoT drift advisory.
