@@ -863,6 +863,58 @@ pub struct MosaicPublishGateDecision {
     pub provenance: MosaicProvenanceRecord,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReflyApprovalState {
+    PendingOperatorApproval,
+    NotRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReflyAreaBounds {
+    pub min_x_m: f64,
+    pub min_y_m: f64,
+    pub max_x_m: f64,
+    pub max_y_m: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReflySuggestion {
+    pub suggestion_id: String,
+    pub frame_set_id: String,
+    pub mission_proposal_ref: String,
+    pub approval_state: ReflyApprovalState,
+    pub dispatch_allowed: bool,
+    pub bounded_area: ReflyAreaBounds,
+    pub cited_metrics: Vec<String>,
+    pub evidence_refs: Vec<String>,
+    pub generated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReflySuggestionRequest {
+    pub mission_ref: String,
+    pub qa_report: FrameSetQaReport,
+    pub quality_report: MosaicQualityReport,
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum ReflySuggestionError {
+    #[error("suggestion_id cannot be empty")]
+    EmptySuggestionId,
+    #[error("mission_ref cannot be empty")]
+    EmptyMissionRef,
+    #[error("generated_at cannot be empty")]
+    EmptyGeneratedAt,
+    #[error("quality report frame_set_id {quality_frame_set_id} does not match QA frame_set_id {qa_frame_set_id}")]
+    FrameSetMismatch {
+        qa_frame_set_id: String,
+        quality_frame_set_id: String,
+    },
+    #[error("cannot bound re-fly area without QA frame or gap geometry")]
+    MissingBoundedArea,
+}
+
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum FeatureMatchingError {
     #[error("frame set must include at least one frame")]
@@ -2280,6 +2332,93 @@ pub fn evaluate_mosaic_publish_gate(
         downstream_consumers,
         blocked_reason,
         provenance,
+    })
+}
+
+pub fn suggest_refly_mission(
+    request: ReflySuggestionRequest,
+    generated_suggestion_id: String,
+    generated_at: String,
+) -> Result<Option<ReflySuggestion>, ReflySuggestionError> {
+    let suggestion_id = normalize_optional_text(Some(generated_suggestion_id))
+        .ok_or(ReflySuggestionError::EmptySuggestionId)?;
+    let mission_ref = normalize_optional_text(Some(request.mission_ref))
+        .ok_or(ReflySuggestionError::EmptyMissionRef)?;
+    let generated_at = normalize_optional_text(Some(generated_at))
+        .ok_or(ReflySuggestionError::EmptyGeneratedAt)?;
+    if request.qa_report.frame_set_id != request.quality_report.frame_set_id {
+        return Err(ReflySuggestionError::FrameSetMismatch {
+            qa_frame_set_id: request.qa_report.frame_set_id,
+            quality_frame_set_id: request.quality_report.frame_set_id,
+        });
+    }
+    if request.qa_report.passes
+        && request.quality_report.verdict == MosaicQualityVerdict::Publishable
+        && request.quality_report.failing_metrics.is_empty()
+    {
+        return Ok(None);
+    }
+
+    let bounded_area = refly_bounds_from_gaps_or_frames(&request.qa_report)
+        .ok_or(ReflySuggestionError::MissingBoundedArea)?;
+    let mut cited_metrics = request
+        .quality_report
+        .metrics
+        .iter()
+        .filter(|metric| !metric.passes)
+        .map(|metric| format!("{:?}:{}", metric.metric, metric.evidence_ref))
+        .collect::<Vec<_>>();
+    for gap in &request.qa_report.gap_regions {
+        cited_metrics.push(format!("{:?}:gap_region", gap.reason_code));
+    }
+    cited_metrics.sort();
+    cited_metrics.dedup();
+    let mut evidence_refs = request.quality_report.evidence_refs.clone();
+    evidence_refs.push(format!("frame_set_qa:{}", request.qa_report.frame_set_id));
+    evidence_refs.sort();
+    evidence_refs.dedup();
+
+    Ok(Some(ReflySuggestion {
+        suggestion_id: suggestion_id.clone(),
+        frame_set_id: request.qa_report.frame_set_id,
+        mission_proposal_ref: format!("{mission_ref}:refly:{suggestion_id}"),
+        approval_state: ReflyApprovalState::PendingOperatorApproval,
+        dispatch_allowed: false,
+        bounded_area,
+        cited_metrics,
+        evidence_refs,
+        generated_at,
+    }))
+}
+
+fn refly_bounds_from_gaps_or_frames(qa_report: &FrameSetQaReport) -> Option<ReflyAreaBounds> {
+    let mut bounds = qa_report
+        .gap_regions
+        .iter()
+        .map(|gap| ReflyAreaBounds {
+            min_x_m: gap.min_x_m,
+            min_y_m: gap.min_y_m,
+            max_x_m: gap.max_x_m,
+            max_y_m: gap.max_y_m,
+        })
+        .collect::<Vec<_>>();
+    if bounds.is_empty() {
+        bounds = qa_report
+            .frames
+            .iter()
+            .map(|frame| ReflyAreaBounds {
+                min_x_m: frame.min_x_m,
+                min_y_m: frame.min_y_m,
+                max_x_m: frame.max_x_m,
+                max_y_m: frame.max_y_m,
+            })
+            .collect();
+    }
+    bounds.into_iter().reduce(|left, right| ReflyAreaBounds {
+        min_x_m: left.min_x_m.min(right.min_x_m),
+        min_y_m: left.min_y_m.min(right.min_y_m),
+        max_x_m: left.max_x_m.max(right.max_x_m),
+        max_y_m: left.max_y_m.max(right.max_y_m),
     })
 }
 
@@ -4329,6 +4468,89 @@ mod tests {
         assert_eq!(json["verdict"], "not_publishable");
         assert_eq!(json["metrics"].as_array().expect("metrics array").len(), 5);
         assert_eq!(json["failing_metrics"][0], "coverage");
+    }
+
+    #[test]
+    fn refly_suggestion_cites_gap_metric_and_requires_approval() {
+        let mut qa = passing_qa_report();
+        qa.coverage_fraction = 0.72;
+        qa.passes = false;
+        qa.gap_regions.push(super::FrameSetQaGapRegion {
+            min_x_m: 10.0,
+            min_y_m: -5.0,
+            max_x_m: 30.0,
+            max_y_m: 15.0,
+            reason_code: FrameQaReasonCode::InsufficientCoverage,
+            frame_a_id: None,
+            frame_b_id: None,
+        });
+        let quality = build_mosaic_quality_report(
+            &qa,
+            &passing_reprojection_report(),
+            &passing_gcp_report(),
+            mosaic_quality_config(),
+            "2026-06-01T12:08:00Z".to_string(),
+        )
+        .expect("quality report should assemble failing verdict");
+
+        let suggestion = super::suggest_refly_mission(
+            super::ReflySuggestionRequest {
+                mission_ref: "mission:ortho-001".to_string(),
+                qa_report: qa,
+                quality_report: quality,
+            },
+            "suggestion-001".to_string(),
+            "2026-06-01T12:09:00Z".to_string(),
+        )
+        .expect("suggestion should evaluate")
+        .expect("coverage gap should produce suggestion");
+
+        assert_eq!(suggestion.frame_set_id, "frame-set-qa");
+        assert_eq!(
+            suggestion.approval_state,
+            super::ReflyApprovalState::PendingOperatorApproval
+        );
+        assert!(!suggestion.dispatch_allowed);
+        assert_eq!(
+            suggestion.mission_proposal_ref,
+            "mission:ortho-001:refly:suggestion-001"
+        );
+        assert_eq!(suggestion.bounded_area.min_x_m, 10.0);
+        assert_eq!(suggestion.bounded_area.max_x_m, 30.0);
+        assert!(suggestion
+            .cited_metrics
+            .iter()
+            .any(|metric| metric.contains("Coverage")));
+        assert!(suggestion
+            .evidence_refs
+            .iter()
+            .any(|evidence| evidence == "frame_set_qa:frame-set-qa"));
+    }
+
+    #[test]
+    fn refly_suggestion_is_absent_for_passing_mosaic() {
+        let qa = passing_qa_report();
+        let quality = build_mosaic_quality_report(
+            &qa,
+            &passing_reprojection_report(),
+            &passing_gcp_report(),
+            mosaic_quality_config(),
+            "2026-06-01T12:08:00Z".to_string(),
+        )
+        .expect("quality report should pass");
+
+        let suggestion = super::suggest_refly_mission(
+            super::ReflySuggestionRequest {
+                mission_ref: "mission:ortho-001".to_string(),
+                qa_report: qa,
+                quality_report: quality,
+            },
+            "suggestion-001".to_string(),
+            "2026-06-01T12:09:00Z".to_string(),
+        )
+        .expect("suggestion should evaluate");
+
+        assert!(suggestion.is_none());
     }
 
     #[test]
