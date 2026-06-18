@@ -569,6 +569,80 @@ pub struct PlatformMigrationReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoundTripCertificationRequest {
+    pub vector_cases: Vec<VectorCertificationCase>,
+    pub raster_products: Vec<RasterProduct>,
+    pub prescriptions: Vec<PrescriptionShapefileRequest>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VectorCertificationCase {
+    pub case_id: String,
+    pub payload: ImportPayload,
+    pub target_crs: String,
+    #[serde(default)]
+    pub injected_exported_bytes: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoundTripCertificationKind {
+    Vector,
+    RasterGeoTiff,
+    PrescriptionShapefile,
+    PrescriptionTaskData,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoundTripCertificationStatus {
+    Passed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoundTripDivergence {
+    ValidationFailed {
+        reason: InteropRejectionReason,
+    },
+    CrsMismatch {
+        expected: String,
+        actual: String,
+    },
+    ExtentDrift {
+        drift: f64,
+        tolerance: f64,
+    },
+    FeatureCountMismatch {
+        expected: usize,
+        actual: usize,
+    },
+    RasterShapeMismatch {
+        expected_width: u32,
+        expected_height: u32,
+        actual_width: u32,
+        actual_height: u32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoundTripCertificationRow {
+    pub case_id: String,
+    pub kind: RoundTripCertificationKind,
+    pub format: ImportFormat,
+    pub status: RoundTripCertificationStatus,
+    pub divergence: Option<RoundTripDivergence>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RoundTripCertificationReport {
+    pub rows: Vec<RoundTripCertificationRow>,
+    pub passed_count: usize,
+    pub failed_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JohnDeereBoundary {
     pub remote_field_id: String,
     pub name: String,
@@ -842,6 +916,301 @@ pub fn round_trip_vector_layer(
         max_coordinate_drift,
         exported_bytes,
     })
+}
+
+pub fn certify_round_trip_fidelity(
+    request: RoundTripCertificationRequest,
+) -> RoundTripCertificationReport {
+    let mut rows = Vec::new();
+    for case in request.vector_cases {
+        rows.push(certify_vector_case(case));
+    }
+    for product in request.raster_products {
+        rows.push(certify_raster_case(product));
+    }
+    for prescription in request.prescriptions {
+        rows.push(certify_prescription_shapefile_case(prescription.clone()));
+        rows.push(certify_prescription_taskdata_case(prescription));
+    }
+
+    let passed_count = rows
+        .iter()
+        .filter(|row| row.status == RoundTripCertificationStatus::Passed)
+        .count();
+    let failed_count = rows.len() - passed_count;
+    RoundTripCertificationReport {
+        rows,
+        passed_count,
+        failed_count,
+    }
+}
+
+fn certify_vector_case(case: VectorCertificationCase) -> RoundTripCertificationRow {
+    let case_id = normalize_optional_text(&case.case_id).unwrap_or_else(|| "vector".to_string());
+    let format = case.payload.format;
+    let imported = match validate_and_reproject_import(
+        case.payload,
+        CrsTransform {
+            target_crs: case.target_crs,
+        },
+    ) {
+        Ok(imported) => imported,
+        Err(error) => {
+            return certification_failed(
+                case_id,
+                RoundTripCertificationKind::Vector,
+                format,
+                validation_divergence(error),
+            );
+        }
+    };
+    let exported_bytes = match case.injected_exported_bytes {
+        Some(bytes) => bytes,
+        None => match export_geojson(&imported) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                return certification_failed(
+                    case_id,
+                    RoundTripCertificationKind::Vector,
+                    format,
+                    validation_divergence(error),
+                );
+            }
+        },
+    };
+    let round_tripped = match validate_and_reproject_import(
+        ImportPayload {
+            format: ImportFormat::GeoJson,
+            filename: format!("{case_id}-round-trip.geojson"),
+            bytes: exported_bytes,
+        },
+        CrsTransform {
+            target_crs: imported.target_crs.clone(),
+        },
+    ) {
+        Ok(round_tripped) => round_tripped,
+        Err(error) => {
+            return certification_failed(
+                case_id,
+                RoundTripCertificationKind::Vector,
+                format,
+                validation_divergence(error),
+            );
+        }
+    };
+    if imported.target_crs != round_tripped.target_crs {
+        return certification_failed(
+            case_id,
+            RoundTripCertificationKind::Vector,
+            format,
+            RoundTripDivergence::CrsMismatch {
+                expected: imported.target_crs,
+                actual: round_tripped.target_crs,
+            },
+        );
+    }
+    if imported.feature_count != round_tripped.feature_count {
+        return certification_failed(
+            case_id,
+            RoundTripCertificationKind::Vector,
+            format,
+            RoundTripDivergence::FeatureCountMismatch {
+                expected: imported.feature_count,
+                actual: round_tripped.feature_count,
+            },
+        );
+    }
+    let drift = extent_drift(imported.extent, round_tripped.extent);
+    if drift > GEOMETRY_EPSILON {
+        return certification_failed(
+            case_id,
+            RoundTripCertificationKind::Vector,
+            format,
+            RoundTripDivergence::ExtentDrift {
+                drift,
+                tolerance: GEOMETRY_EPSILON,
+            },
+        );
+    }
+    certification_passed(case_id, RoundTripCertificationKind::Vector, format)
+}
+
+fn certify_raster_case(product: RasterProduct) -> RoundTripCertificationRow {
+    let case_id =
+        normalize_optional_text(&product.product_id).unwrap_or_else(|| "raster".to_string());
+    let exported = match export_raster_geotiff(product.clone()) {
+        Ok(exported) => exported,
+        Err(error) => {
+            return certification_failed(
+                case_id,
+                RoundTripCertificationKind::RasterGeoTiff,
+                ImportFormat::GeoTiff,
+                validation_divergence(error),
+            );
+        }
+    };
+    let reopened = match reopen_raster_geotiff(&exported.exported_bytes) {
+        Ok(reopened) => reopened,
+        Err(error) => {
+            return certification_failed(
+                case_id,
+                RoundTripCertificationKind::RasterGeoTiff,
+                ImportFormat::GeoTiff,
+                validation_divergence(error),
+            );
+        }
+    };
+    if product.width != reopened.width || product.height != reopened.height {
+        return certification_failed(
+            case_id,
+            RoundTripCertificationKind::RasterGeoTiff,
+            ImportFormat::GeoTiff,
+            RoundTripDivergence::RasterShapeMismatch {
+                expected_width: product.width,
+                expected_height: product.height,
+                actual_width: reopened.width,
+                actual_height: reopened.height,
+            },
+        );
+    }
+    let expected_crs = product.spatial_ref.crs.clone().unwrap_or_default();
+    let actual_crs = reopened.spatial_ref.crs.clone().unwrap_or_default();
+    if expected_crs != actual_crs {
+        return certification_failed(
+            case_id,
+            RoundTripCertificationKind::RasterGeoTiff,
+            ImportFormat::GeoTiff,
+            RoundTripDivergence::CrsMismatch {
+                expected: expected_crs,
+                actual: actual_crs,
+            },
+        );
+    }
+    let expected_extent = product
+        .spatial_ref
+        .bbox
+        .as_ref()
+        .map(interop_extent_from_bounds);
+    let actual_extent = reopened
+        .spatial_ref
+        .bbox
+        .as_ref()
+        .map(interop_extent_from_bounds);
+    if let (Some(expected), Some(actual)) = (expected_extent, actual_extent) {
+        let drift = extent_drift(expected, actual);
+        if drift > GEOMETRY_EPSILON {
+            return certification_failed(
+                case_id,
+                RoundTripCertificationKind::RasterGeoTiff,
+                ImportFormat::GeoTiff,
+                RoundTripDivergence::ExtentDrift {
+                    drift,
+                    tolerance: GEOMETRY_EPSILON,
+                },
+            );
+        }
+    }
+    certification_passed(
+        case_id,
+        RoundTripCertificationKind::RasterGeoTiff,
+        ImportFormat::GeoTiff,
+    )
+}
+
+fn certify_prescription_shapefile_case(
+    prescription: PrescriptionShapefileRequest,
+) -> RoundTripCertificationRow {
+    let case_id = normalize_optional_text(&prescription.prescription_id)
+        .unwrap_or_else(|| "prescription-shapefile".to_string());
+    match export_prescription_shapefile(prescription) {
+        Ok(_) => certification_passed(
+            case_id,
+            RoundTripCertificationKind::PrescriptionShapefile,
+            ImportFormat::GeoJson,
+        ),
+        Err(error) => certification_failed(
+            case_id,
+            RoundTripCertificationKind::PrescriptionShapefile,
+            ImportFormat::GeoJson,
+            validation_divergence(error),
+        ),
+    }
+}
+
+fn certify_prescription_taskdata_case(
+    prescription: PrescriptionShapefileRequest,
+) -> RoundTripCertificationRow {
+    let case_id = normalize_optional_text(&prescription.prescription_id)
+        .map(|id| format!("{id}:taskdata"))
+        .unwrap_or_else(|| "prescription-taskdata".to_string());
+    match export_prescription_taskdata(prescription) {
+        Ok(report) if report.validation.valid => certification_passed(
+            case_id,
+            RoundTripCertificationKind::PrescriptionTaskData,
+            ImportFormat::GeoJson,
+        ),
+        Ok(_) => certification_failed(
+            case_id,
+            RoundTripCertificationKind::PrescriptionTaskData,
+            ImportFormat::GeoJson,
+            RoundTripDivergence::ValidationFailed {
+                reason: InteropRejectionReason::InvalidPrescription {
+                    reason: PrescriptionRejectionReason::InvalidTaskDataSchema {
+                        reason: "TaskData validation returned invalid".to_string(),
+                    },
+                },
+            },
+        ),
+        Err(error) => certification_failed(
+            case_id,
+            RoundTripCertificationKind::PrescriptionTaskData,
+            ImportFormat::GeoJson,
+            validation_divergence(error),
+        ),
+    }
+}
+
+fn certification_passed(
+    case_id: String,
+    kind: RoundTripCertificationKind,
+    format: ImportFormat,
+) -> RoundTripCertificationRow {
+    RoundTripCertificationRow {
+        case_id,
+        kind,
+        format,
+        status: RoundTripCertificationStatus::Passed,
+        divergence: None,
+    }
+}
+
+fn certification_failed(
+    case_id: String,
+    kind: RoundTripCertificationKind,
+    format: ImportFormat,
+    divergence: RoundTripDivergence,
+) -> RoundTripCertificationRow {
+    RoundTripCertificationRow {
+        case_id,
+        kind,
+        format,
+        status: RoundTripCertificationStatus::Failed,
+        divergence: Some(divergence),
+    }
+}
+
+fn validation_divergence(error: InteropError) -> RoundTripDivergence {
+    let InteropError::Rejected { reason, .. } = error;
+    RoundTripDivergence::ValidationFailed { reason }
+}
+
+fn interop_extent_from_bounds(bounds: &GeoBounds) -> InteropExtent {
+    InteropExtent {
+        min_x: bounds.min_lon,
+        min_y: bounds.min_lat,
+        max_x: bounds.max_lon,
+        max_y: bounds.max_lat,
+    }
 }
 
 pub fn validate_geopackage_layers(
@@ -3563,14 +3932,14 @@ impl ExtentBuilder {
 #[cfg(test)]
 mod tests {
     use super::{
-        emit_import_lineage, export_findings_geojson, export_findings_shapefile,
-        export_prescription_shapefile, export_prescription_taskdata, export_raster_geotiff,
-        import_field_boundary, import_trimble_boundaries, migrate_platform_round_trip,
-        pull_john_deere_boundaries, push_climate_fieldview_prescription,
-        push_john_deere_prescription, record_import_rejection, reopen_raster_geotiff,
-        round_trip_vector_layer, validate_and_reproject_import, validate_geopackage_layers,
-        validate_taskdata_xml, BulkFieldBoundaryImportRequest, BulkImportRowStatus,
-        ClimateFieldViewConnectorEndpoint, ClimateFieldViewConnectorError,
+        certify_round_trip_fidelity, emit_import_lineage, export_findings_geojson,
+        export_findings_shapefile, export_prescription_shapefile, export_prescription_taskdata,
+        export_raster_geotiff, import_field_boundary, import_trimble_boundaries,
+        migrate_platform_round_trip, pull_john_deere_boundaries,
+        push_climate_fieldview_prescription, push_john_deere_prescription, record_import_rejection,
+        reopen_raster_geotiff, round_trip_vector_layer, validate_and_reproject_import,
+        validate_geopackage_layers, validate_taskdata_xml, BulkFieldBoundaryImportRequest,
+        BulkImportRowStatus, ClimateFieldViewConnectorEndpoint, ClimateFieldViewConnectorError,
         ClimateFieldViewEndpointError, ClimateFieldViewPrescriptionPushRequest,
         ClimateFieldViewRemoteReceipt, ClimateFieldViewRetryPolicy, ClimateFieldViewUploadPayload,
         CrsTransform, FieldBoundaryImportRequest, FieldBoundaryRejectionReason,
@@ -3581,9 +3950,10 @@ mod tests {
         JohnDeereRetryPolicy, JohnDeereUploadPayload, PlatformMigrationEndpointError,
         PlatformMigrationItemKind, PlatformMigrationSource, PrescriptionField,
         PrescriptionRejectionReason, PrescriptionShapefileRequest, PrescriptionZone, RasterProduct,
-        RemotePrescriptionReceipt, ReprojectedGeometry, TrimbleBoundary,
-        TrimbleBoundaryImportRequest, TrimbleConnectorEndpoint, TrimbleConnectorError,
-        TrimbleEndpointError, TrimbleRetryPolicy,
+        RemotePrescriptionReceipt, ReprojectedGeometry, RoundTripCertificationKind,
+        RoundTripCertificationRequest, RoundTripCertificationStatus, RoundTripDivergence,
+        TrimbleBoundary, TrimbleBoundaryImportRequest, TrimbleConnectorEndpoint,
+        TrimbleConnectorError, TrimbleEndpointError, TrimbleRetryPolicy, VectorCertificationCase,
     };
     use provenance::{ActorIdentity, ActorKind, AuditLedger, AuditOutcome, LineageLedger};
     use shared::schemas::{GeoBounds, RasterResolution, RasterSpatialRef};
@@ -4764,6 +5134,62 @@ mod tests {
         assert!(report.reconciliation.discrepancy);
     }
 
+    #[test]
+    fn round_trip_certification_passes_for_supported_formats() {
+        let report = certify_round_trip_fidelity(RoundTripCertificationRequest {
+            vector_cases: vec![vector_certification_case(
+                "geojson-field-alpha",
+                valid_geojson("EPSG:4326").as_bytes().to_vec(),
+                None,
+            )],
+            raster_products: vec![raster_product()],
+            prescriptions: vec![john_deere_prescription_request()],
+        });
+
+        assert_eq!(report.failed_count, 0);
+        assert_eq!(report.passed_count, 4);
+        assert!(report
+            .rows
+            .iter()
+            .any(|row| row.kind == RoundTripCertificationKind::Vector));
+        assert!(report
+            .rows
+            .iter()
+            .any(|row| row.kind == RoundTripCertificationKind::RasterGeoTiff));
+        assert!(report
+            .rows
+            .iter()
+            .any(|row| row.kind == RoundTripCertificationKind::PrescriptionShapefile));
+        assert!(report
+            .rows
+            .iter()
+            .any(|row| row.kind == RoundTripCertificationKind::PrescriptionTaskData));
+    }
+
+    #[test]
+    fn round_trip_certification_names_crs_dropping_regression() {
+        let report = certify_round_trip_fidelity(RoundTripCertificationRequest {
+            vector_cases: vec![vector_certification_case(
+                "geojson-crs-drop",
+                valid_geojson("EPSG:4326").as_bytes().to_vec(),
+                Some(geojson_without_crs().as_bytes().to_vec()),
+            )],
+            raster_products: Vec::new(),
+            prescriptions: Vec::new(),
+        });
+
+        assert_eq!(report.passed_count, 0);
+        assert_eq!(report.failed_count, 1);
+        assert_eq!(report.rows[0].case_id, "geojson-crs-drop");
+        assert_eq!(report.rows[0].status, RoundTripCertificationStatus::Failed);
+        assert_eq!(
+            report.rows[0].divergence,
+            Some(RoundTripDivergence::ValidationFailed {
+                reason: InteropRejectionReason::MissingCrs
+            })
+        );
+    }
+
     #[derive(Default)]
     struct FakeJohnDeereEndpoint {
         push_results: Vec<Result<RemotePrescriptionReceipt, JohnDeereEndpointError>>,
@@ -5009,6 +5435,23 @@ mod tests {
         }
     }
 
+    fn vector_certification_case(
+        case_id: &str,
+        bytes: Vec<u8>,
+        injected_exported_bytes: Option<Vec<u8>>,
+    ) -> VectorCertificationCase {
+        VectorCertificationCase {
+            case_id: case_id.to_string(),
+            payload: ImportPayload {
+                format: ImportFormat::GeoJson,
+                filename: format!("{case_id}.geojson"),
+                bytes,
+            },
+            target_crs: "EPSG:4326".to_string(),
+            injected_exported_bytes,
+        }
+    }
+
     fn rectangle(min_x: f64, min_y: f64, max_x: f64, max_y: f64) -> Vec<InteropCoordinate> {
         vec![
             InteropCoordinate { x: min_x, y: max_y },
@@ -5182,6 +5625,27 @@ mod tests {
                 }}]
             }}"#
         )
+    }
+
+    fn geojson_without_crs() -> String {
+        r#"{
+            "type": "FeatureCollection",
+            "features": [{
+                "type": "Feature",
+                "properties": {"field_id": "alpha"},
+                "geometry": {
+                    "type": "Polygon",
+                    "coordinates": [[
+                        [-121.0, 39.0],
+                        [-120.99, 39.0],
+                        [-120.99, 39.01],
+                        [-121.0, 39.01],
+                        [-121.0, 39.0]
+                    ]]
+                }
+            }]
+        }"#
+        .to_string()
     }
 
     fn bowtie_geojson(crs: &str) -> String {
