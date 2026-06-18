@@ -3,10 +3,10 @@
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
 - **Last implementation commit**: 83a77b4 (`batch-20260618100014`)
-- **Latest checkpoint commit**: f5b67cf
+- **Latest checkpoint commit**: 38948b9
 - **Current batch**: none
 - **Completed feature rows**: 494 committed; 0 tests_passed; 2 skipped; 2 blocked; 0 pending in this run.
-- **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch.
+- **Blocker**: `07-11` GIS/geospatial hub and `18-10` payments/escrow remain blocked; no pending/claimed/in-progress/test-passed rows remain.
 
 ## Latest verification
 
