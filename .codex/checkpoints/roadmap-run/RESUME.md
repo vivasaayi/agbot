@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: e1311f4 (`batch-20260618015600`)
-- **Latest checkpoint commit**: 9829e24
+- **Last implementation commit**: d12a75e (`batch-20260618020700`)
+- **Latest checkpoint commit**: 4f53fa9
 - **Current batch**: none
-- **Completed feature rows**: 478 committed; 1 tests_passed; 2 skipped; 2 blocked; 15 pending in this run.
+- **Completed feature rows**: 479 committed; 1 tests_passed; 2 skipped; 2 blocked; 14 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch.
 
 ## Latest verification
@@ -121,6 +121,10 @@
 - `cargo test -p geo_hub --test products_api collaboration_` — pass
 - `cargo check -p geo_hub` — pass
 - `21-10` — committed as read-only grower portal collaboration feed with member-scoped stream/alert visibility, direct same-org stream access, direct foreign stream/alert 404 non-leakage, and cross-org feed denial
+- `cargo fmt` — pass
+- `cargo test -p orthomosaic refly_suggestion` — pass
+- `cargo check -p orthomosaic` — pass
+- `22-17` — committed as advisory-only model-assisted re-fly suggestion from deterministic orthomosaic QA, with cited coverage gap/quality metrics, bounded re-fly area, pending operator approval, no auto-dispatch, and no proposal for passing mosaics
 
 ## Next action
 
