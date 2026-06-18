@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: e3571c7 (`batch-20260618091431`)
-- **Latest checkpoint commit**: 4492ec8
+- **Last implementation commit**: d3b3833 (`batch-20260618092711`)
+- **Latest checkpoint commit**: b7f447d
 - **Current batch**: none
-- **Completed feature rows**: 490 committed; 1 tests_passed; 2 skipped; 2 blocked; 3 pending in this run.
+- **Completed feature rows**: 491 committed; 1 tests_passed; 2 skipped; 2 blocked; 2 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch.
 
 ## Latest verification
@@ -187,7 +187,11 @@
 - `cargo test -p plugin_sdk registry --lib` — pass
 - `cargo check -p plugin_sdk` — pass
 - `31-14` — verified as plugin registry browse/install with manifest version/capability catalog metadata, local manifest validation, host API re-check before registration/download authorization, disabled-by-default registration, explicit capability review, and incompatible-entry refusal without registration
+- `cargo fmt` — pass
+- `cargo test -p interop trimble --lib` — pass
+- `cargo check -p interop` — pass
+- `32-11` — verified as Trimble connector boundary import with mock endpoint, CRS/unit validation, field-boundary record creation in the target CRS, retry/backoff on endpoint timeout, and timeout surfacing without imported results
 
 ## Next action
 
-- Select and claim the next pending roadmap feature after `31-14` plugin registry install.
+- Select and claim the next pending roadmap feature after `32-11` Trimble connector.
