@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: 177945f (`batch-20260618004309`)
-- **Latest checkpoint commit**: fd25eee
+- **Last implementation commit**: 2fb1ae9 (`batch-20260618005324`)
+- **Latest checkpoint commit**: 9b08aba
 - **Current batch**: none
-- **Completed feature rows**: 472 committed; 1 tests_passed; 2 skipped; 2 blocked; 21 pending in this run.
+- **Completed feature rows**: 473 committed; 1 tests_passed; 2 skipped; 2 blocked; 20 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch.
 
 ## Latest verification
@@ -88,7 +88,12 @@
 - `cargo test -p geo_hub --test products_api collaboration_` — pass
 - `cargo check -p geo_hub` — pass
 - `21-04` — committed as live stream lifecycle with active camera-source start, persisted stream state, latency-bounded frame relay with encode/relay/view refs, authorized viewer frame listing, drop-to-reconnecting handling, cross-org viewer denial, and source-unavailable no-write
+- `cargo test -p shared collaboration_emergency_alert_fans_out_and_transitions_with_audit --lib` — pass
+- `cargo test -p geo_hub --test products_api collaboration_emergency_alert` — pass
+- `cargo test -p geo_hub --test products_api collaboration_` — pass
+- `cargo check -p geo_hub` — pass
+- `21-05` — committed as emergency alert lifecycle with `01`/`12` source refs, channel fan-out, retry-pending delivery failure records, raise/acknowledge/resolve audit trail, operator-only alert permission, and viewer denial without writes
 
 ## Next action
 
-- Select and claim the next pending feature `21-05` for emergency alerts.
+- Select and claim the next pending feature `21-06` for session recording and audit.
