@@ -95,49 +95,51 @@ use shared::schemas::{
     compare_sustainability_baseline, compute_biodiversity_proxy, compute_carbon_footprint,
     compute_drought_index, compute_marketplace_demand_forecast, compute_soil_carbon_proxy,
     compute_sustainability_kpi, content_portal_embed_item, create_community_contribution,
-    create_content_engagement_event, create_marketplace_fulfillment_record,
-    create_marketplace_rating_record, create_success_story_content, create_sustainability_baseline,
-    create_sustainability_mrv_trail, create_versioned_content, estimate_biomass,
-    fulfill_marketplace_inventory, moderate_community_contribution,
-    normalize_weather_provider_forecast, parse_biodiversity_proxy_status,
-    parse_carbon_footprint_status, parse_content_contribution_status,
-    parse_content_engagement_event_type, parse_content_status, parse_content_type,
-    parse_drought_index_type, parse_marketplace_account_status, parse_marketplace_catalog_category,
-    parse_marketplace_catalog_item_kind, parse_marketplace_demand_forecast_status,
-    parse_marketplace_fulfillment_status, parse_marketplace_listing_status,
-    parse_marketplace_order_status, parse_marketplace_party_type,
+    create_content_engagement_event, create_content_locale_variant,
+    create_marketplace_fulfillment_record, create_marketplace_rating_record,
+    create_success_story_content, create_sustainability_baseline, create_sustainability_mrv_trail,
+    create_versioned_content, estimate_biomass, fulfill_marketplace_inventory,
+    moderate_community_contribution, normalize_weather_provider_forecast,
+    parse_biodiversity_proxy_status, parse_carbon_footprint_status,
+    parse_content_contribution_status, parse_content_engagement_event_type, parse_content_status,
+    parse_content_type, parse_drought_index_type, parse_marketplace_account_status,
+    parse_marketplace_catalog_category, parse_marketplace_catalog_item_kind,
+    parse_marketplace_demand_forecast_status, parse_marketplace_fulfillment_status,
+    parse_marketplace_listing_status, parse_marketplace_order_status, parse_marketplace_party_type,
     parse_marketplace_unit_of_measure, parse_soil_carbon_proxy_status, parse_soil_moisture_qa_flag,
     parse_soil_moisture_rejection_reason, parse_sustainability_comparison_status,
     parse_sustainability_kpi_direction, parse_sustainability_kpi_status,
     parse_sustainability_metric_type, parse_sustainability_mrv_output_kind,
     parse_sustainability_trend, place_marketplace_order_record, prepare_open_data_publication,
     publish_marketplace_listing_record, release_marketplace_inventory,
-    reserve_marketplace_inventory, resolve_content_permissions, search_published_content,
-    soil_moisture_rejection_reason_for_error, soil_moisture_rejection_record,
-    transition_content_workflow, transition_marketplace_account_status,
-    transition_marketplace_fulfillment_status, transition_marketplace_order_status,
-    validate_field_boundary, weather_fetch_failure_record, AnnotationGeometry, AnnotationRecord,
-    BiodiversityProxyError, BiodiversityProxyRequest, BiodiversityProxyResult,
-    BiodiversityProxyStatus, BiomassEstimateError, BiomassEstimateRequest, BiomassEstimateResult,
-    CarbonEmissionFactor, CarbonFootprintComputeRequest, CarbonFootprintError,
-    CarbonFootprintInput, CarbonFootprintResult, CarbonFootprintStatus,
+    reserve_marketplace_inventory, resolve_content_permissions, resolve_localized_content,
+    search_published_content, soil_moisture_rejection_reason_for_error,
+    soil_moisture_rejection_record, transition_content_workflow,
+    transition_marketplace_account_status, transition_marketplace_fulfillment_status,
+    transition_marketplace_order_status, validate_field_boundary, weather_fetch_failure_record,
+    AnnotationGeometry, AnnotationRecord, BiodiversityProxyError, BiodiversityProxyRequest,
+    BiodiversityProxyResult, BiodiversityProxyStatus, BiomassEstimateError, BiomassEstimateRequest,
+    BiomassEstimateResult, CarbonEmissionFactor, CarbonFootprintComputeRequest,
+    CarbonFootprintError, CarbonFootprintInput, CarbonFootprintResult, CarbonFootprintStatus,
     CollaborationChannelCreateRequest, CollaborationChannelRecord, CollaborationChannelThread,
     CollaborationError, CollaborationMessageCreateRequest, CollaborationMessageRecord,
     ContentCommunityContributionCreateRequest, ContentCommunityContributionRecord,
     ContentContributionModerationAuditRecord, ContentContributionModerationRequest,
     ContentContributionModerationResult, ContentCreateRequest, ContentEditRequest,
     ContentEngagementEventCreateRequest, ContentEngagementEventRecord, ContentEngagementSummary,
-    ContentError, ContentPermissionResolveRequest, ContentPermissionSet, ContentPortalEmbed,
-    ContentPortalEmbedItem, ContentPortalEmbedRequest, ContentRecord, ContentSearchDocument,
-    ContentSearchRequest, ContentSearchResult, ContentStatus, ContentSuccessStoryCreateRequest,
-    ContentSuccessStoryRecord, ContentTagApplyRequest, ContentTagRecord, ContentTaxonomyKind,
-    ContentType, ContentVersionRecord, ContentWorkflowAction, ContentWorkflowAuditRecord,
-    ContentWorkflowTransitionRequest, ContentWorkflowTransitionResult, DroughtIndexComputeRequest,
-    DroughtIndexError, DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType,
-    FarmFieldEntityStatus, FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary,
-    FieldBoundaryRecord, FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
-    FleetNodeKind, FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
-    GpsCoords, ImageMetadata, MarketplaceAccountCreateRequest, MarketplaceAccountError,
+    ContentError, ContentLocaleVariantCreateRequest, ContentLocaleVariantRecord,
+    ContentLocalizedRecord, ContentPermissionResolveRequest, ContentPermissionSet,
+    ContentPortalEmbed, ContentPortalEmbedItem, ContentPortalEmbedRequest, ContentRecord,
+    ContentSearchDocument, ContentSearchRequest, ContentSearchResult, ContentStatus,
+    ContentSuccessStoryCreateRequest, ContentSuccessStoryRecord, ContentTagApplyRequest,
+    ContentTagRecord, ContentTaxonomyKind, ContentType, ContentVersionRecord,
+    ContentWorkflowAction, ContentWorkflowAuditRecord, ContentWorkflowTransitionRequest,
+    ContentWorkflowTransitionResult, DroughtIndexComputeRequest, DroughtIndexError,
+    DroughtIndexPeriod, DroughtIndexRecord, DroughtIndexType, FarmFieldEntityStatus,
+    FarmFieldListPage, FarmFieldListQuery, FarmRecord, FieldBoundary, FieldBoundaryRecord,
+    FieldRecord, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeKind,
+    FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, GpsCoords,
+    ImageMetadata, MarketplaceAccountCreateRequest, MarketplaceAccountError,
     MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplaceCatalogCategory,
     MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind,
     MarketplaceCatalogItemRecord, MarketplaceDemandForecastError, MarketplaceDemandForecastRecord,
@@ -950,6 +952,12 @@ pub struct ContentTagFilterQuery {
 pub struct ContentEngagementSummaryQuery {
     pub org_id: String,
     pub period: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContentLocalizedQuery {
+    pub org_id: String,
+    pub locale: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -5256,6 +5264,59 @@ pub async fn create_content_engagement_event_route(
     insert_content_engagement_event(&state, &event).await?;
 
     Ok(Json(event))
+}
+
+pub async fn create_content_locale_variant_route(
+    Path(content_id): Path<String>,
+    Query(query): Query<ContentItemScopeQuery>,
+    State(state): State<AppState>,
+    Json(request): Json<ContentLocaleVariantCreateRequest>,
+) -> AppResult<Json<ContentLocaleVariantRecord>> {
+    let org_id = normalize_optional_text(query.org_id)
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let content = load_content_record(&state, &content_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    if content.org_id != org_id {
+        return Err(AppError::NotFound);
+    }
+    let variant = create_content_locale_variant(
+        &content,
+        request,
+        format!("content-locale-version-{}", Uuid::new_v4()),
+        current_record_timestamp(),
+    )
+    .map_err(content_error)?;
+    upsert_content_locale_variant(&state, &variant).await?;
+
+    Ok(Json(variant))
+}
+
+pub async fn get_localized_content_item(
+    Path(content_id): Path<String>,
+    Query(query): Query<ContentLocalizedQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<ContentLocalizedRecord>> {
+    let org_id = normalize_optional_text(Some(query.org_id))
+        .ok_or_else(|| AppError::BadRequest("org_id query parameter is required".to_string()))?;
+    let versioned = load_versioned_content(&state, &content_id, &org_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    let canonical = versioned
+        .versions
+        .iter()
+        .find(|version| version.version_id == versioned.content.current_version)
+        .ok_or(AppError::NotFound)?;
+    let variant = load_content_locale_variant(&state, &content_id, &query.locale).await?;
+    let localized = resolve_localized_content(
+        &versioned.content,
+        canonical.body.clone(),
+        query.locale,
+        variant,
+    )
+    .map_err(content_error)?;
+
+    Ok(Json(localized))
 }
 
 pub async fn get_content_engagement_summary(
@@ -12503,6 +12564,20 @@ fn decode_community_contribution_record(
     })
 }
 
+fn decode_content_locale_variant_record(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<ContentLocaleVariantRecord> {
+    Ok(ContentLocaleVariantRecord {
+        content_id: row.get("content_id"),
+        locale: row.get("locale"),
+        version_id: row.get("version_id"),
+        body: row.get("body"),
+        status: parse_content_status(&row.get::<String, _>("status")).map_err(content_error)?,
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
 fn decode_content_engagement_event_record(
     row: &sqlx::sqlite::SqliteRow,
 ) -> AppResult<ContentEngagementEventRecord> {
@@ -16204,6 +16279,37 @@ async fn insert_content_engagement_event(
     Ok(())
 }
 
+async fn upsert_content_locale_variant(
+    state: &AppState,
+    variant: &ContentLocaleVariantRecord,
+) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO cms_content_locale_variants (
+            content_id, locale, version_id, body, status, created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        ON CONFLICT(content_id, locale) DO UPDATE SET
+            version_id = excluded.version_id,
+            body = excluded.body,
+            status = excluded.status,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(&variant.content_id)
+    .bind(&variant.locale)
+    .bind(&variant.version_id)
+    .bind(&variant.body)
+    .bind(variant.status.as_str())
+    .bind(&variant.created_at)
+    .bind(&variant.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
 async fn upsert_content_engagement_summary(
     state: &AppState,
     summary: &ContentEngagementSummary,
@@ -16480,6 +16586,30 @@ async fn load_content_engagement_events(
     rows.into_iter()
         .map(|row| decode_content_engagement_event_record(&row))
         .collect()
+}
+
+async fn load_content_locale_variant(
+    state: &AppState,
+    content_id: &str,
+    locale: &str,
+) -> AppResult<Option<ContentLocaleVariantRecord>> {
+    let normalized_locale = locale.trim().replace('_', "-").to_ascii_lowercase();
+    let row = sqlx::query(
+        r#"
+        SELECT content_id, locale, version_id, body, status, created_at, updated_at
+        FROM cms_content_locale_variants
+        WHERE content_id = ?1
+          AND locale = ?2
+        "#,
+    )
+    .bind(content_id)
+    .bind(normalized_locale)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_content_locale_variant_record(&row))
+        .transpose()
 }
 
 async fn load_content_versions(

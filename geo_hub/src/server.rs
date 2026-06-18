@@ -474,6 +474,14 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::get_content_engagement_summary),
         )
         .route(
+            "/api/content/items/:content_id/locales",
+            post(routes::create_content_locale_variant_route),
+        )
+        .route(
+            "/api/content/items/:content_id/localized",
+            get(routes::get_localized_content_item),
+        )
+        .route(
             "/api/content/permissions/resolve",
             get(routes::resolve_content_permissions_route),
         )

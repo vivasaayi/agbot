@@ -12600,6 +12600,37 @@ pub struct VersionedContentRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentLocaleVariantCreateRequest {
+    pub locale: String,
+    pub body: String,
+    #[serde(default)]
+    pub status: Option<ContentStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentLocaleVariantRecord {
+    pub content_id: String,
+    pub locale: String,
+    pub version_id: String,
+    pub body: String,
+    pub status: ContentStatus,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentLocalizedRecord {
+    pub content_id: String,
+    pub org_id: String,
+    pub locale: String,
+    pub version_id: String,
+    pub body: String,
+    pub status: ContentStatus,
+    pub fallback_used: bool,
+    pub evidence_refs: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentSuccessStoryRecord {
     pub content_id: String,
     pub grower: String,
@@ -13002,6 +13033,10 @@ pub enum ContentError {
     },
     #[error("unsupported content contribution status {value}")]
     UnsupportedContributionStatus { value: String },
+    #[error("content locale cannot be empty")]
+    EmptyLocale,
+    #[error("content locale variant is not published")]
+    LocaleVariantNotPublished,
 }
 
 pub fn create_versioned_content(
@@ -13060,6 +13095,71 @@ pub fn append_content_version(
     };
 
     Ok((updated, version))
+}
+
+pub fn create_content_locale_variant(
+    content: &ContentRecord,
+    request: ContentLocaleVariantCreateRequest,
+    generated_version_id: String,
+    created_at: String,
+) -> Result<ContentLocaleVariantRecord, ContentError> {
+    let locale = normalize_locale(request.locale).ok_or(ContentError::EmptyLocale)?;
+    let body = normalize_content_text(request.body).ok_or(ContentError::EmptyBody)?;
+    let version_id =
+        normalize_content_text(generated_version_id).ok_or(ContentError::EmptyVersionId)?;
+    let created_at = normalize_content_text(created_at).ok_or(ContentError::EmptyCreatedAt)?;
+
+    Ok(ContentLocaleVariantRecord {
+        content_id: content.content_id.clone(),
+        locale,
+        version_id,
+        body,
+        status: request.status.unwrap_or_default(),
+        created_at: created_at.clone(),
+        updated_at: created_at,
+    })
+}
+
+pub fn resolve_localized_content(
+    content: &ContentRecord,
+    canonical_body: String,
+    requested_locale: String,
+    variant: Option<ContentLocaleVariantRecord>,
+) -> Result<ContentLocalizedRecord, ContentError> {
+    let requested_locale = normalize_locale(requested_locale).ok_or(ContentError::EmptyLocale)?;
+    if let Some(variant) = variant.filter(|variant| {
+        variant.locale == requested_locale && variant.status == ContentStatus::Published
+    }) {
+        return Ok(ContentLocalizedRecord {
+            evidence_refs: vec![
+                format!("content:{}", content.content_id),
+                format!("content-locale-version:{}", variant.version_id),
+            ],
+            content_id: content.content_id.clone(),
+            org_id: content.org_id.clone(),
+            locale: variant.locale,
+            version_id: variant.version_id,
+            body: variant.body,
+            status: variant.status,
+            fallback_used: false,
+        });
+    }
+    if content.status != ContentStatus::Published {
+        return Err(ContentError::LocaleVariantNotPublished);
+    }
+    Ok(ContentLocalizedRecord {
+        content_id: content.content_id.clone(),
+        org_id: content.org_id.clone(),
+        locale: "canonical".to_string(),
+        version_id: content.current_version.clone(),
+        body: canonical_body,
+        status: content.status,
+        fallback_used: true,
+        evidence_refs: vec![
+            format!("content:{}", content.content_id),
+            format!("content-version:{}", content.current_version),
+        ],
+    })
 }
 
 pub fn create_success_story_content(
@@ -13673,6 +13773,11 @@ fn normalize_content_optional_text(value: Option<String>) -> Option<String> {
 fn normalize_content_text(value: String) -> Option<String> {
     let value = value.trim();
     (!value.is_empty()).then(|| value.to_string())
+}
+
+fn normalize_locale(value: String) -> Option<String> {
+    let value = value.trim().replace('_', "-").to_ascii_lowercase();
+    (!value.is_empty()).then_some(value)
 }
 
 fn validate_success_story_fields(
@@ -17186,9 +17291,10 @@ mod tests {
         compute_marketplace_demand_forecast, compute_soil_carbon_proxy, compute_sustainability_kpi,
         compute_water_evapotranspiration, compute_weather_growing_degree_day,
         compute_weather_reference_et, create_community_contribution,
-        create_content_engagement_event, create_marketplace_fulfillment_record,
-        create_marketplace_rating_record, create_success_story_content,
-        create_sustainability_baseline, create_sustainability_mrv_trail, create_versioned_content,
+        create_content_engagement_event, create_content_locale_variant,
+        create_marketplace_fulfillment_record, create_marketplace_rating_record,
+        create_success_story_content, create_sustainability_baseline,
+        create_sustainability_mrv_trail, create_versioned_content,
         deconflict_tractor_swath_reservations, derive_drought_mitigation_recommendation,
         detect_tractor_obstacle, dry_run_fleet_config_bundle, dry_run_irrigation_valve_plan,
         estimate_biomass, evaluate_access_anomaly_advisories, evaluate_and_route_drought_alerts,
@@ -17204,71 +17310,72 @@ mod tests {
         plan_tractor_swath_coverage, publish_marketplace_listing_record, query_drought_history,
         query_irrigation_history, query_weather_history, release_marketplace_inventory,
         report_water_use_savings, reserve_marketplace_inventory, resolve_content_permissions,
-        resolve_weather_forecast_to_field, route_weather_alert, run_tractor_straight_path_guidance,
-        schedule_irrigation_plan, search_published_content, sign_fleet_config_bundle,
-        soil_moisture_rejection_record, tractor_cross_track_error_m, transition_content_workflow,
-        transition_marketplace_account_status, transition_marketplace_fulfillment_status,
-        transition_marketplace_order_status, validate_field_boundary,
-        validate_water_weather_input_contract, verify_and_apply_fleet_config_bundle,
-        verify_weather_forecast_accuracy, weather_fetch_failure_record,
-        zone_water_need_insufficient, AccessAnomalySignal, AccessAnomalyThresholds,
-        AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry, AnnotationChangeType,
-        AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord, AuditedAnnotationRecord,
-        BiodiversityImageryLayer, BiodiversityProxyRequest, BiodiversityProxyStatus,
-        BiomassEstimateError, BiomassEstimateRequest, BiomassLayerInput, CarbonEmissionFactor,
-        CarbonFootprintComputeRequest, CarbonFootprintFactorSet, CarbonFootprintInput,
-        CarbonFootprintInputKind, CarbonFootprintStatus, CollaborationChannelCreateRequest,
-        CollaborationError, CollaborationMessageCreateRequest,
+        resolve_localized_content, resolve_weather_forecast_to_field, route_weather_alert,
+        run_tractor_straight_path_guidance, schedule_irrigation_plan, search_published_content,
+        sign_fleet_config_bundle, soil_moisture_rejection_record, tractor_cross_track_error_m,
+        transition_content_workflow, transition_marketplace_account_status,
+        transition_marketplace_fulfillment_status, transition_marketplace_order_status,
+        validate_field_boundary, validate_water_weather_input_contract,
+        verify_and_apply_fleet_config_bundle, verify_weather_forecast_accuracy,
+        weather_fetch_failure_record, zone_water_need_insufficient, AccessAnomalySignal,
+        AccessAnomalyThresholds, AccessAuditDecision, AccessAuditEvent, AnnotationAuditRegistry,
+        AnnotationChangeType, AnnotationGeometry, AnnotationPersistenceError, AnnotationRecord,
+        AuditedAnnotationRecord, BiodiversityImageryLayer, BiodiversityProxyRequest,
+        BiodiversityProxyStatus, BiomassEstimateError, BiomassEstimateRequest, BiomassLayerInput,
+        CarbonEmissionFactor, CarbonFootprintComputeRequest, CarbonFootprintFactorSet,
+        CarbonFootprintInput, CarbonFootprintInputKind, CarbonFootprintStatus,
+        CollaborationChannelCreateRequest, CollaborationError, CollaborationMessageCreateRequest,
         ContentCommunityContributionCreateRequest, ContentContributionModerationAction,
         ContentContributionModerationRequest, ContentContributionStatus, ContentCreateRequest,
         ContentEngagementEventCreateRequest, ContentEngagementEventRecord,
-        ContentEngagementEventType, ContentError, ContentPermissionResolveRequest,
-        ContentPortalEmbedRequest, ContentRecord, ContentSearchDocument, ContentSearchRequest,
-        ContentStatus, ContentSuccessMetric, ContentSuccessStoryCreateRequest,
-        ContentSuccessStoryFields, ContentTagApplyRequest, ContentTaxonomyKind, ContentTaxonomyTag,
-        ContentType, ContentWorkflowAction, ContentWorkflowActorRole,
-        ContentWorkflowTransitionRequest, CropPlanRecord, DroughtAdvisoryLoopRequest,
-        DroughtAdvisoryLoopStatus, DroughtAlertRoutingRequest, DroughtBaselineTrendError,
-        DroughtBaselineTrendRequest, DroughtBaselineTrendStatus, DroughtEvidenceFusionError,
-        DroughtEvidenceFusionRequest, DroughtEvidenceFusionStatus, DroughtEvidenceInputStatus,
-        DroughtForecastRequest, DroughtForecastStatus, DroughtForecastUncertaintyBand,
-        DroughtHistoryEntry, DroughtHistoryEntryKind, DroughtHistoryError, DroughtHistoryQuery,
-        DroughtIndexComputeRequest, DroughtIndexError, DroughtIndexPeriod, DroughtIndexType,
-        DroughtMitigationActionTarget, DroughtMitigationError, DroughtMitigationRequest,
-        DroughtMitigationStatus, DroughtReportError, DroughtReportRequest,
-        DroughtReportSectionKind, DroughtRiskBand, DroughtRiskScoreError, DroughtRiskScoreRequest,
-        DroughtRiskScoreStatus, DroughtRiskThresholds, DroughtStressEvidenceError,
-        DroughtStressEvidenceLayer, DroughtStressIndex, DroughtTrendDirection,
-        FarmFieldEntityStatus, FarmFieldError, FarmFieldListQuery, FarmFieldRegistry, FarmRecord,
-        FieldBoundary, FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord,
-        FleetConfigApplyStatus, FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState,
-        FleetHeartbeatEvaluation, FleetInventoryFilter, FleetNodeComponentHealth,
-        FleetNodeComponentStatus, FleetNodeEnrollmentError, FleetNodeEnrollmentRequest,
-        FleetNodeHealthState, FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError,
-        FleetNodeRecord, FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint,
-        IrrigationEventRecord, IrrigationEventRequest, IrrigationHistoryQuery,
-        IrrigationScheduleRequest, IrrigationValveActionStatus, IrrigationValveDryRunRequest,
-        IrrigationValveDryRunStatus, IrrigationValveExecuteRequest, IrrigationValveExecutionStatus,
-        IrrigationValveSpec, MarketplaceAccountCreateRequest, MarketplaceAccountError,
-        MarketplaceAccountRecord, MarketplaceAccountStatus, MarketplaceAvailabilityWindow,
-        MarketplaceCatalogCategory, MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest,
-        MarketplaceCatalogItemKind, MarketplaceDemandForecastRequest,
-        MarketplaceDemandForecastStatus, MarketplaceFulfillmentCreateRequest,
-        MarketplaceFulfillmentError, MarketplaceFulfillmentStatus, MarketplaceInventoryError,
-        MarketplaceInventoryUpsertRequest, MarketplaceListingError,
-        MarketplaceListingPublishRequest, MarketplaceListingStatus, MarketplaceOrderCreateRequest,
-        MarketplaceOrderError, MarketplaceOrderStatus, MarketplaceOrgReportRequest,
-        MarketplacePartyType, MarketplacePortalEntryError, MarketplaceRatingCreateRequest,
-        MarketplaceRatingError, MarketplaceReportPeriod, MarketplaceUnitOfMeasure,
-        MultispectralImage, OpenDataPublishError, OpenDataPublishRefusalReason,
-        OpenDataPublishRequest, RasterResolution, RasterSpatialRef, RasterSpatialRefError,
-        RecommendationLifecycleRegistry, RecommendationPersistenceError, RecommendationPriority,
-        RecommendationRecord, RecommendationStatus, RecommendationStatusChangeType,
-        RemoteSensingMoistureIndex, RemoteSensingMoistureProxyError,
-        RemoteSensingMoistureProxyLayer, RemoteSensingMoistureZoneValue, ReportDeliverableRegistry,
-        ReportFormat, ReportPersistenceError, ReportRecord, ReportVisibility,
-        SceneFieldCoverageStatus, SceneLayerMetadataError, SceneLayerRecord, SceneRecord,
-        SeasonRecord, SoilCarbonEvidenceInput, SoilCarbonPracticeInput, SoilCarbonProxyRequest,
+        ContentEngagementEventType, ContentError, ContentLocaleVariantCreateRequest,
+        ContentPermissionResolveRequest, ContentPortalEmbedRequest, ContentRecord,
+        ContentSearchDocument, ContentSearchRequest, ContentStatus, ContentSuccessMetric,
+        ContentSuccessStoryCreateRequest, ContentSuccessStoryFields, ContentTagApplyRequest,
+        ContentTaxonomyKind, ContentTaxonomyTag, ContentType, ContentWorkflowAction,
+        ContentWorkflowActorRole, ContentWorkflowTransitionRequest, CropPlanRecord,
+        DroughtAdvisoryLoopRequest, DroughtAdvisoryLoopStatus, DroughtAlertRoutingRequest,
+        DroughtBaselineTrendError, DroughtBaselineTrendRequest, DroughtBaselineTrendStatus,
+        DroughtEvidenceFusionError, DroughtEvidenceFusionRequest, DroughtEvidenceFusionStatus,
+        DroughtEvidenceInputStatus, DroughtForecastRequest, DroughtForecastStatus,
+        DroughtForecastUncertaintyBand, DroughtHistoryEntry, DroughtHistoryEntryKind,
+        DroughtHistoryError, DroughtHistoryQuery, DroughtIndexComputeRequest, DroughtIndexError,
+        DroughtIndexPeriod, DroughtIndexType, DroughtMitigationActionTarget,
+        DroughtMitigationError, DroughtMitigationRequest, DroughtMitigationStatus,
+        DroughtReportError, DroughtReportRequest, DroughtReportSectionKind, DroughtRiskBand,
+        DroughtRiskScoreError, DroughtRiskScoreRequest, DroughtRiskScoreStatus,
+        DroughtRiskThresholds, DroughtStressEvidenceError, DroughtStressEvidenceLayer,
+        DroughtStressIndex, DroughtTrendDirection, FarmFieldEntityStatus, FarmFieldError,
+        FarmFieldListQuery, FarmFieldRegistry, FarmRecord, FieldBoundary,
+        FieldBoundaryValidationError, FieldOperationalWindow, FieldRecord, FleetConfigApplyStatus,
+        FleetConfigBundle, FleetConfigRejectionReason, FleetConfigState, FleetHeartbeatEvaluation,
+        FleetInventoryFilter, FleetNodeComponentHealth, FleetNodeComponentStatus,
+        FleetNodeEnrollmentError, FleetNodeEnrollmentRequest, FleetNodeHealthState,
+        FleetNodeHeartbeat, FleetNodeKind, FleetNodeOperationError, FleetNodeRecord,
+        FleetNodeRuntimeMode, FleetNodeStatus, GeoBounds, GeoPoint, IrrigationEventRecord,
+        IrrigationEventRequest, IrrigationHistoryQuery, IrrigationScheduleRequest,
+        IrrigationValveActionStatus, IrrigationValveDryRunRequest, IrrigationValveDryRunStatus,
+        IrrigationValveExecuteRequest, IrrigationValveExecutionStatus, IrrigationValveSpec,
+        MarketplaceAccountCreateRequest, MarketplaceAccountError, MarketplaceAccountRecord,
+        MarketplaceAccountStatus, MarketplaceAvailabilityWindow, MarketplaceCatalogCategory,
+        MarketplaceCatalogError, MarketplaceCatalogItemCreateRequest, MarketplaceCatalogItemKind,
+        MarketplaceDemandForecastRequest, MarketplaceDemandForecastStatus,
+        MarketplaceFulfillmentCreateRequest, MarketplaceFulfillmentError,
+        MarketplaceFulfillmentStatus, MarketplaceInventoryError, MarketplaceInventoryUpsertRequest,
+        MarketplaceListingError, MarketplaceListingPublishRequest, MarketplaceListingStatus,
+        MarketplaceOrderCreateRequest, MarketplaceOrderError, MarketplaceOrderStatus,
+        MarketplaceOrgReportRequest, MarketplacePartyType, MarketplacePortalEntryError,
+        MarketplaceRatingCreateRequest, MarketplaceRatingError, MarketplaceReportPeriod,
+        MarketplaceUnitOfMeasure, MultispectralImage, OpenDataPublishError,
+        OpenDataPublishRefusalReason, OpenDataPublishRequest, RasterResolution, RasterSpatialRef,
+        RasterSpatialRefError, RecommendationLifecycleRegistry, RecommendationPersistenceError,
+        RecommendationPriority, RecommendationRecord, RecommendationStatus,
+        RecommendationStatusChangeType, RemoteSensingMoistureIndex,
+        RemoteSensingMoistureProxyError, RemoteSensingMoistureProxyLayer,
+        RemoteSensingMoistureZoneValue, ReportDeliverableRegistry, ReportFormat,
+        ReportPersistenceError, ReportRecord, ReportVisibility, SceneFieldCoverageStatus,
+        SceneLayerMetadataError, SceneLayerRecord, SceneRecord, SeasonRecord,
+        SoilCarbonEvidenceInput, SoilCarbonPracticeInput, SoilCarbonProxyRequest,
         SoilCarbonProxyStatus, SoilMoistureQaFlag, SoilMoistureReadingError,
         SoilMoistureReadingRequest, SoilMoistureRejectionReason,
         SustainabilityBaselineCreateRequest, SustainabilityBaselineRecord,
@@ -20291,6 +20398,59 @@ mod tests {
             scheduled.audit.scheduled_effective_at.as_deref(),
             Some("2026-06-14T00:00:00Z")
         );
+    }
+
+    #[test]
+    fn content_localization_serves_published_requested_locale() {
+        let mut content =
+            content_record_for_search("article-localized", "org-alpha", ContentStatus::Published);
+        content.current_version = "version-canonical".to_string();
+        let variant = create_content_locale_variant(
+            &content,
+            ContentLocaleVariantCreateRequest {
+                locale: "fr-FR".to_string(),
+                body: "Guide en francais sur les cultures de couverture.".to_string(),
+                status: Some(ContentStatus::Published),
+            },
+            "version-fr".to_string(),
+            "2026-06-17T07:32:00Z".to_string(),
+        )
+        .expect("locale variant should create");
+
+        let localized = resolve_localized_content(
+            &content,
+            "Canonical cover crop guide.".to_string(),
+            "fr_fr".to_string(),
+            Some(variant),
+        )
+        .expect("published locale should resolve");
+
+        assert_eq!(localized.locale, "fr-fr");
+        assert_eq!(localized.version_id, "version-fr");
+        assert!(!localized.fallback_used);
+        assert!(localized
+            .evidence_refs
+            .contains(&"content-locale-version:version-fr".to_string()));
+    }
+
+    #[test]
+    fn content_localization_falls_back_to_canonical_when_locale_missing() {
+        let mut content =
+            content_record_for_search("article-localized", "org-alpha", ContentStatus::Published);
+        content.current_version = "version-canonical".to_string();
+
+        let localized = resolve_localized_content(
+            &content,
+            "Canonical cover crop guide.".to_string(),
+            "es-MX".to_string(),
+            None,
+        )
+        .expect("missing locale should fall back");
+
+        assert_eq!(localized.locale, "canonical");
+        assert_eq!(localized.version_id, "version-canonical");
+        assert_eq!(localized.body, "Canonical cover crop guide.");
+        assert!(localized.fallback_used);
     }
 
     #[test]

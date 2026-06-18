@@ -7513,6 +7513,120 @@ async fn content_community_contribution_moderator_rejects_with_audit_without_con
 }
 
 #[tokio::test]
+async fn content_localization_serves_requested_published_locale() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-localized-fr",
+        "Canonical cover crop guide.",
+        "org-alpha",
+    )
+    .await?;
+    publish_content_fixture(&ctx, "article-localized-fr", "org-alpha").await?;
+
+    let create_locale = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/content/items/article-localized-fr/locales?org_id=org-alpha")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "locale": "fr-FR",
+                        "body": "Guide en francais sur les cultures de couverture.",
+                        "status": "published"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(create_locale.status(), StatusCode::OK);
+
+    let localized = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/items/article-localized-fr/localized?org_id=org-alpha&locale=fr_FR")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(localized.status(), StatusCode::OK);
+    let body = to_bytes(localized.into_body(), 64 * 1024).await?;
+    let localized: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        localized.get("locale").and_then(|value| value.as_str()),
+        Some("fr-fr")
+    );
+    assert_eq!(
+        localized.get("body").and_then(|value| value.as_str()),
+        Some("Guide en francais sur les cultures de couverture.")
+    );
+    assert_eq!(
+        localized
+            .get("fallback_used")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn content_localization_missing_locale_falls_back_to_canonical() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    create_content_fixture_body(
+        &ctx,
+        "article-localized-fallback",
+        "Canonical cover crop guide.",
+        "org-alpha",
+    )
+    .await?;
+    publish_content_fixture(&ctx, "article-localized-fallback", "org-alpha").await?;
+
+    let localized = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/content/items/article-localized-fallback/localized?org_id=org-alpha&locale=es-MX")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(localized.status(), StatusCode::OK);
+    let body = to_bytes(localized.into_body(), 64 * 1024).await?;
+    let localized: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        localized.get("locale").and_then(|value| value.as_str()),
+        Some("canonical")
+    );
+    assert_eq!(
+        localized.get("body").and_then(|value| value.as_str()),
+        Some("Canonical cover crop guide.")
+    );
+    assert_eq!(
+        localized
+            .get("fallback_used")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn collaboration_channels_create_post_list_and_deny_cross_org_read() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;

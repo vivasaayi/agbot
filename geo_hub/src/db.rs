@@ -1379,6 +1379,23 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS cms_content_locale_variants (
+            content_id TEXT NOT NULL,
+            locale TEXT NOT NULL,
+            version_id TEXT NOT NULL,
+            body TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY (content_id, locale)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS cms_community_contributions (
             contribution_id TEXT PRIMARY KEY,
             org_id TEXT NOT NULL,
