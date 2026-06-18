@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: 2fb1ae9 (`batch-20260618005324`)
-- **Latest checkpoint commit**: 9b08aba
+- **Last implementation commit**: f126620 (`batch-20260618010242`)
+- **Latest checkpoint commit**: af4cfb2
 - **Current batch**: none
-- **Completed feature rows**: 473 committed; 1 tests_passed; 2 skipped; 2 blocked; 20 pending in this run.
+- **Completed feature rows**: 474 committed; 1 tests_passed; 2 skipped; 2 blocked; 19 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch.
 
 ## Latest verification
@@ -93,7 +93,12 @@
 - `cargo test -p geo_hub --test products_api collaboration_` — pass
 - `cargo check -p geo_hub` — pass
 - `21-05` — committed as emergency alert lifecycle with `01`/`12` source refs, channel fan-out, retry-pending delivery failure records, raise/acknowledge/resolve audit trail, operator-only alert permission, and viewer denial without writes
+- `cargo test -p shared collaboration_session_replay_orders_events_and_preserves_gaps --lib` — pass
+- `cargo test -p geo_hub --test products_api collaboration_session` — pass
+- `cargo test -p geo_hub --test products_api collaboration_` — pass
+- `cargo check -p geo_hub` — pass
+- `21-06` — committed as immutable session recording and replay with deterministic event ordering, actor/timestamp/subject refs, explicit stream-gap representation, persisted events, and cross-org replay denial
 
 ## Next action
 
-- Select and claim the next pending feature `21-06` for session recording and audit.
+- Select and claim the next pending feature `21-07` for collaborative mission planning.
