@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: d12a75e (`batch-20260618020700`)
-- **Latest checkpoint commit**: 4f53fa9
+- **Last implementation commit**: 0264184 (`batch-20260618022730`)
+- **Latest checkpoint commit**: b58674a
 - **Current batch**: none
-- **Completed feature rows**: 479 committed; 1 tests_passed; 2 skipped; 2 blocked; 14 pending in this run.
+- **Completed feature rows**: 480 committed; 1 tests_passed; 2 skipped; 2 blocked; 13 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch.
 
 ## Latest verification
@@ -125,7 +125,15 @@
 - `cargo test -p orthomosaic refly_suggestion` — pass
 - `cargo check -p orthomosaic` — pass
 - `22-17` — committed as advisory-only model-assisted re-fly suggestion from deterministic orthomosaic QA, with cited coverage gap/quality metrics, bounded re-fly area, pending operator approval, no auto-dispatch, and no proposal for passing mosaics
+- `cargo fmt` — pass
+- `cargo test -p crop_intelligence inference_run_progress --lib` — pass
+- `cargo test -p crop_intelligence inference_run_stall --lib` — pass
+- `cargo test -p geo_hub --test products_api crop_intelligence_inference_progress` — pass
+- `cargo test -p geo_hub --test products_api crop_intelligence_` — pass
+- `cargo check -p crop_intelligence` — pass
+- `cargo check -p geo_hub` — pass
+- `23-04` — committed as crop inference run progress observability with timestamped tile progress, coverage fractions, persisted progress streams, stall detection after the configured no-progress window, and API coverage for non-stalled and flagged stalled runs
 
 ## Next action
 
-- Select and claim the next pending roadmap feature.
+- Select and claim the next pending roadmap feature after `23-04` crop inference progress observability.
