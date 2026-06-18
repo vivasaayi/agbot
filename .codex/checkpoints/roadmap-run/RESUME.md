@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: 8328738 (`batch-20260617073200`)
-- **Latest checkpoint commit**: pending commit after `8328738`
+- **Last implementation commit**: 3f1c292 (`batch-20260618002503`)
+- **Latest checkpoint commit**: b922ef0
 - **Current batch**: none
-- **Completed feature rows**: 469 committed; 1 tests_passed; 2 skipped; 2 blocked; 24 pending in this run.
+- **Completed feature rows**: 470 committed; 1 tests_passed; 2 skipped; 2 blocked; 23 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch.
 
 ## Latest verification
@@ -75,7 +75,11 @@
 - `cargo test -p geo_hub --test products_api content_` — pass
 - `cargo check -p geo_hub` — pass
 - `20-10` — committed as locale-tagged content variants with per-locale status, published requested-locale serving, deterministic missing-locale fallback to canonical published content, locale evidence refs, and persisted API coverage
+- `cargo test -p shared collaboration_permissions_are_role_and_tenant_scoped --lib` — pass
+- `cargo test -p geo_hub --test products_api collaboration_` — pass
+- `cargo check -p geo_hub` — pass
+- `21-02` — committed as tenant-scoped collaboration permission resolution with operator stream/dispatch grants, viewer stream/dispatch/post denials, denied-action audit rows, and no unauthorized message writes
 
 ## Next action
 
-- Select and claim the next pending feature `21-02` for realtime collaboration presence/editing foundation.
+- Select and claim the next pending feature `21-03` for presence and notifications.
