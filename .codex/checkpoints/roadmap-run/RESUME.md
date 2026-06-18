@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: e25f255 (`batch-20260617065100`)
-- **Latest checkpoint commit**: pending commit for `batch-20260617071000`
-- **Current batch**: `batch-20260617071000`
-- **Completed feature rows**: 467 committed; 2 tests_passed; 2 skipped; 2 blocked; 25 pending in this run.
+- **Last implementation commit**: 5eeade2 (`batch-20260617071000`)
+- **Latest checkpoint commit**: pending checkpoint commit after 5eeade2 (`batch-20260617071000`)
+- **Current batch**: none
+- **Completed feature rows**: 468 committed; 1 tests_passed; 2 skipped; 2 blocked; 25 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch.
 
 ## Latest verification
@@ -69,8 +69,8 @@
 - `cargo test -p geo_hub --test products_api content_community_contribution` — pass
 - `cargo test -p geo_hub --test products_api content_` — pass
 - `cargo check -p geo_hub` — pass
-- `20-09` — verified as community contribution moderation with submitted queue persistence, hidden/unpublished submissions, moderator-only approval/rejection through `cms:editor`, audited decisions, approved contributions converted to draft CMS content for the standard publish flow, and non-moderator denial leaving the queue item submitted
+- `20-09` — committed as community contribution moderation with submitted queue persistence, hidden/unpublished submissions, moderator-only approval/rejection through `cms:editor`, audited decisions, approved contributions converted to draft CMS content for the standard publish flow, and non-moderator denial leaving the queue item submitted
 
 ## Next action
 
-- Commit `batch-20260617071000` for `20-09`, update checkpoint commit SHA, then select and claim the next pending feature `20-10`.
+- Select and claim the next pending feature after `20-09` community moderation; next pending is `20-10` localization.
