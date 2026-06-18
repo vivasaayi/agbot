@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: 2ce4b8f (`batch-20260618003451`)
-- **Latest checkpoint commit**: 4d9cb7a
+- **Last implementation commit**: 177945f (`batch-20260618004309`)
+- **Latest checkpoint commit**: fd25eee
 - **Current batch**: none
-- **Completed feature rows**: 471 committed; 1 tests_passed; 2 skipped; 2 blocked; 22 pending in this run.
+- **Completed feature rows**: 472 committed; 1 tests_passed; 2 skipped; 2 blocked; 21 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch.
 
 ## Latest verification
@@ -83,7 +83,12 @@
 - `cargo test -p geo_hub --test products_api collaboration_` — pass
 - `cargo check -p geo_hub` — pass
 - `21-03` — committed as collaboration presence and notifications with online heartbeat persistence, stale heartbeat expiry to offline, channel-member notification fan-out, delivered-state persistence, and tenant-scoped channel checks
+- `cargo test -p shared collaboration_stream_starts_relays_and_reconnects_on_drop --lib` — pass
+- `cargo test -p geo_hub --test products_api collaboration_stream` — pass
+- `cargo test -p geo_hub --test products_api collaboration_` — pass
+- `cargo check -p geo_hub` — pass
+- `21-04` — committed as live stream lifecycle with active camera-source start, persisted stream state, latency-bounded frame relay with encode/relay/view refs, authorized viewer frame listing, drop-to-reconnecting handling, cross-org viewer denial, and source-unavailable no-write
 
 ## Next action
 
-- Select and claim the next pending feature `21-04` for live drone video streaming.
+- Select and claim the next pending feature `21-05` for emergency alerts.
