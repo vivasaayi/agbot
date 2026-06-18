@@ -531,6 +531,75 @@ impl RemainingUsefulLifeEstimate {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PredictiveMaintenanceScheduleRequest {
+    #[serde(default)]
+    pub proposal_id: Option<String>,
+    #[serde(default)]
+    pub generated_at: String,
+    pub rul_estimate: RemainingUsefulLifeEstimate,
+    pub severity: MaintenanceWorkOrderSeverity,
+    #[serde(default)]
+    pub requested_by: String,
+    #[serde(default)]
+    pub authorize_dispatch: bool,
+    #[serde(default)]
+    pub clear_existing_verdict: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PredictiveMaintenanceScheduleApprovalStatus {
+    PendingFleetTechApproval,
+    Approved,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PredictiveMaintenanceScheduleProposal {
+    pub proposal_id: String,
+    pub component_id: String,
+    pub generated_at: String,
+    pub requested_by: String,
+    pub severity: MaintenanceWorkOrderSeverity,
+    pub window_start: String,
+    pub window_end: String,
+    pub expected_service_at: String,
+    pub uncertainty_lower_days: f64,
+    pub uncertainty_expected_days: f64,
+    pub uncertainty_upper_days: f64,
+    pub confidence: f64,
+    pub uncertainty_summary: String,
+    pub evidence_refs: Vec<String>,
+    pub requires_fleet_tech_approval: bool,
+    pub approval_status: PredictiveMaintenanceScheduleApprovalStatus,
+    pub dispatch_authorized: bool,
+    pub clears_verdict: bool,
+    pub readiness_status: FleetReadinessDecisionStatus,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct PredictiveMaintenanceScheduleApprovalRequest {
+    #[serde(default)]
+    pub approved_by: String,
+    #[serde(default)]
+    pub approved_at: String,
+    #[serde(default)]
+    pub generated_wo_id: String,
+    #[serde(default)]
+    pub authorize_dispatch: bool,
+    #[serde(default)]
+    pub clear_existing_verdict: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ApprovedPredictiveMaintenanceSchedule {
+    pub proposal: PredictiveMaintenanceScheduleProposal,
+    pub work_order: MaintenanceWorkOrder,
+    pub dispatch_authorized: bool,
+    pub clears_verdict: bool,
+    pub readiness_status: FleetReadinessDecisionStatus,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HealthEvidenceSubjectKind {
@@ -1134,6 +1203,16 @@ pub enum FleetHealthError {
     HealthEvidenceOverwriteRefused { record_id: String },
     #[error("remaining useful life confidence must be finite and in the range 0.0..=1.0")]
     InvalidRemainingUsefulLifeConfidence,
+    #[error("predictive maintenance schedule proposal_id cannot be empty")]
+    EmptyMaintenanceScheduleProposalId,
+    #[error("predictive maintenance schedule requires an available RUL range")]
+    RemainingUsefulLifeUnavailableForScheduling,
+    #[error("predictive maintenance schedule window must be finite, non-negative, and ordered lower <= expected <= upper")]
+    InvalidMaintenanceScheduleWindow,
+    #[error(
+        "predictive maintenance scheduling cannot authorize dispatch or clear a health verdict"
+    )]
+    PredictiveMaintenanceAutoActionRefused,
     #[error(
         "health threshold must be finite, non-negative, and ordered watch <= degraded <= critical"
     )]
@@ -1907,6 +1986,122 @@ pub fn estimate_remaining_useful_life(
         confidence: request.confidence,
         evidence_refs: request.trend_report.evidence_refs,
         readiness_status: request.readiness_decision.status,
+    })
+}
+
+pub fn propose_predictive_maintenance_schedule(
+    request: PredictiveMaintenanceScheduleRequest,
+    generated_proposal_id: String,
+) -> Result<PredictiveMaintenanceScheduleProposal, FleetHealthError> {
+    if request.authorize_dispatch || request.clear_existing_verdict {
+        return Err(FleetHealthError::PredictiveMaintenanceAutoActionRefused);
+    }
+
+    let proposal_id = match request.proposal_id {
+        Some(proposal_id) => normalize_required_text(
+            proposal_id,
+            FleetHealthError::EmptyMaintenanceScheduleProposalId,
+        )?,
+        None => normalize_required_text(
+            generated_proposal_id,
+            FleetHealthError::EmptyMaintenanceScheduleProposalId,
+        )?,
+    };
+    let generated_at =
+        normalize_required_text(request.generated_at, FleetHealthError::EmptyCreatedAt)?;
+    let generated_at_ts = parse_health_sample_timestamp(&generated_at)?;
+    let requested_by = normalize_required_text(
+        request.requested_by,
+        FleetHealthError::EmptyServiceTechnician,
+    )?;
+    let rul = request.rul_estimate;
+    if rul.status != RemainingUsefulLifeStatus::Available {
+        return Err(FleetHealthError::RemainingUsefulLifeUnavailableForScheduling);
+    }
+    let lower_days = rul
+        .lower_days
+        .ok_or(FleetHealthError::RemainingUsefulLifeUnavailableForScheduling)?;
+    let expected_days = rul
+        .expected_days
+        .ok_or(FleetHealthError::RemainingUsefulLifeUnavailableForScheduling)?;
+    let upper_days = rul
+        .upper_days
+        .ok_or(FleetHealthError::RemainingUsefulLifeUnavailableForScheduling)?;
+    validate_maintenance_schedule_window(lower_days, expected_days, upper_days)?;
+    validate_confidence(rul.confidence)?;
+
+    let window_start = add_days_to_timestamp(generated_at_ts, lower_days)?;
+    let expected_service_at = add_days_to_timestamp(generated_at_ts, expected_days)?;
+    let window_end = add_days_to_timestamp(generated_at_ts, upper_days)?;
+    let uncertainty_summary = format!(
+        "RUL {:.2}-{:.2} days (expected {:.2}, confidence {:.0}%)",
+        lower_days,
+        upper_days,
+        expected_days,
+        rul.confidence * 100.0
+    );
+
+    Ok(PredictiveMaintenanceScheduleProposal {
+        proposal_id,
+        component_id: rul.component_id,
+        generated_at,
+        requested_by,
+        severity: request.severity,
+        window_start,
+        window_end,
+        expected_service_at,
+        uncertainty_lower_days: lower_days,
+        uncertainty_expected_days: expected_days,
+        uncertainty_upper_days: upper_days,
+        confidence: rul.confidence,
+        uncertainty_summary,
+        evidence_refs: rul.evidence_refs,
+        requires_fleet_tech_approval: true,
+        approval_status: PredictiveMaintenanceScheduleApprovalStatus::PendingFleetTechApproval,
+        dispatch_authorized: false,
+        clears_verdict: false,
+        readiness_status: rul.readiness_status,
+    })
+}
+
+pub fn approve_predictive_maintenance_schedule(
+    mut proposal: PredictiveMaintenanceScheduleProposal,
+    request: PredictiveMaintenanceScheduleApprovalRequest,
+) -> Result<ApprovedPredictiveMaintenanceSchedule, FleetHealthError> {
+    if request.authorize_dispatch || request.clear_existing_verdict {
+        return Err(FleetHealthError::PredictiveMaintenanceAutoActionRefused);
+    }
+    let approved_by = normalize_required_text(
+        request.approved_by,
+        FleetHealthError::EmptyServiceTechnician,
+    )?;
+    let approved_at =
+        normalize_required_text(request.approved_at, FleetHealthError::EmptyCreatedAt)?;
+    let generated_wo_id =
+        normalize_required_text(request.generated_wo_id, FleetHealthError::EmptyWorkOrderId)?;
+
+    proposal.approval_status = PredictiveMaintenanceScheduleApprovalStatus::Approved;
+    let work_order = open_maintenance_work_order(
+        OpenMaintenanceWorkOrderRequest {
+            wo_id: None,
+            component_id: proposal.component_id.clone(),
+            reason: format!(
+                "predictive maintenance schedule {}; uncertainty {}",
+                proposal.proposal_id, proposal.uncertainty_summary
+            ),
+            severity: proposal.severity,
+            opened_at: approved_at,
+            technician: approved_by,
+        },
+        generated_wo_id,
+    )?;
+
+    Ok(ApprovedPredictiveMaintenanceSchedule {
+        readiness_status: proposal.readiness_status,
+        proposal,
+        work_order,
+        dispatch_authorized: false,
+        clears_verdict: false,
     })
 }
 
@@ -3173,6 +3368,41 @@ fn validate_degradation_config(
     }
 }
 
+fn validate_maintenance_schedule_window(
+    lower_days: f64,
+    expected_days: f64,
+    upper_days: f64,
+) -> Result<(), FleetHealthError> {
+    let valid = lower_days.is_finite()
+        && expected_days.is_finite()
+        && upper_days.is_finite()
+        && lower_days >= 0.0
+        && expected_days >= lower_days
+        && upper_days >= expected_days;
+    if valid {
+        Ok(())
+    } else {
+        Err(FleetHealthError::InvalidMaintenanceScheduleWindow)
+    }
+}
+
+fn add_days_to_timestamp(
+    timestamp: chrono::DateTime<chrono::Utc>,
+    days: f64,
+) -> Result<String, FleetHealthError> {
+    if !days.is_finite() || days < 0.0 {
+        return Err(FleetHealthError::InvalidMaintenanceScheduleWindow);
+    }
+    let seconds = (days * 86_400.0).round();
+    if seconds < 0.0 || seconds > i64::MAX as f64 {
+        return Err(FleetHealthError::InvalidMaintenanceScheduleWindow);
+    }
+    let scheduled = timestamp
+        .checked_add_signed(chrono::Duration::seconds(seconds as i64))
+        .ok_or(FleetHealthError::InvalidMaintenanceScheduleWindow)?;
+    Ok(scheduled.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+}
+
 fn parse_health_sample_timestamp(
     value: &str,
 ) -> Result<chrono::DateTime<chrono::Utc>, FleetHealthError> {
@@ -3580,21 +3810,23 @@ fn validate_nonnegative_finite(
 mod tests {
     use super::{
         accrue_component_duty, append_health_evidence_record, apply_rollout_control,
-        build_component_duty_accruals, build_component_record,
-        build_degradation_event_evidence_record, build_fleet_health_dashboard,
-        build_fleet_operations_dashboard_feed, build_health_verdict_evidence_record,
-        close_maintenance_work_order, component_event, derive_health_indicators,
-        detect_health_indicator_degradation, estimate_remaining_useful_life,
-        evaluate_battery_health_trend, evaluate_component_health_verdict, evaluate_fleet_readiness,
+        approve_predictive_maintenance_schedule, build_component_duty_accruals,
+        build_component_record, build_degradation_event_evidence_record,
+        build_fleet_health_dashboard, build_fleet_operations_dashboard_feed,
+        build_health_verdict_evidence_record, close_maintenance_work_order, component_event,
+        derive_health_indicators, detect_health_indicator_degradation,
+        estimate_remaining_useful_life, evaluate_battery_health_trend,
+        evaluate_component_health_verdict, evaluate_fleet_readiness,
         evaluate_fleet_readiness_with_work_orders, evaluate_ota_rollout,
         evaluate_predictive_maintenance_advisory, fleet_operations_source_current,
         fleet_operations_source_unavailable, install_component, integrate_ground_vehicle_health,
-        open_maintenance_work_order, refuse_health_evidence_overwrite, suggest_rollout_strategy,
-        BatteryHealthTrendConfig, CloseMaintenanceWorkOrderRequest, ComponentHealthVerdict,
-        ComponentHealthVerdictRequest, ComponentHealthVerdictStatus, ComponentServiceLimit,
-        DutyAccrualRequest, FleetComponentRecord, FleetComponentType,
-        FleetHealthDashboardAircraftStatus, FleetHealthDashboardRequest, FleetHealthError,
-        FleetHealthIndicator, FleetOperationsFeedSource, FleetOperationsFeedSourceStatus,
+        open_maintenance_work_order, propose_predictive_maintenance_schedule,
+        refuse_health_evidence_overwrite, suggest_rollout_strategy, BatteryHealthTrendConfig,
+        CloseMaintenanceWorkOrderRequest, ComponentHealthVerdict, ComponentHealthVerdictRequest,
+        ComponentHealthVerdictStatus, ComponentServiceLimit, DutyAccrualRequest,
+        FleetComponentRecord, FleetComponentType, FleetHealthDashboardAircraftStatus,
+        FleetHealthDashboardRequest, FleetHealthError, FleetHealthIndicator,
+        FleetOperationsFeedSource, FleetOperationsFeedSourceStatus,
         FleetOperationsRolloutFeedState, FleetReadinessBlockReason, FleetReadinessDecision,
         FleetReadinessDecisionStatus, FleetReadinessRequest, GroundVehicleHealthIngestRequest,
         HealthDegradationDetectionConfig, HealthDegradationDetectionRequest,
@@ -3606,11 +3838,13 @@ mod tests {
         OtaArtifactVersion, OtaNodeHealthReport, OtaRolloutDecisionReason,
         OtaRolloutDecisionStatus, OtaRolloutNode, OtaRolloutRequest, OtaRolloutStage,
         PredictiveMaintenanceAdvisoryReason, PredictiveMaintenanceAdvisoryRequest,
-        PredictiveMaintenanceAdvisoryStatus, RegisterComponentRequest,
-        RemainingUsefulLifeReasonCode, RemainingUsefulLifeRequest, RemainingUsefulLifeStatus,
-        RolloutControlAction, RolloutControlReason, RolloutControlRequest, RolloutControlStatus,
-        RolloutStrategyAdvisoryReason, RolloutStrategyAdvisoryRequest,
-        RolloutStrategyAdvisoryStatus, ServiceHistoryEntry, TelemetryHealthIndicatorRequest,
+        PredictiveMaintenanceAdvisoryStatus, PredictiveMaintenanceScheduleApprovalRequest,
+        PredictiveMaintenanceScheduleApprovalStatus, PredictiveMaintenanceScheduleRequest,
+        RegisterComponentRequest, RemainingUsefulLifeReasonCode, RemainingUsefulLifeRequest,
+        RemainingUsefulLifeStatus, RolloutControlAction, RolloutControlReason,
+        RolloutControlRequest, RolloutControlStatus, RolloutStrategyAdvisoryReason,
+        RolloutStrategyAdvisoryRequest, RolloutStrategyAdvisoryStatus, ServiceHistoryEntry,
+        TelemetryHealthIndicatorRequest,
     };
     use shared::fleet_alerts::{
         FleetAlertComparator, FleetAlertEvidence, FleetAlertKind, FleetAlertRecord,
@@ -4489,6 +4723,171 @@ mod tests {
             FleetReadinessDecisionStatus::Blocked
         );
         assert!(estimate.expected_days.is_none());
+    }
+
+    #[test]
+    fn predictive_maintenance_schedule_proposes_window_with_uncertainty_and_approval_gate() {
+        let estimate = estimate_remaining_useful_life(RemainingUsefulLifeRequest {
+            component_id: "motor-001".to_string(),
+            evaluated_at: "2026-06-22T16:00:00Z".to_string(),
+            method_version: "fleet-rul-v1".to_string(),
+            enabled: true,
+            trend_report: degrading_trend_report(),
+            readiness_decision: permitted_readiness_decision(),
+            current_value: 0.65,
+            failure_threshold: 1.25,
+            confidence: 0.80,
+        })
+        .expect("rul should estimate");
+
+        let proposal = propose_predictive_maintenance_schedule(
+            PredictiveMaintenanceScheduleRequest {
+                proposal_id: Some("sched-001".to_string()),
+                generated_at: "2026-06-22T16:00:00Z".to_string(),
+                rul_estimate: estimate,
+                severity: MaintenanceWorkOrderSeverity::Degraded,
+                requested_by: "planner-1".to_string(),
+                authorize_dispatch: false,
+                clear_existing_verdict: false,
+            },
+            "generated-sched".to_string(),
+        )
+        .expect("schedule proposal should build");
+
+        assert_eq!(proposal.proposal_id, "sched-001");
+        assert_eq!(proposal.component_id, "motor-001");
+        assert_eq!(
+            proposal.approval_status,
+            PredictiveMaintenanceScheduleApprovalStatus::PendingFleetTechApproval
+        );
+        assert!(proposal.requires_fleet_tech_approval);
+        assert!(!proposal.dispatch_authorized);
+        assert!(!proposal.clears_verdict);
+        assert!(proposal.window_start < proposal.expected_service_at);
+        assert!(proposal.expected_service_at < proposal.window_end);
+        assert!(proposal.uncertainty_summary.contains("RUL"));
+        assert!(proposal.uncertainty_summary.contains("confidence 80%"));
+        assert!(proposal.uncertainty_lower_days < proposal.uncertainty_expected_days);
+        assert!(proposal.uncertainty_expected_days < proposal.uncertainty_upper_days);
+        assert_eq!(proposal.evidence_refs.len(), 4);
+    }
+
+    #[test]
+    fn approved_predictive_maintenance_schedule_opens_work_order_without_dispatch_authority() {
+        let proposal = propose_predictive_maintenance_schedule(
+            PredictiveMaintenanceScheduleRequest {
+                proposal_id: Some("sched-001".to_string()),
+                generated_at: "2026-06-22T16:00:00Z".to_string(),
+                rul_estimate: estimate_remaining_useful_life(RemainingUsefulLifeRequest {
+                    component_id: "motor-001".to_string(),
+                    evaluated_at: "2026-06-22T16:00:00Z".to_string(),
+                    method_version: "fleet-rul-v1".to_string(),
+                    enabled: true,
+                    trend_report: degrading_trend_report(),
+                    readiness_decision: permitted_readiness_decision(),
+                    current_value: 0.65,
+                    failure_threshold: 1.25,
+                    confidence: 0.80,
+                })
+                .expect("rul should estimate"),
+                severity: MaintenanceWorkOrderSeverity::Degraded,
+                requested_by: "planner-1".to_string(),
+                authorize_dispatch: false,
+                clear_existing_verdict: false,
+            },
+            "generated-sched".to_string(),
+        )
+        .expect("schedule proposal should build");
+
+        let approved = approve_predictive_maintenance_schedule(
+            proposal,
+            PredictiveMaintenanceScheduleApprovalRequest {
+                approved_by: "fleet-tech-1".to_string(),
+                approved_at: "2026-06-22T17:00:00Z".to_string(),
+                generated_wo_id: "wo-predictive-001".to_string(),
+                authorize_dispatch: false,
+                clear_existing_verdict: false,
+            },
+        )
+        .expect("approval should open work order");
+
+        assert_eq!(
+            approved.proposal.approval_status,
+            PredictiveMaintenanceScheduleApprovalStatus::Approved
+        );
+        assert_eq!(approved.work_order.wo_id, "wo-predictive-001");
+        assert_eq!(approved.work_order.status, MaintenanceWorkOrderStatus::Open);
+        assert!(approved.work_order.reason.contains("uncertainty RUL"));
+        assert!(!approved.dispatch_authorized);
+        assert!(!approved.clears_verdict);
+        assert_eq!(
+            approved.readiness_status,
+            FleetReadinessDecisionStatus::Permitted
+        );
+    }
+
+    #[test]
+    fn predictive_maintenance_schedule_refuses_auto_dispatch_or_verdict_clearance() {
+        let estimate = estimate_remaining_useful_life(RemainingUsefulLifeRequest {
+            component_id: "motor-001".to_string(),
+            evaluated_at: "2026-06-22T16:00:00Z".to_string(),
+            method_version: "fleet-rul-v1".to_string(),
+            enabled: true,
+            trend_report: degrading_trend_report(),
+            readiness_decision: permitted_readiness_decision(),
+            current_value: 0.65,
+            failure_threshold: 1.25,
+            confidence: 0.80,
+        })
+        .expect("rul should estimate");
+
+        let proposal_error = propose_predictive_maintenance_schedule(
+            PredictiveMaintenanceScheduleRequest {
+                proposal_id: Some("sched-001".to_string()),
+                generated_at: "2026-06-22T16:00:00Z".to_string(),
+                rul_estimate: estimate.clone(),
+                severity: MaintenanceWorkOrderSeverity::Degraded,
+                requested_by: "planner-1".to_string(),
+                authorize_dispatch: true,
+                clear_existing_verdict: false,
+            },
+            "generated-sched".to_string(),
+        )
+        .expect_err("proposal should not authorize dispatch");
+        assert_eq!(
+            proposal_error,
+            FleetHealthError::PredictiveMaintenanceAutoActionRefused
+        );
+
+        let proposal = propose_predictive_maintenance_schedule(
+            PredictiveMaintenanceScheduleRequest {
+                proposal_id: Some("sched-001".to_string()),
+                generated_at: "2026-06-22T16:00:00Z".to_string(),
+                rul_estimate: estimate,
+                severity: MaintenanceWorkOrderSeverity::Degraded,
+                requested_by: "planner-1".to_string(),
+                authorize_dispatch: false,
+                clear_existing_verdict: false,
+            },
+            "generated-sched".to_string(),
+        )
+        .expect("schedule proposal should build");
+        let approval_error = approve_predictive_maintenance_schedule(
+            proposal,
+            PredictiveMaintenanceScheduleApprovalRequest {
+                approved_by: "fleet-tech-1".to_string(),
+                approved_at: "2026-06-22T17:00:00Z".to_string(),
+                generated_wo_id: "wo-predictive-001".to_string(),
+                authorize_dispatch: false,
+                clear_existing_verdict: true,
+            },
+        )
+        .expect_err("approval should not clear verdicts");
+
+        assert_eq!(
+            approval_error,
+            FleetHealthError::PredictiveMaintenanceAutoActionRefused
+        );
     }
 
     #[test]
