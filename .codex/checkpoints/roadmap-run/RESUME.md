@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: 9180eee (`batch-20260618094613`)
-- **Latest checkpoint commit**: 0d8e7e5
+- **Last implementation commit**: 83a77b4 (`batch-20260618100014`)
+- **Latest checkpoint commit**: b0dd22c
 - **Current batch**: none
-- **Completed feature rows**: 492 committed; 1 tests_passed; 2 skipped; 2 blocked; 1 pending in this run.
+- **Completed feature rows**: 493 committed; 1 tests_passed; 2 skipped; 2 blocked; 0 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch.
 
 ## Latest verification
@@ -195,7 +195,11 @@
 - `cargo test -p interop migration --lib` — pass
 - `cargo check -p interop` — pass
 - `32-13` — verified as platform migration round-trip with mock source pulls for boundaries and prescriptions, reuse of validated import/export paths, reconciliation counts/areas/CRS, and invalid item reporting as unmigrated with discrepancy flagged
+- `cargo fmt` — pass
+- `cargo test -p interop certification --lib` — pass
+- `cargo check -p interop` — pass
+- `32-14` — verified as round-trip fidelity certification suite for vector GeoJSON, raster GeoTIFF, prescription Shapefile, and TaskData, with named certification rows and explicit CRS-dropping regression failure
 
 ## Next action
 
-- Select and claim the next pending roadmap feature after `32-13` platform migration round-trip.
+- Reassess roadmap checkpoint state; no pending feature rows remain apart from the carried `05-21` tests_passed row and blocked/skipped rows.
