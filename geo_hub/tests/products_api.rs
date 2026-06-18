@@ -13230,6 +13230,201 @@ async fn crop_intelligence_rejects_uncited_finding_emission() -> Result<()> {
 }
 
 #[tokio::test]
+async fn crop_intelligence_closed_loop_proposal_is_advisory_and_approval_gated() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+
+    let verified_finding = json!({
+        "finding_id": "finding-closed-loop-1",
+        "finding_type": "weed_mapping",
+        "field_id": "field-closed-loop",
+        "zone_id": "zone-a",
+        "detection_id": "weed:tile-1:1",
+        "label": "waterhemp",
+        "confidence": 0.86,
+        "evidence_tile_refs": ["tile-1"],
+        "evidence_refs": [
+            "detection:weed:tile-1:1",
+            "model:weed-detector@2026.06.1",
+            "tile:tile-1",
+            "verification:confirmed"
+        ],
+        "model_version": {
+            "model_id": "weed-detector",
+            "version": "2026.06.1"
+        },
+        "verification_state": "confirmed",
+        "zone_geometry": {
+            "crs": "EPSG:4326",
+            "bbox": {
+                "min_lon": -96.60,
+                "min_lat": 41.18,
+                "max_lon": -96.55,
+                "max_lat": 41.22
+            }
+        },
+        "emitted_at": "2026-06-12T15:00:00Z"
+    });
+
+    let response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/crop-intelligence/closed-loop-proposals")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "proposal_id": "proposal-closed-loop-1",
+                        "action": "refly_and_treatment",
+                        "findings": [verified_finding],
+                        "requested_by": "agronomist-7",
+                        "created_at": "2026-06-12T15:05:00Z",
+                        "confidence_floor": 0.75,
+                        "treatment_prescription_ref": "rx:weed:field-closed-loop"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), 64 * 1024).await?;
+    let proposal: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        proposal.get("proposal_id").and_then(|value| value.as_str()),
+        Some("proposal-closed-loop-1")
+    );
+    assert_eq!(
+        proposal
+            .get("approval_status")
+            .and_then(|value| value.as_str()),
+        Some("pending")
+    );
+    assert_eq!(
+        proposal
+            .get("approval_required")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+    assert_eq!(
+        proposal
+            .get("dispatch_authorized")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+    assert_eq!(
+        proposal
+            .pointer("/refly_area/bbox/min_lon")
+            .and_then(|value| value.as_f64()),
+        Some(-96.60)
+    );
+    assert!(proposal
+        .get("evidence_refs")
+        .and_then(|value| value.as_array())
+        .expect("proposal should cite evidence")
+        .iter()
+        .any(|value| value == "treatment_prescription:rx:weed:field-closed-loop"));
+
+    let stored_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/crop-intelligence/closed-loop-proposals/proposal-closed-loop-1")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(stored_response.status(), StatusCode::OK);
+    let body = to_bytes(stored_response.into_body(), 64 * 1024).await?;
+    let stored: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        stored
+            .get("dispatch_authorized")
+            .and_then(|value| value.as_bool()),
+        Some(false)
+    );
+
+    let mission_dispatch_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM collab_mission_dispatch_audits")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(mission_dispatch_count, 0);
+    let tractor_audit_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM tractor_command_audits")
+            .fetch_one(&ctx.pool)
+            .await?;
+    assert_eq!(tractor_audit_count, 0);
+
+    let refused = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/crop-intelligence/closed-loop-proposals")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "proposal_id": "proposal-closed-loop-refused",
+                        "action": "refly",
+                        "findings": [{
+                            "finding_id": "finding-unverified",
+                            "finding_type": "disease_detection",
+                            "field_id": "field-closed-loop",
+                            "detection_id": "disease:tile-2:1",
+                            "label": "northern_leaf_blight",
+                            "confidence": 0.62,
+                            "evidence_tile_refs": ["tile-2"],
+                            "evidence_refs": ["detection:disease:tile-2:1", "tile:tile-2"],
+                            "model_version": {
+                                "model_id": "lesion-detector",
+                                "version": "2026.06.1"
+                            },
+                            "verification_state": "unverified",
+                            "zone_geometry": {
+                                "crs": "EPSG:4326",
+                                "bbox": {
+                                    "min_lon": -96.50,
+                                    "min_lat": 41.10,
+                                    "max_lon": -96.45,
+                                    "max_lat": 41.15
+                                }
+                            },
+                            "emitted_at": "2026-06-12T15:00:00Z"
+                        }],
+                        "requested_by": "agronomist-7",
+                        "created_at": "2026-06-12T15:10:00Z",
+                        "confidence_floor": 0.75
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    let body = to_bytes(refused.into_body(), 64 * 1024).await?;
+    let message = String::from_utf8(body.to_vec())?;
+    assert!(message.contains("finding finding-unverified is not human verified"));
+    let proposal_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM crop_closed_loop_proposals WHERE proposal_id = 'proposal-closed-loop-refused'",
+    )
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(proposal_count, 0);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn compliance_records_create_list_append_versions_and_refuse_delete() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;

@@ -36,10 +36,12 @@ use copilot::{
     CopilotTurnRecord, CopilotTurnRole,
 };
 use crop_intelligence::{
-    apply_detection_verification, assemble_detection_finding, build_inference_run_progress_record,
-    build_inference_run_record, build_model_version_record, detect_inference_run_stall,
-    inference_run_progress_stream, transition_inference_run_status,
-    validate_detection_finding_promotion, validate_model_reference, CropDetectionCorrectionLabel,
+    apply_detection_verification, assemble_detection_finding, build_crop_closed_loop_proposal,
+    build_inference_run_progress_record, build_inference_run_record, build_model_version_record,
+    detect_inference_run_stall, inference_run_progress_stream, transition_inference_run_status,
+    validate_detection_finding_promotion, validate_model_reference, CropClosedLoopAction,
+    CropClosedLoopApprovalStatus, CropClosedLoopFindingEvidence, CropClosedLoopProposal,
+    CropClosedLoopProposalError, CropClosedLoopProposalRequest, CropDetectionCorrectionLabel,
     CropDetectionFindingError, CropDetectionFindingRecord, CropDetectionFindingRequest,
     CropDetectionVerificationAction, CropDetectionVerificationError,
     CropDetectionVerificationRecord, CropDetectionVerificationRequest, CropModelRegistryError,
@@ -7724,6 +7726,28 @@ pub async fn emit_crop_detection_finding(
     Ok(Json(recommendation))
 }
 
+pub async fn create_crop_closed_loop_proposal(
+    State(state): State<AppState>,
+    Json(request): Json<CropClosedLoopProposalRequest>,
+) -> AppResult<Json<CropClosedLoopProposal>> {
+    let proposal =
+        build_crop_closed_loop_proposal(request).map_err(crop_closed_loop_proposal_error)?;
+    persist_crop_closed_loop_proposal(&state, &proposal).await?;
+
+    Ok(Json(proposal))
+}
+
+pub async fn get_crop_closed_loop_proposal(
+    Path(proposal_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<CropClosedLoopProposal>> {
+    let proposal = load_crop_closed_loop_proposal(&state, &proposal_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    Ok(Json(proposal))
+}
+
 pub async fn create_compliance_record(
     State(state): State<AppState>,
     Json(request): Json<CreateComplianceRecordRequest>,
@@ -11396,6 +11420,10 @@ fn finding_promotion_error(error: FindingPromotionError) -> AppError {
 }
 
 fn crop_detection_finding_error(error: CropDetectionFindingError) -> AppError {
+    AppError::BadRequest(error.to_string())
+}
+
+fn crop_closed_loop_proposal_error(error: CropClosedLoopProposalError) -> AppError {
     AppError::BadRequest(error.to_string())
 }
 
@@ -19616,6 +19644,133 @@ async fn persist_crop_detection_finding_recommendation(
 
     tx.commit().await.map_err(Error::from)?;
     Ok(())
+}
+
+async fn persist_crop_closed_loop_proposal(
+    state: &AppState,
+    proposal: &CropClosedLoopProposal,
+) -> AppResult<()> {
+    let action_json =
+        serde_json::to_string(&proposal.action).map_err(|err| AppError::Anyhow(err.into()))?;
+    let refly_area_json = proposal
+        .refly_area
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    let findings_json =
+        serde_json::to_string(&proposal.findings).map_err(|err| AppError::Anyhow(err.into()))?;
+    let evidence_refs_json = serde_json::to_string(&proposal.evidence_refs)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+
+    sqlx::query(
+        r#"
+        INSERT INTO crop_closed_loop_proposals (
+            proposal_id, action, field_id, requested_by, created_at, approval_status,
+            approval_required, dispatch_authorized, confidence_floor, refly_area_json,
+            treatment_prescription_ref, findings_json, evidence_refs_json
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+        "#,
+    )
+    .bind(&proposal.proposal_id)
+    .bind(action_json)
+    .bind(&proposal.field_id)
+    .bind(&proposal.requested_by)
+    .bind(&proposal.created_at)
+    .bind(proposal.approval_status.as_str())
+    .bind(proposal.approval_required)
+    .bind(proposal.dispatch_authorized)
+    .bind(proposal.confidence_floor)
+    .bind(refly_area_json)
+    .bind(&proposal.treatment_prescription_ref)
+    .bind(findings_json)
+    .bind(evidence_refs_json)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn load_crop_closed_loop_proposal(
+    state: &AppState,
+    proposal_id: &str,
+) -> AppResult<Option<CropClosedLoopProposal>> {
+    let row = sqlx::query(
+        r#"
+        SELECT proposal_id, action, field_id, requested_by, created_at, approval_status,
+               approval_required, dispatch_authorized, confidence_floor, refly_area_json,
+               treatment_prescription_ref, findings_json, evidence_refs_json
+        FROM crop_closed_loop_proposals
+        WHERE proposal_id = ?1
+        "#,
+    )
+    .bind(proposal_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    row.map(|row| decode_crop_closed_loop_proposal(&row))
+        .transpose()
+}
+
+fn decode_crop_closed_loop_proposal(
+    row: &sqlx::sqlite::SqliteRow,
+) -> AppResult<CropClosedLoopProposal> {
+    let action = serde_json::from_str::<CropClosedLoopAction>(&row.get::<String, _>("action"))
+        .map_err(|err| {
+            AppError::Anyhow(
+                Error::new(err).context("failed to decode crop closed-loop proposal action"),
+            )
+        })?;
+    let approval_status = match row.get::<String, _>("approval_status").as_str() {
+        "pending" => CropClosedLoopApprovalStatus::Pending,
+        value => {
+            return Err(AppError::Anyhow(Error::msg(format!(
+                "unknown crop closed-loop approval status {value}"
+            ))))
+        }
+    };
+    let refly_area = row
+        .get::<Option<String>, _>("refly_area_json")
+        .map(|json| serde_json::from_str::<DetectionZoneGeometry>(&json))
+        .transpose()
+        .map_err(|err| {
+            AppError::Anyhow(
+                Error::new(err).context("failed to decode crop closed-loop refly_area_json"),
+            )
+        })?;
+    let findings = serde_json::from_str::<Vec<CropClosedLoopFindingEvidence>>(
+        &row.get::<String, _>("findings_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(Error::new(err).context("failed to decode crop closed-loop findings_json"))
+    })?;
+    let evidence_refs = serde_json::from_str::<Vec<String>>(
+        &row.get::<String, _>("evidence_refs_json"),
+    )
+    .map_err(|err| {
+        AppError::Anyhow(
+            Error::new(err).context("failed to decode crop closed-loop evidence_refs_json"),
+        )
+    })?;
+
+    Ok(CropClosedLoopProposal {
+        proposal_id: row.get("proposal_id"),
+        action,
+        field_id: row.get("field_id"),
+        requested_by: row.get("requested_by"),
+        created_at: row.get("created_at"),
+        approval_status,
+        approval_required: row.get("approval_required"),
+        dispatch_authorized: row.get("dispatch_authorized"),
+        confidence_floor: row.get("confidence_floor"),
+        refly_area,
+        treatment_prescription_ref: row.get("treatment_prescription_ref"),
+        findings,
+        evidence_refs,
+    })
 }
 
 async fn assert_field_owned_by_org(

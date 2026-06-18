@@ -812,6 +812,71 @@ pub struct CropDetectionFindingRecord {
     pub emitted_at: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CropClosedLoopAction {
+    Refly,
+    Treatment,
+    ReflyAndTreatment,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CropClosedLoopApprovalStatus {
+    Pending,
+}
+
+impl CropClosedLoopApprovalStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CropClosedLoopApprovalStatus::Pending => "pending",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CropClosedLoopProposalRequest {
+    pub proposal_id: String,
+    pub action: CropClosedLoopAction,
+    pub findings: Vec<CropDetectionFindingRecord>,
+    pub requested_by: String,
+    pub created_at: String,
+    pub confidence_floor: f64,
+    #[serde(default)]
+    pub treatment_prescription_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CropClosedLoopFindingEvidence {
+    pub finding_id: String,
+    pub finding_type: CropModelTask,
+    #[serde(default)]
+    pub zone_id: Option<String>,
+    pub detection_id: String,
+    pub confidence: f64,
+    pub evidence_refs: Vec<String>,
+    pub zone_geometry: DetectionZoneGeometry,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CropClosedLoopProposal {
+    pub proposal_id: String,
+    pub action: CropClosedLoopAction,
+    pub field_id: String,
+    pub requested_by: String,
+    pub created_at: String,
+    pub approval_status: CropClosedLoopApprovalStatus,
+    pub approval_required: bool,
+    pub dispatch_authorized: bool,
+    pub confidence_floor: f64,
+    #[serde(default)]
+    pub refly_area: Option<DetectionZoneGeometry>,
+    #[serde(default)]
+    pub treatment_prescription_ref: Option<String>,
+    pub findings: Vec<CropClosedLoopFindingEvidence>,
+    pub evidence_refs: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CropModelRegistryError {
     #[error("model_id cannot be empty")]
@@ -1191,6 +1256,44 @@ pub enum CropDetectionFindingError {
     UnverifiedDetection { detection_id: String },
     #[error("detection {detection_id} was rejected and cannot be emitted as a finding")]
     RejectedDetection { detection_id: String },
+}
+
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum CropClosedLoopProposalError {
+    #[error("proposal_id cannot be empty")]
+    EmptyProposalId,
+    #[error("requested_by cannot be empty")]
+    EmptyRequestedBy,
+    #[error("created_at cannot be empty")]
+    EmptyCreatedAt,
+    #[error("closed-loop proposal requires at least one finding")]
+    EmptyFindings,
+    #[error("confidence_floor must be finite and between 0 and 1")]
+    InvalidConfidenceFloor,
+    #[error("finding {finding_id} belongs to field {finding_field_id}, expected {field_id}")]
+    FieldMismatch {
+        finding_id: String,
+        field_id: String,
+        finding_field_id: String,
+    },
+    #[error("finding {finding_id} is not human verified")]
+    UnverifiedFinding { finding_id: String },
+    #[error("finding {finding_id} confidence {confidence} is below floor {confidence_floor}")]
+    LowConfidenceFinding {
+        finding_id: String,
+        confidence: f64,
+        confidence_floor: f64,
+    },
+    #[error("finding {finding_id} does not cite evidence")]
+    UncitedFinding { finding_id: String },
+    #[error("finding {finding_id} CRS {finding_crs} does not match proposal CRS {proposal_crs}")]
+    FindingCrsMismatch {
+        finding_id: String,
+        proposal_crs: String,
+        finding_crs: String,
+    },
+    #[error("treatment proposals require a treatment_prescription_ref")]
+    EmptyTreatmentPrescriptionRef,
 }
 
 pub fn build_model_version_record(
@@ -2513,6 +2616,136 @@ pub fn assemble_detection_finding(
     })
 }
 
+pub fn build_crop_closed_loop_proposal(
+    request: CropClosedLoopProposalRequest,
+) -> Result<CropClosedLoopProposal, CropClosedLoopProposalError> {
+    let proposal_id = normalize_closed_loop_text(
+        request.proposal_id,
+        CropClosedLoopProposalError::EmptyProposalId,
+    )?;
+    let requested_by = normalize_closed_loop_text(
+        request.requested_by,
+        CropClosedLoopProposalError::EmptyRequestedBy,
+    )?;
+    let created_at = normalize_closed_loop_text(
+        request.created_at,
+        CropClosedLoopProposalError::EmptyCreatedAt,
+    )?;
+    if !request.confidence_floor.is_finite()
+        || request.confidence_floor < 0.0
+        || request.confidence_floor > 1.0
+    {
+        return Err(CropClosedLoopProposalError::InvalidConfidenceFloor);
+    }
+    if request.findings.is_empty() {
+        return Err(CropClosedLoopProposalError::EmptyFindings);
+    }
+
+    let treatment_prescription_ref = match request.action {
+        CropClosedLoopAction::Treatment | CropClosedLoopAction::ReflyAndTreatment => {
+            Some(normalize_closed_loop_text(
+                request.treatment_prescription_ref.unwrap_or_default(),
+                CropClosedLoopProposalError::EmptyTreatmentPrescriptionRef,
+            )?)
+        }
+        CropClosedLoopAction::Refly => request
+            .treatment_prescription_ref
+            .and_then(normalize_optional_finding_text),
+    };
+
+    let field_id = normalize_closed_loop_text(
+        request.findings[0].field_id.clone(),
+        CropClosedLoopProposalError::EmptyFindings,
+    )?;
+    let proposal_crs = normalize_closed_loop_text(
+        request.findings[0].zone_geometry.crs.clone(),
+        CropClosedLoopProposalError::UncitedFinding {
+            finding_id: request.findings[0].finding_id.clone(),
+        },
+    )?;
+    let mut refly_bbox = request.findings[0].zone_geometry.bbox.clone();
+    let mut findings = Vec::new();
+    let mut evidence_refs = BTreeSet::new();
+
+    for finding in request.findings {
+        if finding.field_id != field_id {
+            return Err(CropClosedLoopProposalError::FieldMismatch {
+                finding_id: finding.finding_id,
+                field_id,
+                finding_field_id: finding.field_id,
+            });
+        }
+        match finding.verification_state {
+            DetectionVerificationState::Confirmed | DetectionVerificationState::Corrected => {}
+            DetectionVerificationState::Unverified | DetectionVerificationState::Rejected => {
+                return Err(CropClosedLoopProposalError::UnverifiedFinding {
+                    finding_id: finding.finding_id,
+                });
+            }
+        }
+        if finding.confidence < request.confidence_floor {
+            return Err(CropClosedLoopProposalError::LowConfidenceFinding {
+                finding_id: finding.finding_id,
+                confidence: finding.confidence,
+                confidence_floor: request.confidence_floor,
+            });
+        }
+        if finding.evidence_refs.is_empty() || finding.evidence_tile_refs.is_empty() {
+            return Err(CropClosedLoopProposalError::UncitedFinding {
+                finding_id: finding.finding_id,
+            });
+        }
+        if finding.zone_geometry.crs != proposal_crs {
+            return Err(CropClosedLoopProposalError::FindingCrsMismatch {
+                finding_id: finding.finding_id,
+                proposal_crs,
+                finding_crs: finding.zone_geometry.crs,
+            });
+        }
+
+        refly_bbox.min_lon = refly_bbox.min_lon.min(finding.zone_geometry.bbox.min_lon);
+        refly_bbox.min_lat = refly_bbox.min_lat.min(finding.zone_geometry.bbox.min_lat);
+        refly_bbox.max_lon = refly_bbox.max_lon.max(finding.zone_geometry.bbox.max_lon);
+        refly_bbox.max_lat = refly_bbox.max_lat.max(finding.zone_geometry.bbox.max_lat);
+        evidence_refs.insert(format!("finding:{}", finding.finding_id));
+        evidence_refs.insert(format!("detection:{}", finding.detection_id));
+        evidence_refs.extend(finding.evidence_refs.iter().cloned());
+
+        findings.push(CropClosedLoopFindingEvidence {
+            finding_id: finding.finding_id,
+            finding_type: finding.finding_type,
+            zone_id: finding.zone_id,
+            detection_id: finding.detection_id,
+            confidence: finding.confidence,
+            evidence_refs: finding.evidence_refs,
+            zone_geometry: finding.zone_geometry,
+        });
+    }
+
+    if let Some(prescription_ref) = treatment_prescription_ref.as_ref() {
+        evidence_refs.insert(format!("treatment_prescription:{prescription_ref}"));
+    }
+
+    Ok(CropClosedLoopProposal {
+        proposal_id,
+        action: request.action,
+        field_id,
+        requested_by,
+        created_at,
+        approval_status: CropClosedLoopApprovalStatus::Pending,
+        approval_required: true,
+        dispatch_authorized: false,
+        confidence_floor: request.confidence_floor,
+        refly_area: Some(DetectionZoneGeometry {
+            crs: proposal_crs,
+            bbox: refly_bbox,
+        }),
+        treatment_prescription_ref,
+        findings,
+        evidence_refs: evidence_refs.into_iter().collect(),
+    })
+}
+
 fn normalize_required_text(
     value: String,
     error: CropModelRegistryError,
@@ -3217,6 +3450,18 @@ fn normalize_optional_finding_text(value: String) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
+fn normalize_closed_loop_text(
+    value: String,
+    error: CropClosedLoopProposalError,
+) -> Result<String, CropClosedLoopProposalError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        Err(error)
+    } else {
+        Ok(trimmed.to_string())
+    }
+}
+
 fn normalize_finding_evidence_refs(
     values: Vec<String>,
 ) -> Result<Vec<String>, CropDetectionFindingError> {
@@ -3252,7 +3497,7 @@ fn density_per_ha(count: usize, area_m2: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_detection_verification, assemble_detection_finding,
+        apply_detection_verification, assemble_detection_finding, build_crop_closed_loop_proposal,
         build_inference_run_progress_record, build_inference_run_record,
         build_model_version_record, build_training_dataset_manifest,
         build_weed_spot_spray_prescription, detect_inference_run_stall, estimate_growth_stage,
@@ -3260,7 +3505,8 @@ mod tests {
         run_disease_lesion_detection, run_pest_detection, run_stand_count,
         run_tiled_inference_pipeline, run_weed_mapping, transition_inference_run_status,
         validate_detection_finding_promotion, validate_model_reference, CanopyCoverConfig,
-        CanopyCoverError, CanopyCoverTile, CropDetectionFindingError, CropDetectionFindingRequest,
+        CanopyCoverError, CanopyCoverTile, CropClosedLoopAction, CropClosedLoopProposalError,
+        CropClosedLoopProposalRequest, CropDetectionFindingError, CropDetectionFindingRequest,
         CropDetectionVerificationAction, CropDetectionVerificationRequest, CropModelRegistryError,
         CropModelTask, DetectionVerificationState, DetectionZoneGeometry, DiseaseDetectionConfig,
         DiseaseDetectionError, DiseaseLesionCandidate, FindingPromotionError,
@@ -4642,6 +4888,96 @@ mod tests {
         .expect_err("uncited finding should be rejected");
 
         assert_eq!(error, CropDetectionFindingError::EmptyEvidence);
+    }
+
+    #[test]
+    fn verified_findings_build_approval_gated_closed_loop_proposal() {
+        let finding = assemble_detection_finding(CropDetectionFindingRequest {
+            finding_id: "finding-closed-loop-1".to_string(),
+            field_id: "field-1".to_string(),
+            zone_id: Some("zone-a".to_string()),
+            detection: confirmed_detection(),
+            model: registered_model(),
+            emitted_at: "2026-06-12T15:00:00Z".to_string(),
+        })
+        .expect("verified detection should assemble into a finding");
+
+        let proposal = build_crop_closed_loop_proposal(CropClosedLoopProposalRequest {
+            proposal_id: "proposal-1".to_string(),
+            action: CropClosedLoopAction::ReflyAndTreatment,
+            findings: vec![finding],
+            requested_by: "agronomist-7".to_string(),
+            created_at: "2026-06-12T15:05:00Z".to_string(),
+            confidence_floor: 0.75,
+            treatment_prescription_ref: Some("rx:weed:field-1".to_string()),
+        })
+        .expect("verified cited finding should produce an advisory proposal");
+
+        assert_eq!(proposal.proposal_id, "proposal-1");
+        assert_eq!(proposal.field_id, "field-1");
+        assert!(proposal.approval_required);
+        assert!(!proposal.dispatch_authorized);
+        assert_eq!(
+            proposal.treatment_prescription_ref.as_deref(),
+            Some("rx:weed:field-1")
+        );
+        assert_eq!(
+            proposal
+                .refly_area
+                .as_ref()
+                .expect("proposal should bound a re-fly area")
+                .bbox,
+            GeoBounds {
+                min_lon: 5.0,
+                min_lat: 5.0,
+                max_lon: 15.0,
+                max_lat: 15.0,
+            }
+        );
+        assert!(proposal
+            .evidence_refs
+            .iter()
+            .any(|value| value == "finding:finding-closed-loop-1"));
+        assert!(proposal
+            .evidence_refs
+            .iter()
+            .any(|value| value == "treatment_prescription:rx:weed:field-1"));
+    }
+
+    #[test]
+    fn closed_loop_proposal_refuses_unverified_or_low_confidence_findings() {
+        let mut finding = assemble_detection_finding(CropDetectionFindingRequest {
+            finding_id: "finding-low-confidence".to_string(),
+            field_id: "field-1".to_string(),
+            zone_id: Some("zone-a".to_string()),
+            detection: confirmed_detection(),
+            model: registered_model(),
+            emitted_at: "2026-06-12T15:00:00Z".to_string(),
+        })
+        .expect("verified detection should assemble into a finding");
+        finding.confidence = 0.60;
+
+        let error = build_crop_closed_loop_proposal(CropClosedLoopProposalRequest {
+            proposal_id: "proposal-low-confidence".to_string(),
+            action: CropClosedLoopAction::Refly,
+            findings: vec![finding],
+            requested_by: "agronomist-7".to_string(),
+            created_at: "2026-06-12T15:05:00Z".to_string(),
+            confidence_floor: 0.75,
+            treatment_prescription_ref: None,
+        })
+        .expect_err("low-confidence finding should not produce an action proposal");
+
+        assert!(matches!(
+            error,
+            CropClosedLoopProposalError::LowConfidenceFinding {
+                finding_id,
+                confidence,
+                confidence_floor,
+            } if finding_id == "finding-low-confidence"
+                && (confidence - 0.60).abs() < f64::EPSILON
+                && (confidence_floor - 0.75).abs() < f64::EPSILON
+        ));
     }
 
     fn plant_tile(

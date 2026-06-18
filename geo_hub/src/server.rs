@@ -149,6 +149,14 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::emit_crop_detection_finding),
         )
         .route(
+            "/api/crop-intelligence/closed-loop-proposals",
+            post(routes::create_crop_closed_loop_proposal),
+        )
+        .route(
+            "/api/crop-intelligence/closed-loop-proposals/:proposal_id",
+            get(routes::get_crop_closed_loop_proposal),
+        )
+        .route(
             "/api/crop-intelligence/inference-requests/validate",
             post(routes::validate_crop_model_for_inference),
         )

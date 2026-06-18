@@ -2091,6 +2091,28 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS crop_closed_loop_proposals (
+            proposal_id TEXT PRIMARY KEY,
+            action TEXT NOT NULL,
+            field_id TEXT NOT NULL,
+            requested_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            approval_status TEXT NOT NULL,
+            approval_required INTEGER NOT NULL,
+            dispatch_authorized INTEGER NOT NULL,
+            confidence_floor REAL NOT NULL,
+            refly_area_json TEXT,
+            treatment_prescription_ref TEXT,
+            findings_json TEXT NOT NULL,
+            evidence_refs_json TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE TABLE IF NOT EXISTS compliance_records (
             record_id TEXT NOT NULL,
             version INTEGER NOT NULL,
