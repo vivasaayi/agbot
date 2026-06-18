@@ -59,6 +59,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/tractors/:tractor_id", get(routes::get_tractor))
         .route(
+            "/api/tractors/:tractor_id/fleet-health",
+            post(routes::ingest_tractor_fleet_health),
+        )
+        .route(
             "/api/tractors/:tractor_id/motion-commands/validate",
             post(routes::validate_tractor_motion_command),
         )

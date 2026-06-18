@@ -9971,6 +9971,171 @@ async fn fleet_health_indicators_persist_timeseries_and_explicit_gaps() -> Resul
 }
 
 #[tokio::test]
+async fn fleet_health_ingests_tractor_health_and_blocks_overdue_service() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    seed_tractor_registry_field(&ctx).await?;
+
+    let tractor_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tractors")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "tractor_id": "tractor-health-001",
+                        "org_id": "org-alpha",
+                        "field_id": "field-tractor",
+                        "capabilities": ["sprayer"],
+                        "implement_ref": {
+                            "implement_id": "implement-sprayer-health",
+                            "implement_type": "sprayer",
+                            "working_width_m": 6.0
+                        },
+                        "status": "available"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(tractor_response.status(), StatusCode::OK);
+
+    let ingest_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/tractors/tractor-health-001/fleet-health")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "vehicle_id": "ignored-by-path",
+                        "checked_at": "2026-06-12T13:00:00Z",
+                        "component": {
+                            "component_id": "tractor-hydraulic-pump-1",
+                            "component_type": "motor",
+                            "serial": "TRACTOR-PUMP-001",
+                            "airframe_id": null,
+                            "installed_at": "2026-06-01T10:00:00Z",
+                            "removed_at": null,
+                            "service_history": [],
+                            "flight_hours": 155.0,
+                            "cycles": 0,
+                            "duty_score": 12.0,
+                            "created_at": "2026-06-01T10:05:00Z",
+                            "updated_at": "2026-06-12T13:00:00Z"
+                        },
+                        "service_limit": {
+                            "component_id": "tractor-hydraulic-pump-1",
+                            "max_flight_hours": 150.0,
+                            "max_cycles": null,
+                            "max_duty_score": null
+                        },
+                        "health_verdict": {
+                            "component_id": "tractor-hydraulic-pump-1",
+                            "evaluated_at": "2026-06-12T12:30:00Z",
+                            "method_version": "fleet-health-thresholds-v1",
+                            "status": "ok",
+                            "reason_code": "all_indicators_within_threshold",
+                            "indicator": "motor_vibration",
+                            "threshold": 1.0,
+                            "value": 0.40,
+                            "freshness": "fresh",
+                            "evidence": [{
+                                "indicator": "motor_vibration",
+                                "value": 0.40,
+                                "threshold": 1.0,
+                                "status": "ok",
+                                "reason_code": "all_indicators_within_threshold",
+                                "sample_ts": "2026-06-12T12:29:00Z",
+                                "source_ref": "14:tractor-health-001:telemetry",
+                                "freshness": "fresh"
+                            }]
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+
+    assert_eq!(ingest_response.status(), StatusCode::OK);
+    let body = to_bytes(ingest_response.into_body(), 128 * 1024).await?;
+    let integration: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        integration
+            .get("vehicle_id")
+            .and_then(|value| value.as_str()),
+        Some("tractor-health-001")
+    );
+    assert_eq!(
+        integration
+            .pointer("/component/airframe_id")
+            .and_then(|value| value.as_str()),
+        Some("tractor-health-001")
+    );
+    assert_eq!(
+        integration
+            .pointer("/readiness_decision/status")
+            .and_then(|value| value.as_str()),
+        Some("blocked")
+    );
+    assert_eq!(
+        integration
+            .pointer("/readiness_decision/blockers/0/reason_code")
+            .and_then(|value| value.as_str()),
+        Some("overdue_service_hours")
+    );
+    assert_eq!(
+        integration
+            .pointer("/dashboard/aircraft/0/status")
+            .and_then(|value| value.as_str()),
+        Some("blocked")
+    );
+
+    let list_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/api/fleet-health/components?airframe_id=tractor-health-001")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(list_response.status(), StatusCode::OK);
+    let body = to_bytes(list_response.into_body(), 64 * 1024).await?;
+    let components: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(components.len(), 1);
+    assert_eq!(
+        components[0]
+            .get("component_id")
+            .and_then(|value| value.as_str()),
+        Some("tractor-hydraulic-pump-1")
+    );
+
+    let event_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM fleet_component_events WHERE component_id = ?1 AND event_type = ?2",
+    )
+    .bind("tractor-hydraulic-pump-1")
+    .bind("ground_vehicle_health_ingested")
+    .fetch_one(&ctx.pool)
+    .await?;
+    assert_eq!(event_count, 1);
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn fleet_health_ota_rollout_evaluates_stage_and_rollback() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;

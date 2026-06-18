@@ -61,12 +61,13 @@ use crop_intelligence::{
 use fleet_health::{
     accrue_component_duty, apply_rollout_control, build_component_duty_accruals,
     build_component_record, component_event, derive_health_indicators, evaluate_ota_rollout,
-    install_component, ComponentDutyAccrualRecord, DutyAccrualRequest, FleetComponentEventRecord,
-    FleetComponentRecord, FleetComponentType, FleetHealthError, FleetHealthIndicator,
-    FleetHealthIndicatorDerivation, FleetHealthIndicatorSample, HealthIndicatorFreshness,
-    HealthTelemetryGap, InstallComponentRequest, OtaRolloutDecision, OtaRolloutRequest,
-    RegisterComponentRequest, RolloutControlDecision, RolloutControlRequest, ServiceHistoryEntry,
-    TelemetryHealthIndicatorRequest,
+    install_component, integrate_ground_vehicle_health, ComponentDutyAccrualRecord,
+    DutyAccrualRequest, FleetComponentEventRecord, FleetComponentRecord, FleetComponentType,
+    FleetHealthError, FleetHealthIndicator, FleetHealthIndicatorDerivation,
+    FleetHealthIndicatorSample, GroundVehicleHealthIngestRequest, GroundVehicleHealthIntegration,
+    HealthIndicatorFreshness, HealthTelemetryGap, InstallComponentRequest, OtaRolloutDecision,
+    OtaRolloutRequest, RegisterComponentRequest, RolloutControlDecision, RolloutControlRequest,
+    ServiceHistoryEntry, TelemetryHealthIndicatorRequest,
 };
 use geojson::{
     feature::Id as GeoJsonId, Feature, FeatureCollection, GeoJson, Geometry, Value as GeoJsonValue,
@@ -3057,6 +3058,34 @@ pub async fn derive_fleet_health_indicators_route(
     }
 
     Ok(Json(derived))
+}
+
+pub async fn ingest_tractor_fleet_health(
+    Path(tractor_id): Path<String>,
+    State(state): State<AppState>,
+    Json(mut request): Json<GroundVehicleHealthIngestRequest>,
+) -> AppResult<Json<GroundVehicleHealthIntegration>> {
+    load_tractor(&state, &tractor_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    request.vehicle_id = tractor_id.clone();
+    let integration = integrate_ground_vehicle_health(request).map_err(fleet_health_error)?;
+    upsert_fleet_component(&state, &integration.component).await?;
+    append_fleet_component_event(
+        &state,
+        &component_event(
+            &integration.component.component_id,
+            "ground_vehicle_health_ingested",
+            Some(tractor_id),
+            integration.readiness_decision.checked_at.clone(),
+            None,
+            Some("tractor health ingested from domain 14".to_string()),
+        )
+        .map_err(fleet_health_error)?,
+    )
+    .await?;
+
+    Ok(Json(integration))
 }
 
 pub async fn list_fleet_health_indicators(
@@ -14256,6 +14285,48 @@ async fn insert_fleet_component(state: &AppState, record: &FleetComponentRecord)
             service_history_json, flight_hours, cycles, duty_score, created_at, updated_at
         )
         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        "#,
+    )
+    .bind(&record.component_id)
+    .bind(record.component_type.as_str())
+    .bind(&record.serial)
+    .bind(&record.airframe_id)
+    .bind(&record.installed_at)
+    .bind(&record.removed_at)
+    .bind(service_history_json)
+    .bind(record.flight_hours)
+    .bind(i64::from(record.cycles))
+    .bind(record.duty_score)
+    .bind(&record.created_at)
+    .bind(&record.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(())
+}
+
+async fn upsert_fleet_component(state: &AppState, record: &FleetComponentRecord) -> AppResult<()> {
+    let service_history_json = serde_json::to_string(&record.service_history)
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    sqlx::query(
+        r#"
+        INSERT INTO fleet_components (
+            component_id, component_type, serial, airframe_id, installed_at, removed_at,
+            service_history_json, flight_hours, cycles, duty_score, created_at, updated_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        ON CONFLICT(component_id) DO UPDATE SET
+            component_type = excluded.component_type,
+            serial = excluded.serial,
+            airframe_id = excluded.airframe_id,
+            installed_at = excluded.installed_at,
+            removed_at = excluded.removed_at,
+            service_history_json = excluded.service_history_json,
+            flight_hours = excluded.flight_hours,
+            cycles = excluded.cycles,
+            duty_score = excluded.duty_score,
+            updated_at = excluded.updated_at
         "#,
     )
     .bind(&record.component_id)

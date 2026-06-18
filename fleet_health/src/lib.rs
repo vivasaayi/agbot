@@ -1021,6 +1021,26 @@ pub struct FleetHealthDashboard {
     pub alerts: Vec<FleetAlertRecord>,
 }
 
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct GroundVehicleHealthIngestRequest {
+    #[serde(default)]
+    pub vehicle_id: String,
+    #[serde(default)]
+    pub checked_at: String,
+    pub component: FleetComponentRecord,
+    pub service_limit: ComponentServiceLimit,
+    pub health_verdict: ComponentHealthVerdict,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GroundVehicleHealthIntegration {
+    pub vehicle_id: String,
+    pub component: FleetComponentRecord,
+    pub health_verdict: ComponentHealthVerdict,
+    pub readiness_decision: FleetReadinessDecision,
+    pub dashboard: FleetHealthDashboard,
+}
+
 impl FleetReadinessDecision {
     pub fn is_clear(&self) -> bool {
         self.status == FleetReadinessDecisionStatus::Permitted && self.blockers.is_empty()
@@ -2347,6 +2367,41 @@ pub fn evaluate_fleet_readiness_with_work_orders(
     Ok(decision)
 }
 
+pub fn integrate_ground_vehicle_health(
+    request: GroundVehicleHealthIngestRequest,
+) -> Result<GroundVehicleHealthIntegration, FleetHealthError> {
+    let vehicle_id =
+        normalize_required_text(request.vehicle_id, FleetHealthError::EmptyAirframeId)?;
+    let checked_at = normalize_required_text(request.checked_at, FleetHealthError::EmptyCreatedAt)?;
+    let mut component = request.component;
+    component.airframe_id = Some(vehicle_id.clone());
+    component.removed_at = None;
+    let service_limit = request.service_limit;
+    let health_verdict = request.health_verdict;
+    let readiness_decision = evaluate_fleet_readiness(FleetReadinessRequest {
+        airframe_id: vehicle_id.clone(),
+        checked_at: checked_at.clone(),
+        installed_components: vec![component.clone()],
+        service_limits: vec![service_limit],
+        health_verdicts: vec![health_verdict.clone()],
+    })?;
+    let dashboard = build_fleet_health_dashboard(FleetHealthDashboardRequest {
+        generated_at: checked_at,
+        components: vec![component.clone()],
+        readiness_decisions: vec![readiness_decision.clone()],
+        health_verdicts: vec![health_verdict.clone()],
+        degradation_reports: Vec::new(),
+    })?;
+
+    Ok(GroundVehicleHealthIntegration {
+        vehicle_id,
+        component,
+        health_verdict,
+        readiness_decision,
+        dashboard,
+    })
+}
+
 pub fn evaluate_ota_rollout(
     request: OtaRolloutRequest,
 ) -> Result<OtaRolloutDecision, FleetHealthError> {
@@ -3533,19 +3588,19 @@ mod tests {
         evaluate_battery_health_trend, evaluate_component_health_verdict, evaluate_fleet_readiness,
         evaluate_fleet_readiness_with_work_orders, evaluate_ota_rollout,
         evaluate_predictive_maintenance_advisory, fleet_operations_source_current,
-        fleet_operations_source_unavailable, install_component, open_maintenance_work_order,
-        refuse_health_evidence_overwrite, suggest_rollout_strategy, BatteryHealthTrendConfig,
-        CloseMaintenanceWorkOrderRequest, ComponentHealthVerdict, ComponentHealthVerdictRequest,
-        ComponentHealthVerdictStatus, ComponentServiceLimit, DutyAccrualRequest,
-        FleetComponentRecord, FleetComponentType, FleetHealthDashboardAircraftStatus,
-        FleetHealthDashboardRequest, FleetHealthError, FleetHealthIndicator,
-        FleetOperationsFeedSource, FleetOperationsFeedSourceStatus,
+        fleet_operations_source_unavailable, install_component, integrate_ground_vehicle_health,
+        open_maintenance_work_order, refuse_health_evidence_overwrite, suggest_rollout_strategy,
+        BatteryHealthTrendConfig, CloseMaintenanceWorkOrderRequest, ComponentHealthVerdict,
+        ComponentHealthVerdictRequest, ComponentHealthVerdictStatus, ComponentServiceLimit,
+        DutyAccrualRequest, FleetComponentRecord, FleetComponentType,
+        FleetHealthDashboardAircraftStatus, FleetHealthDashboardRequest, FleetHealthError,
+        FleetHealthIndicator, FleetOperationsFeedSource, FleetOperationsFeedSourceStatus,
         FleetOperationsRolloutFeedState, FleetReadinessBlockReason, FleetReadinessDecision,
-        FleetReadinessDecisionStatus, FleetReadinessRequest, HealthDegradationDetectionConfig,
-        HealthDegradationDetectionRequest, HealthDegradationDetectionStatus,
-        HealthDegradationReasonCode, HealthEvidenceRecord, HealthEvidenceSubjectKind,
-        HealthIndicatorFreshness, HealthIndicatorThreshold, HealthTelemetryGap,
-        HealthTelemetrySample, HealthVerdictEvidence, HealthVerdictReasonCode,
+        FleetReadinessDecisionStatus, FleetReadinessRequest, GroundVehicleHealthIngestRequest,
+        HealthDegradationDetectionConfig, HealthDegradationDetectionRequest,
+        HealthDegradationDetectionStatus, HealthDegradationReasonCode, HealthEvidenceRecord,
+        HealthEvidenceSubjectKind, HealthIndicatorFreshness, HealthIndicatorThreshold,
+        HealthTelemetryGap, HealthTelemetrySample, HealthVerdictEvidence, HealthVerdictReasonCode,
         InstallComponentRequest, MaintenancePartUsage, MaintenanceWorkOrderSeverity,
         MaintenanceWorkOrderStatus, NodeMetricTrendSample, OpenMaintenanceWorkOrderRequest,
         OtaArtifactVersion, OtaNodeHealthReport, OtaRolloutDecisionReason,
@@ -4615,6 +4670,47 @@ mod tests {
         );
         assert_eq!(decision.blockers[0].observed_value, Some(121.0));
         assert_eq!(decision.blockers[0].threshold, Some(100.0));
+    }
+
+    #[test]
+    fn ground_vehicle_health_uses_shared_readiness_contract() {
+        let integration = integrate_ground_vehicle_health(GroundVehicleHealthIngestRequest {
+            vehicle_id: "tractor-001".to_string(),
+            checked_at: "2026-06-12T13:00:00Z".to_string(),
+            component: component_for_readiness(
+                "tractor-hydraulic-pump-1",
+                FleetComponentType::Motor,
+                155.0,
+                0,
+                12.0,
+            ),
+            service_limit: service_limit("tractor-hydraulic-pump-1", Some(150.0), None, None),
+            health_verdict: component_verdict(
+                "tractor-hydraulic-pump-1",
+                ComponentHealthVerdictStatus::Ok,
+                HealthIndicatorFreshness::Fresh,
+            ),
+        })
+        .expect("tractor health should integrate through readiness");
+
+        assert_eq!(integration.vehicle_id, "tractor-001");
+        assert_eq!(
+            integration.component.airframe_id.as_deref(),
+            Some("tractor-001")
+        );
+        assert_eq!(
+            integration.readiness_decision.status,
+            FleetReadinessDecisionStatus::Blocked
+        );
+        assert_eq!(
+            integration.readiness_decision.blockers[0].reason_code,
+            FleetReadinessBlockReason::OverdueServiceHours
+        );
+        assert_eq!(integration.dashboard.aircraft.len(), 1);
+        assert_eq!(
+            integration.dashboard.aircraft[0].status,
+            FleetHealthDashboardAircraftStatus::Blocked
+        );
     }
 
     #[test]
