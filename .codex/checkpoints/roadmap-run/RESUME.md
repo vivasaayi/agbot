@@ -2,10 +2,10 @@
 
 - **Run ID**: run-02-sim
 - **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: 68c5cab (`batch-20260618060000`)
-- **Latest checkpoint commit**: df0fb75
+- **Last implementation commit**: 38f731a (`batch-20260618064000`)
+- **Latest checkpoint commit**: f32359b
 - **Current batch**: none
-- **Completed feature rows**: 485 committed; 1 tests_passed; 2 skipped; 2 blocked; 8 pending in this run.
+- **Completed feature rows**: 486 committed; 1 tests_passed; 2 skipped; 2 blocked; 7 pending in this run.
 - **Blocker**: `18-10` payments/escrow is blocked pending external provider integration and compliance approval. No blocker for current batch.
 
 ## Latest verification
@@ -167,7 +167,11 @@
 - `cargo test -p fleet_health predictive_maintenance_schedule --lib` — pass
 - `cargo check -p fleet_health` — pass
 - `25-13` — verified as predictive maintenance scheduling with RUL-range service windows, uncertainty summary/evidence, required FLEET-TECH approval, work-order opening on approval, and explicit no-dispatch/no-verdict-clearance safety gates
+- `cargo fmt` — pass
+- `cargo test -p copilot proactive_closed_loop --lib` — pass
+- `cargo check -p copilot` — pass
+- `26-12` — verified as proactive closed-loop copilot advisory with high-severity change-event evidence resolution, cited deterministic advisory text, audit-sink write before surfacing, approval-gated draft action, unresolved-evidence skip, and no action execution without approval
 
 ## Next action
 
-- Select and claim the next pending roadmap feature after `25-13` predictive maintenance scheduling.
+- Select and claim the next pending roadmap feature after `26-12` proactive copilot advisory.
