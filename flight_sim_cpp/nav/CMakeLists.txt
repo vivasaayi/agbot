@@ -8,6 +8,8 @@ add_library(agbot_nav
     src/RoadGraphPlanner.cpp
     src/LocalPlanner.cpp
     src/MppiPlanner.cpp
+    src/DynamicAgents.cpp
+    src/Tracking.cpp
     src/Localization.cpp
     src/Controller.cpp
     src/NavigationPipeline.cpp
@@ -61,3 +63,13 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(agbot_nav_road_tests PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 add_test(NAME agbot_nav_road_tests COMMAND agbot_nav_road_tests)
+
+add_executable(agbot_nav_dynamic_tests tests/dynamic_tests.cpp)
+target_link_libraries(agbot_nav_dynamic_tests PRIVATE agbot_nav)
+target_compile_definitions(agbot_nav_dynamic_tests
+    PRIVATE FLIGHT_SIM_ROOT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/.."
+)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(agbot_nav_dynamic_tests PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+add_test(NAME agbot_nav_dynamic_tests COMMAND agbot_nav_dynamic_tests)

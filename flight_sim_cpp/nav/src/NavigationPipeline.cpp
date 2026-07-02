@@ -113,6 +113,20 @@ NavigationPipeline::NavigationPipeline(const NavigationPipelineConfig& config) {
         error_ = "unknown_localizer: " + localizer_name;
         return;
     }
+    const agbot::config::ParamTable& tracking = section_or_empty(root, "tracking");
+    const std::string tracker_name = algorithm_of(tracking, "none");
+    if (tracker_name != "none") {
+        tracker_ = default_tracker_registry().create(tracker_name, tracking);
+        if (tracker_ == nullptr) {
+            error_ = "unknown_tracker: " + tracker_name;
+            return;
+        }
+        track_use_object_ids_ =
+            agbot::config::bool_or(tracking, "use_object_ids", track_use_object_ids_);
+        track_cluster_distance_m_ = agbot::config::double_or(
+            tracking, "cluster_distance_m", track_cluster_distance_m_);
+    }
+
     noisy_localization_ = localizer_name != "ground_truth";
     gps_sigma_m_ = agbot::config::double_or(localization, "gps_sigma_m", gps_sigma_m_);
     gps_period_s_ = agbot::config::double_or(localization, "gps_period_s", gps_period_s_);
@@ -225,7 +239,36 @@ void NavigationPipeline::tick(
         if (std::isfinite(min_range)) {
             last_min_range_m_ = min_range;
         }
-        const PerceptionResult segmented = perception_->segment(frame);
+        // Tracking stage: cluster this frame's dynamic-class returns into
+        // detections and update the multi-object tracker. With tracking
+        // enabled the dynamic points are removed from the frame fed to
+        // perception/mapping — moving obstacles live in the tracker, not the
+        // static occupancy grid.
+        const SensorFrame* mapping_frame = &frame;
+        SensorFrame static_frame;
+        if (tracker_ != nullptr) {
+            const std::vector<Detection> detections = cluster_dynamic_detections(
+                frame.cloud, track_use_object_ids_, track_cluster_distance_m_);
+            tracked_objects_ = tracker_->update(detections, time_s_);
+
+            static_frame = frame;
+            static_frame.cloud.points.clear();
+            static_frame.cloud.classes.clear();
+            static_frame.cloud.object_ids.clear();
+            for (std::size_t i = 0; i < frame.cloud.points.size(); ++i) {
+                if (is_dynamic_class(frame.cloud.classes[i])) {
+                    continue;
+                }
+                static_frame.cloud.points.push_back(frame.cloud.points[i]);
+                static_frame.cloud.classes.push_back(frame.cloud.classes[i]);
+                if (!frame.cloud.object_ids.empty()) {
+                    static_frame.cloud.object_ids.push_back(frame.cloud.object_ids[i]);
+                }
+            }
+            mapping_frame = &static_frame;
+        }
+
+        const PerceptionResult segmented = perception_->segment(*mapping_frame);
         const Pose2D sensor_pose{
             nav_state.position.x, nav_state.position.z, nav_state.yaw_rad};
         mapper_->integrate(segmented.obstacles, sensor_pose, time_s_);
@@ -245,8 +288,8 @@ void NavigationPipeline::tick(
     // Local planning stage.
     if (!global_path_.points.empty() && local_elapsed_s_ + 1e-9 >= local_period_s_) {
         local_elapsed_s_ = 0.0;
-        local_plan_ =
-            local_planner_->compute(costmap_, global_path_, nav_state, vehicle_->limits(), goal);
+        local_plan_ = local_planner_->compute(
+            costmap_, global_path_, nav_state, vehicle_->limits(), goal, tracked_objects_);
     }
 
     // Control + vehicle integration every tick.
@@ -289,6 +332,24 @@ void NavigationPipeline::tick(
     }
     sample.path_length_m = global_path_.length_m();
     sample.min_obstacle_distance_m = last_min_range_m_;
+    sample.tracked_object_count = tracked_objects_.size();
+    if (!tracked_objects_.empty()) {
+        // Min constant-velocity-predicted separation (robot CV vs object CV)
+        // over the next 3 s: the yield-margin evidence for telemetry.
+        constexpr double kPredictHorizonS = 3.0;
+        constexpr double kPredictStepS = 0.1;
+        double min_separation = std::numeric_limits<double>::infinity();
+        for (double tau = 0.0; tau <= kPredictHorizonS + 1e-9; tau += kPredictStepS) {
+            const double rx = state.position.x + state.velocity.x * tau;
+            const double rz = state.position.z + state.velocity.z * tau;
+            for (const TrackedObject& object : tracked_objects_) {
+                const double dx = rx - (object.position.x + object.velocity.x * tau);
+                const double dz = rz - (object.position.z + object.velocity.z * tau);
+                min_separation = std::min(min_separation, std::sqrt(dx * dx + dz * dz));
+            }
+        }
+        sample.min_predicted_separation_m = min_separation;
+    }
     sample.distance_to_goal_m = goal_distance;
     sample.goal_reached = goal_reached_;
     telemetry_.push_back(sample);

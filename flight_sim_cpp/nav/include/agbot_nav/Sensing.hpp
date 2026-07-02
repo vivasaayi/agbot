@@ -36,7 +36,10 @@ public:
 
 // Forward-facing depth camera ray-traced against the NavWorld: exact
 // ray-vs-prism intersection for every SceneObject footprint (extruded to its
-// height) plus the flat ground plane. This is the ground-vehicle adaptation of
+// height), exact ray-vs-cylinder intersection for every DynamicAgent
+// (classes kClassPedestrian/kClassVehicle, object ids
+// kDynamicObjectIdBase + agent id, distinct from static prism ids), plus the
+// flat ground plane. This is the ground-vehicle adaptation of
 // agbot::flight_sim::raytrace_camera_frame, whose published API is a nadir
 // footprint sampler and cannot express a yawed/pitched forward mount.
 //

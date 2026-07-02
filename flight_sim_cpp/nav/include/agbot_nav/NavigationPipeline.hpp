@@ -9,6 +9,7 @@
 #include "agbot_nav/Mapping.hpp"
 #include "agbot_nav/Perception.hpp"
 #include "agbot_nav/Sensing.hpp"
+#include "agbot_nav/Tracking.hpp"
 #include "agbot_vehicles/IVehicleModel.hpp"
 
 #include <cstdint>
@@ -36,6 +37,14 @@ struct NavigationPipelineConfig {
 // the true state (gps_sigma_m, gps_period_s, compass_sigma_rad,
 // compass_period_s, odom_v_sigma, odom_yaw_rate_sigma, noise_seed) and plans
 // from the estimated pose instead of the raw EntityState.
+//
+// The optional [tracking] section wires a multi-object tracker between
+// perception and local planning (`algorithm = "none"` by default for exact
+// backward compatibility, or "greedy_nn" plus GreedyNnTracker params and
+// use_object_ids / cluster_distance_m for the detection clustering). With
+// tracking enabled, dynamic-class sensor points feed the tracker instead of
+// the static occupancy map, and the tracked objects are handed to the local
+// planner for predictive avoidance.
 [[nodiscard]] NavigationPipelineConfig parse_pipeline_config(const std::string& toml_text);
 
 // Staged navigation pipeline: sense -> perceive -> map/inflate -> global plan
@@ -59,6 +68,11 @@ public:
     [[nodiscard]] bool goal_reached() const { return goal_reached_; }
     [[nodiscard]] const Path& global_path() const { return global_path_; }
     [[nodiscard]] const Costmap& costmap() const { return costmap_; }
+    // Latest confirmed tracks from the [tracking] stage (empty when the
+    // tracker is disabled or idle).
+    [[nodiscard]] const std::vector<TrackedObject>& tracked_objects() const {
+        return tracked_objects_;
+    }
     [[nodiscard]] const std::vector<NavTelemetry>& telemetry() const { return telemetry_; }
     [[nodiscard]] std::uint8_t lethal_threshold() const;
 
@@ -85,6 +99,10 @@ private:
     std::unique_ptr<ILocalPlanner> local_planner_;
     std::unique_ptr<IController> controller_;
     std::unique_ptr<ILocalizer> localizer_;
+    std::unique_ptr<ITracker> tracker_; // null when [tracking] is "none"
+    bool track_use_object_ids_ = true;
+    double track_cluster_distance_m_ = 1.0;
+    std::vector<TrackedObject> tracked_objects_;
 
     // Simulated navigation sensors for non-ground-truth localizers.
     bool noisy_localization_ = false;

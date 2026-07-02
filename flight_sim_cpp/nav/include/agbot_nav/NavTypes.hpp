@@ -2,6 +2,7 @@
 
 #include "agbot_flight_sim/SceneSynthesis.hpp"
 #include "agbot_flight_sim/Vec3.hpp"
+#include "agbot_nav/DynamicAgents.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -15,6 +16,10 @@ using agbot::flight_sim::Vec3;
 struct PointCloud {
     std::vector<Vec3> points;
     std::vector<std::uint32_t> classes; // parallel to points; semantic class ids
+    // Optional per-point source object ids (parallel to points when
+    // non-empty): 0 = ground/none, 1 + scene-object index for static prisms,
+    // kDynamicObjectIdBase + agent id for dynamic agents.
+    std::vector<std::uint32_t> object_ids;
 
     [[nodiscard]] std::size_t size() const { return points.size(); }
     [[nodiscard]] bool empty() const { return points.empty(); }
@@ -23,6 +28,12 @@ struct PointCloud {
 // Semantic class ids used across the pipeline.
 inline constexpr std::uint32_t kClassGround = 0;
 inline constexpr std::uint32_t kClassObstacle = 1;
+inline constexpr std::uint32_t kClassPedestrian = 2;
+inline constexpr std::uint32_t kClassVehicle = 3;
+
+[[nodiscard]] inline bool is_dynamic_class(std::uint32_t class_id) {
+    return class_id == kClassPedestrian || class_id == kClassVehicle;
+}
 
 struct Pose2D {
     double x = 0.0;
@@ -111,11 +122,27 @@ struct Trajectory {
     std::vector<TrajectoryPoint> points;
 };
 
-// Synthetic world the navigation sensors observe: a flat ground plane plus the
-// scene-synthesis objects treated as extruded footprint prisms.
+// Synthetic world the navigation sensors observe: a flat ground plane, the
+// scene-synthesis objects treated as extruded footprint prisms, and moving
+// agents (pedestrians/vehicles) treated as vertical cylinders. The world
+// owner steps `agents` (step_agents) between pipeline ticks; an empty agent
+// list keeps the sensor output bit-identical to the static-world behavior.
 struct NavWorld {
     double ground_height_m = 0.0;
     agbot::flight_sim::SceneSynthesisManifest scene;
+    std::vector<DynamicAgent> agents;
+};
+
+// One tracked dynamic obstacle as reported by an ITracker: constant-velocity
+// state estimate on the XZ plane plus track bookkeeping evidence.
+struct TrackedObject {
+    std::uint32_t id = 0;
+    Vec3 position;          // y = 0
+    Vec3 velocity;          // y = 0, m/s
+    double radius_m = 0.3;
+    std::string class_name; // "pedestrian" | "vehicle" | "obstacle"
+    int age = 0;            // update calls since birth
+    int missed = 0;         // consecutive missed associations (coasting)
 };
 
 struct NavTelemetry {
@@ -129,6 +156,11 @@ struct NavTelemetry {
     double min_obstacle_distance_m = 0.0; // min sensed range in the latest frame
     double distance_to_goal_m = 0.0;
     bool goal_reached = false;
+    // Dynamic-obstacle evidence (0 / -1 when tracking is disabled or idle).
+    std::size_t tracked_object_count = 0;
+    // Min constant-velocity-predicted separation between the robot and any
+    // tracked object over the next few seconds; -1 when nothing is tracked.
+    double min_predicted_separation_m = -1.0;
 };
 
 } // namespace agbot::nav

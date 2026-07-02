@@ -123,6 +123,62 @@ double ray_prism_entry(
     return best;
 }
 
+// Nearest ray parameter t >= 0 where the ray enters the vertical cylinder of
+// radius `radius` around axis (cx, cz), spanning y in [y0, y1], or a negative
+// value when there is no hit within max_t. Cap entries fall out of the
+// slab/radial interval intersection naturally.
+double ray_cylinder_entry(
+    const Vec3& origin,
+    const Vec3& direction,
+    double cx,
+    double cz,
+    double radius,
+    double y0,
+    double y1,
+    double max_t) {
+    if (radius <= 0.0 || y1 <= y0) {
+        return -1.0;
+    }
+
+    // Vertical slab interval [ty0, ty1] where origin + t*d has y in [y0, y1].
+    double ty0 = 0.0;
+    double ty1 = max_t;
+    if (std::abs(direction.y) > kEps) {
+        double ta = (y0 - origin.y) / direction.y;
+        double tb = (y1 - origin.y) / direction.y;
+        if (ta > tb) {
+            std::swap(ta, tb);
+        }
+        ty0 = std::max(0.0, ta);
+        ty1 = std::min(max_t, tb);
+    } else if (origin.y < y0 || origin.y > y1) {
+        return -1.0;
+    }
+    if (ty0 > ty1) {
+        return -1.0;
+    }
+
+    const double ox = origin.x - cx;
+    const double oz = origin.z - cz;
+    const double a = direction.x * direction.x + direction.z * direction.z;
+    if (a <= kEps) {
+        // Vertical ray: hits only when horizontally inside the disk.
+        return (ox * ox + oz * oz <= radius * radius) ? ty0 : -1.0;
+    }
+    const double b = 2.0 * (ox * direction.x + oz * direction.z);
+    const double c = ox * ox + oz * oz - radius * radius;
+    const double disc = b * b - 4.0 * a * c;
+    if (disc < 0.0) {
+        return -1.0;
+    }
+    const double sq = std::sqrt(disc);
+    const double t_radial_lo = (-b - sq) / (2.0 * a);
+    const double t_radial_hi = (-b + sq) / (2.0 * a);
+    const double lo = std::max({t_radial_lo, ty0, 0.0});
+    const double hi = std::min({t_radial_hi, ty1, max_t});
+    return lo <= hi ? lo : -1.0;
+}
+
 } // namespace
 
 DepthCameraSensor::DepthCameraSensor(const agbot::config::ParamTable& params) {
@@ -183,6 +239,7 @@ SensorFrame DepthCameraSensor::sense(
     frame.depth_m.assign(static_cast<std::size_t>(width_) * static_cast<std::size_t>(height_), 0.0);
     frame.cloud.points.reserve(frame.depth_m.size());
     frame.cloud.classes.reserve(frame.depth_m.size());
+    frame.cloud.object_ids.reserve(frame.depth_m.size());
 
     for (int py = 0; py < height_; ++py) {
         for (int px = 0; px < width_; ++px) {
@@ -195,6 +252,7 @@ SensorFrame DepthCameraSensor::sense(
 
             double best_t = -1.0;
             std::uint32_t hit_class = kClassGround;
+            std::uint32_t hit_object = 0;
 
             // Ground plane.
             if (dir.y < -kEps) {
@@ -205,7 +263,8 @@ SensorFrame DepthCameraSensor::sense(
             }
 
             // Scene object prisms.
-            for (const auto& object : world.scene.objects) {
+            for (std::size_t oi = 0; oi < world.scene.objects.size(); ++oi) {
+                const auto& object = world.scene.objects[oi];
                 const double limit = best_t > 0.0 ? best_t : max_range_m_;
                 const double t = ray_prism_entry(
                     origin,
@@ -217,6 +276,28 @@ SensorFrame DepthCameraSensor::sense(
                 if (t >= 0.0 && (best_t < 0.0 || t < best_t)) {
                     best_t = t;
                     hit_class = kClassObstacle;
+                    hit_object = static_cast<std::uint32_t>(oi + 1);
+                }
+            }
+
+            // Dynamic agents as vertical cylinders. Empty agent lists skip
+            // this loop entirely, keeping the static-world depth image and
+            // noise stream bit-identical to the pre-agent behavior.
+            for (const DynamicAgent& agent : world.agents) {
+                const double limit = best_t > 0.0 ? best_t : max_range_m_;
+                const double t = ray_cylinder_entry(
+                    origin,
+                    dir,
+                    agent.x,
+                    agent.z,
+                    agent.radius_m,
+                    world.ground_height_m,
+                    world.ground_height_m + agent.height_m,
+                    limit);
+                if (t >= 0.0 && (best_t < 0.0 || t < best_t)) {
+                    best_t = t;
+                    hit_class = agent_class_id(agent.kind);
+                    hit_object = kDynamicObjectIdBase + agent.id;
                 }
             }
 
@@ -244,6 +325,7 @@ SensorFrame DepthCameraSensor::sense(
             // cell instead of the free cell that merely touches the face.
             frame.cloud.points.push_back(origin + dir * (range + kSurfaceBiasM));
             frame.cloud.classes.push_back(hit_class);
+            frame.cloud.object_ids.push_back(hit_object);
         }
     }
     return frame;

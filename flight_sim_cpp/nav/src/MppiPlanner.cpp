@@ -106,6 +106,11 @@ MppiPlanner::MppiPlanner(const agbot::config::ParamTable& params) {
     goal_slow_gain_ = double_or(params, "goal_slow_gain", goal_slow_gain_);
     seed_ = static_cast<std::uint64_t>(
         std::max<std::int64_t>(0, integer_or(params, "seed", static_cast<std::int64_t>(seed_))));
+    w_dynamic_ = double_or(params, "w_dynamic", w_dynamic_);
+    dynamic_margin_m_ = double_or(params, "dynamic_margin_m", dynamic_margin_m_);
+    dynamic_sigma_m_ = double_or(params, "dynamic_sigma_m", dynamic_sigma_m_);
+    max_prediction_s_ = double_or(params, "max_prediction_s", max_prediction_s_);
+    robot_radius_m_ = double_or(params, "robot_radius_m", robot_radius_m_);
 }
 
 LocalPlan MppiPlanner::compute(
@@ -113,7 +118,8 @@ LocalPlan MppiPlanner::compute(
     const Path& global_path,
     const agbot::vehicles::EntityState& state,
     const agbot::vehicles::VehicleLimits& limits,
-    const Vec3& goal) {
+    const Vec3& goal,
+    const std::vector<TrackedObject>& tracked_objects) {
     LocalPlan plan;
     if (global_path.points.empty()) {
         plan.reason = "empty_path";
@@ -180,6 +186,7 @@ LocalPlan MppiPlanner::compute(
         double path_acc = 0.0;
         double speed_acc = 0.0;
         double smooth_acc = 0.0;
+        double dynamic_acc = 0.0;
         double lethal_cost = 0.0;
         EntityState rolled = state;
         double v = v0;
@@ -212,6 +219,27 @@ LocalPlan MppiPlanner::compute(
                 lethal_cost += kLethalPenalty;
             }
             obstacle_acc += static_cast<double>(cost) / 254.0;
+
+            // Predictive dynamic-obstacle critic: constant-velocity
+            // extrapolation of every tracked object to this rollout time.
+            if (!tracked_objects.empty()) {
+                const double tau =
+                    std::min(static_cast<double>(t + 1) * dt_, max_prediction_s_);
+                const double inv_two_sigma_sq =
+                    1.0 / std::max(1e-9, 2.0 * dynamic_sigma_m_ * dynamic_sigma_m_);
+                for (const TrackedObject& object : tracked_objects) {
+                    const double px = object.position.x + object.velocity.x * tau;
+                    const double pz = object.position.z + object.velocity.z * tau;
+                    const double dx = rolled.position.x - px;
+                    const double dz = rolled.position.z - pz;
+                    const double d = std::sqrt(dx * dx + dz * dz);
+                    if (d < robot_radius_m_ + object.radius_m + dynamic_margin_m_) {
+                        lethal_cost += kLethalPenalty;
+                    }
+                    dynamic_acc += std::exp(-(d * d) * inv_two_sigma_sq);
+                }
+            }
+
             path_acc += distance_to_polyline(path_window, rolled.position);
             speed_acc += std::abs(v - v_target);
             smooth_acc += (noise_a * noise_a)
@@ -226,7 +254,8 @@ LocalPlan MppiPlanner::compute(
             + w_path_ * path_acc / steps
             + w_goal_ * goal_score
             + w_speed_ * speed_acc / std::max(1e-6, v_target) / steps
-            + w_smooth_ * smooth_acc / steps;
+            + w_smooth_ * smooth_acc / steps
+            + w_dynamic_ * dynamic_acc / steps;
     }
 
     const double best_score = *std::min_element(scores.begin(), scores.end());

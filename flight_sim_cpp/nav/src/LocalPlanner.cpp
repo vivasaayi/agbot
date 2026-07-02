@@ -87,6 +87,9 @@ PurePursuitPlanner::PurePursuitPlanner(const agbot::config::ParamTable& params) 
     min_speed_mps_ = agbot::config::double_or(params, "min_speed_mps", min_speed_mps_);
     horizon_s_ = agbot::config::double_or(params, "horizon_s", horizon_s_);
     rollout_dt_s_ = agbot::config::double_or(params, "rollout_dt_s", rollout_dt_s_);
+    robot_radius_m_ = agbot::config::double_or(params, "robot_radius_m", robot_radius_m_);
+    stop_distance_m_ = agbot::config::double_or(params, "stop_distance_m", stop_distance_m_);
+    max_prediction_s_ = agbot::config::double_or(params, "max_prediction_s", max_prediction_s_);
 }
 
 LocalPlan PurePursuitPlanner::compute(
@@ -94,7 +97,8 @@ LocalPlan PurePursuitPlanner::compute(
     const Path& global_path,
     const agbot::vehicles::EntityState& state,
     const agbot::vehicles::VehicleLimits& limits,
-    const Vec3& goal) {
+    const Vec3& goal,
+    const std::vector<TrackedObject>& tracked_objects) {
     LocalPlan plan;
     if (global_path.points.empty()) {
         plan.reason = "empty_path";
@@ -136,6 +140,35 @@ LocalPlan PurePursuitPlanner::compute(
     }
     const double goal_distance = (goal - state.position).horizontal_length();
     speed = std::min(speed, std::max(min_speed_mps_, goal_slow_gain_ * goal_distance));
+
+    // Dynamic-obstacle yield guard: sample the robot's straight-ahead
+    // constant-speed motion against every tracked object's constant-velocity
+    // extrapolation; scale the commanded speed toward a full stop when the
+    // minimum predicted surface separation drops below stop_distance_m.
+    if (!tracked_objects.empty()) {
+        constexpr double kPredictStepS = 0.1;
+        double min_separation = std::numeric_limits<double>::infinity();
+        const double heading_x = std::cos(state.yaw_rad);
+        const double heading_z = std::sin(state.yaw_rad);
+        for (double tau = 0.0; tau <= max_prediction_s_ + 1e-9; tau += kPredictStepS) {
+            const double rx = state.position.x + heading_x * speed * tau;
+            const double rz = state.position.z + heading_z * speed * tau;
+            for (const TrackedObject& object : tracked_objects) {
+                const double px = object.position.x + object.velocity.x * tau;
+                const double pz = object.position.z + object.velocity.z * tau;
+                const double dx = rx - px;
+                const double dz = rz - pz;
+                const double separation =
+                    std::sqrt(dx * dx + dz * dz) - (robot_radius_m_ + object.radius_m);
+                min_separation = std::min(min_separation, separation);
+            }
+        }
+        if (min_separation < stop_distance_m_) {
+            const double scale =
+                std::clamp(min_separation / std::max(1e-9, stop_distance_m_), 0.0, 1.0);
+            speed *= scale;
+        }
+    }
     plan.v_cmd = speed;
 
     // Reference trajectory for the tracking controller: the global path
@@ -182,6 +215,11 @@ DwaPlanner::DwaPlanner(const agbot::config::ParamTable& params) {
     w_speed_ = agbot::config::double_or(params, "w_speed", w_speed_);
     min_speed_mps_ = agbot::config::double_or(params, "min_speed_mps", min_speed_mps_);
     goal_slow_gain_ = agbot::config::double_or(params, "goal_slow_gain", goal_slow_gain_);
+    w_dynamic_ = agbot::config::double_or(params, "w_dynamic", w_dynamic_);
+    dynamic_margin_m_ = agbot::config::double_or(params, "dynamic_margin_m", dynamic_margin_m_);
+    dynamic_sigma_m_ = agbot::config::double_or(params, "dynamic_sigma_m", dynamic_sigma_m_);
+    max_prediction_s_ = agbot::config::double_or(params, "max_prediction_s", max_prediction_s_);
+    robot_radius_m_ = agbot::config::double_or(params, "robot_radius_m", robot_radius_m_);
 }
 
 LocalPlan DwaPlanner::compute(
@@ -189,7 +227,8 @@ LocalPlan DwaPlanner::compute(
     const Path& global_path,
     const agbot::vehicles::EntityState& state,
     const agbot::vehicles::VehicleLimits& limits,
-    const Vec3& goal) {
+    const Vec3& goal,
+    const std::vector<TrackedObject>& tracked_objects) {
     LocalPlan plan;
     if (global_path.points.empty()) {
         plan.reason = "empty_path";
@@ -223,8 +262,11 @@ LocalPlan DwaPlanner::compute(
             // Rollout and critics.
             EntityState rolled = state;
             double max_cost = 0.0;
+            double max_dynamic_proximity = 0.0;
             bool lethal = false;
             double t = 0.0;
+            const double inv_two_sigma_sq =
+                1.0 / std::max(1e-9, 2.0 * dynamic_sigma_m_ * dynamic_sigma_m_);
             while (t + 1e-9 < horizon_s_) {
                 rolled = bicycle_propagate(rolled, v, steer, limits.wheelbase_m, rollout_dt_s_);
                 t += rollout_dt_s_;
@@ -237,6 +279,29 @@ LocalPlan DwaPlanner::compute(
                     break;
                 }
                 max_cost = std::max(max_cost, static_cast<double>(cost));
+
+                // Predictive dynamic-obstacle critic: constant-velocity
+                // extrapolation; inside the hard margin the rollout is
+                // rejected like a lethal cell.
+                if (!tracked_objects.empty()) {
+                    const double tau = std::min(t, max_prediction_s_);
+                    for (const TrackedObject& object : tracked_objects) {
+                        const double px = object.position.x + object.velocity.x * tau;
+                        const double pz = object.position.z + object.velocity.z * tau;
+                        const double dx = rolled.position.x - px;
+                        const double dz = rolled.position.z - pz;
+                        const double d = std::sqrt(dx * dx + dz * dz);
+                        if (d < robot_radius_m_ + object.radius_m + dynamic_margin_m_) {
+                            lethal = true;
+                            break;
+                        }
+                        max_dynamic_proximity = std::max(
+                            max_dynamic_proximity, std::exp(-(d * d) * inv_two_sigma_sq));
+                    }
+                    if (lethal) {
+                        break;
+                    }
+                }
             }
             if (lethal) {
                 continue;
@@ -247,7 +312,8 @@ LocalPlan DwaPlanner::compute(
             const double goal_score = (goal - rolled.position).horizontal_length();
             const double speed_score = 1.0 - v / std::max(1e-6, v_cap);
             const double score = w_obstacle_ * obstacle_score + w_path_ * path_score
-                + w_goal_ * goal_score + w_speed_ * speed_score;
+                + w_goal_ * goal_score + w_speed_ * speed_score
+                + w_dynamic_ * max_dynamic_proximity;
             // Strict < keeps the first-best sample under the deterministic
             // iteration order.
             if (score < best_score) {

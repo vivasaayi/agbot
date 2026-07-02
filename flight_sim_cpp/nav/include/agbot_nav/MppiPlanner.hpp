@@ -22,9 +22,18 @@ namespace agbot::nav {
 // step, Box-Muller transform) makes every compute() bit-identical for a fixed
 // seed and call sequence, independent of platform library distributions.
 //
+// Dynamic-obstacle critic: at rollout step t each tracked object is
+// extrapolated along its constant-velocity estimate to
+// position + velocity * min(t * dt, max_prediction_s); a rollout sample
+// entering the hard margin (robot_radius_m + object radius +
+// dynamic_margin_m) accrues the lethal penalty, and every step pays
+// w_dynamic * exp(-d^2 / (2 * dynamic_sigma_m^2)) on the predicted
+// separation d. An empty tracked-object list adds exactly zero cost.
+//
 // Params: time_steps, dt, num_samples, lambda, sigma_accel, sigma_steer_rate,
 // cruise_speed_mps, lethal_threshold, w_obstacle, w_path, w_goal, w_speed,
-// w_smooth, min_speed_mps, goal_slow_gain, seed.
+// w_smooth, min_speed_mps, goal_slow_gain, seed, w_dynamic,
+// dynamic_margin_m, dynamic_sigma_m, max_prediction_s, robot_radius_m.
 class MppiPlanner final : public ILocalPlanner {
 public:
     MppiPlanner() = default;
@@ -35,7 +44,8 @@ public:
         const Path& global_path,
         const agbot::vehicles::EntityState& state,
         const agbot::vehicles::VehicleLimits& limits,
-        const Vec3& goal) override;
+        const Vec3& goal,
+        const std::vector<TrackedObject>& tracked_objects = {}) override;
 
     [[nodiscard]] std::string name() const override { return "mppi"; }
 
@@ -61,6 +71,11 @@ private:
     double min_speed_mps_ = 0.0;
     double goal_slow_gain_ = 0.8;
     std::uint64_t seed_ = 1;
+    double w_dynamic_ = 3.0;
+    double dynamic_margin_m_ = 0.3;
+    double dynamic_sigma_m_ = 1.2;
+    double max_prediction_s_ = 3.0;
+    double robot_radius_m_ = 0.5;
 
     std::vector<Control> nominal_; // previous solution, shifted each call
     double plan_steer_seed_ = 0.0; // steer state carried between calls

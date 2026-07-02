@@ -118,6 +118,23 @@ rollout_dt_s = 0.1
 # w_smooth = 0.05                  # control-effort critic weight
 # seed = 1                         # counter-RNG seed (bit-deterministic)
 
+# Predictive dynamic-obstacle costing (mppi + dwa; requires the [tracking]
+# stage to feed tracked objects). Each tracked object is extrapolated along
+# its constant-velocity estimate to the rollout step time; rollouts inside
+# the hard margin (robot_radius_m + object radius + dynamic_margin_m) are
+# rejected/penalized as lethal, surviving ones pay
+# w_dynamic * exp(-d^2 / (2 * dynamic_sigma_m^2)). Defaults shown:
+# w_dynamic = 3.0                  # predicted-proximity critic weight
+# dynamic_margin_m = 0.3           # extra hard margin around the object
+# dynamic_sigma_m = 1.2            # gaussian proximity falloff (m)
+# max_prediction_s = 3.0           # constant-velocity extrapolation cap (s)
+# robot_radius_m = 0.5             # robot body radius for the hard margin
+# pure_pursuit instead uses a simple yield guard: it samples its
+# straight-ahead motion against each tracked object's prediction and scales
+# speed to a stop when the predicted surface separation drops below
+# stop_distance_m (params: robot_radius_m, stop_distance_m = 2.0,
+# max_prediction_s).
+
 # Optional localization stage. Default (section absent or "ground_truth")
 # passes the true pose through, leaving legacy behavior bit-identical.
 # [localization]
@@ -136,6 +153,26 @@ rollout_dt_s = 0.1
 # NavigationPipeline::set_gps_quality(q) drives urban-canyon degradation:
 # q in [0, 1] scales both the simulated GPS noise and the EKF measurement
 # covariance R.
+
+# Multi-object tracking stage between perception and local planning. The
+# default ("none", or section absent) keeps legacy behavior bit-identical:
+# no tracker runs and dynamic sensor returns fall into the static map. With
+# a tracker enabled, pedestrian/vehicle depth returns are clustered into
+# detections, tracked with per-track constant-velocity Kalman filters, kept
+# out of the static occupancy grid, and handed to the local planner for
+# predictive avoidance.
+[tracking]
+algorithm = "none"                 # "none" | "greedy_nn"
+# use_object_ids = true            # cluster by sensor object id (GT path);
+#                                  # false = distance-based clustering
+# cluster_distance_m = 1.0         # fallback clustering join distance
+# gate_m = 2.5                     # nearest-neighbor association gate
+# min_hits = 2                     # hits before a track is reported (birth)
+# max_missed = 5                   # consecutive misses before track death
+# q_pos = 0.3                      # KF position process noise (m^2/s)
+# q_vel = 2.0                      # KF velocity process noise ((m/s)^2/s)
+# r_pos = 0.2                      # measurement sigma (m)
+# init_vel_sigma = 3.0             # initial velocity sigma of new tracks
 
 [control]
 algorithm = "pid_stanley"
