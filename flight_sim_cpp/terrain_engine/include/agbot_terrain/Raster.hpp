@@ -72,6 +72,9 @@ struct ImageryBundle {
     int grid_width = 0;
     int grid_height = 0;
     std::optional<HeightField> dem_prior;
+    // Optional RGB imagery for learned estimators (e.g. mono_depth_onnx).
+    // Path to a PNG covering the AOI, decoded via the module PNG decoder.
+    std::string rgb_image_path;
 
     // Resolved square grid resolution for estimators that produce AOI grids.
     [[nodiscard]] int resolved_resolution() const;

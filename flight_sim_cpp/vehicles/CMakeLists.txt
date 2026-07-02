@@ -3,6 +3,8 @@ add_library(agbot_vehicles
     src/VehicleTypes.cpp
     src/KinematicBicycleModel.cpp
     src/MultirotorModel.cpp
+    src/FixedWingModel.cpp
+    src/FixedWingAutopilot.cpp
     src/VehicleRegistry.cpp
 )
 
@@ -24,3 +26,12 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(agbot_vehicle_tests PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 add_test(NAME agbot_vehicle_tests COMMAND agbot_vehicle_tests)
+
+add_executable(agbot_cessna_tests tests/cessna_tests.cpp)
+target_link_libraries(agbot_cessna_tests PRIVATE agbot_vehicles)
+target_compile_definitions(agbot_cessna_tests
+    PRIVATE AGBOT_VEHICLES_CONFIG_DIR="${CMAKE_CURRENT_SOURCE_DIR}/configs")
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(agbot_cessna_tests PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+add_test(NAME agbot_cessna_tests COMMAND agbot_cessna_tests)

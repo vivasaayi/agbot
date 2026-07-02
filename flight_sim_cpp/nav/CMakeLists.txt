@@ -7,6 +7,7 @@ add_library(agbot_nav
     src/LocalPlanner.cpp
     src/Controller.cpp
     src/NavigationPipeline.cpp
+    src/AerialPlanner.cpp
 )
 
 target_include_directories(agbot_nav
@@ -27,3 +28,10 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(agbot_nav_tests PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 add_test(NAME agbot_nav_tests COMMAND agbot_nav_tests)
+
+add_executable(agbot_aerial_tests tests/aerial_tests.cpp)
+target_link_libraries(agbot_aerial_tests PRIVATE agbot_nav)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(agbot_aerial_tests PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+add_test(NAME agbot_aerial_tests COMMAND agbot_aerial_tests)

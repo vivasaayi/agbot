@@ -410,6 +410,8 @@ PngImage decode_png_rgba(const std::vector<std::uint8_t>& file_bytes) {
 
     int bit_depth = 0;
     int color_type = -1;
+    std::vector<std::uint8_t> palette;      // PLTE: packed RGB triples
+    std::vector<std::uint8_t> palette_alpha; // tRNS: per-entry alpha
     std::vector<std::uint8_t> compressed;
     std::size_t pos = 8;
     bool saw_ihdr = false;
@@ -440,7 +442,8 @@ PngImage decode_png_rgba(const std::vector<std::uint8_t>& file_bytes) {
                 image.error = "png_unsupported_bit_depth";
                 return image;
             }
-            if (color_type != 0 && color_type != 2 && color_type != 4 && color_type != 6) {
+            if (color_type != 0 && color_type != 2 && color_type != 3 &&
+                color_type != 4 && color_type != 6) {
                 image.error = "png_unsupported_color_type";
                 return image;
             }
@@ -449,6 +452,18 @@ PngImage decode_png_rgba(const std::vector<std::uint8_t>& file_bytes) {
                 return image;
             }
             saw_ihdr = true;
+        } else if (std::memcmp(type, "PLTE", 4) == 0) {
+            if (length == 0 || length % 3 != 0 || length > 256 * 3) {
+                image.error = "png_bad_plte";
+                return image;
+            }
+            palette.assign(payload, payload + length);
+        } else if (std::memcmp(type, "tRNS", 4) == 0 && color_type == 3) {
+            if (length > 256) {
+                image.error = "png_bad_trns";
+                return image;
+            }
+            palette_alpha.assign(payload, payload + length);
         } else if (std::memcmp(type, "IDAT", 4) == 0) {
             compressed.insert(compressed.end(), payload, payload + length);
         } else if (std::memcmp(type, "IEND", 4) == 0) {
@@ -460,6 +475,10 @@ PngImage decode_png_rgba(const std::vector<std::uint8_t>& file_bytes) {
         image.error = saw_ihdr ? "png_missing_idat" : "png_missing_ihdr";
         return image;
     }
+    if (color_type == 3 && palette.empty()) {
+        image.error = "png_missing_plte";
+        return image;
+    }
 
     const InflateResult inflated = inflate_zlib_stream(compressed.data(), compressed.size());
     if (!inflated.ok) {
@@ -467,7 +486,8 @@ PngImage decode_png_rgba(const std::vector<std::uint8_t>& file_bytes) {
         return image;
     }
 
-    const int channels = color_type == 0 ? 1 : color_type == 2 ? 3 : color_type == 4 ? 2 : 4;
+    const int channels = (color_type == 0 || color_type == 3) ? 1
+        : color_type == 2 ? 3 : color_type == 4 ? 2 : 4;
     const std::size_t stride =
         static_cast<std::size_t>(image.width) * static_cast<std::size_t>(channels);
     const std::size_t expected = (stride + 1) * static_cast<std::size_t>(image.height);
@@ -514,6 +534,18 @@ PngImage decode_png_rgba(const std::vector<std::uint8_t>& file_bytes) {
         switch (color_type) {
         case 0: dst[0] = dst[1] = dst[2] = src[0]; dst[3] = 255; break;
         case 2: dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = 255; break;
+        case 3: {
+            const std::size_t index = src[0];
+            if (index * 3 + 2 >= palette.size()) {
+                image.error = "png_palette_index_out_of_range";
+                return image;
+            }
+            dst[0] = palette[index * 3];
+            dst[1] = palette[index * 3 + 1];
+            dst[2] = palette[index * 3 + 2];
+            dst[3] = index < palette_alpha.size() ? palette_alpha[index] : 255;
+            break;
+        }
         case 4: dst[0] = dst[1] = dst[2] = src[0]; dst[3] = src[1]; break;
         default: dst[0] = src[0]; dst[1] = src[1]; dst[2] = src[2]; dst[3] = src[3]; break;
         }

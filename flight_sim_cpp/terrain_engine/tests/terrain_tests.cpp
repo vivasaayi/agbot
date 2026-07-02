@@ -1,6 +1,7 @@
 #include "agbot_config/Toml.hpp"
 #include "agbot_terrain/ElevationEstimator.hpp"
 #include "agbot_terrain/Fusion.hpp"
+#include "agbot_terrain/MonoDepth.hpp"
 #include "agbot_terrain/Png.hpp"
 #include "agbot_terrain/Raster.hpp"
 #include "agbot_terrain/TerrainPipeline.hpp"
@@ -105,12 +106,15 @@ void test_registry() {
     terrain::ImageryBundle bundle;
     bundle.aoi = test_bounds();
     const auto mono = registry.create("mono_depth_onnx");
-    expect(mono != nullptr && !mono->accepts(bundle), "onnx stub rejects bundles");
+    expect(mono != nullptr && !mono->accepts(bundle),
+           "mono_depth_onnx rejects bundles without RGB imagery");
+#if !defined(AGBOT_TERRAIN_HAS_ONNX)
     if (mono != nullptr) {
         const auto result = mono->estimate(bundle, {});
         expect(!result.ok && result.error == "onnx_runtime_unavailable",
                "onnx stub reports reason-coded error");
     }
+#endif
 }
 
 void test_dem_prior_roundtrip() {
@@ -443,6 +447,329 @@ void test_real_tile_decode() {
     }
 }
 
+void test_affine_fit() {
+    // Known line y = 2.5x - 40 with three gross outliers; the sigma-clipped
+    // fit must recover the exact coefficients and reject the outliers.
+    std::vector<float> x;
+    std::vector<float> y;
+    for (int i = 0; i < 100; ++i) {
+        const float xv = static_cast<float>(i) * 0.1f;
+        x.push_back(xv);
+        y.push_back(2.5f * xv - 40.0f);
+    }
+    y[10] += 500.0f;
+    y[50] -= 300.0f;
+    y[80] += 250.0f;
+    const auto fit = terrain::fit_affine_sigma_clipped(x, y);
+    expect(fit.ok, "affine fit succeeds");
+    expect(std::abs(fit.a - 2.5) < 1e-3, "affine fit recovers slope a=2.5");
+    expect(std::abs(fit.b + 40.0) < 1e-2, "affine fit recovers intercept b=-40");
+    expect(fit.inliers == 97, "affine fit rejects the 3 outliers");
+    expect(fit.sigma < 1e-3, "affine fit inlier sigma near zero on exact line");
+
+    const auto empty = terrain::fit_affine_sigma_clipped({}, {});
+    expect(!empty.ok, "affine fit rejects empty input");
+    const auto degenerate = terrain::fit_affine_sigma_clipped(
+        { 1.0f, 1.0f, 1.0f }, { 2.0f, 3.0f, 4.0f });
+    expect(!degenerate.ok, "affine fit rejects constant x (degenerate)");
+    const auto mismatched = terrain::fit_affine_sigma_clipped({ 1.0f }, { 1.0f, 2.0f });
+    expect(!mismatched.ok, "affine fit rejects mismatched sizes");
+}
+
+#if defined(AGBOT_TERRAIN_HAS_ONNX)
+
+// --- Minimal PNG writer (RGB8, filter 0, stored-deflate) for test imagery ---
+
+std::uint32_t crc32_bytes(const std::uint8_t* data, std::size_t size, std::uint32_t crc) {
+    crc = ~crc;
+    for (std::size_t i = 0; i < size; ++i) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; ++bit) {
+            crc = (crc >> 1) ^ (0xEDB88320u & (~(crc & 1u) + 1u));
+        }
+    }
+    return ~crc;
+}
+
+void append_u32_be(std::vector<std::uint8_t>& out, std::uint32_t value) {
+    out.push_back(static_cast<std::uint8_t>(value >> 24));
+    out.push_back(static_cast<std::uint8_t>(value >> 16));
+    out.push_back(static_cast<std::uint8_t>(value >> 8));
+    out.push_back(static_cast<std::uint8_t>(value));
+}
+
+void append_chunk(
+    std::vector<std::uint8_t>& out, const char* type, const std::vector<std::uint8_t>& payload) {
+    append_u32_be(out, static_cast<std::uint32_t>(payload.size()));
+    std::vector<std::uint8_t> body(type, type + 4);
+    body.insert(body.end(), payload.begin(), payload.end());
+    out.insert(out.end(), body.begin(), body.end());
+    append_u32_be(out, crc32_bytes(body.data(), body.size(), 0));
+}
+
+// rgb: tightly packed RGB8 rows, top row first.
+bool write_test_png_rgb(
+    const std::filesystem::path& path, int width, int height,
+    const std::vector<std::uint8_t>& rgb) {
+    std::vector<std::uint8_t> raw; // filter byte 0 + scanline, per row
+    raw.reserve(static_cast<std::size_t>(height) * (1 + static_cast<std::size_t>(width) * 3));
+    for (int row = 0; row < height; ++row) {
+        raw.push_back(0);
+        const std::size_t offset = static_cast<std::size_t>(row) *
+            static_cast<std::size_t>(width) * 3;
+        raw.insert(raw.end(), rgb.begin() + static_cast<std::ptrdiff_t>(offset),
+                   rgb.begin() + static_cast<std::ptrdiff_t>(offset +
+                       static_cast<std::size_t>(width) * 3));
+    }
+    // zlib wrapper with stored deflate blocks.
+    std::vector<std::uint8_t> zlib = { 0x78, 0x01 };
+    std::size_t position = 0;
+    while (position < raw.size()) {
+        const std::size_t block = std::min<std::size_t>(65535, raw.size() - position);
+        const bool final_block = position + block == raw.size();
+        zlib.push_back(final_block ? 0x01 : 0x00);
+        zlib.push_back(static_cast<std::uint8_t>(block & 0xFF));
+        zlib.push_back(static_cast<std::uint8_t>(block >> 8));
+        zlib.push_back(static_cast<std::uint8_t>(~block & 0xFF));
+        zlib.push_back(static_cast<std::uint8_t>((~block >> 8) & 0xFF));
+        zlib.insert(zlib.end(), raw.begin() + static_cast<std::ptrdiff_t>(position),
+                    raw.begin() + static_cast<std::ptrdiff_t>(position + block));
+        position += block;
+    }
+    std::uint32_t s1 = 1;
+    std::uint32_t s2 = 0;
+    for (const std::uint8_t byte : raw) {
+        s1 = (s1 + byte) % 65521u;
+        s2 = (s2 + s1) % 65521u;
+    }
+    append_u32_be(zlib, (s2 << 16) | s1);
+
+    std::vector<std::uint8_t> file = { 0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A };
+    std::vector<std::uint8_t> ihdr;
+    append_u32_be(ihdr, static_cast<std::uint32_t>(width));
+    append_u32_be(ihdr, static_cast<std::uint32_t>(height));
+    ihdr.push_back(8); // bit depth
+    ihdr.push_back(2); // color type RGB
+    ihdr.push_back(0);
+    ihdr.push_back(0);
+    ihdr.push_back(0);
+    append_chunk(file, "IHDR", ihdr);
+    append_chunk(file, "IDAT", zlib);
+    append_chunk(file, "IEND", {});
+
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream stream(path, std::ios::binary);
+    if (!stream) {
+        return false;
+    }
+    stream.write(reinterpret_cast<const char*>(file.data()),
+                 static_cast<std::streamsize>(file.size()));
+    return static_cast<bool>(stream);
+}
+
+std::string depth_model_path() {
+    return std::string(AGBOT_FLIGHT_SIM_SOURCE_DIR) +
+        "/data/models/depth_anything_v2_small.onnx";
+}
+
+void test_mono_depth_reason_codes() {
+    const auto estimator = terrain::estimator_registry().create("mono_depth_onnx");
+    terrain::ImageryBundle bundle;
+    bundle.aoi = test_bounds();
+    bundle.grid_width = 16;
+    bundle.grid_height = 16;
+
+    cfg::ParamTable bogus;
+    bogus["model_path"] = cfg::ParamValue("/nonexistent/depth_model.onnx");
+    const auto missing_model = estimator->estimate(bundle, bogus);
+    expect(!missing_model.ok && missing_model.error.rfind("model_missing", 0) == 0,
+           "mono_depth reports model_missing for bogus path");
+
+    if (!std::filesystem::exists(depth_model_path())) {
+        std::cout << "SKIP mono_depth reason codes needing the real model ("
+                  << depth_model_path() << " absent; run tools/fetch_depth_model.sh)\n";
+        return;
+    }
+    const auto no_rgb = estimator->estimate(bundle, {});
+    expect(!no_rgb.ok && no_rgb.error == "rgb_missing",
+           "mono_depth reports rgb_missing without imagery");
+    expect(!estimator->accepts(bundle), "mono_depth accepts() false without imagery");
+
+    bundle.rgb_image_path = "out/terrain/does_not_matter.png";
+    const auto no_anchor = estimator->estimate(bundle, {});
+    expect(!no_anchor.ok && no_anchor.error == "anchor_missing",
+           "mono_depth reports anchor_missing without dem_prior");
+}
+
+void test_mono_depth_synthetic_end_to_end() {
+    if (!std::filesystem::exists(depth_model_path())) {
+        std::cout << "SKIP mono_depth synthetic end-to-end (model absent: "
+                  << depth_model_path() << ")\n";
+        return;
+    }
+    // Deterministic gradient scene with a bright square "structure".
+    const int width = 96;
+    const int height = 96;
+    std::vector<std::uint8_t> rgb(static_cast<std::size_t>(width) * height * 3);
+    for (int row = 0; row < height; ++row) {
+        for (int col = 0; col < width; ++col) {
+            const std::size_t i = (static_cast<std::size_t>(row) * width + col) * 3;
+            const bool structure = row >= 32 && row < 64 && col >= 32 && col < 64;
+            rgb[i + 0] = static_cast<std::uint8_t>(structure ? 230 : col * 2);
+            rgb[i + 1] = static_cast<std::uint8_t>(structure ? 220 : row * 2);
+            rgb[i + 2] = static_cast<std::uint8_t>(structure ? 210 : 96);
+        }
+    }
+    const std::filesystem::path png_path =
+        std::filesystem::path("out") / "terrain" / "mono_depth_gradient.png";
+    expect(write_test_png_rgb(png_path, width, height, rgb), "synthetic RGB PNG written");
+    const terrain::PngImage decoded = terrain::decode_png_rgba_file(png_path);
+    expect(decoded.ok && decoded.width == width, "synthetic RGB PNG decodes back");
+
+    terrain::ImageryBundle bundle;
+    bundle.aoi = test_bounds();
+    bundle.grid_width = 48;
+    bundle.grid_height = 48;
+    bundle.rgb_image_path = png_path.string();
+    terrain::HeightField prior;
+    prior.elevation = analytic_raster(bundle.aoi, 96);
+    prior.confidence = terrain::Raster::filled(96, 96, bundle.aoi, 1.0f);
+    prior.source_algorithm = "analytic_fixture";
+    bundle.dem_prior = prior;
+
+    const auto estimator = terrain::estimator_registry().create("mono_depth_onnx");
+    expect(estimator->accepts(bundle), "mono_depth accepts RGB + dem_prior bundle");
+    cfg::ParamTable params;
+    params["input_size"] = cfg::ParamValue(252); // multiple of 14, fast on CPU
+    const auto first = estimator->estimate(bundle, params);
+    expect(first.ok, "mono_depth synthetic estimate succeeds" +
+           (first.ok ? "" : " (" + first.error + ")"));
+    if (!first.ok) {
+        return;
+    }
+    expect(first.field.elevation.width == 48 && first.field.elevation.height == 48,
+           "mono_depth honors requested grid");
+    bool all_finite = true;
+    float min_elev = std::numeric_limits<float>::max();
+    float max_elev = std::numeric_limits<float>::lowest();
+    for (const float value : first.field.elevation.values) {
+        if (!std::isfinite(value)) {
+            all_finite = false;
+        } else {
+            min_elev = std::min(min_elev, value);
+            max_elev = std::max(max_elev, value);
+        }
+    }
+    expect(all_finite, "mono_depth elevation values all finite");
+    bool confidence_in_range = true;
+    for (const float value : first.field.confidence.values) {
+        if (!(value >= 0.05f && value <= 0.9f)) {
+            confidence_in_range = false;
+        }
+    }
+    expect(confidence_in_range, "mono_depth confidence within [0.05, 0.9]");
+    // Anchored output must live in the DEM prior's ballpark (50..265 m).
+    expect(min_elev > -200.0f && max_elev < 600.0f,
+           "mono_depth anchored to DEM prior range (" +
+           std::to_string(min_elev) + ".." + std::to_string(max_elev) + " m)");
+
+    const auto second = estimator->estimate(bundle, params);
+    expect(second.ok && terrain::raster_hash(first.field.elevation) ==
+           terrain::raster_hash(second.field.elevation),
+           "mono_depth deterministic across two runs");
+}
+
+void test_mono_depth_map_tile_smoke() {
+    if (!std::filesystem::exists(depth_model_path())) {
+        std::cout << "SKIP mono_depth map-tile smoke (model absent)\n";
+        return;
+    }
+    // Prefer the deepest-zoom cached map tile whose AOI has real DEM
+    // coverage in the z12/z13 elevation cache.
+    const std::filesystem::path map_tiles =
+        std::filesystem::path(AGBOT_FLIGHT_SIM_SOURCE_DIR) / "out" / "map_tiles";
+    if (!std::filesystem::exists(map_tiles)) {
+        std::cout << "SKIP mono_depth map-tile smoke (no cached map tiles)\n";
+        return;
+    }
+    std::vector<std::filesystem::path> candidates;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(map_tiles)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".png") {
+            candidates.push_back(entry.path());
+        }
+    }
+    std::sort(candidates.begin(), candidates.end(),
+        [](const std::filesystem::path& a, const std::filesystem::path& b) {
+            const auto zoom_of = [](const std::filesystem::path& p) {
+                return std::stoi(p.parent_path().parent_path().filename().string());
+            };
+            const int za = zoom_of(a);
+            const int zb = zoom_of(b);
+            if (za != zb) {
+                return za > zb;
+            }
+            return a.string() < b.string();
+        });
+
+    const auto dem_estimator = terrain::estimator_registry().create("dem_fusion");
+    const auto mono = terrain::estimator_registry().create("mono_depth_onnx");
+    for (const std::filesystem::path& tile_path : candidates) {
+        const int y = std::stoi(tile_path.stem().string());
+        const int x = std::stoi(tile_path.parent_path().filename().string());
+        const int z = std::stoi(tile_path.parent_path().parent_path().filename().string());
+        if (z < 12) {
+            break; // sorted descending; low zooms span too much terrain
+        }
+        terrain::ImageryBundle bundle;
+        bundle.aoi = fsim::TileCoordinate { z, x, y }.bounds();
+        bundle.grid_width = 64;
+        bundle.grid_height = 64;
+
+        cfg::ParamTable dem_params;
+        dem_params["zoom"] = cfg::ParamValue(12);
+        dem_params["void_fill"] = cfg::ParamValue("idw");
+        const auto dem = dem_estimator->estimate(bundle, dem_params);
+        if (!dem.ok) {
+            continue;
+        }
+        std::size_t trusted = 0;
+        for (const float value : dem.field.confidence.values) {
+            if (value >= 0.9f) {
+                ++trusted;
+            }
+        }
+        if (trusted < dem.field.confidence.values.size()) {
+            continue; // needs full real DEM coverage to be a meaningful anchor
+        }
+
+        bundle.dem_prior = dem.field;
+        bundle.rgb_image_path = tile_path.string();
+        const auto result = mono->estimate(bundle, {});
+        expect(result.ok, "mono_depth map-tile smoke estimate succeeds (" +
+               tile_path.string() + ")" + (result.ok ? "" : " error=" + result.error));
+        if (!result.ok) {
+            return;
+        }
+        const auto metrics =
+            terrain::compute_metrics(result.field.elevation, dem.field.elevation);
+        expect(metrics.sample_count == 64 * 64,
+               "mono_depth map-tile smoke covers full grid");
+        expect(metrics.rmse < 30.0,
+               "mono_depth anchored within 30 m RMSE of DEM (rmse=" +
+               std::to_string(metrics.rmse) + " m)");
+        // Consistency: re-fitting mono output against the DEM must be ~identity.
+        const auto identity = terrain::fit_affine_sigma_clipped(
+            result.field.elevation.values, dem.field.elevation.values, 1, 2.0);
+        std::cout << "  map-tile smoke: tile z" << z << "/" << x << "/" << y
+                  << " rmse=" << metrics.rmse << " m bias=" << metrics.bias
+                  << " m refit a=" << identity.a << " b=" << identity.b << "\n";
+        return;
+    }
+    std::cout << "SKIP mono_depth map-tile smoke (no map tile with full DEM coverage)\n";
+}
+
+#endif // AGBOT_TERRAIN_HAS_ONNX
+
 void test_pipeline_determinism() {
     const char* kConfig = R"toml(
 [pipeline]
@@ -527,6 +854,14 @@ int main() {
     test_validation_json();
     test_inflate_stored_and_png_synthetic();
     test_real_tile_decode();
+    test_affine_fit();
+#if defined(AGBOT_TERRAIN_HAS_ONNX)
+    test_mono_depth_reason_codes();
+    test_mono_depth_synthetic_end_to_end();
+    test_mono_depth_map_tile_smoke();
+#else
+    std::cout << "SKIP mono_depth ONNX tests (built without ONNX Runtime)\n";
+#endif
     test_pipeline_determinism();
     test_pipeline_default_config_file();
 

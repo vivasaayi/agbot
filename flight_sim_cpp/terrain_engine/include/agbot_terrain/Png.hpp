@@ -7,8 +7,9 @@
 
 namespace agbot::terrain {
 
-// Minimal, portable PNG decode for cached DEM tiles: 8-bit RGB / RGBA /
-// greyscale / grey+alpha, non-interlaced. Output is always tightly packed
+// Minimal, portable PNG decode for cached DEM/map tiles: 8-bit RGB / RGBA /
+// greyscale / grey+alpha / palette (PLTE, optional tRNS), non-interlaced.
+// Output is always tightly packed
 // RGBA. Includes a self-contained DEFLATE (RFC 1951) inflater covering
 // stored, fixed-Huffman, and dynamic-Huffman blocks.
 struct PngImage {

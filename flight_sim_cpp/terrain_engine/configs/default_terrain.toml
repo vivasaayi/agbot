@@ -26,6 +26,25 @@ weight = 1.0
   seed = 1337
   confidence = 0.3
 
+# Optional learned mono-depth layer (disabled by default). Requires a build
+# with ONNX Runtime (AGBOT_TERRAIN_HAS_ONNX), the Depth-Anything-V2-Small
+# model fetched via terrain_engine/tools/fetch_depth_model.sh, and an
+# ImageryBundle carrying rgb_image_path plus a dem_prior anchor. The relative
+# depth output is anchored to the DEM prior by a sigma-clipped affine fit.
+#
+# [[layer]]
+# algorithm = "mono_depth_onnx"
+# weight = 1.0
+#   [layer.params]
+#   model_path = "data/models/depth_anything_v2_small.onnx"  # default under flight_sim_cpp/
+#   input_size = 518             # square model input, multiple of 14
+#   metric_mode = "relative_affine_fit"
+#   scale_anchor = "dem_prior"
+#   invert = true                # depth -> height before the affine fit
+#   execution_provider = "cpu"   # or "coreml" (falls back to cpu)
+#   norm_mean = [0.485, 0.456, 0.406]
+#   norm_std = [0.229, 0.224, 0.225]
+
 [fusion]
 method = "detail_injection"
 lambda = 0.5

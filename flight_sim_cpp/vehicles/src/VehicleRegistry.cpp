@@ -1,3 +1,4 @@
+#include "agbot_vehicles/FixedWingModel.hpp"
 #include "agbot_vehicles/IVehicleModel.hpp"
 #include "agbot_vehicles/KinematicBicycleModel.hpp"
 #include "agbot_vehicles/MultirotorModel.hpp"
@@ -16,6 +17,11 @@ const VehicleModelRegistry& default_vehicle_registry() {
             "multirotor",
             [](const agbot::config::ParamTable& params) -> std::unique_ptr<IVehicleModel> {
                 return std::make_unique<MultirotorModel>(params);
+            });
+        built.register_factory(
+            "fixed_wing",
+            [](const agbot::config::ParamTable& params) -> std::unique_ptr<IVehicleModel> {
+                return std::make_unique<FixedWingModel>(params);
             });
         return built;
     }();

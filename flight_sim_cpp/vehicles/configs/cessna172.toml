@@ -1,0 +1,76 @@
+# Cessna 172 class fixed-wing parameters.
+# Sources: Roskam "Airplane Flight Dynamics", UIUC coefficient database,
+# Beard & McLain stall-blend idiom. See FixedWingModel.cpp for details.
+
+[fixed_wing]
+# Mass / geometry
+mass_kg = 1043.0
+wing_area_m2 = 16.17
+wing_span_m = 11.0
+wing_chord_m = 1.49
+ixx = 1285.0
+iyy = 1825.0
+izz = 2667.0
+
+# Lift and stall
+cl0 = 0.31
+cl_alpha = 5.1
+alpha_stall_rad = 0.2618
+stall_blend_rate = 50.0
+
+# Drag polar
+cd0 = 0.031
+k_induced = 0.054
+
+# Side force
+cy_beta = -0.31
+
+# Pitch moment
+cm0 = -0.015
+cm_alpha = -0.89
+cm_de = -1.28
+cm_q = -12.4
+
+# Roll moment
+cl_da = 0.178
+cl_p = -0.47
+cl_beta = -0.089
+cl_r = 0.096
+
+# Yaw moment
+cn_beta = 0.065
+cn_dr = -0.069
+cn_r = -0.099
+cn_p = -0.03
+
+# Surface deflection limits (rad)
+elevator_max_rad = 0.4363
+aileron_max_rad = 0.3491
+rudder_max_rad = 0.2793
+
+# Propulsion (quadratic airspeed falloff, see FixedWingParams)
+t_max_n = 2200.0
+v_max_mps = 85.0
+
+# Atmosphere / limits
+rho = 1.225
+gravity = 9.80665
+max_bank_rad = 0.5236
+
+[autopilot]
+kp_speed = 0.12
+ki_speed = 0.04
+kp_alt = 0.15
+climb_rate_limit_mps = 3.5
+kp_vs = 0.03
+ki_vs = 0.012
+pitch_min_rad = -0.30
+pitch_max_rad = 0.30
+kp_pitch = 3.0
+kd_q = 5.0
+kp_heading = 1.6
+bank_limit_rad = 0.5236
+kp_roll = 2.0
+kd_p = 0.6
+k_yaw_damper = 1.0
+washout_tau_s = 1.0
