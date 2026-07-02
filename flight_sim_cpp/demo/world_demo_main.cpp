@@ -13,11 +13,15 @@
 #include "agbot_flight_sim/MissionLoader.hpp"
 #include "agbot_render/RenderScene.hpp"
 #include "agbot_render/SceneFile.hpp"
+#include "agbot_terrain/Png.hpp"
 #include "agbot_terrain/TerrainPipeline.hpp"
 #include "agbot_nav/AerialPlanner.hpp"
+#include "agbot_nav/RoadGraphPlanner.hpp"
 #include "agbot_vehicles/FixedWingAutopilot.hpp"
 #include "agbot_vehicles/FixedWingModel.hpp"
+#include "agbot_worldgen/RoadNetwork.hpp"
 #include "agbot_worldgen/SceneMesh.hpp"
+#include "agbot_worldgen/extractors/RoadImport.hpp"
 #include "agbot_worldgen/extractors/VectorImport.hpp"
 
 #include <algorithm>
@@ -26,6 +30,8 @@
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
+#include <memory>
+#include <optional>
 #include <string>
 
 namespace {
@@ -155,6 +161,128 @@ agbot::render::RenderMesh terrain_render_mesh(const agbot::terrain::HeightField&
         }
     }
 
+    for (int row = 0; row + 1 < height; ++row) {
+        for (int col = 0; col + 1 < width; ++col) {
+            const std::uint32_t i00 = static_cast<std::uint32_t>(row * width + col);
+            const std::uint32_t i01 = i00 + 1;
+            const std::uint32_t i10 = i00 + static_cast<std::uint32_t>(width);
+            const std::uint32_t i11 = i10 + 1;
+            mesh.indices.insert(mesh.indices.end(), {i00, i11, i10, i00, i01, i11});
+        }
+    }
+    return mesh;
+}
+
+// Fractional web-mercator tile coordinates at a zoom level.
+void mercator_tile_fraction(double latitude, double longitude, int zoom,
+                            double& x_fraction, double& y_fraction) {
+    const double n = static_cast<double>(1 << zoom);
+    x_fraction = (longitude + 180.0) / 360.0 * n;
+    const double lat_rad = latitude * 3.14159265358979323846 / 180.0;
+    y_fraction = (1.0 - std::log(std::tan(lat_rad) + 1.0 / std::cos(lat_rad)) /
+                            3.14159265358979323846) /
+        2.0 * n;
+}
+
+// Drape the cached OSM basemap over the heightfield: composite the covering
+// z15 tiles into one texture and emit a textured terrain grid. Returns
+// nullopt (caller falls back to the height-colored mesh) when any tile is
+// missing from the on-disk cache.
+std::optional<agbot::render::TexturedMesh> textured_terrain_mesh(
+    const agbot::terrain::HeightField& field,
+    const fs::GeoCoordinate& origin,
+    const std::filesystem::path& source_dir) {
+    constexpr int kZoom = 15;
+    constexpr int kTilePx = 256;
+    const agbot::terrain::Raster& elevation = field.elevation;
+
+    const std::vector<fs::TileCoordinate> tiles =
+        fs::tiles_for_bounds(elevation.bounds, kZoom);
+    if (tiles.empty()) {
+        return std::nullopt;
+    }
+    int min_x = tiles.front().x;
+    int max_x = tiles.front().x;
+    int min_y = tiles.front().y;
+    int max_y = tiles.front().y;
+    for (const fs::TileCoordinate& tile : tiles) {
+        min_x = std::min(min_x, tile.x);
+        max_x = std::max(max_x, tile.x);
+        min_y = std::min(min_y, tile.y);
+        max_y = std::max(max_y, tile.y);
+    }
+    const int tiles_x = max_x - min_x + 1;
+    const int tiles_y = max_y - min_y + 1;
+
+    agbot::render::TextureImage texture;
+    texture.width = tiles_x * kTilePx;
+    texture.height = tiles_y * kTilePx;
+    texture.rgba.assign(
+        static_cast<std::size_t>(texture.width) * texture.height * 4, 0);
+    for (int tile_y = min_y; tile_y <= max_y; ++tile_y) {
+        for (int tile_x = min_x; tile_x <= max_x; ++tile_x) {
+            const std::filesystem::path tile_path = source_dir / "out/map_tiles" /
+                std::to_string(kZoom) / std::to_string(tile_x) /
+                (std::to_string(tile_y) + ".png");
+            const agbot::terrain::PngImage tile =
+                agbot::terrain::decode_png_rgba_file(tile_path);
+            if (!tile.ok || tile.width != kTilePx || tile.height != kTilePx) {
+                return std::nullopt;
+            }
+            const int dest_x0 = (tile_x - min_x) * kTilePx;
+            const int dest_y0 = (tile_y - min_y) * kTilePx;
+            for (int row = 0; row < kTilePx; ++row) {
+                const std::size_t dest_offset =
+                    (static_cast<std::size_t>(dest_y0 + row) * texture.width + dest_x0) * 4;
+                const std::size_t src_offset =
+                    static_cast<std::size_t>(row) * kTilePx * 4;
+                std::copy_n(tile.rgba.begin() + static_cast<std::ptrdiff_t>(src_offset),
+                            static_cast<std::size_t>(kTilePx) * 4,
+                            texture.rgba.begin() + static_cast<std::ptrdiff_t>(dest_offset));
+            }
+        }
+    }
+
+    agbot::render::TexturedMesh mesh;
+    mesh.texture = std::move(texture);
+    const int width = elevation.width;
+    const int height = elevation.height;
+    const double lat_span = elevation.bounds.max_latitude - elevation.bounds.min_latitude;
+    const double lon_span = elevation.bounds.max_longitude - elevation.bounds.min_longitude;
+    mesh.vertices.reserve(static_cast<std::size_t>(width) * height);
+
+    auto elevation_at = [&](int row, int col) -> float {
+        const float value = elevation.at(std::clamp(row, 0, height - 1),
+                                         std::clamp(col, 0, width - 1));
+        return agbot::terrain::Raster::is_nodata(value) ? 0.0f : value;
+    };
+
+    for (int row = 0; row < height; ++row) {
+        const double latitude = elevation.bounds.max_latitude -
+            lat_span * static_cast<double>(row) / static_cast<double>(height - 1);
+        for (int col = 0; col < width; ++col) {
+            const double longitude = elevation.bounds.min_longitude +
+                lon_span * static_cast<double>(col) / static_cast<double>(width - 1);
+            const float elev = elevation_at(row, col);
+            const fs::Vec3 local =
+                fs::local_from_geo({latitude, longitude, static_cast<double>(elev)}, origin);
+
+            double x_fraction = 0.0;
+            double y_fraction = 0.0;
+            mercator_tile_fraction(latitude, longitude, kZoom, x_fraction, y_fraction);
+
+            agbot::render::TexturedVertex vertex;
+            vertex.px = static_cast<float>(local.x);
+            vertex.py = elev;
+            vertex.pz = static_cast<float>(local.z);
+            vertex.nx = 0.0f;
+            vertex.ny = 1.0f;
+            vertex.nz = 0.0f;
+            vertex.u = static_cast<float>((x_fraction - min_x) / tiles_x);
+            vertex.v = static_cast<float>((y_fraction - min_y) / tiles_y);
+            mesh.vertices.push_back(vertex);
+        }
+    }
     for (int row = 0; row + 1 < height; ++row) {
         for (int col = 0; col + 1 < width; ++col) {
             const std::uint32_t i00 = static_cast<std::uint32_t>(row * width + col);
@@ -331,12 +459,71 @@ int main(int argc, char** argv) {
     };
     const FlythroughResult flight = fly_circuit(400.0, 55.0);
 
+    // --- Delivery-robot street route: plan along the real OSM road graph and
+    // trace it into the scene. Soft-skips when road data is not fetched. ---
+    struct StreetRouteResult {
+        bool attempted = false;
+        bool ok = false;
+        double length_m = 0.0;
+        double euclidean_m = 0.0;
+        std::vector<agbot::render::RenderScene::Marker> trail;
+    };
+    StreetRouteResult street;
+    const std::filesystem::path roads_path =
+        source_dir / "data/worldgen/manhattan_roads.json";
+    if (std::filesystem::exists(roads_path)) {
+        street.attempted = true;
+        cfg::ParamTable road_params;
+        road_params["path"] = cfg::ParamValue(roads_path.string());
+        const agbot::worldgen::RoadImportExtractor road_extractor;
+        const agbot::worldgen::ExtractionResult roads =
+            road_extractor.extract({aoi, road_params});
+        if (roads.ok) {
+            auto network = std::make_shared<agbot::worldgen::RoadNetwork>(
+                agbot::worldgen::RoadNetwork::build(
+                    roads.features, origin,
+                    agbot::worldgen::road_network_params_from({})));
+            agbot::nav::RoadGraphPlanner planner;
+            planner.set_network(network);
+            const fs::Vec3 start{-1200.0, 0.0, -800.0};
+            const fs::Vec3 goal{1200.0, 0.0, 800.0};
+            const agbot::nav::PlanResult route =
+                planner.plan(agbot::nav::Costmap{}, start, goal);
+            street.ok = route.ok;
+            if (route.ok && route.path.points.size() > 1) {
+                street.euclidean_m = std::sqrt(
+                    (goal.x - start.x) * (goal.x - start.x) +
+                    (goal.z - start.z) * (goal.z - start.z));
+                for (std::size_t i = 1; i < route.path.points.size(); ++i) {
+                    const fs::Vec3& a = route.path.points[i - 1];
+                    const fs::Vec3& b = route.path.points[i];
+                    street.length_m += std::sqrt(
+                        (b.x - a.x) * (b.x - a.x) + (b.z - a.z) * (b.z - a.z));
+                }
+                for (std::size_t i = 0; i < route.path.points.size(); i += 6) {
+                    const fs::Vec3& p = route.path.points[i];
+                    street.trail.push_back({static_cast<float>(p.x), 8.0f,
+                                            static_cast<float>(p.z),
+                                            0.15f, 0.9f, 0.3f, 6.0f});
+                }
+            }
+        }
+    }
+
     // --- Scene assembly ---
     agbot::render::RenderScene scene;
-    scene.static_meshes.push_back(terrain_render_mesh(terrain.fused, origin));
+    std::optional<agbot::render::TexturedMesh> draped =
+        textured_terrain_mesh(terrain.fused, origin, source_dir);
+    const bool terrain_textured = draped.has_value();
+    if (terrain_textured) {
+        scene.textured_meshes.push_back(std::move(*draped));
+    } else {
+        scene.static_meshes.push_back(terrain_render_mesh(terrain.fused, origin));
+    }
     scene.static_meshes.push_back(city_render_mesh(city));
     scene.markers.push_back({0.0f, 320.0f, 0.0f, 1.0f, 0.25f, 0.2f, 12.0f});
     scene.markers.insert(scene.markers.end(), flight.trail.begin(), flight.trail.end());
+    scene.markers.insert(scene.markers.end(), street.trail.begin(), street.trail.end());
     scene.sun_dir[0] = 0.4f;
     scene.sun_dir[1] = -0.75f;
     scene.sun_dir[2] = 0.53f;
@@ -380,6 +567,12 @@ int main(int argc, char** argv) {
               << "  city mesh " << stats.city_vertices << " verts, " << stats.city_triangles
               << " tris, " << stats.city_batches << " batches\n"
               << "  param_hash " << std::hex << terrain.param_hash << std::dec << "\n"
+              << "  terrain basemap: " << (terrain_textured ? "OSM tiles draped" : "height-colored fallback") << "\n"
+              << "  street route: " << (street.attempted
+                     ? (street.ok ? std::to_string(street.length_m) + " m over roads ("
+                            + std::to_string(street.euclidean_m) + " m euclidean)"
+                            : std::string("FAILED"))
+                     : std::string("skipped (no road data)")) << "\n"
               << "  cessna circuit: " << (flight.completed ? "completed" : "incomplete")
               << " in " << flight.elapsed_s << " s, max altitude error "
               << flight.max_altitude_error_m << " m, trail markers "
@@ -401,12 +594,20 @@ int main(int argc, char** argv) {
                "tallest building 150-400 m");
         expect(stats.city_triangles > 50000, "city mesh has >50k triangles");
         expect(stats.city_batches > 10, "spatial batching active");
+        expect(!street.attempted || street.ok, "street route plans over the OSM road graph");
+        expect(!street.ok || (street.length_m > street.euclidean_m &&
+                              street.length_m < 2.5 * street.euclidean_m),
+               "street route length plausible (1..2.5x euclidean)");
+        expect(!street.ok || street.trail.size() > 10, "street route traced into the scene");
         expect(flight.completed, "cessna completes the Dubins circuit over the city");
         expect(flight.max_altitude_error_m < 30.0, "cessna altitude held within 30 m");
         expect(flight.trail.size() > 30, "flight trail traced into the scene");
         const auto readback = agbot::render::read_scene_file(out_path);
-        expect(readback.ok() && readback.scene.static_meshes.size() == 2,
+        expect(readback.ok() &&
+               readback.scene.static_meshes.size() + readback.scene.textured_meshes.size() == 2,
                "scene file round-trips with 2 meshes");
+        expect(!terrain_textured || readback.scene.textured_meshes.size() == 1,
+               "draped basemap terrain survives scene round-trip");
         if (failures != 0) {
             std::cout << failures << " failing checks\n";
             return 1;

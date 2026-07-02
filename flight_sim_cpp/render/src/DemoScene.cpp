@@ -174,6 +174,45 @@ RenderMesh build_city_mesh() {
     return mesh;
 }
 
+// Deterministic checkerboard-textured quad hovering above the city center so
+// the textured pipeline (v2 scenes, texture upload, textured shader) is
+// exercised end-to-end by the demo scene and the viewer --self-check.
+TexturedMesh build_checkerboard_quad() {
+    TexturedMesh mesh;
+
+    // Above the tallest demo building (terrain <= 14m + box height <= 40m) so
+    // the quad is visibly textured from the self-check camera, not occluded.
+    constexpr float kHalf = 60.0F;
+    constexpr float kY = 70.0F;
+    const TexturedVertex corners[4] = {
+        {-kHalf, kY, -kHalf, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F},
+        {-kHalf, kY, kHalf, 0.0F, 1.0F, 0.0F, 0.0F, 1.0F},
+        {kHalf, kY, kHalf, 0.0F, 1.0F, 0.0F, 1.0F, 1.0F},
+        {kHalf, kY, -kHalf, 0.0F, 1.0F, 0.0F, 1.0F, 0.0F},
+    };
+    mesh.vertices.assign(corners, corners + 4);
+    // Both windings so the quad is visible from above and below despite
+    // back-face culling (it floats above the demo city).
+    mesh.indices = {0, 1, 2, 0, 2, 3, 0, 2, 1, 0, 3, 2};
+
+    constexpr int kTexSize = 64;
+    constexpr int kCellPx = 8;
+    mesh.texture.width = kTexSize;
+    mesh.texture.height = kTexSize;
+    mesh.texture.rgba.resize(static_cast<std::size_t>(kTexSize) * kTexSize * 4);
+    for (int y = 0; y < kTexSize; ++y) {
+        for (int x = 0; x < kTexSize; ++x) {
+            const bool dark = (((x / kCellPx) + (y / kCellPx)) % 2) == 0;
+            const std::size_t at = (static_cast<std::size_t>(y) * kTexSize + x) * 4;
+            mesh.texture.rgba[at + 0] = dark ? 40 : 235;
+            mesh.texture.rgba[at + 1] = dark ? 40 : 120;
+            mesh.texture.rgba[at + 2] = dark ? 40 : 30;
+            mesh.texture.rgba[at + 3] = 255;
+        }
+    }
+    return mesh;
+}
+
 } // namespace
 
 float value_noise_2d(float x, float y, std::uint32_t seed) {
@@ -198,6 +237,7 @@ RenderScene build_demo_scene() {
     RenderScene scene;
     scene.static_meshes.push_back(build_heightfield_mesh());
     scene.static_meshes.push_back(build_city_mesh());
+    scene.textured_meshes.push_back(build_checkerboard_quad());
 
     scene.markers.push_back(RenderScene::Marker{0.0F, terrain_height(0.0F, 0.0F) + 30.0F, 0.0F,
                                                 1.0F, 0.2F, 0.2F, 2.0F});

@@ -7,6 +7,7 @@ namespace agbot::render {
 // Deterministic procedural demo scene so the viewer is demoable standalone:
 // - a 200x200-vertex heightfield mesh built from value noise (mesh 0)
 // - a grid of ~200 extruded boxes as a fake city (mesh 1)
+// - a checkerboard-textured quad exercising the textured pipeline
 // - a few colored markers and a fixed sun direction.
 RenderScene build_demo_scene();
 

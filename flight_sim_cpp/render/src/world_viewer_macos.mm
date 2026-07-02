@@ -33,9 +33,10 @@ agbot::render::RenderScene load_scene_or_demo(int argc, const char** argv) {
         const std::filesystem::path path = argv[1];
         agbot::render::SceneFileResult result = agbot::render::read_scene_file(path);
         if (result.ok()) {
-            std::printf("[agbot_world_viewer] loaded scene file: %s (%zu meshes, %zu markers)\n",
+            std::printf("[agbot_world_viewer] loaded scene file: %s "
+                        "(%zu meshes, %zu textured meshes, %zu markers)\n",
                         path.string().c_str(), result.scene.static_meshes.size(),
-                        result.scene.markers.size());
+                        result.scene.textured_meshes.size(), result.scene.markers.size());
             return result.scene;
         }
         std::fprintf(stderr, "[agbot_world_viewer] %s — falling back to demo scene\n",
@@ -47,7 +48,13 @@ agbot::render::RenderScene load_scene_or_demo(int argc, const char** argv) {
 
 // ---------------------------------------------------------------------------
 // Offscreen self-check: CGL context (no window, no NSApplication run loop),
-// render the demo scene into an FBO, read pixels back, assert non-uniform.
+// render the demo scene into an FBO, read pixels back, assert non-uniform and
+// that the textured pipeline drew at least one mesh.
+//
+// The self-check deliberately keeps the sky gradient OFF (GlRenderer default)
+// and single-sample rendering, so the pixel-diff against the flat clear color
+// stays a meaningful "geometry was rendered" signal. The windowed viewer is
+// where the sky gradient and 4x MSAA are enabled.
 // ---------------------------------------------------------------------------
 
 bool write_ppm(const std::filesystem::path& path, int width, int height,
@@ -156,6 +163,15 @@ int run_self_check(const agbot::render::RenderScene& scene) {
                         max_z = std::max(max_z, vertex.pz);
                     }
                 }
+                for (const agbot::render::TexturedMesh& mesh : scene.textured_meshes) {
+                    for (const agbot::render::TexturedVertex& vertex : mesh.vertices) {
+                        min_x = std::min(min_x, vertex.px);
+                        max_x = std::max(max_x, vertex.px);
+                        max_y = std::max(max_y, vertex.py);
+                        min_z = std::min(min_z, vertex.pz);
+                        max_z = std::max(max_z, vertex.pz);
+                    }
+                }
                 const float span = std::max(max_x - min_x, max_z - min_z);
                 agbot::render::Camera camera;
                 camera.far_plane = std::max(camera.far_plane, span * 2.5F);
@@ -200,18 +216,30 @@ int run_self_check(const agbot::render::RenderScene& scene) {
                 const std::filesystem::path ppm_path = "out/render/self_check.ppm";
                 const bool ppm_ok = write_ppm(ppm_path, kWidth, kHeight, rgba);
 
-                std::printf("[self-check] non-clear pixels: %zu / %zu (%.1f%%), ppm: %s (%s)\n",
+                const int textured_draws = renderer.last_textured_draw_count();
+                std::printf("[self-check] non-clear pixels: %zu / %zu (%.1f%%), "
+                            "untextured draws: %d, textured draws: %d, ppm: %s (%s)\n",
                             differing, pixel_count, fraction * 100.0,
+                            renderer.last_untextured_draw_count(), textured_draws,
                             ppm_path.string().c_str(), ppm_ok ? "written" : "WRITE FAILED");
 
-                if (fraction > 0.05) {
+                // A scene loaded from a v1 file legitimately has no textured
+                // meshes; only require a textured draw when the scene has one.
+                const bool textured_ok =
+                    scene.textured_meshes.empty() || textured_draws >= 1;
+                if (fraction > 0.05 && textured_ok) {
                     std::printf("self-check PASS\n");
                     exit_code = 0;
-                } else {
+                } else if (fraction <= 0.05) {
                     std::fprintf(stderr,
                                  "self-check FAIL: rendered image too uniform "
                                  "(%.2f%% pixels differ, need >5%%)\n",
                                  fraction * 100.0);
+                } else {
+                    std::fprintf(stderr,
+                                 "self-check FAIL: scene has %zu textured meshes "
+                                 "but no textured draw call happened\n",
+                                 scene.textured_meshes.size());
                 }
             }
         }
@@ -251,7 +279,9 @@ int run_self_check(const agbot::render::RenderScene& scene) {
 @implementation AgbotWorldView
 
 - (instancetype)initWithFrame:(NSRect)frame scene:(agbot::render::RenderScene*)scene {
-    NSOpenGLPixelFormatAttribute attrs41[] = {
+    // Preferred: OpenGL 4.1 Core with 4x MSAA; graceful fallbacks to 4.1
+    // without MSAA and finally 3.2 Core.
+    NSOpenGLPixelFormatAttribute attrs41Msaa[] = {
         NSOpenGLPFAOpenGLProfile, NSOpenGLProfileVersion4_1Core,
         NSOpenGLPFAColorSize, 24,
         NSOpenGLPFADepthSize, 24,
@@ -262,7 +292,20 @@ int run_self_check(const agbot::render::RenderScene& scene) {
         NSOpenGLPFASamples, 4,
         0,
     };
-    NSOpenGLPixelFormat* format = [[NSOpenGLPixelFormat alloc] initWithAttributes:attrs41];
+    NSOpenGLPixelFormat* format = [[NSOpenGLPixelFormat alloc] initWithAttributes:attrs41Msaa];
+    if (format == nil) {
+        NSLog(@"[agbot_world_viewer] 4x MSAA pixel format unavailable, "
+              @"falling back to non-MSAA OpenGL 4.1 Core");
+        NSOpenGLPixelFormatAttribute attrs41[] = {
+            NSOpenGLPFAOpenGLProfile, NSOpenGLProfileVersion4_1Core,
+            NSOpenGLPFAColorSize, 24,
+            NSOpenGLPFADepthSize, 24,
+            NSOpenGLPFADoubleBuffer,
+            NSOpenGLPFAAccelerated,
+            0,
+        };
+        format = [[NSOpenGLPixelFormat alloc] initWithAttributes:attrs41];
+    }
     if (format == nil) {
         NSOpenGLPixelFormatAttribute attrs32[] = {
             NSOpenGLPFAOpenGLProfile, NSOpenGLProfileVersion3_2Core,
@@ -317,6 +360,18 @@ int run_self_check(const agbot::render::RenderScene& scene) {
         NSLog(@"[agbot_world_viewer] renderer init failed: %s", _renderer->last_error());
         [NSApp terminate:nil];
         return;
+    }
+    // Windowed mode gets the sky gradient (the offscreen self-check keeps the
+    // flat clear color so its pixel-diff stays meaningful) and MSAA when the
+    // pixel format provided sample buffers.
+    _renderer->set_sky_enabled(true);
+    GLint samples = 0;
+    glGetIntegerv(GL_SAMPLES, &samples);
+    if (samples > 1) {
+        glEnable(GL_MULTISAMPLE);
+        NSLog(@"[agbot_world_viewer] MSAA enabled: %d samples", samples);
+    } else {
+        NSLog(@"[agbot_world_viewer] MSAA unavailable, rendering single-sample");
     }
     if (!_renderer->uploadScene(*_scene)) {
         NSLog(@"[agbot_world_viewer] scene upload failed: %s", _renderer->last_error());

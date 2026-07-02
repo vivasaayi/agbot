@@ -29,6 +29,36 @@ struct RenderMesh {
     std::vector<std::uint32_t> indices;
 };
 
+// Textured vertex: position + normal + UV. Used for meshes that sample a
+// per-mesh RGBA texture (e.g. OSM basemap tiles draped over terrain) instead
+// of carrying per-vertex color.
+struct TexturedVertex {
+    float px = 0.0F;
+    float py = 0.0F;
+    float pz = 0.0F;
+    float nx = 0.0F;
+    float ny = 1.0F;
+    float nz = 0.0F;
+    float u = 0.0F;
+    float v = 0.0F;
+};
+
+static_assert(sizeof(TexturedVertex) == 8 * sizeof(float),
+              "TexturedVertex must be tightly packed (8 floats)");
+
+// CPU-side RGBA8 texture image (row-major, tightly packed, width*height*4 bytes).
+struct TextureImage {
+    int width = 0;
+    int height = 0;
+    std::vector<std::uint8_t> rgba;
+};
+
+struct TexturedMesh {
+    std::vector<TexturedVertex> vertices;
+    std::vector<std::uint32_t> indices;
+    TextureImage texture;
+};
+
 struct RenderScene {
     struct Marker {
         float x = 0.0F;
@@ -43,6 +73,8 @@ struct RenderScene {
     std::vector<RenderMesh> static_meshes;
     std::vector<Marker> markers;
     float sun_dir[3] = {0.35F, -0.8F, 0.45F};
+    // Optional textured meshes (format v2, AGBSCN02). Empty for v1 scenes.
+    std::vector<TexturedMesh> textured_meshes;
 };
 
 static_assert(sizeof(RenderScene::Marker) == 7 * sizeof(float),

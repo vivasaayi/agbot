@@ -4,11 +4,14 @@ add_library(agbot_worldgen
     src/FeatureExtractor.cpp
     src/HeightResolver.cpp
     src/Polygonize.cpp
+    src/RoadMesh.cpp
+    src/RoadNetwork.cpp
     src/SceneBridge.cpp
     src/SceneMesh.cpp
     src/SegTiler.cpp
     src/extractors/ClassicalIndex.cpp
     src/extractors/OnnxSemSeg.cpp
+    src/extractors/RoadImport.cpp
     src/extractors/VectorImport.cpp
 )
 
@@ -92,3 +95,14 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(agbot_worldgen_seg_tests PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 add_test(NAME agbot_worldgen_seg_tests COMMAND agbot_worldgen_seg_tests)
+
+# Road-lane tests: OSM road import, routable road network, and road ribbons.
+add_executable(agbot_worldgen_road_tests tests/road_tests.cpp)
+target_link_libraries(agbot_worldgen_road_tests PRIVATE agbot_worldgen)
+target_compile_definitions(agbot_worldgen_road_tests
+    PRIVATE WORLDGEN_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}"
+)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(agbot_worldgen_road_tests PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+add_test(NAME agbot_worldgen_road_tests COMMAND agbot_worldgen_road_tests)

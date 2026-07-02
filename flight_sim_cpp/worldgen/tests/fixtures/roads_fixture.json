@@ -1,0 +1,89 @@
+{
+  "version": 0.6,
+  "generator": "hand-written test fixture (Overpass out geom shape)",
+  "elements": [
+    {
+      "type": "way",
+      "id": 101,
+      "tags": {"highway": "residential", "name": "A Street"},
+      "geometry": [
+        {"lat": 0.0, "lon": 0.0},
+        {"lat": 0.0, "lon": 0.002},
+        {"lat": 0.0, "lon": 0.004}
+      ]
+    },
+    {
+      "type": "way",
+      "id": 102,
+      "tags": {"highway": "residential", "name": "B Street"},
+      "geometry": [
+        {"lat": 0.002, "lon": 0.0},
+        {"lat": 0.002, "lon": 0.002},
+        {"lat": 0.002, "lon": 0.004}
+      ]
+    },
+    {
+      "type": "way",
+      "id": 103,
+      "tags": {"highway": "primary", "name": "First Avenue"},
+      "geometry": [
+        {"lat": 0.0, "lon": 0.0},
+        {"lat": 0.002, "lon": 0.0}
+      ]
+    },
+    {
+      "type": "way",
+      "id": 104,
+      "tags": {"highway": "residential", "name": "Second Avenue", "oneway": "yes"},
+      "geometry": [
+        {"lat": 0.0, "lon": 0.002},
+        {"lat": 0.002, "lon": 0.002}
+      ]
+    },
+    {
+      "type": "way",
+      "id": 105,
+      "tags": {"highway": "residential", "name": "Third Avenue"},
+      "geometry": [
+        {"lat": 0.0, "lon": 0.004},
+        {"lat": 0.002, "lon": 0.004}
+      ]
+    },
+    {
+      "type": "way",
+      "id": 106,
+      "tags": {"highway": "service", "name": "Spur", "lanes": "2"},
+      "geometry": [
+        {"lat": 0.0, "lon": 0.004},
+        {"lat": -0.001, "lon": 0.004}
+      ]
+    },
+    {
+      "type": "way",
+      "id": 107,
+      "tags": {"highway": "service", "name": "Shortcut"},
+      "geometry": [
+        {"lat": 0.0, "lon": 0.0},
+        {"lat": 0.002, "lon": 0.002}
+      ]
+    },
+    {
+      "type": "way",
+      "id": 108,
+      "tags": {"highway": "footway", "name": "Footpath"},
+      "geometry": [
+        {"lat": 0.0, "lon": 0.0},
+        {"lat": 0.001, "lon": 0.001}
+      ]
+    },
+    {
+      "type": "way",
+      "id": 109,
+      "tags": {"highway": "residential", "name": "Far Away Road"},
+      "geometry": [
+        {"lat": 1.0, "lon": 1.0},
+        {"lat": 1.0, "lon": 1.002}
+      ]
+    }
+  ]
+}

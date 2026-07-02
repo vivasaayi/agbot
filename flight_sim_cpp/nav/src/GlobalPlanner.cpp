@@ -1,6 +1,7 @@
 #include "agbot_nav/GlobalPlanner.hpp"
 
 #include "agbot_nav/HybridAStarPlanner.hpp"
+#include "agbot_nav/RoadGraphPlanner.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -230,6 +231,11 @@ const GlobalPlannerRegistry& default_global_planner_registry() {
             "hybrid_astar",
             [](const agbot::config::ParamTable& params) -> std::unique_ptr<IGlobalPlanner> {
                 return std::make_unique<HybridAStarPlanner>(params);
+            });
+        built.register_factory(
+            "road_graph",
+            [](const agbot::config::ParamTable& params) -> std::unique_ptr<IGlobalPlanner> {
+                return std::make_unique<RoadGraphPlanner>(params);
             });
         return built;
     }();

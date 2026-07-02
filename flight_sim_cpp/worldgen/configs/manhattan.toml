@@ -27,6 +27,22 @@ algorithm = "vector_import"
   simplify_tol_m = 0.0
   max_features = 0
 
+# --- Optional road layer (disabled by default) ------------------------------
+# OSM street centerlines fetched by worldgen/tools/fetch_osm_roads.sh
+# (Overpass `out geom` dump; GeoJSON LineStrings also accepted). Road
+# features carry an OPEN POLYLINE in `exterior`
+# (attributes.geometry_type = "polyline"), plus highway/oneway/lanes/way_id.
+# Feed the features to RoadNetwork::build for routing (nav "road_graph"
+# global planner) and build_road_mesh for rendering.
+#
+# [[layer]]
+# algorithm = "road_import"
+#   [layer.params]
+#   path = "data/worldgen/manhattan_roads.json"
+#   highway_filter = ["motorway", "trunk", "primary", "secondary", "tertiary", "residential", "unclassified", "living_street", "service"]
+#   min_points = 2
+#   max_features = 0
+
 # --- Optional imagery-based layers (disabled by default) -------------------
 # Both layers vectorize class masks from a georeferenced PNG that spans the
 # pipeline AOI exactly (row 0 = north edge).

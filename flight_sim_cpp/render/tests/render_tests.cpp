@@ -8,9 +8,11 @@
 #include "agbot_render/SceneFile.hpp"
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <string>
 
 namespace {
@@ -37,6 +39,9 @@ using agbot::render::Mat4;
 using agbot::render::RenderMesh;
 using agbot::render::RenderScene;
 using agbot::render::RenderVertex;
+using agbot::render::TextureImage;
+using agbot::render::TexturedMesh;
+using agbot::render::TexturedVertex;
 using agbot::render::Vec3f;
 
 // ---------------------------------------------------------------------------
@@ -222,6 +227,53 @@ RenderScene make_reference_scene() {
     return scene;
 }
 
+TexturedMesh make_reference_textured_mesh() {
+    TexturedMesh mesh;
+    mesh.vertices = {
+        TexturedVertex{0.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 0.0F, 0.0F},
+        TexturedVertex{4.0F, 0.0F, 0.0F, 0.0F, 1.0F, 0.0F, 1.0F, 0.0F},
+        TexturedVertex{4.0F, 0.0F, 4.0F, 0.0F, 1.0F, 0.0F, 1.0F, 1.0F},
+        TexturedVertex{0.0F, 0.0F, 4.0F, 0.0F, 1.0F, 0.0F, 0.0F, 1.0F},
+    };
+    mesh.indices = {0, 1, 2, 0, 2, 3};
+    mesh.texture.width = 4;
+    mesh.texture.height = 2;
+    mesh.texture.rgba.resize(4U * 2U * 4U);
+    for (std::size_t i = 0; i < mesh.texture.rgba.size(); ++i) {
+        mesh.texture.rgba[i] = static_cast<std::uint8_t>((i * 37U + 11U) & 0xFFU);
+    }
+    return mesh;
+}
+
+// Hand-writes a v1 (AGBSCN01) scene file so the v1-compat read path is
+// exercised against the legacy byte layout, independent of write_scene_file.
+bool write_v1_scene_file(const std::filesystem::path& path, const RenderScene& scene) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out.is_open()) {
+        return false;
+    }
+    out.write(agbot::render::kSceneFileMagicV1, sizeof(agbot::render::kSceneFileMagicV1));
+
+    auto put_u32 = [&out](std::uint32_t value) {
+        out.write(reinterpret_cast<const char*>(&value), sizeof(value));
+    };
+
+    put_u32(static_cast<std::uint32_t>(scene.static_meshes.size()));
+    for (const RenderMesh& mesh : scene.static_meshes) {
+        put_u32(static_cast<std::uint32_t>(mesh.vertices.size()));
+        put_u32(static_cast<std::uint32_t>(mesh.indices.size()));
+        out.write(reinterpret_cast<const char*>(mesh.vertices.data()),
+                  static_cast<std::streamsize>(mesh.vertices.size() * sizeof(RenderVertex)));
+        out.write(reinterpret_cast<const char*>(mesh.indices.data()),
+                  static_cast<std::streamsize>(mesh.indices.size() * sizeof(std::uint32_t)));
+    }
+    put_u32(static_cast<std::uint32_t>(scene.markers.size()));
+    out.write(reinterpret_cast<const char*>(scene.markers.data()),
+              static_cast<std::streamsize>(scene.markers.size() * sizeof(RenderScene::Marker)));
+    out.write(reinterpret_cast<const char*>(scene.sun_dir), sizeof(scene.sun_dir));
+    return out.good();
+}
+
 void test_scene_file_round_trip() {
     const RenderScene original = make_reference_scene();
     const std::filesystem::path path =
@@ -267,6 +319,114 @@ void test_scene_file_round_trip() {
     }
     check(std::memcmp(loaded.sun_dir, original.sun_dir, sizeof(loaded.sun_dir)) == 0,
           "round-trip sun dir byte-equal");
+
+    std::filesystem::remove(path);
+}
+
+void test_textured_types_packed() {
+    check(sizeof(TexturedVertex) == 8 * sizeof(float), "TexturedVertex is 8 packed floats");
+    check(sizeof(RenderVertex) == 10 * sizeof(float), "RenderVertex is 10 packed floats");
+    const TextureImage empty;
+    check(empty.width == 0 && empty.height == 0 && empty.rgba.empty(),
+          "TextureImage default-constructs empty");
+    const TexturedVertex v;
+    check(near_eq(v.ny, 1.0F) && near_eq(v.u, 0.0F) && near_eq(v.v, 0.0F),
+          "TexturedVertex defaults (up normal, zero uv)");
+}
+
+void test_scene_file_v2_textured_round_trip() {
+    RenderScene original = make_reference_scene();
+    original.textured_meshes.push_back(make_reference_textured_mesh());
+    TexturedMesh second = make_reference_textured_mesh();
+    second.texture.width = 2;
+    second.texture.height = 2;
+    second.texture.rgba.assign(2U * 2U * 4U, 0x5AU);
+    original.textured_meshes.push_back(second);
+
+    const std::filesystem::path path =
+        std::filesystem::temp_directory_path() / "agbot_render_v2_roundtrip.agbscn";
+
+    const auto write_error = agbot::render::write_scene_file(path, original);
+    check(!write_error.has_value(),
+          "v2 scene write ok" + (write_error ? ": " + write_error->message : std::string()));
+
+    // File starts with the v2 magic.
+    {
+        std::FILE* f = std::fopen(path.string().c_str(), "rb");
+        char magic[8] = {};
+        check(f != nullptr && std::fread(magic, 1, 8, f) == 8, "v2 magic readable");
+        if (f != nullptr) {
+            std::fclose(f);
+        }
+        check(std::memcmp(magic, "AGBSCN02", 8) == 0, "written file has AGBSCN02 magic");
+    }
+
+    const auto result = agbot::render::read_scene_file(path);
+    check(result.ok(), "v2 scene read ok" +
+                           (result.error ? ": " + result.error->message : std::string()));
+    if (!result.ok()) {
+        return;
+    }
+    const RenderScene& loaded = result.scene;
+    check(loaded.static_meshes.size() == original.static_meshes.size(),
+          "v2 round-trip static mesh count");
+    check(loaded.textured_meshes.size() == original.textured_meshes.size(),
+          "v2 round-trip textured mesh count");
+    for (std::size_t i = 0;
+         i < loaded.textured_meshes.size() && i < original.textured_meshes.size(); ++i) {
+        const TexturedMesh& a = original.textured_meshes[i];
+        const TexturedMesh& b = loaded.textured_meshes[i];
+        check(a.vertices.size() == b.vertices.size(),
+              "v2 textured vertex count " + std::to_string(i));
+        check(a.indices.size() == b.indices.size(),
+              "v2 textured index count " + std::to_string(i));
+        check(a.texture.width == b.texture.width && a.texture.height == b.texture.height,
+              "v2 texture dims " + std::to_string(i));
+        if (a.vertices.size() == b.vertices.size() && !a.vertices.empty()) {
+            check(std::memcmp(a.vertices.data(), b.vertices.data(),
+                              a.vertices.size() * sizeof(TexturedVertex)) == 0,
+                  "v2 textured vertices byte-equal " + std::to_string(i));
+        }
+        if (a.indices.size() == b.indices.size() && !a.indices.empty()) {
+            check(std::memcmp(a.indices.data(), b.indices.data(),
+                              a.indices.size() * sizeof(std::uint32_t)) == 0,
+                  "v2 textured indices byte-equal " + std::to_string(i));
+        }
+        check(a.texture.rgba == b.texture.rgba,
+              "v2 texture rgba byte-equal " + std::to_string(i));
+    }
+
+    std::filesystem::remove(path);
+}
+
+void test_scene_file_v1_compat() {
+    const RenderScene original = make_reference_scene();
+    const std::filesystem::path path =
+        std::filesystem::temp_directory_path() / "agbot_render_v1_compat.agbscn";
+
+    check(write_v1_scene_file(path, original), "v1 fixture written");
+
+    const auto result = agbot::render::read_scene_file(path);
+    check(result.ok(), "v1 scene read ok" +
+                           (result.error ? ": " + result.error->message : std::string()));
+    if (!result.ok()) {
+        return;
+    }
+    const RenderScene& loaded = result.scene;
+    check(loaded.textured_meshes.empty(), "v1 scene has empty textured_meshes");
+    check(loaded.static_meshes.size() == original.static_meshes.size(),
+          "v1 compat mesh count");
+    check(loaded.markers.size() == original.markers.size(), "v1 compat marker count");
+    if (loaded.static_meshes.size() == original.static_meshes.size() &&
+        !loaded.static_meshes.empty() &&
+        loaded.static_meshes[0].vertices.size() == original.static_meshes[0].vertices.size()) {
+        check(std::memcmp(loaded.static_meshes[0].vertices.data(),
+                          original.static_meshes[0].vertices.data(),
+                          original.static_meshes[0].vertices.size() * sizeof(RenderVertex)) == 0,
+              "v1 compat vertices byte-equal");
+    }
+    check(std::memcmp(loaded.sun_dir, original.sun_dir, sizeof(loaded.sun_dir)) == 0,
+          "v1 compat sun dir byte-equal");
 
     std::filesystem::remove(path);
 }
@@ -333,6 +493,32 @@ void test_demo_scene() {
     check(sun_len > 0.1F, "demo sun dir non-degenerate");
     check(scene.sun_dir[1] < 0.0F, "demo sun points downward");
 
+    // Textured pipeline: the demo carries at least one checkerboard mesh with
+    // valid UVs in [0, 1] and a non-empty texture.
+    check(!scene.textured_meshes.empty(), "demo scene has >= 1 textured mesh");
+    for (const TexturedMesh& mesh : scene.textured_meshes) {
+        check(!mesh.vertices.empty(), "demo textured mesh has vertices");
+        check(!mesh.indices.empty(), "demo textured mesh has indices");
+        check(mesh.indices.size() % 3 == 0, "demo textured index count divisible by 3");
+        check(mesh.texture.width > 0 && mesh.texture.height > 0,
+              "demo textured mesh texture dims > 0");
+        check(mesh.texture.rgba.size() == static_cast<std::size_t>(mesh.texture.width) *
+                                              static_cast<std::size_t>(mesh.texture.height) * 4U,
+              "demo textured rgba payload matches dims");
+        for (std::uint32_t index : mesh.indices) {
+            if (index >= mesh.vertices.size()) {
+                check(false, "demo textured mesh index in range");
+                break;
+            }
+        }
+        for (const TexturedVertex& v : mesh.vertices) {
+            if (v.u < 0.0F || v.u > 1.0F || v.v < 0.0F || v.v > 1.0F) {
+                check(false, "demo textured mesh UVs in [0,1]");
+                break;
+            }
+        }
+    }
+
     // Determinism: two builds are identical.
     const RenderScene again = agbot::render::build_demo_scene();
     check(again.static_meshes.size() == scene.static_meshes.size() &&
@@ -341,6 +527,16 @@ void test_demo_scene() {
                           scene.static_meshes[0].vertices.data(),
                           scene.static_meshes[0].vertices.size() * sizeof(RenderVertex)) == 0,
           "demo scene deterministic");
+    check(again.textured_meshes.size() == scene.textured_meshes.size() &&
+              !again.textured_meshes.empty() &&
+              again.textured_meshes[0].vertices.size() ==
+                  scene.textured_meshes[0].vertices.size() &&
+              std::memcmp(again.textured_meshes[0].vertices.data(),
+                          scene.textured_meshes[0].vertices.data(),
+                          scene.textured_meshes[0].vertices.size() * sizeof(TexturedVertex)) ==
+                  0 &&
+              again.textured_meshes[0].texture.rgba == scene.textured_meshes[0].texture.rgba,
+          "demo textured mesh deterministic");
 }
 
 void test_value_noise() {
@@ -371,6 +567,9 @@ int main() {
     test_camera_mvp_known_point();
     test_camera_axes_orthonormal();
     test_scene_file_round_trip();
+    test_textured_types_packed();
+    test_scene_file_v2_textured_round_trip();
+    test_scene_file_v1_compat();
     test_scene_file_bad_magic();
     test_demo_scene();
     test_value_noise();
