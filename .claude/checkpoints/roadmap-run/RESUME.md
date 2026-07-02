@@ -12,4 +12,6 @@
 - M5 DONE: OSM road import + welded street graph + road_graph planner (real route 5090 m);
   AGBSCN02 textured meshes, basemap draped over terrain, 4x MSAA, sky gradient.
 - Fresh-clone also needs: fetch_osm_roads.sh; OSM basemap tiles z15 x9646-9650 y12316-12321.
-- Next (beyond plan): dynamic obstacles + tracking, CDLOD streaming terrain, VIO/LIO SLAM.
+- M6 DONE (e858ae6): dynamic agents + KF tracker + predictive MPPI/DWA avoidance;
+  corridor + street-delivery scenarios collision-free, deterministic. 17/17 suites.
+- Next: CDLOD streaming terrain, VIO/LIO SLAM, viewer entity animation, ROS2 bridge.
