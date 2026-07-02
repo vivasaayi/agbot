@@ -267,6 +267,8 @@ int run_self_check(const agbot::render::RenderScene& scene) {
     agbot::render::Camera _camera;
     NSTimer* _timer;
     std::unordered_set<unsigned short>* _keysDown;
+    id _keyDownMonitor;
+    id _keyUpMonitor;
     BOOL _sceneUploaded;
     double _lastFrameTime;
     double _fpsAccumTime;
@@ -323,6 +325,8 @@ int run_self_check(const agbot::render::RenderScene& scene) {
         _renderer = new agbot::render::GlRenderer();
         _scene = scene;
         _keysDown = new std::unordered_set<unsigned short>();
+        _keyDownMonitor = nil;
+        _keyUpMonitor = nil;
         _sceneUploaded = NO;
         _lastFrameTime = 0.0;
         _fpsAccumTime = 0.0;
@@ -337,6 +341,8 @@ int run_self_check(const agbot::render::RenderScene& scene) {
 }
 
 - (void)dealloc {
+    if (_keyDownMonitor != nil) { [NSEvent removeMonitor:_keyDownMonitor]; }
+    if (_keyUpMonitor != nil) { [NSEvent removeMonitor:_keyUpMonitor]; }
     [_timer invalidate];
     delete _renderer;
     delete _keysDown;
@@ -404,10 +410,18 @@ int run_self_check(const agbot::render::RenderScene& scene) {
 
     const float move_speed = 45.0F; // m/s fly speed
     const float step = move_speed * dt;
-    if (_keysDown->count(13) > 0) { _camera.move_forward(step); }  // W
-    if (_keysDown->count(1) > 0) { _camera.move_forward(-step); }  // S
-    if (_keysDown->count(0) > 0) { _camera.move_right(-step); }    // A
-    if (_keysDown->count(2) > 0) { _camera.move_right(step); }     // D
+    if (_keysDown->count(13) > 0 || _keysDown->count(126) > 0) {
+        _camera.move_forward(step);                                // W / Up
+    }
+    if (_keysDown->count(1) > 0 || _keysDown->count(125) > 0) {
+        _camera.move_forward(-step);                               // S / Down
+    }
+    if (_keysDown->count(0) > 0 || _keysDown->count(123) > 0) {
+        _camera.move_right(-step);                                 // A / Left
+    }
+    if (_keysDown->count(2) > 0 || _keysDown->count(124) > 0) {
+        _camera.move_right(step);                                  // D / Right
+    }
     if (_keysDown->count(12) > 0) { _camera.move_up(-step); }      // Q
     if (_keysDown->count(14) > 0) { _camera.move_up(step); }       // E
 
@@ -435,15 +449,47 @@ int run_self_check(const agbot::render::RenderScene& scene) {
 }
 
 - (void)keyDown:(NSEvent*)event {
-    if ([event keyCode] == 53) { // ESC
-        [NSApp terminate:nil];
-        return;
-    }
-    _keysDown->insert([event keyCode]);
+    [self handleKeyDownCode:[event keyCode]];
 }
 
 - (void)keyUp:(NSEvent*)event {
     _keysDown->erase([event keyCode]);
+}
+
+- (void)handleKeyDownCode:(unsigned short)code {
+    if (code == 53) { // ESC
+        [NSApp terminate:nil];
+        return;
+    }
+    _keysDown->insert(code);
+}
+
+// Click restores key focus if it was ever lost.
+- (void)mouseDown:(NSEvent*)event {
+    (void)event;
+    [[self window] makeFirstResponder:self];
+}
+
+// Local monitor: receives key events for this app regardless of the
+// responder chain. Unbundled binaries sometimes fail to route keys to the
+// content view even when the window is key; this guarantees WASD works.
+- (void)installKeyMonitors {
+    __block AgbotWorldView* blockSelf = self;
+    _keyDownMonitor = [NSEvent
+        addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown
+                                     handler:^NSEvent*(NSEvent* event) {
+        if (([event modifierFlags] & NSEventModifierFlagCommand) != 0) {
+            return event; // keep Cmd-Q etc. working
+        }
+        [blockSelf handleKeyDownCode:[event keyCode]];
+        return nil; // consumed (also silences the system beep)
+    }];
+    _keyUpMonitor = [NSEvent
+        addLocalMonitorForEventsMatchingMask:NSEventMaskKeyUp
+                                     handler:^NSEvent*(NSEvent* event) {
+        blockSelf->_keysDown->erase([event keyCode]);
+        return nil;
+    }];
 }
 
 - (void)mouseDragged:(NSEvent*)event {
@@ -465,6 +511,17 @@ int run_self_check(const agbot::render::RenderScene& scene) {
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)sender {
     (void)sender;
     return YES;
+}
+
+// Activating before [NSApp run] races for unbundled binaries: the window
+// appears but never becomes key, so keystrokes stay with the terminal.
+// Re-assert activation and key focus once launching has finished.
+- (void)applicationDidFinishLaunching:(NSNotification*)notification {
+    (void)notification;
+    [NSApp activateIgnoringOtherApps:YES];
+    NSWindow* window = [[NSApp windows] firstObject];
+    [window makeKeyAndOrderFront:nil];
+    [window makeFirstResponder:[window contentView]];
 }
 @end
 
@@ -495,9 +552,10 @@ int run_windowed(int argc, const char** argv) {
         [window makeFirstResponder:view];
         [window makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];
+        [view installKeyMonitors];
 
-        std::printf("[agbot_world_viewer] controls: WASD move, Q/E down/up, "
-                    "mouse drag look, scroll zoom, ESC quit\n");
+        std::printf("[agbot_world_viewer] controls: WASD or arrow keys move, "
+                    "Q/E down/up, mouse drag look, scroll zoom, ESC quit\n");
         [NSApp run];
     }
     return 0;
