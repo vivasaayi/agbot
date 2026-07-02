@@ -1,0 +1,56 @@
+# Default terrain elevation pipeline: cached Terrarium DEM base with a
+# deterministic synthetic detail layer injected on top.
+
+[pipeline]
+target_gsd_m = 10.0
+resolution = 64
+vertical_datum = "egm2008"
+aoi = { min_lat = 40.70, min_lon = -74.02, max_lat = 40.82, max_lon = -73.93 }
+
+[[layer]]
+algorithm = "dem_fusion"
+weight = 1.0
+  [layer.params]
+  source = "terrarium"
+  resample = "bilinear"
+  void_fill = "idw"
+  smoothing_sigma = 0.0
+
+[[layer]]
+algorithm = "synthetic_detail"
+weight = 1.0
+  [layer.params]
+  amplitude_m = 2.0
+  octaves = 4
+  frequency = 6.0
+  seed = 1337
+  confidence = 0.3
+
+# Optional learned mono-depth layer (disabled by default). Requires a build
+# with ONNX Runtime (AGBOT_TERRAIN_HAS_ONNX), the Depth-Anything-V2-Small
+# model fetched via terrain_engine/tools/fetch_depth_model.sh, and an
+# ImageryBundle carrying rgb_image_path plus a dem_prior anchor. The relative
+# depth output is anchored to the DEM prior by a sigma-clipped affine fit.
+#
+# [[layer]]
+# algorithm = "mono_depth_onnx"
+# weight = 1.0
+#   [layer.params]
+#   model_path = "data/models/depth_anything_v2_small.onnx"  # default under flight_sim_cpp/
+#   input_size = 518             # square model input, multiple of 14
+#   metric_mode = "relative_affine_fit"
+#   scale_anchor = "dem_prior"
+#   invert = true                # depth -> height before the affine fit
+#   execution_provider = "cpu"   # or "coreml" (falls back to cpu)
+#   norm_mean = [0.485, 0.456, 0.406]
+#   norm_std = [0.229, 0.224, 0.225]
+
+[fusion]
+method = "detail_injection"
+lambda = 0.5
+cutoff_cells = 3
+
+[validation]
+enabled = true
+reference_layer = 0
+output_json = "out/terrain/validation.json"

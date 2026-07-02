@@ -1,0 +1,24 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {"highway": "residential", "name": "GeoJSON Street", "oneway": "yes", "lanes": "3", "way_id": "201"},
+      "geometry": {
+        "type": "LineString",
+        "coordinates": [[0.0, 0.0], [0.002, 0.0], [0.004, 0.0]]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {"highway": "service", "name": "GeoJSON Multi", "way_id": "202"},
+      "geometry": {
+        "type": "MultiLineString",
+        "coordinates": [
+          [[0.0, 0.0], [0.0, 0.002]],
+          [[0.004, 0.0], [0.004, 0.002]]
+        ]
+      }
+    }
+  ]
+}
