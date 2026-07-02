@@ -97,3 +97,30 @@ if(APPLE)
         -Wno-deprecated-declarations
     )
 endif()
+
+# --- World-simulator modules (config, terrain, city, vehicles, navigation, render) ---
+
+add_library(agbot_third_party INTERFACE)
+target_include_directories(agbot_third_party INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+
+add_subdirectory(config)
+add_subdirectory(terrain_engine)
+add_subdirectory(worldgen)
+add_subdirectory(vehicles)
+add_subdirectory(nav)
+add_subdirectory(render)
+
+add_executable(agbot_world_demo demo/world_demo_main.cpp)
+target_link_libraries(agbot_world_demo
+    PRIVATE
+        agbot_terrain
+        agbot_worldgen
+        agbot_render
+        agbot_flight_sim_core
+        agbot_config
+)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(agbot_world_demo PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+add_test(NAME agbot_world_demo_check COMMAND agbot_world_demo --check)
+set_tests_properties(agbot_world_demo_check PROPERTIES SKIP_RETURN_CODE 77)

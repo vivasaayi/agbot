@@ -1,0 +1,37 @@
+# Default terrain elevation pipeline: cached Terrarium DEM base with a
+# deterministic synthetic detail layer injected on top.
+
+[pipeline]
+target_gsd_m = 10.0
+resolution = 64
+vertical_datum = "egm2008"
+aoi = { min_lat = 40.70, min_lon = -74.02, max_lat = 40.82, max_lon = -73.93 }
+
+[[layer]]
+algorithm = "dem_fusion"
+weight = 1.0
+  [layer.params]
+  source = "terrarium"
+  resample = "bilinear"
+  void_fill = "idw"
+  smoothing_sigma = 0.0
+
+[[layer]]
+algorithm = "synthetic_detail"
+weight = 1.0
+  [layer.params]
+  amplitude_m = 2.0
+  octaves = 4
+  frequency = 6.0
+  seed = 1337
+  confidence = 0.3
+
+[fusion]
+method = "detail_injection"
+lambda = 0.5
+cutoff_cells = 3
+
+[validation]
+enabled = true
+reference_layer = 0
+output_json = "out/terrain/validation.json"

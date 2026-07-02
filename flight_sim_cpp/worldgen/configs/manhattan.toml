@@ -1,0 +1,28 @@
+# Lower Manhattan city extraction pipeline.
+# Data: NYC Open Data "Building Footprints" (Socrata dataset 5zhs-2jue),
+# fetched by worldgen/tools/fetch_nyc_buildings.sh into data/worldgen/.
+# Verified attribute names: height_roof (feet), ground_elevation (feet), bin.
+
+[pipeline]
+name = "manhattan_lower"
+seed = 42
+tile_size_m = 500.0
+aoi = { min_lat = 40.700, min_lon = -74.020, max_lat = 40.740, max_lon = -73.980 }
+
+[[layer]]
+algorithm = "vector_import"
+  [layer.params]
+  path = "data/worldgen/manhattan_buildings.geojson"
+  height_attr = "height_roof"
+  height_units = "feet"
+  base_elev_attr = "ground_elevation"
+  base_units = "feet"
+  levels_attr = ""
+  default_level_height_m = 3.0
+  default_height_m = 3.0
+  class_attr = ""
+  default_class = "building"
+  id_attr = "bin"
+  min_area_m2 = 10.0
+  simplify_tol_m = 0.0
+  max_features = 0
