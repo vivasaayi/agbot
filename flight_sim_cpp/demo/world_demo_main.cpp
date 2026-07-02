@@ -14,10 +14,14 @@
 #include "agbot_render/RenderScene.hpp"
 #include "agbot_render/SceneFile.hpp"
 #include "agbot_terrain/TerrainPipeline.hpp"
+#include "agbot_nav/AerialPlanner.hpp"
+#include "agbot_vehicles/FixedWingAutopilot.hpp"
+#include "agbot_vehicles/FixedWingModel.hpp"
 #include "agbot_worldgen/SceneMesh.hpp"
 #include "agbot_worldgen/extractors/VectorImport.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -243,11 +247,96 @@ int main(int argc, char** argv) {
     const agbot::worldgen::CityMesh city =
         agbot::worldgen::build_city_mesh(extraction.features, origin, mesh_params);
 
+    // --- Cessna flythrough: fly a Dubins-planned circuit above the city and
+    // trace the actual 6-DOF flight path into the scene as markers. ---
+    struct FlythroughResult {
+        bool completed = false;
+        double max_altitude_error_m = 0.0;
+        double elapsed_s = 0.0;
+        std::vector<agbot::render::RenderScene::Marker> trail;
+    };
+    const auto fly_circuit = [](double cruise_alt_m, double airspeed_mps) {
+        FlythroughResult flight;
+        agbot::vehicles::FixedWingModel cessna;
+        agbot::vehicles::FixedWingAutopilot autopilot;
+
+        cfg::ParamTable planner_params;
+        planner_params["turn_radius_m"] = cfg::ParamValue(450.0);
+        planner_params["sample_spacing_m"] = cfg::ParamValue(40.0);
+        const agbot::nav::DubinsAirplanePlanner planner(planner_params);
+
+        // Rectangle inside the AOI (local meters around the AOI center).
+        const std::array<agbot::nav::AirPose, 4> corners = {{
+            {-1200.0, -1200.0, 0.0, cruise_alt_m},
+            {1200.0, -1200.0, 1.5707963, cruise_alt_m},
+            {1200.0, 1200.0, 3.1415926, cruise_alt_m},
+            {-1200.0, 1200.0, -1.5707963, cruise_alt_m},
+        }};
+        std::vector<fs::Vec3> route;
+        for (std::size_t leg = 0; leg < corners.size(); ++leg) {
+            const auto plan =
+                planner.plan(corners[leg], corners[(leg + 1) % corners.size()]);
+            if (!plan.ok) {
+                return flight;
+            }
+            route.insert(route.end(), plan.path.points.begin(), plan.path.points.end());
+        }
+
+        agbot::vehicles::EntityState state = cessna.set_initial_trim(
+            cruise_alt_m, airspeed_mps, corners[0].heading_rad, corners[0].x, corners[0].z);
+        autopilot.reset(cessna.trim_controls());
+
+        constexpr double kDt = 0.02;
+        constexpr double kLookaheadM = 250.0;
+        std::size_t target_index = 0;
+        double marker_accum_s = 0.0;
+        const double time_budget_s = 1.35 *
+            (8.0 * 2400.0) / airspeed_mps; // generous perimeter+turns budget
+        while (flight.elapsed_s < time_budget_s) {
+            // Advance the target waypoint past anything within the lookahead.
+            while (target_index + 1 < route.size()) {
+                const double dx = route[target_index].x - state.position.x;
+                const double dz = route[target_index].z - state.position.z;
+                if (std::sqrt(dx * dx + dz * dz) > kLookaheadM) {
+                    break;
+                }
+                ++target_index;
+            }
+            if (target_index + 1 >= route.size()) {
+                flight.completed = true;
+                break;
+            }
+            const fs::Vec3& target = route[target_index];
+            agbot::vehicles::AutopilotCommand command;
+            command.heading_rad =
+                std::atan2(target.z - state.position.z, target.x - state.position.x);
+            command.altitude_m = cruise_alt_m;
+            command.airspeed_mps = airspeed_mps;
+            cessna.set_controls(
+                autopilot.update(state, cessna.body_rates(), command, kDt));
+            state = cessna.step(state, {}, kDt);
+            flight.elapsed_s += kDt;
+            flight.max_altitude_error_m = std::max(
+                flight.max_altitude_error_m, std::abs(state.position.y - cruise_alt_m));
+            marker_accum_s += kDt;
+            if (marker_accum_s >= 4.0) {
+                marker_accum_s = 0.0;
+                flight.trail.push_back({static_cast<float>(state.position.x),
+                                        static_cast<float>(state.position.y),
+                                        static_cast<float>(state.position.z),
+                                        1.0f, 0.85f, 0.1f, 8.0f});
+            }
+        }
+        return flight;
+    };
+    const FlythroughResult flight = fly_circuit(400.0, 55.0);
+
     // --- Scene assembly ---
     agbot::render::RenderScene scene;
     scene.static_meshes.push_back(terrain_render_mesh(terrain.fused, origin));
     scene.static_meshes.push_back(city_render_mesh(city));
     scene.markers.push_back({0.0f, 320.0f, 0.0f, 1.0f, 0.25f, 0.2f, 12.0f});
+    scene.markers.insert(scene.markers.end(), flight.trail.begin(), flight.trail.end());
     scene.sun_dir[0] = 0.4f;
     scene.sun_dir[1] = -0.75f;
     scene.sun_dir[2] = 0.53f;
@@ -290,7 +379,11 @@ int main(int argc, char** argv) {
               << stats.max_building_height_m << " m\n"
               << "  city mesh " << stats.city_vertices << " verts, " << stats.city_triangles
               << " tris, " << stats.city_batches << " batches\n"
-              << "  param_hash " << std::hex << terrain.param_hash << std::dec << "\n";
+              << "  param_hash " << std::hex << terrain.param_hash << std::dec << "\n"
+              << "  cessna circuit: " << (flight.completed ? "completed" : "incomplete")
+              << " in " << flight.elapsed_s << " s, max altitude error "
+              << flight.max_altitude_error_m << " m, trail markers "
+              << flight.trail.size() << "\n";
 
     if (check_mode) {
         int failures = 0;
@@ -308,6 +401,9 @@ int main(int argc, char** argv) {
                "tallest building 150-400 m");
         expect(stats.city_triangles > 50000, "city mesh has >50k triangles");
         expect(stats.city_batches > 10, "spatial batching active");
+        expect(flight.completed, "cessna completes the Dubins circuit over the city");
+        expect(flight.max_altitude_error_m < 30.0, "cessna altitude held within 30 m");
+        expect(flight.trail.size() > 30, "flight trail traced into the scene");
         const auto readback = agbot::render::read_scene_file(out_path);
         expect(readback.ok() && readback.scene.static_meshes.size() == 2,
                "scene file round-trips with 2 meshes");

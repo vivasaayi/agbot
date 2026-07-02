@@ -1,5 +1,7 @@
 #include "agbot_nav/LocalPlanner.hpp"
 
+#include "agbot_nav/MppiPlanner.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -282,6 +284,11 @@ const LocalPlannerRegistry& default_local_planner_registry() {
             "dwa",
             [](const agbot::config::ParamTable& params) -> std::unique_ptr<ILocalPlanner> {
                 return std::make_unique<DwaPlanner>(params);
+            });
+        built.register_factory(
+            "mppi",
+            [](const agbot::config::ParamTable& params) -> std::unique_ptr<ILocalPlanner> {
+                return std::make_unique<MppiPlanner>(params);
             });
         return built;
     }();

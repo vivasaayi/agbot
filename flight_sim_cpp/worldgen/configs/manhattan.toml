@@ -26,3 +26,44 @@ algorithm = "vector_import"
   min_area_m2 = 10.0
   simplify_tol_m = 0.0
   max_features = 0
+
+# --- Optional imagery-based layers (disabled by default) -------------------
+# Both layers vectorize class masks from a georeferenced PNG that spans the
+# pipeline AOI exactly (row 0 = north edge).
+
+# Classical pseudo-index segmentation (RGB only, no NIR):
+#   vegetation via excess green (2g - r - b over chromatic coords) or
+#   green_ratio; water via blueness ((B - max(R, G)) / 255).
+#
+# [[layer]]
+# algorithm = "classical_index"
+#   [layer.params]
+#   imagery_path = "out/imagery/manhattan_rgb.png"
+#   veg_method = "exg"        # "exg" | "green_ratio"
+#   veg_thresh = 0.08         # use ~0.40 with green_ratio
+#   water_method = "blueness"
+#   water_thresh = 0.05
+#   morph_open_px = 1         # binary opening radius (salt-noise removal)
+#   min_area_m2 = 25.0
+#   simplify_tol_m = 1.0
+#   confidence = 0.6          # fixed confidence for classical masks
+
+# ONNX semantic segmentation (SegFormer-B0 / ADE20K by default; fetch the
+# model with worldgen/tools/fetch_seg_model.sh). Compile-gated: without ONNX
+# Runtime the layer reports reason code "onnx_runtime_unavailable".
+#
+# [[layer]]
+# algorithm = "onnx_semseg"
+#   [layer.params]
+#   imagery_path = "out/imagery/manhattan_rgb.png"
+#   model_path = "data/models/segformer_b0_ade20k_512.onnx"  # default
+#   input_size = 512          # square model input, multiple of 32
+#   overlap_px = 64           # tile overlap; center-crop priority stitching
+#   execution_provider = "cpu" # "cpu" | "coreml"
+#   norm_mean = [0.485, 0.456, 0.406]   # ImageNet (SegFormer default)
+#   norm_std = [0.229, 0.224, 0.225]
+#   min_area_m2 = 25.0
+#   simplify_tol_m = 1.0
+#   default_confidence = 0.5  # fallback when a blob has no probability mass
+#   # ADE20K model class index -> worldgen feature class (default shown):
+#   class_map = { 1 = "building", 4 = "vegetation", 6 = "road", 9 = "vegetation", 11 = "road", 13 = "bare", 21 = "water", 26 = "water", 60 = "water" }

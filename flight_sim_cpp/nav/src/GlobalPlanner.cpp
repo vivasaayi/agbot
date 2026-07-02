@@ -1,5 +1,7 @@
 #include "agbot_nav/GlobalPlanner.hpp"
 
+#include "agbot_nav/HybridAStarPlanner.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -223,6 +225,11 @@ const GlobalPlannerRegistry& default_global_planner_registry() {
             "astar",
             [](const agbot::config::ParamTable& params) -> std::unique_ptr<IGlobalPlanner> {
                 return std::make_unique<AStarPlanner>(params);
+            });
+        built.register_factory(
+            "hybrid_astar",
+            [](const agbot::config::ParamTable& params) -> std::unique_ptr<IGlobalPlanner> {
+                return std::make_unique<HybridAStarPlanner>(params);
             });
         return built;
     }();

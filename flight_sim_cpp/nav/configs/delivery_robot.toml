@@ -59,6 +59,20 @@ cost_weight = 4.0
 unknown_cost = 0
 smooth = true
 
+# Alternate: kinodynamic Hybrid-A* (bicycle motion primitives + Dubins
+# analytic expansion). Set algorithm = "hybrid_astar" and uncomment:
+# min_turn_radius_m = 1.5          # bicycle minimum turn radius
+# arc_length_m = 1.0               # length of one motion primitive
+# n_headings = 24                  # heading discretization bins
+# allow_reverse = false            # enable backing-up primitives
+# reverse_penalty = 2.0            # cost multiplier on reverse arcs
+# steer_change_penalty = 0.5      # cost per unit steer-fraction change
+# heuristic_weight = 1.0           # euclidean heuristic inflation
+# cost_weight = 2.0                # costmap traversal cost weight
+# analytic_expansion_period = 8    # Dubins goal shot every N expansions
+# goal_xy_tolerance_m = 1.0
+# goal_yaw_tolerance_rad = 0.35
+
 [local]
 algorithm = "pure_pursuit"
 lookahead_m = 2.5
@@ -69,6 +83,40 @@ goal_slow_gain = 0.8
 min_speed_mps = 0.4
 horizon_s = 1.5
 rollout_dt_s = 0.1
+
+# Alternate: sampling MPC (MPPI). Set algorithm = "mppi" and uncomment:
+# time_steps = 30                  # horizon length (steps)
+# dt = 0.05                        # rollout step (s)
+# num_samples = 1024               # control sequences per solve
+# lambda = 0.4                     # softmax temperature
+# sigma_accel = 1.0                # accel noise sigma (m/s^2)
+# sigma_steer_rate = 1.2           # steer-rate noise sigma (rad/s)
+# lethal_threshold = 200
+# w_obstacle = 3.0                 # obstacle critic weight
+# w_path = 1.2                     # path alignment critic weight
+# w_goal = 0.6                     # goal progress critic weight
+# w_speed = 0.4                    # cruise-speed critic weight
+# w_smooth = 0.05                  # control-effort critic weight
+# seed = 1                         # counter-RNG seed (bit-deterministic)
+
+# Optional localization stage. Default (section absent or "ground_truth")
+# passes the true pose through, leaving legacy behavior bit-identical.
+# [localization]
+# algorithm = "ekf_2d"             # or "ground_truth"
+# sigma_odom_v = 0.05              # EKF process noise, speed (m/s)
+# sigma_odom_yaw_rate = 0.01       # EKF process noise, yaw rate (rad/s)
+# init_pos_sigma_m = 0.5           # initial position sigma
+# init_yaw_sigma_rad = 0.05        # initial heading sigma
+# gps_sigma_m = 0.6                # simulated GPS sigma (nominal quality)
+# gps_period_s = 0.2               # GPS fix period
+# compass_sigma_rad = 0.03         # simulated compass sigma
+# compass_period_s = 0.1           # compass period
+# odom_v_sigma = 0.05              # simulated odometry slip noise
+# odom_yaw_rate_sigma = 0.01       # simulated yaw-rate noise
+# noise_seed = 11                  # deterministic sensor noise seed
+# NavigationPipeline::set_gps_quality(q) drives urban-canyon degradation:
+# q in [0, 1] scales both the simulated GPS noise and the EKF measurement
+# covariance R.
 
 [control]
 algorithm = "pid_stanley"

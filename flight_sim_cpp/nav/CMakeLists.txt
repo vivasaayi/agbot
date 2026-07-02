@@ -4,7 +4,10 @@ add_library(agbot_nav
     src/Perception.cpp
     src/Mapping.cpp
     src/GlobalPlanner.cpp
+    src/HybridAStarPlanner.cpp
     src/LocalPlanner.cpp
+    src/MppiPlanner.cpp
+    src/Localization.cpp
     src/Controller.cpp
     src/NavigationPipeline.cpp
     src/AerialPlanner.cpp
@@ -28,6 +31,13 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(agbot_nav_tests PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 add_test(NAME agbot_nav_tests COMMAND agbot_nav_tests)
+
+add_executable(agbot_nav_tests2 tests/nav_tests2.cpp)
+target_link_libraries(agbot_nav_tests2 PRIVATE agbot_nav)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(agbot_nav_tests2 PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+add_test(NAME agbot_nav_tests2 COMMAND agbot_nav_tests2)
 
 add_executable(agbot_aerial_tests tests/aerial_tests.cpp)
 target_link_libraries(agbot_aerial_tests PRIVATE agbot_nav)

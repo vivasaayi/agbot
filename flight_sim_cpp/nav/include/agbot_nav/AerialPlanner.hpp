@@ -1,6 +1,7 @@
 #pragma once
 
 #include "agbot_config/Params.hpp"
+#include "agbot_nav/Dubins2D.hpp"
 #include "agbot_nav/NavTypes.hpp"
 #include "agbot_vehicles/ParamRegistry.hpp"
 
@@ -36,21 +37,8 @@ public:
     [[nodiscard]] virtual std::string name() const = 0;
 };
 
-enum class DubinsWord {
-    LSL,
-    RSR,
-    LSR,
-    RSL,
-    RLR,
-    LRL,
-};
-
-inline constexpr std::array<DubinsWord, 6> kAllDubinsWords = {
-    DubinsWord::LSL, DubinsWord::RSR, DubinsWord::LSR,
-    DubinsWord::RSL, DubinsWord::RLR, DubinsWord::LRL,
-};
-
-[[nodiscard]] const char* to_string(DubinsWord word);
+// DubinsWord, kAllDubinsWords and to_string(DubinsWord) live in
+// agbot_nav/Dubins2D.hpp (shared with Hybrid-A*'s analytic expansion).
 
 // Minimum turn radius from the coordinated-turn bank limit:
 // R = V^2 / (g * tan(phi_max)).

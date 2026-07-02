@@ -115,9 +115,8 @@ target_link_libraries(agbot_world_demo
     PRIVATE
         agbot_terrain
         agbot_worldgen
+        agbot_nav
         agbot_render
-        agbot_flight_sim_core
-        agbot_config
 )
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(agbot_world_demo PRIVATE -Wall -Wextra -Wpedantic)

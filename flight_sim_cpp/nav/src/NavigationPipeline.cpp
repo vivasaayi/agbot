@@ -106,6 +106,27 @@ NavigationPipeline::NavigationPipeline(const NavigationPipelineConfig& config) {
         return;
     }
 
+    const agbot::config::ParamTable& localization = section_or_empty(root, "localization");
+    const std::string localizer_name = algorithm_of(localization, "ground_truth");
+    localizer_ = default_localizer_registry().create(localizer_name, localization);
+    if (localizer_ == nullptr) {
+        error_ = "unknown_localizer: " + localizer_name;
+        return;
+    }
+    noisy_localization_ = localizer_name != "ground_truth";
+    gps_sigma_m_ = agbot::config::double_or(localization, "gps_sigma_m", gps_sigma_m_);
+    gps_period_s_ = agbot::config::double_or(localization, "gps_period_s", gps_period_s_);
+    compass_sigma_rad_ =
+        agbot::config::double_or(localization, "compass_sigma_rad", compass_sigma_rad_);
+    compass_period_s_ =
+        agbot::config::double_or(localization, "compass_period_s", compass_period_s_);
+    odom_v_sigma_ = agbot::config::double_or(localization, "odom_v_sigma", odom_v_sigma_);
+    odom_yaw_rate_sigma_ =
+        agbot::config::double_or(localization, "odom_yaw_rate_sigma", odom_yaw_rate_sigma_);
+    noise_seed_ = static_cast<std::uint64_t>(std::max<std::int64_t>(
+        0, agbot::config::integer_or(
+               localization, "noise_seed", static_cast<std::int64_t>(noise_seed_))));
+
     ok_ = true;
 }
 
@@ -126,6 +147,70 @@ void NavigationPipeline::tick(
     plan_elapsed_s_ += dt_s;
     local_elapsed_s_ += dt_s;
 
+    // Localization stage: pass truth through (ground_truth uses it, filters
+    // initialize from it once), then for filter localizers synthesize
+    // deterministic noisy odometry/GPS/compass measurements from the true
+    // motion and run predict/correct. Planning below consumes the estimate.
+    const Pose2D truth{state.position.x, state.position.z, state.yaw_rad};
+    const double truth_speed = state.velocity.horizontal_length();
+    localizer_->observe_truth(truth, truth_speed);
+    if (noisy_localization_) {
+        if (has_last_truth_) {
+            const double dx = truth.x - last_truth_.x;
+            const double dz = truth.z - last_truth_.z;
+            const double forward = dx * std::cos(last_truth_.yaw) + dz * std::sin(last_truth_.yaw);
+            double dyaw = truth.yaw - last_truth_.yaw;
+            while (dyaw > 3.14159265358979323846) {
+                dyaw -= 2.0 * 3.14159265358979323846;
+            }
+            while (dyaw < -3.14159265358979323846) {
+                dyaw += 2.0 * 3.14159265358979323846;
+            }
+            const double v_odom = forward / dt_s
+                + odom_v_sigma_ * noise::gaussian(noise_seed_, 1, noise_counter_);
+            const double yaw_rate_odom = dyaw / dt_s
+                + odom_yaw_rate_sigma_ * noise::gaussian(noise_seed_, 2, noise_counter_);
+            localizer_->predict(v_odom, yaw_rate_odom, dt_s);
+        }
+        gps_elapsed_s_ += dt_s;
+        if (gps_elapsed_s_ + 1e-9 >= gps_period_s_) {
+            gps_elapsed_s_ = 0.0;
+            const double quality = std::clamp(gps_quality_, 0.01, 1.0);
+            const double sigma_eff = gps_sigma_m_ / quality;
+            const double gx =
+                truth.x + sigma_eff * noise::gaussian(noise_seed_, 3, noise_counter_);
+            const double gz =
+                truth.z + sigma_eff * noise::gaussian(noise_seed_, 4, noise_counter_);
+            localizer_->correct_gps(gx, gz, gps_sigma_m_, quality);
+        }
+        compass_elapsed_s_ += dt_s;
+        if (compass_elapsed_s_ + 1e-9 >= compass_period_s_) {
+            compass_elapsed_s_ = 0.0;
+            const double heading = truth.yaw
+                + compass_sigma_rad_ * noise::gaussian(noise_seed_, 5, noise_counter_);
+            localizer_->correct_heading(heading, compass_sigma_rad_);
+        }
+        ++noise_counter_;
+    }
+    has_last_truth_ = true;
+    last_truth_ = truth;
+
+    // The pose the planners consume: exactly the true state for ground_truth,
+    // the filter estimate otherwise.
+    agbot::vehicles::EntityState nav_state = state;
+    if (noisy_localization_) {
+        const Pose2D estimate = localizer_->pose();
+        const double est_speed = localizer_->speed_mps();
+        nav_state.position.x = estimate.x;
+        nav_state.position.z = estimate.z;
+        nav_state.yaw_rad = estimate.yaw;
+        nav_state.velocity = {
+            est_speed * std::cos(estimate.yaw),
+            0.0,
+            est_speed * std::sin(estimate.yaw),
+        };
+    }
+
     // Sensing + perception + mapping stage.
     if (sensor_elapsed_s_ + 1e-9 >= sensor_period_s_) {
         sensor_elapsed_s_ = 0.0;
@@ -141,7 +226,8 @@ void NavigationPipeline::tick(
             last_min_range_m_ = min_range;
         }
         const PerceptionResult segmented = perception_->segment(frame);
-        const Pose2D sensor_pose{state.position.x, state.position.z, state.yaw_rad};
+        const Pose2D sensor_pose{
+            nav_state.position.x, nav_state.position.z, nav_state.yaw_rad};
         mapper_->integrate(segmented.obstacles, sensor_pose, time_s_);
         costmap_ = inflation_.inflate(mapper_->grid());
         has_costmap_ = true;
@@ -150,7 +236,7 @@ void NavigationPipeline::tick(
     // Global planning stage.
     if (has_costmap_ && (plan_elapsed_s_ + 1e-9 >= plan_period_s_ || global_path_.points.empty())) {
         plan_elapsed_s_ = 0.0;
-        const PlanResult planned = global_planner_->plan(costmap_, state.position, goal);
+        const PlanResult planned = global_planner_->plan(costmap_, nav_state.position, goal);
         if (planned.ok) {
             global_path_ = planned.path;
         }
@@ -160,11 +246,11 @@ void NavigationPipeline::tick(
     if (!global_path_.points.empty() && local_elapsed_s_ + 1e-9 >= local_period_s_) {
         local_elapsed_s_ = 0.0;
         local_plan_ =
-            local_planner_->compute(costmap_, global_path_, state, vehicle_->limits(), goal);
+            local_planner_->compute(costmap_, global_path_, nav_state, vehicle_->limits(), goal);
     }
 
     // Control + vehicle integration every tick.
-    const double goal_distance = (goal - state.position).horizontal_length();
+    const double goal_distance = (goal - nav_state.position).horizontal_length();
     if (goal_distance <= goal_tolerance_m_) {
         goal_reached_ = true;
     }
@@ -179,8 +265,8 @@ void NavigationPipeline::tick(
         for (const TrajectoryPoint& point : local_plan_.trajectory.points) {
             reference.points.push_back(point.position);
         }
-        actuation =
-            controller_->control(state, reference, local_plan_.v_cmd, vehicle_->limits(), dt_s);
+        actuation = controller_->control(
+            nav_state, reference, local_plan_.v_cmd, vehicle_->limits(), dt_s);
     }
     state = vehicle_->step(state, actuation, dt_s);
     time_s_ += dt_s;
