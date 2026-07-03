@@ -9,6 +9,7 @@ add_library(agbot_worldgen
     src/SceneBridge.cpp
     src/SceneMesh.cpp
     src/SegTiler.cpp
+    src/WorldCompiler.cpp
     src/extractors/ClassicalIndex.cpp
     src/extractors/OnnxSemSeg.cpp
     src/extractors/RoadImport.cpp
@@ -29,10 +30,12 @@ target_include_directories(agbot_worldgen SYSTEM
 
 target_compile_features(agbot_worldgen PUBLIC cxx_std_20)
 # agbot_terrain provides the self-contained PNG decoder used by the imagery
-# extractors (classical_index, onnx_semseg).
+# extractors and the terrain pipeline consumed by the world compiler;
+# agbot_render provides the RenderScene / .agbscn types the compiler emits.
+# Both are PUBLIC because WorldCompiler.hpp exposes their types.
 target_link_libraries(agbot_worldgen
-    PUBLIC agbot_config agbot_flight_sim_core
-    PRIVATE agbot_third_party agbot_terrain
+    PUBLIC agbot_config agbot_flight_sim_core agbot_terrain agbot_render
+    PRIVATE agbot_third_party
 )
 
 # ONNX Runtime is optional; onnx_semseg registers a reason-coded stub when it

@@ -111,12 +111,12 @@ add_subdirectory(nav)
 add_subdirectory(render)
 
 add_executable(agbot_world_demo demo/world_demo_main.cpp)
+# agbot_worldgen PUBLIC-links agbot_terrain + agbot_render (the world compiler
+# exposes their types), so the demo only names worldgen + nav directly.
 target_link_libraries(agbot_world_demo
     PRIVATE
-        agbot_terrain
         agbot_worldgen
         agbot_nav
-        agbot_render
 )
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(agbot_world_demo PRIVATE -Wall -Wextra -Wpedantic)

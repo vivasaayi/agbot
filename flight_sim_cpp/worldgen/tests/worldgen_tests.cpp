@@ -3,6 +3,7 @@
 #include "agbot_worldgen/HeightResolver.hpp"
 #include "agbot_worldgen/SceneBridge.hpp"
 #include "agbot_worldgen/SceneMesh.hpp"
+#include "agbot_worldgen/WorldCompiler.hpp"
 #include "agbot_worldgen/extractors/VectorImport.hpp"
 
 #include "agbot_flight_sim/SceneSynthesis.hpp"
@@ -341,6 +342,105 @@ void test_manhattan_integration() {
               << mesh.indices.size() / 3 << " triangles, " << mesh.batches.size() << " batches\n";
 }
 
+// --- Gate 1: world-compile determinism ------------------------------------
+
+// Hermetic terrain: a single synthetic_detail layer over the fixture AOI,
+// dem_locked fusion, validation against itself. No terrarium tiles, no basemap
+// draping, no file writes -> fully reproducible without network or cache.
+const char* kHermeticTerrain = R"toml(
+[pipeline]
+target_gsd_m = 30.0
+resolution = 48
+aoi = { min_lat = 40.700, min_lon = -74.010, max_lat = 40.710, max_lon = -74.000 }
+
+[[layer]]
+algorithm = "synthetic_detail"
+weight = 1.0
+  [layer.params]
+  amplitude_m = 8.0
+  octaves = 4
+  frequency = 8.0
+  seed = 7
+  confidence = 1.0
+
+[fusion]
+method = "dem_locked"
+
+[validation]
+enabled = true
+reference_layer = 0
+)toml";
+
+agbot::worldgen::WorldCompileSpec gate1_spec() {
+    agbot::worldgen::WorldCompileSpec spec;
+    spec.seed = 4242;
+    spec.terrain_config_toml = kHermeticTerrain;
+    spec.terrain_license = "test-synthetic";
+    spec.buildings_path = kFixturePath;
+    spec.buildings_license = "test-fixture";
+    spec.building_params["height_attr"] = std::string("height_roof");
+    spec.building_params["height_units"] = std::string("feet");
+    spec.building_params["base_elev_attr"] = std::string("ground_elevation");
+    spec.building_params["base_units"] = std::string("feet");
+    spec.building_params["levels_attr"] = std::string("num_floors");
+    spec.building_params["id_attr"] = std::string("bin");
+    spec.building_params["min_area_m2"] = 10.0;
+    return spec;
+}
+
+void test_world_compiler_determinism() {
+    const auto first = agbot::worldgen::compile_world(gate1_spec());
+    expect(first.ok, "gate1 world compiles");
+    if (!first.ok) {
+        std::cout << "  gate1 compile error: " << first.error_code << " — "
+                  << first.error_detail << "\n";
+        return;
+    }
+    expect(first.manifest.world_hash != 0, "gate1 world_hash is nonzero");
+    expect(first.manifest.tiles.size() == 1, "gate1 emits a single AOI tile");
+    expect(first.manifest.sources.size() == 2, "gate1 records terrain + building sources");
+    expect(
+        !first.manifest.tiles.empty() && first.manifest.tiles.front().provenance.size() == 2,
+        "gate1 tile carries terrain + building provenance");
+    expect(first.manifest.quality.building_count == 5, "gate1 building count matches fixture");
+    expect(first.buildings.size() == 5 && first.city.indices.size() % 3 == 0,
+           "gate1 city mesh triangulated from fixture buildings");
+
+    const auto second = agbot::worldgen::compile_world(gate1_spec());
+    expect(second.ok, "gate1 recompiles");
+    expect(first.manifest.world_hash == second.manifest.world_hash,
+           "gate1 world_hash reproducible across compiles");
+    expect(
+        first.manifest.tiles.front().content_hash == second.manifest.tiles.front().content_hash,
+        "gate1 tile content hash reproducible");
+    expect(first.manifest.to_json() == second.manifest.to_json(),
+           "gate1 manifest JSON byte-identical across compiles");
+
+    // The world seed is part of world identity but not of tile geometry.
+    auto reseeded = gate1_spec();
+    reseeded.seed = 9999;
+    const auto diff = agbot::worldgen::compile_world(reseeded);
+    expect(diff.ok && diff.manifest.world_hash != first.manifest.world_hash,
+           "gate1 changing seed changes world_hash");
+    expect(diff.ok && diff.manifest.tiles.front().content_hash ==
+                          first.manifest.tiles.front().content_hash,
+           "gate1 changing seed leaves geometry hash stable");
+
+    // Provenance is auditable: every tile layer names a declared source.
+    bool provenance_resolves = true;
+    for (const auto& tile : first.manifest.tiles) {
+        for (const auto& layer : tile.provenance) {
+            const bool found = std::any_of(
+                first.manifest.sources.begin(), first.manifest.sources.end(),
+                [&layer](const agbot::worldgen::SourceSnapshot& s) {
+                    return s.source_id == layer.source_id;
+                });
+            provenance_resolves = provenance_resolves && found;
+        }
+    }
+    expect(provenance_resolves, "gate1 every layer provenance resolves to a source");
+}
+
 } // namespace
 
 int main() {
@@ -352,6 +452,7 @@ int main() {
     test_scene_bridge();
     test_mesh_builder();
     test_manhattan_integration();
+    test_world_compiler_determinism();
 
     if (failures > 0) {
         std::cout << failures << " test(s) failed\n";
