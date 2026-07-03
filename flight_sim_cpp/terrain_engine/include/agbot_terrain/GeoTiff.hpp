@@ -25,4 +25,10 @@ struct GeoTiffResult {
 // USGS 3DEP ImageServer exportImage endpoint returns, not the full TIFF spec.
 [[nodiscard]] GeoTiffResult read_geotiff_dem(const std::filesystem::path& path);
 
+// As read_geotiff_dem, but also accepts single-band unsigned/signed integer
+// sample formats (8/16/32-bit), decoding class ids into the float Raster. Used
+// for categorical rasters such as a land-cover class grid delivered as a lon/lat
+// integer GeoTIFF at the compiler boundary.
+[[nodiscard]] GeoTiffResult read_geotiff_categorical(const std::filesystem::path& path);
+
 } // namespace agbot::terrain

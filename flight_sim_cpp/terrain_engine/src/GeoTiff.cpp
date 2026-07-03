@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <map>
 #include <vector>
 
@@ -117,7 +118,10 @@ std::string read_ascii(const Reader& r, const Entry& e) {
 
 } // namespace
 
-GeoTiffResult read_geotiff_dem(const std::filesystem::path& path) {
+// Shared reader for single-band GeoTIFFs. `integer_ok` additionally accepts
+// unsigned/signed integer sample formats (8/16/32-bit), decoding class ids into
+// the float Raster — used for categorical rasters such as land cover.
+GeoTiffResult read_geotiff_impl(const std::filesystem::path& path, bool integer_ok) {
     GeoTiffResult result;
     std::ifstream in(path, std::ios::binary);
     if (!in) {
@@ -196,14 +200,36 @@ GeoTiffResult read_geotiff_dem(const std::filesystem::path& path) {
         result.error = "geotiff_unsupported_samples";
         return result;
     }
-    if (sample_format != 3 || (bits != 32 && bits != 64)) {
-        result.error = "geotiff_not_float";
+    std::size_t bytes_per_sample = 0;
+    std::function<float(std::size_t)> sample_at;
+    if (sample_format == 3 && (bits == 32 || bits == 64)) {
+        bytes_per_sample = bits == 64 ? 8 : 4;
+        sample_at = [&r, bits](std::size_t off) -> float {
+            return bits == 64 ? static_cast<float>(r.f64(off)) : r.f32(off);
+        };
+    } else if (integer_ok && (sample_format == 1 || sample_format == 2) &&
+               (bits == 8 || bits == 16 || bits == 32)) {
+        bytes_per_sample = static_cast<std::size_t>(bits) / 8;
+        const bool is_signed = sample_format == 2;
+        sample_at = [&r, bits, is_signed](std::size_t off) -> float {
+            if (bits == 8) {
+                const std::uint8_t v = r.bytes[off];
+                return is_signed ? static_cast<float>(static_cast<std::int8_t>(v))
+                                 : static_cast<float>(v);
+            }
+            if (bits == 16) {
+                const std::uint16_t v = r.u16(off);
+                return is_signed ? static_cast<float>(static_cast<std::int16_t>(v))
+                                 : static_cast<float>(v);
+            }
+            const std::uint32_t v = r.u32(off);
+            return is_signed ? static_cast<float>(static_cast<std::int32_t>(v))
+                             : static_cast<float>(v);
+        };
+    } else {
+        result.error = integer_ok ? "geotiff_unsupported_format" : "geotiff_not_float";
         return result;
     }
-    const std::size_t bytes_per_sample = bits == 64 ? 8 : 4;
-    const auto sample_at = [&](std::size_t off) -> float {
-        return bits == 64 ? static_cast<float>(r.f64(off)) : r.f32(off);
-    };
 
     // Optional GDAL_NODATA (ASCII) + generic float-nodata sentinel.
     double nodata_value = 0.0;
@@ -299,6 +325,14 @@ GeoTiffResult read_geotiff_dem(const std::filesystem::path& path) {
     result.raster = std::move(raster);
     result.ok = true;
     return result;
+}
+
+GeoTiffResult read_geotiff_dem(const std::filesystem::path& path) {
+    return read_geotiff_impl(path, /*integer_ok=*/false);
+}
+
+GeoTiffResult read_geotiff_categorical(const std::filesystem::path& path) {
+    return read_geotiff_impl(path, /*integer_ok=*/true);
 }
 
 } // namespace agbot::terrain

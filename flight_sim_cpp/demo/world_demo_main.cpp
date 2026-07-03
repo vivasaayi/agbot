@@ -247,6 +247,27 @@ int main(int argc, char** argv) {
     spec.building_params["id_attr"] = cfg::ParamValue(std::string("bin"));
     spec.building_params["min_area_m2"] = cfg::ParamValue(10.0);
 
+    // Optional surface-detail sources (M3 batch 3). Activate the ranked LoD1
+    // measured tier + land-cover semantic mask when the reprojected rasters are
+    // present; the compile falls back cleanly otherwise. Fetch with
+    // terrain_engine/tools/fetch_nyc_dsm.sh / fetch_nyc_landcover.sh.
+    const std::filesystem::path dsm_path = source_dir / "data/terrain/manhattan_nyc_dsm.tif";
+    if (!dem_geotiff.empty() && std::filesystem::exists(dsm_path)) {
+        spec.dsm_path = dsm_path.string();
+        spec.dsm_license = "NYC Open Data (public domain)";
+        spec.dsm_uri = "https://data.cityofnewyork.us/";
+        spec.dsm_version = "NYC 2017 highest-hit DSM";
+        spec.dsm_vertical_datum = "NAVD88";
+    }
+    const std::filesystem::path landcover_path =
+        source_dir / "data/terrain/manhattan_nyc_landcover.tif";
+    if (std::filesystem::exists(landcover_path)) {
+        spec.landcover_path = landcover_path.string();
+        spec.landcover_license = "NYC Open Data (public domain)";
+        spec.landcover_uri = "https://data.cityofnewyork.us/";
+        spec.landcover_version = "NYC 2017 6-inch Land Cover";
+    }
+
     spec.roads_path = (source_dir / "data/worldgen/manhattan_roads.json").string();
     spec.roads_license = "OpenStreetMap (ODbL)";
     spec.roads_uri = "https://overpass-api.de/api/interpreter";

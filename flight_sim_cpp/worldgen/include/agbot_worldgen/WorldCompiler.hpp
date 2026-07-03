@@ -32,7 +32,7 @@ struct SourceSnapshot {
 };
 
 // Which world layer a provenance entry describes.
-enum class WorldLayerKind { Terrain, Buildings, Roads, Basemap };
+enum class WorldLayerKind { Terrain, Buildings, Roads, Basemap, Dsm, LandCover };
 [[nodiscard]] const char* to_string(WorldLayerKind kind);
 
 // Per-tile terrain provenance status. Missing elevation is never coerced to
@@ -101,6 +101,12 @@ struct WorldQuality {
     std::size_t city_vertex_count = 0;
     std::size_t city_triangle_count = 0;
     std::size_t city_batch_count = 0;
+    // DSM-derived measured building heights actually applied (subset of
+    // height_from_measured; 0 when no DSM source was supplied).
+    std::size_t dsm_measured_applied = 0;
+    // Land-cover class id -> terrain cell count (sorted by class id); empty when
+    // no land-cover source was supplied. Class -1 is unknown/outside coverage.
+    std::vector<std::pair<int, std::size_t>> landcover_histogram;
 };
 
 // The .agbworld manifest-of-manifests: everything needed to reproduce and audit
@@ -153,6 +159,30 @@ struct WorldCompileSpec {
     // Vertical datum the building base elevations reference (e.g. "NAVD88").
     // Must be compatible with terrain_vertical_datum when both are declared.
     std::string buildings_vertical_datum;
+
+    // Optional highest-hit DSM (float32 GeoTIFF, same georef convention as the
+    // 3DEP DEM) used to derive per-building measured heights (DSM - bare-earth
+    // ground) at the footprint centroid. When present and valid, the measured
+    // tier outranks the height attribute in the ranked LoD1 stack.
+    std::string dsm_path;
+    std::string dsm_source_id = "dsm";
+    std::string dsm_uri;
+    std::string dsm_version;
+    std::string dsm_license;
+    std::string dsm_vertical_datum;
+    // Plausible bounds (m) for an accepted DSM-derived building height; residuals
+    // outside fall through to the attribute/levels/default tiers.
+    double dsm_min_height_m = 2.0;
+    double dsm_max_height_m = 600.0;
+
+    // Optional land-cover semantic raster (single-band integer GeoTIFF, class
+    // ids per cell, lon/lat georef). Sampled onto the terrain grid to produce a
+    // per-class cell histogram recorded in the manifest quality block.
+    std::string landcover_path;
+    std::string landcover_source_id = "landcover";
+    std::string landcover_uri;
+    std::string landcover_version;
+    std::string landcover_license;
 
     std::string roads_path;                             // optional
     agbot::config::ParamTable road_params;

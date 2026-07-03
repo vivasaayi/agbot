@@ -10,6 +10,7 @@ add_library(agbot_worldgen
     src/SceneBridge.cpp
     src/SceneMesh.cpp
     src/SegTiler.cpp
+    src/TerrainSemantics.cpp
     src/WorldCompiler.cpp
     src/extractors/ClassicalIndex.cpp
     src/extractors/OnnxSemSeg.cpp

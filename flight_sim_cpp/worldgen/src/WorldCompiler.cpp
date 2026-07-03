@@ -4,9 +4,11 @@
 #include "agbot_flight_sim/Mission.hpp"
 #include "agbot_worldgen/Crs.hpp"
 #include "agbot_render/SceneFile.hpp"
+#include "agbot_terrain/GeoTiff.hpp"
 #include "agbot_terrain/Png.hpp"
 #include "agbot_terrain/TerrainPipeline.hpp"
 #include "agbot_terrain/WaterMask.hpp"
+#include "agbot_worldgen/TerrainSemantics.hpp"
 #include "agbot_worldgen/extractors/RoadImport.hpp"
 #include "agbot_worldgen/extractors/VectorImport.hpp"
 
@@ -361,6 +363,8 @@ const char* to_string(WorldLayerKind kind) {
         case WorldLayerKind::Buildings: return "buildings";
         case WorldLayerKind::Roads: return "roads";
         case WorldLayerKind::Basemap: return "basemap";
+        case WorldLayerKind::Dsm: return "dsm";
+        case WorldLayerKind::LandCover: return "landcover";
     }
     return "unknown";
 }
@@ -466,7 +470,14 @@ std::string WorldManifest::to_json() const {
         << ", \"default\": " << quality.height_from_default << "}"
         << ", \"city_vertex_count\": " << quality.city_vertex_count
         << ", \"city_triangle_count\": " << quality.city_triangle_count
-        << ", \"city_batch_count\": " << quality.city_batch_count << "},\n";
+        << ", \"city_batch_count\": " << quality.city_batch_count
+        << ", \"dsm_measured_applied\": " << quality.dsm_measured_applied
+        << ", \"landcover_histogram\": {";
+    for (std::size_t i = 0; i < quality.landcover_histogram.size(); ++i) {
+        out << (i == 0 ? "" : ", ") << "\"" << quality.landcover_histogram[i].first
+            << "\": " << quality.landcover_histogram[i].second;
+    }
+    out << "}},\n";
 
     out << "  \"world_hash\": " << world_hash << "\n";
     out << "}\n";
@@ -528,8 +539,44 @@ WorldCompileResult compile_world(const WorldCompileSpec& spec) {
         return result;
     }
 
+    // 2b. Surface-detail adapters (optional): DSM residual measured heights and
+    // land-cover semantic mask. Each activates only when its source raster is
+    // present; both no-op cleanly otherwise (no silent fabrication).
+    bool have_dsm = false;
+    std::size_t dsm_applied = 0;
+    if (!spec.dsm_path.empty() && std::filesystem::exists(spec.dsm_path)) {
+        const VerticalDatum dsm_datum = vertical_datum_from_name(spec.dsm_vertical_datum);
+        if (!vertical_datums_compatible(terrain_datum, dsm_datum)) {
+            result.error_code = "mixed_vertical_datum_dsm";
+            result.error_detail = std::string("terrain=") + to_string(terrain_datum) +
+                " dsm=" + to_string(dsm_datum);
+            return result;
+        }
+        const agbot::terrain::GeoTiffResult dsm = agbot::terrain::read_geotiff_dem(spec.dsm_path);
+        if (dsm.ok && dsm.has_georef) {
+            DsmResidualParams dp;
+            dp.min_height_m = spec.dsm_min_height_m;
+            dp.max_height_m = spec.dsm_max_height_m;
+            const DsmResidualStats stats = apply_dsm_measured_heights(
+                result.buildings, dsm.raster, result.terrain.elevation, dp);
+            dsm_applied = stats.applied;
+            have_dsm = true;
+        }
+    }
+
+    bool have_landcover = false;
+    LandCoverHistogram landcover_hist;
+    if (!spec.landcover_path.empty() && std::filesystem::exists(spec.landcover_path)) {
+        const agbot::terrain::GeoTiffResult lc =
+            agbot::terrain::read_geotiff_categorical(spec.landcover_path);
+        if (lc.ok && lc.has_georef) {
+            landcover_hist = sample_landcover_histogram(result.terrain.elevation, lc.raster);
+            have_landcover = true;
+        }
+    }
+
     // 3. City mesh -----------------------------------------------------------
-    result.city = build_city_mesh(buildings.features, result.origin, spec.mesh_params);
+    result.city = build_city_mesh(result.buildings, result.origin, spec.mesh_params);
 
     // 4. Roads (optional) ----------------------------------------------------
     ExtractionResult roads;
@@ -650,6 +697,8 @@ WorldCompileResult compile_world(const WorldCompileSpec& spec) {
     manifest.quality.city_vertex_count = result.city.vertices.size();
     manifest.quality.city_triangle_count = result.city.indices.size() / 3;
     manifest.quality.city_batch_count = result.city.batches.size();
+    manifest.quality.dsm_measured_applied = dsm_applied;
+    manifest.quality.landcover_histogram = landcover_hist;
 
     // 7. Sources (provenance) ------------------------------------------------
     SourceSnapshot terrain_source;
@@ -691,6 +740,27 @@ WorldCompileResult compile_world(const WorldCompileSpec& spec) {
         basemap_source.crs = "EPSG:3857";
         manifest.sources.push_back(basemap_source);
     }
+    if (have_dsm) {
+        SourceSnapshot dsm_source;
+        dsm_source.source_id = spec.dsm_source_id;
+        dsm_source.uri = spec.dsm_uri;
+        dsm_source.version = spec.dsm_version;
+        dsm_source.license = spec.dsm_license;
+        dsm_source.crs = "EPSG:4326";
+        dsm_source.vertical_datum = spec.dsm_vertical_datum;
+        dsm_source.content_hash = hash_file_bytes(spec.dsm_path);
+        manifest.sources.push_back(dsm_source);
+    }
+    if (have_landcover) {
+        SourceSnapshot lc_source;
+        lc_source.source_id = spec.landcover_source_id;
+        lc_source.uri = spec.landcover_uri;
+        lc_source.version = spec.landcover_version;
+        lc_source.license = spec.landcover_license;
+        lc_source.crs = "EPSG:4326";
+        lc_source.content_hash = hash_file_bytes(spec.landcover_path);
+        manifest.sources.push_back(lc_source);
+    }
 
     // 8. Tile (single AOI-wide tile for M1) ----------------------------------
     WorldTile tile;
@@ -705,6 +775,14 @@ WorldCompileResult compile_world(const WorldCompileSpec& spec) {
                                terrain.fused.source_algorithm, terrain.param_hash});
     tile.provenance.push_back({WorldLayerKind::Buildings, spec.buildings_source_id,
                                buildings.algorithm_id, buildings.params_hash});
+    if (have_dsm) {
+        tile.provenance.push_back(
+            {WorldLayerKind::Dsm, spec.dsm_source_id, "dsm_residual", 0});
+    }
+    if (have_landcover) {
+        tile.provenance.push_back(
+            {WorldLayerKind::LandCover, spec.landcover_source_id, "landcover_sample", 0});
+    }
     if (have_roads) {
         tile.provenance.push_back({WorldLayerKind::Roads, spec.roads_source_id,
                                    roads.algorithm_id, roads.params_hash});

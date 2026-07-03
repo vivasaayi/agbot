@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -382,6 +384,114 @@ void test_validation_json() {
 // Reads the committed 3DEP fixture and pins the C++ GeoTIFF reader to the
 // values an independent decode produced (min -16.618, max 13.830, mean 6.421,
 // NW corner 4.089, SE corner 1.592 over 40.705..40.715 / -74.015..-74.005).
+// Minimal little-endian, single-strip, uint8 GeoTIFF writer for exercising the
+// categorical reader without committing a binary fixture. Georeferenced via
+// ModelPixelScale + ModelTiepoint, matching the exportImage convention.
+void write_u8_geotiff(const std::filesystem::path& path, int width, int height,
+                      const std::vector<std::uint8_t>& pixels, double west, double north,
+                      double px_deg) {
+    std::vector<std::uint8_t> out;
+    auto u16 = [&](std::uint16_t v) {
+        out.push_back(v & 0xff);
+        out.push_back((v >> 8) & 0xff);
+    };
+    auto u32 = [&](std::uint32_t v) {
+        for (int i = 0; i < 4; ++i) out.push_back((v >> (8 * i)) & 0xff);
+    };
+    auto f64_at = [](double d, std::vector<std::uint8_t>& dst) {
+        std::uint64_t bits = 0;
+        std::memcpy(&bits, &d, 8);
+        for (int i = 0; i < 8; ++i) dst.push_back((bits >> (8 * i)) & 0xff);
+    };
+    // Header: II, 42, IFD offset (filled after we know layout).
+    out.push_back('I');
+    out.push_back('I');
+    u16(42);
+    const std::size_t ifd_off_pos = out.size();
+    u32(0); // placeholder
+
+    // Doubles block: ModelPixelScale (3) + ModelTiepoint (6).
+    const std::uint32_t scale_off = 8;
+    std::vector<std::uint8_t> doubles;
+    f64_at(px_deg, doubles); // sx
+    f64_at(px_deg, doubles); // sy
+    f64_at(0.0, doubles);    // sz
+    f64_at(0.0, doubles);    // i
+    f64_at(0.0, doubles);    // j
+    f64_at(0.0, doubles);    // k
+    f64_at(west, doubles);   // x (lon at col 0)
+    f64_at(north, doubles);  // y (lat at row 0)
+    f64_at(0.0, doubles);    // z
+    const std::uint32_t tie_off = scale_off + 3 * 8;
+    // Pad file to scale_off then write doubles.
+    while (out.size() < scale_off) out.push_back(0);
+    out.insert(out.end(), doubles.begin(), doubles.end());
+
+    // Pixel data strip.
+    const std::uint32_t strip_off = static_cast<std::uint32_t>(out.size());
+    out.insert(out.end(), pixels.begin(), pixels.end());
+
+    // IFD.
+    const std::uint32_t ifd_off = static_cast<std::uint32_t>(out.size());
+    out[ifd_off_pos] = ifd_off & 0xff;
+    out[ifd_off_pos + 1] = (ifd_off >> 8) & 0xff;
+    out[ifd_off_pos + 2] = (ifd_off >> 16) & 0xff;
+    out[ifd_off_pos + 3] = (ifd_off >> 24) & 0xff;
+
+    struct Tag {
+        std::uint16_t id, type;
+        std::uint32_t count, value;
+    };
+    std::vector<Tag> tags = {
+        {256, 3, 1, static_cast<std::uint32_t>(width)},   // ImageWidth
+        {257, 3, 1, static_cast<std::uint32_t>(height)},  // ImageLength
+        {258, 3, 1, 8},                                    // BitsPerSample
+        {259, 3, 1, 1},                                    // Compression = none
+        {262, 3, 1, 1},                                    // Photometric
+        {273, 4, 1, strip_off},                            // StripOffsets
+        {277, 3, 1, 1},                                    // SamplesPerPixel
+        {278, 3, 1, static_cast<std::uint32_t>(height)},   // RowsPerStrip
+        {279, 4, 1, static_cast<std::uint32_t>(pixels.size())}, // StripByteCounts
+        {339, 3, 1, 1},                                    // SampleFormat = uint
+        {33550, 12, 3, scale_off},                         // ModelPixelScale
+        {33922, 12, 6, tie_off},                           // ModelTiepoint
+    };
+    u16(static_cast<std::uint16_t>(tags.size()));
+    for (const Tag& t : tags) {
+        u16(t.id);
+        u16(t.type);
+        u32(t.count);
+        u32(t.value);
+    }
+    u32(0); // next IFD
+
+    std::ofstream f(path, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(out.data()), static_cast<std::streamsize>(out.size()));
+}
+
+void test_geotiff_categorical_reader() {
+    const std::filesystem::path path =
+        std::filesystem::temp_directory_path() / "agbot_landcover_test.tif";
+    // 4x2 class grid; row 0 is northernmost.
+    const std::vector<std::uint8_t> pixels = {5, 5, 6, 4, 1, 1, 2, 4};
+    write_u8_geotiff(path, 4, 2, pixels, -74.01, 40.71, 0.001);
+
+    const terrain::GeoTiffResult lc = terrain::read_geotiff_categorical(path);
+    expect(lc.ok && lc.has_georef, "categorical geotiff reads with georeference");
+    expect(lc.raster.width == 4 && lc.raster.height == 2, "categorical geotiff is 4x2");
+    expect(lc.raster.at(0, 0) == 5.0f && lc.raster.at(0, 3) == 4.0f && lc.raster.at(1, 2) == 2.0f,
+           "categorical class ids decode exactly (uint8)");
+    expect(std::abs(lc.raster.bounds.max_latitude - 40.71) < 1e-9 &&
+               std::abs(lc.raster.bounds.min_longitude - (-74.01)) < 1e-9,
+           "categorical geotiff georef from tiepoint/scale");
+    // The float DEM reader must reject the integer format.
+    const terrain::GeoTiffResult as_dem = terrain::read_geotiff_dem(path);
+    expect(!as_dem.ok && as_dem.error == "geotiff_not_float",
+           "float DEM reader rejects an integer raster");
+    std::error_code ec;
+    std::filesystem::remove(path, ec);
+}
+
 void test_geotiff_dem_reader() {
     const std::filesystem::path fixture =
         std::filesystem::path(AGBOT_TERRAIN_SOURCE_DIR) / "tests" / "fixtures" / "dem_128.tif";
@@ -927,6 +1037,7 @@ int main() {
     test_validation_metrics();
     test_validation_json();
     test_inflate_stored_and_png_synthetic();
+    test_geotiff_categorical_reader();
     test_geotiff_dem_reader();
     test_water_mask_boundary_connected();
     test_real_tile_decode();

@@ -4,13 +4,18 @@
 #include "agbot_worldgen/Crs.hpp"
 #include "agbot_worldgen/SceneBridge.hpp"
 #include "agbot_worldgen/SceneMesh.hpp"
+#include "agbot_worldgen/TerrainSemantics.hpp"
 #include "agbot_worldgen/WorldCompiler.hpp"
 #include "agbot_worldgen/extractors/VectorImport.hpp"
+
+#include "agbot_terrain/Raster.hpp"
 
 #include "agbot_flight_sim/SceneSynthesis.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -684,6 +689,193 @@ void test_gate3_building_quality() {
            "gate3 manifest serializes the height-source breakdown");
 }
 
+// Minimal little-endian, single-strip float32 GeoTIFF writer for the DSM
+// integration test (a constant-elevation highest-hit surface over the AOI).
+void write_f32_geotiff(const std::filesystem::path& path, int width, int height, float value,
+                       double west, double north, double px_deg) {
+    std::vector<std::uint8_t> out;
+    auto u16 = [&](std::uint16_t v) {
+        out.push_back(v & 0xff);
+        out.push_back((v >> 8) & 0xff);
+    };
+    auto u32 = [&](std::uint32_t v) {
+        for (int i = 0; i < 4; ++i) out.push_back((v >> (8 * i)) & 0xff);
+    };
+    auto push_f64 = [&](double d, std::vector<std::uint8_t>& dst) {
+        std::uint64_t bits = 0;
+        std::memcpy(&bits, &d, 8);
+        for (int i = 0; i < 8; ++i) dst.push_back((bits >> (8 * i)) & 0xff);
+    };
+    out.push_back('I');
+    out.push_back('I');
+    u16(42);
+    const std::size_t ifd_off_pos = out.size();
+    u32(0);
+
+    const std::uint32_t scale_off = 8;
+    std::vector<std::uint8_t> doubles;
+    push_f64(px_deg, doubles);
+    push_f64(px_deg, doubles);
+    push_f64(0.0, doubles);
+    push_f64(0.0, doubles);
+    push_f64(0.0, doubles);
+    push_f64(0.0, doubles);
+    push_f64(west, doubles);
+    push_f64(north, doubles);
+    push_f64(0.0, doubles);
+    const std::uint32_t tie_off = scale_off + 3 * 8;
+    while (out.size() < scale_off) out.push_back(0);
+    out.insert(out.end(), doubles.begin(), doubles.end());
+
+    const std::uint32_t strip_off = static_cast<std::uint32_t>(out.size());
+    std::uint32_t vbits = 0;
+    std::memcpy(&vbits, &value, 4);
+    for (int p = 0; p < width * height; ++p) {
+        for (int i = 0; i < 4; ++i) out.push_back((vbits >> (8 * i)) & 0xff);
+    }
+
+    const std::uint32_t ifd_off = static_cast<std::uint32_t>(out.size());
+    out[ifd_off_pos] = ifd_off & 0xff;
+    out[ifd_off_pos + 1] = (ifd_off >> 8) & 0xff;
+    out[ifd_off_pos + 2] = (ifd_off >> 16) & 0xff;
+    out[ifd_off_pos + 3] = (ifd_off >> 24) & 0xff;
+
+    struct Tag {
+        std::uint16_t id, type;
+        std::uint32_t count, value;
+    };
+    const std::vector<Tag> tags = {
+        {256, 3, 1, static_cast<std::uint32_t>(width)},
+        {257, 3, 1, static_cast<std::uint32_t>(height)},
+        {258, 3, 1, 32},
+        {259, 3, 1, 1},
+        {262, 3, 1, 1},
+        {273, 4, 1, strip_off},
+        {277, 3, 1, 1},
+        {278, 3, 1, static_cast<std::uint32_t>(height)},
+        {279, 4, 1, static_cast<std::uint32_t>(width * height * 4)},
+        {339, 3, 1, 3}, // SampleFormat = IEEE float
+        {33550, 12, 3, scale_off},
+        {33922, 12, 6, tie_off},
+    };
+    u16(static_cast<std::uint16_t>(tags.size()));
+    for (const Tag& t : tags) {
+        u16(t.id);
+        u16(t.type);
+        u32(t.count);
+        u32(t.value);
+    }
+    u32(0);
+
+    std::ofstream f(path, std::ios::binary);
+    f.write(reinterpret_cast<const char*>(out.data()), static_cast<std::streamsize>(out.size()));
+}
+
+void test_dsm_residual_compiler_wiring() {
+    namespace wg = agbot::worldgen;
+    // Highest-hit DSM at a constant 80 m over the fixture AOI (synthetic terrain
+    // is ~±8 m), so residuals land in [~72, 88] m for every fixture building.
+    const std::filesystem::path dsm =
+        std::filesystem::temp_directory_path() / "agbot_dsm_wiring.tif";
+    write_f32_geotiff(dsm, 64, 64, 80.0f, -74.010, 40.710, 0.00015625);
+
+    wg::WorldCompileSpec spec = gate1_spec();
+    spec.terrain_vertical_datum = "NAVD88";
+    spec.dsm_path = dsm.string();
+    spec.dsm_vertical_datum = "NAVD88";
+
+    const auto world = wg::compile_world(spec);
+    expect(world.ok, "compile with DSM succeeds");
+    if (world.ok) {
+        const auto& q = world.manifest.quality;
+        expect(q.dsm_measured_applied > 0, "DSM residual applied to at least one building");
+        expect(q.height_from_measured == q.dsm_measured_applied,
+               "every measured-tier height came from the DSM residual");
+        expect(world.manifest.to_json().find("\"dsm_measured_applied\": 0") == std::string::npos,
+               "manifest reports a non-zero DSM measured count");
+        bool has_dsm_source = false;
+        for (const auto& s : world.manifest.sources) {
+            if (s.source_id == "dsm") has_dsm_source = true;
+        }
+        expect(has_dsm_source, "DSM source recorded in manifest provenance");
+    }
+
+    // Datum discipline: an ellipsoidal DSM against an orthometric terrain is
+    // rejected rather than silently differenced.
+    spec.dsm_vertical_datum = "ellipsoidal";
+    const auto bad = wg::compile_world(spec);
+    expect(!bad.ok && bad.error_code == "mixed_vertical_datum_dsm",
+           "mismatched DSM vertical datum is rejected");
+
+    std::error_code ec;
+    std::filesystem::remove(dsm, ec);
+}
+
+void test_dsm_residual_measured_heights() {
+    namespace wg = agbot::worldgen;
+    namespace terrain = agbot::terrain;
+    const agbot::flight_sim::GeoBounds bounds = {40.700, -74.010, 40.710, -74.000};
+
+    // Bare-earth ground flat at 10 m; DSM at 40 m over the whole AOI -> 30 m
+    // measured building height.
+    terrain::Raster ground = terrain::Raster::filled(8, 8, bounds, 10.0f);
+    terrain::Raster dsm = terrain::Raster::filled(8, 8, bounds, 40.0f);
+
+    auto box = [&](double lat, double lon) {
+        wg::ExtractedFeature f;
+        f.cls = wg::FeatureClass::Building;
+        f.class_name = "building";
+        const double d = 0.0005;
+        f.exterior = {{lat - d, lon - d, 0.0},
+                      {lat - d, lon + d, 0.0},
+                      {lat + d, lon + d, 0.0},
+                      {lat + d, lon - d, 0.0}};
+        f.height_m = 12.0; // attribute height that measured should override
+        f.attributes["height_source"] = "attr";
+        return f;
+    };
+    std::vector<wg::ExtractedFeature> buildings = {box(40.705, -74.005)};
+    // A building outside the DSM coverage keeps its attribute height.
+    std::vector<wg::ExtractedFeature> outside = {box(41.0, -73.0)};
+    buildings.push_back(outside.front());
+
+    const wg::DsmResidualStats stats =
+        wg::apply_dsm_measured_heights(buildings, dsm, ground, {});
+    expect(stats.applied == 1, "dsm residual applied to the in-coverage building");
+    expect(stats.rejected == 1, "dsm residual rejects the out-of-coverage building");
+    expect(near(*buildings[0].height_m, 30.0, 1e-6) &&
+               buildings[0].attributes["height_source"] == "measured",
+           "measured height = DSM - ground, tagged measured");
+    expect(near(*buildings[1].height_m, 12.0, 1e-6) &&
+               buildings[1].attributes["height_source"] == "attr",
+           "out-of-coverage building keeps its attribute height");
+}
+
+void test_landcover_histogram() {
+    namespace wg = agbot::worldgen;
+    namespace terrain = agbot::terrain;
+    const agbot::flight_sim::GeoBounds bounds = {40.700, -74.010, 40.710, -74.000};
+    terrain::Raster terrain_grid = terrain::Raster::filled(4, 4, bounds, 5.0f);
+
+    // Land-cover: top half class 5 (buildings), bottom half class 6 (roads).
+    terrain::Raster lc = terrain::Raster::filled(4, 4, bounds, 5.0f);
+    for (int r = 2; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            lc.set(r, c, 6.0f);
+        }
+    }
+    const wg::LandCoverHistogram hist = wg::sample_landcover_histogram(terrain_grid, lc);
+    std::size_t c5 = 0;
+    std::size_t c6 = 0;
+    for (const auto& [cls, count] : hist) {
+        if (cls == 5) c5 = count;
+        if (cls == 6) c6 = count;
+    }
+    expect(c5 == 8 && c6 == 8, "landcover histogram tallies both classes over the grid");
+    expect(!hist.empty() && hist.front().first <= hist.back().first,
+           "landcover histogram is sorted by class id");
+}
+
 } // namespace
 
 int main() {
@@ -701,6 +893,9 @@ int main() {
     test_2263_ingest();
     test_elevation_state_authoritative();
     test_gate3_building_quality();
+    test_dsm_residual_measured_heights();
+    test_dsm_residual_compiler_wiring();
+    test_landcover_histogram();
 
     if (failures > 0) {
         std::cout << failures << " test(s) failed\n";
