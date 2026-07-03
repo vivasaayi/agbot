@@ -409,6 +409,12 @@ void test_world_compiler_determinism() {
     expect(first.manifest.quality.building_count == 5, "gate1 building count matches fixture");
     expect(first.buildings.size() == 5 && first.city.indices.size() % 3 == 0,
            "gate1 city mesh triangulated from fixture buildings");
+    // Synthetic terrain is not authoritative -> Fallback, no-silent-zero reason.
+    expect(!first.manifest.tiles.empty() &&
+               first.manifest.tiles.front().elevation_state ==
+                   agbot::worldgen::ElevationState::Fallback &&
+               first.manifest.tiles.front().elevation_fallback_reason == "NO_AUTHORITATIVE_SOURCE",
+           "gate1 non-authoritative terrain is labelled Fallback");
 
     const auto second = agbot::worldgen::compile_world(gate1_spec());
     expect(second.ok, "gate1 recompiles");
@@ -595,6 +601,63 @@ void test_2263_ingest() {
     std::filesystem::remove(fixture, ec_rm);
 }
 
+void test_elevation_state_authoritative() {
+    namespace wg = agbot::worldgen;
+    const std::string dem_fixture =
+        std::string(WORLDGEN_SOURCE_DIR) + "/../terrain_engine/tests/fixtures/dem_128.tif";
+    if (!std::filesystem::exists(dem_fixture)) {
+        std::cout << "SKIP elevation-state authoritative (DEM fixture absent)\n";
+        return;
+    }
+    // AOI strictly inside the DEM fixture bounds (40.705..40.715 / -74.015..-74.005)
+    // so the authoritative DEM fully covers it.
+    const std::string terrain_toml =
+        "[pipeline]\n"
+        "target_gsd_m = 30.0\n"
+        "resolution = 32\n"
+        "aoi = { min_lat = 40.706, min_lon = -74.014, max_lat = 40.714, max_lon = -74.006 }\n"
+        "[[layer]]\n"
+        "algorithm = \"dem_fusion\"\n"
+        "weight = 1.0\n"
+        "  [layer.params]\n"
+        "  source = \"geotiff\"\n"
+        "  path = \"" + dem_fixture + "\"\n"
+        "  resample = \"bilinear\"\n"
+        "[fusion]\n"
+        "method = \"dem_locked\"\n"
+        "[validation]\n"
+        "enabled = true\n"
+        "reference_layer = 0\n";
+
+    wg::WorldCompileSpec spec;
+    spec.seed = 7;
+    spec.terrain_config_toml = terrain_toml;
+    spec.terrain_authoritative = true;
+    spec.terrain_vertical_datum = "NAVD88";
+    spec.buildings_path = kFixturePath;
+    spec.building_params["id_attr"] = std::string("bin");
+    spec.building_params["min_area_m2"] = 10.0;
+
+    const auto world = wg::compile_world(spec);
+    expect(world.ok, "authoritative compile succeeds from geotiff DEM");
+    if (!world.ok) {
+        std::cout << "  error: " << world.error_code << " — " << world.error_detail << "\n";
+        return;
+    }
+    const auto& tile = world.manifest.tiles.front();
+    expect(tile.elevation_state == wg::ElevationState::Authoritative,
+           "geotiff DEM yields Authoritative elevation state");
+    expect(tile.elevation_fallback_reason.empty(),
+           "fully-covered authoritative tile has no fallback reason");
+    const auto& q = world.manifest.quality;
+    expect(q.terrain_cell_count == 32 * 32, "authoritative terrain cell count");
+    expect(q.terrain_nodata_cells == 0 && q.terrain_authoritative_cells == q.terrain_cell_count,
+           "authoritative AOI is fully covered (no silent-zero)");
+    expect(world.manifest.to_json().find("\"elevation_state\": \"authoritative\"") !=
+               std::string::npos,
+           "manifest serializes the authoritative elevation state");
+}
+
 } // namespace
 
 int main() {
@@ -610,6 +673,7 @@ int main() {
     test_crs_conversions();
     test_datum_discipline();
     test_2263_ingest();
+    test_elevation_state_authoritative();
 
     if (failures > 0) {
         std::cout << failures << " test(s) failed\n";

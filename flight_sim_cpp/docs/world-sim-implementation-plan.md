@@ -100,10 +100,20 @@ Multi-batch (needs external data; user authorized acquisition).
 - Tests: GeoTIFF reader pinned to an independent decode of a committed 128² fixture;
   `dem_fusion:geotiff` estimator path; Gate 2 assertions in `world_demo --check`.
 
-**Batch 2 (remaining) — enrichment layers**
-- DSM−DEM surface residual, 6-inch land-cover semantic mask, topobathy waterfront fusion.
-- Per-tile elevation-state (`authoritative`/`fallback`/`masked_water`/`missing`) +
-  `fallback_reason`; water polygons intentional (no resampled harbor holes).
+**Batch 2 — per-tile elevation-state + no-silent-zero — ✅ DONE**
+- `ElevationState` {authoritative, fallback, masked_water, missing} + `fallback_reason`
+  on every tile; terrain cell / authoritative-cell / nodata-cell accounting in the
+  manifest quality block; folded into `world_hash`.
+- Missing elevation is never coerced to zero: it is counted and reason-coded
+  (`NO_AUTHORITATIVE_SOURCE`, `NODATA_STRIP`, `NO_TERRAIN`).
+- Tests: authoritative state from the 3DEP fixture (full coverage, no gaps);
+  fallback state from synthetic terrain; demo asserts cell accounting + state class.
+
+**Batch 3 (remaining) — enrichment layers**
+- DSM−DEM surface residual, 6-inch land-cover semantic mask, topobathy waterfront +
+  `masked_water` state. Deferred: NYC DSM/land-cover are LAS-derived tile downloads and
+  NLCD is Albers-projected WCS — neither is a clean lon/lat float `exportImage` like 3DEP,
+  so each needs its own ingest adapter (a fetch+reproject step at the compiler boundary).
 
 ### M4 — Buildings LoD1 ranked height + hole preservation
 - Ranked height stack: NYC-3D benchmark → Overture per-building → BES/planimetric →

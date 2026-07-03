@@ -92,6 +92,8 @@ constexpr std::uint64_t kFnvPrime = 1099511628211ULL;
             acc = fold_str(acc, p.algorithm_id);
             acc = fold_u64(acc, p.params_hash);
         }
+        acc = fold_u64(acc, static_cast<std::uint64_t>(t.elevation_state));
+        acc = fold_str(acc, t.elevation_fallback_reason);
     }
     return acc;
 }
@@ -362,6 +364,16 @@ const char* to_string(WorldLayerKind kind) {
     return "unknown";
 }
 
+const char* to_string(ElevationState state) {
+    switch (state) {
+        case ElevationState::Authoritative: return "authoritative";
+        case ElevationState::Fallback: return "fallback";
+        case ElevationState::MaskedWater: return "masked_water";
+        case ElevationState::Missing: return "missing";
+    }
+    return "missing";
+}
+
 std::uint64_t hash_file_bytes(const std::filesystem::path& path) {
     std::ifstream in(path, std::ios::binary);
     if (!in) {
@@ -425,7 +437,9 @@ std::string WorldManifest::to_json() const {
                 << "\", \"algorithm_id\": \"" << escape_json(p.algorithm_id)
                 << "\", \"params_hash\": " << p.params_hash << "}";
         }
-        out << "]}";
+        out << "], \"elevation_state\": \"" << to_string(t.elevation_state)
+            << "\", \"elevation_fallback_reason\": \"" << escape_json(t.elevation_fallback_reason)
+            << "\"}";
     }
     out << (tiles.empty() ? "" : "\n  ") << "],\n";
 
@@ -435,6 +449,9 @@ std::string WorldManifest::to_json() const {
         << ", \"terrain_bias_m\": " << fmt_double(quality.terrain_bias_m, 4)
         << ", \"terrain_min_m\": " << fmt_double(quality.terrain_min_m, 3)
         << ", \"terrain_max_m\": " << fmt_double(quality.terrain_max_m, 3)
+        << ", \"terrain_cell_count\": " << quality.terrain_cell_count
+        << ", \"terrain_authoritative_cells\": " << quality.terrain_authoritative_cells
+        << ", \"terrain_nodata_cells\": " << quality.terrain_nodata_cells
         << ", \"building_count\": " << quality.building_count
         << ", \"max_building_height_m\": " << fmt_double(quality.max_building_height_m, 3)
         << ", \"city_vertex_count\": " << quality.city_vertex_count
@@ -542,8 +559,11 @@ WorldCompileResult compile_world(const WorldCompileSpec& spec) {
     manifest.quality.terrain_bias_m = terrain.validation.metrics.bias;
     float terrain_min = std::numeric_limits<float>::max();
     float terrain_max = std::numeric_limits<float>::lowest();
+    std::size_t nodata_cells = 0;
     for (const float value : terrain.fused.elevation.values) {
-        if (!agbot::terrain::Raster::is_nodata(value)) {
+        if (agbot::terrain::Raster::is_nodata(value)) {
+            ++nodata_cells;
+        } else {
             terrain_min = std::min(terrain_min, value);
             terrain_max = std::max(terrain_max, value);
         }
@@ -551,6 +571,27 @@ WorldCompileResult compile_world(const WorldCompileSpec& spec) {
     if (terrain_min <= terrain_max) {
         manifest.quality.terrain_min_m = terrain_min;
         manifest.quality.terrain_max_m = terrain_max;
+    }
+    const std::size_t terrain_cells = terrain.fused.elevation.values.size();
+    const std::size_t data_cells = terrain_cells - nodata_cells;
+    manifest.quality.terrain_cell_count = terrain_cells;
+    manifest.quality.terrain_nodata_cells = nodata_cells;
+    manifest.quality.terrain_authoritative_cells = spec.terrain_authoritative ? data_cells : 0;
+
+    // No-silent-zero: classify the tile's elevation provenance explicitly.
+    ElevationState elevation_state = ElevationState::Missing;
+    std::string elevation_reason;
+    if (!terrain.fused.elevation.valid() || data_cells == 0) {
+        elevation_state = ElevationState::Missing;
+        elevation_reason = "NO_TERRAIN";
+    } else if (spec.terrain_authoritative) {
+        elevation_state = ElevationState::Authoritative;
+        if (nodata_cells > 0) {
+            elevation_reason = "NODATA_STRIP";
+        }
+    } else {
+        elevation_state = ElevationState::Fallback;
+        elevation_reason = "NO_AUTHORITATIVE_SOURCE";
     }
     manifest.quality.building_count = result.buildings.size();
     for (const ExtractedFeature& feature : result.buildings) {
@@ -608,6 +649,8 @@ WorldCompileResult compile_world(const WorldCompileSpec& spec) {
     WorldTile tile;
     tile.tile_id = "t_0_0";
     tile.bounds = aoi;
+    tile.elevation_state = elevation_state;
+    tile.elevation_fallback_reason = elevation_reason;
     tile.content_hash =
         fold_u64(fold_u64(kFnvOffset, terrain.validation.fused_raster_hash),
                  city_mesh_vertex_hash(result.city));

@@ -226,6 +226,7 @@ int main(int argc, char** argv) {
             "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer";
         spec.terrain_version = "3DEP exportImage 512px";
         spec.terrain_vertical_datum = "NAVD88";
+        spec.terrain_authoritative = true;
     } else {
         spec.terrain_license = "AWS Terrarium (mixed source licenses)";
         spec.terrain_uri = "s3://elevation-tiles-prod/terrarium";
@@ -343,6 +344,19 @@ int main(int argc, char** argv) {
                "Gate 2: fused terrain stays anchored to the reference DEM");
         expect(dem_geotiff.empty() || authoritative,
                "3DEP DEM, when present, is compiled as the authoritative terrain");
+        // No-silent-zero: the tile carries an explicit elevation state.
+        const auto& tile0 = world.manifest.tiles.front();
+        const bool state_consistent =
+            authoritative
+                ? (tile0.elevation_state == agbot::worldgen::ElevationState::Authoritative)
+                : (tile0.elevation_state == agbot::worldgen::ElevationState::Fallback);
+        expect(state_consistent, "tile elevation_state matches the terrain source class");
+        expect(q.terrain_cell_count > 0 &&
+                   q.terrain_authoritative_cells + q.terrain_nodata_cells <= q.terrain_cell_count,
+               "terrain cell accounting is consistent");
+        expect(!authoritative || (q.terrain_nodata_cells == 0 &&
+                                  q.terrain_authoritative_cells == q.terrain_cell_count),
+               "authoritative AOI has full DEM coverage (no silent-zero gaps)");
         expect(q.building_count > 1000, "more than 1000 buildings imported");
         expect(q.max_building_height_m > 150.0 && q.max_building_height_m < 400.0,
                "tallest building 150-400 m");
