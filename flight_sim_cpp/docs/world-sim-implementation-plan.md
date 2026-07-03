@@ -82,7 +82,7 @@ six acceptance gates.
 - Tests: 2263/UTM18N round-trip + analytic anchor + independent scale checks;
   end-to-end 2263 ingest; datum-mismatch rejection.
 
-### M3 — Authoritative terrain stack + no-silent-zero — 🚧 IN PROGRESS
+### M3 — Authoritative terrain stack + no-silent-zero — ✅ DONE
 Multi-batch (needs external data; user authorized acquisition).
 
 **Batch 1 — authoritative 3DEP DEM + Gate 2 — ✅ DONE**
@@ -117,10 +117,27 @@ Multi-batch (needs external data; user authorized acquisition).
 - Lower Manhattan: 3822/16384 cells (~23%) masked as the Hudson + East rivers.
 - Tests: boundary-connected channel is water, interior pit is not, threshold sweeps.
 
-**Batch 3 (still remaining) — DSM residual + land-cover semantic classes**
-- DSM−DEM surface residual (feeds the `measured` height tier) and 6-inch land-cover
-  classes need NYC LAS-derived rasters / Albers NLCD — each an ingest adapter
-  (fetch+reproject at the compiler boundary), not a clean lon/lat float `exportImage`.
+**Batch 3 (DSM residual + land-cover semantic classes) — ✅ DONE (commit ec091a2)**
+- `worldgen/TerrainSemantics`: `apply_dsm_measured_heights` samples a highest-hit
+  DSM and the bare-earth ground at each footprint centroid; the residual populates
+  the `measured` height tier (`height_source="measured"`, outranks the attribute).
+  Out-of-coverage / implausible residuals fall through. Vertical-datum discipline:
+  an ellipsoidal DSM against orthometric terrain is rejected (`mixed_vertical_datum_dsm`).
+- `read_geotiff_categorical` generalizes the GeoTIFF reader to single-band integer
+  sample formats (8/16/32-bit); the float DEM reader still rejects integers.
+  `sample_landcover_histogram` tallies class ids over the terrain grid (nearest,
+  class -1 = unknown) into a deterministic manifest histogram.
+- Both adapters are optional (activate when the reprojected raster is present).
+  DSM + land-cover source snapshots + tile provenance layers recorded.
+- Ingest scripts `fetch_nyc_dsm.sh` / `fetch_nyc_landcover.sh` reproject the NYC
+  DSM / 6-inch land cover to lon/lat GeoTIFFs (GDAL; nearest for categorical) with
+  provenance sidecars.
+- Tests: adapter unit tests, categorical + float GeoTIFF reader coverage (in-test
+  writers), and an end-to-end compiler wiring test (applied count, measured-tier
+  accounting, provenance, datum rejection).
+- **Note:** the NYC DSM/land-cover snapshots are not yet fetched, so the demo
+  compiles in fallback (measured 0, 100% attribute heights). Run the fetch scripts
+  to activate the measured tier + land-cover histogram on Lower Manhattan.
 
 ### M4 — Buildings LoD1 ranked height + hole preservation — ✅ DONE
 - `HeightResolver` extended into a ranked, provenance-tagged stack:
@@ -151,41 +168,81 @@ Multi-batch (needs external data; user authorized acquisition).
 - Deferred (non-blocking): bgfx/Dawn GPU backend, terrain clipmaps, 3D-Tiles streaming.
   The deterministic scene geometry hash already lives in `.agbworld` (tile.content_hash).
 
-### M6 — Autonomy evidence loop + nav gate
-- Wire unified loop: offscreen RGB+depth+semantic+LiDAR → occupancy/voxel → costmap →
-  global (A*/Hybrid-A*) → local (MPPI) → recovery. Components exist; wire them end-to-end.
-- Keep Pure Pursuit / Stanley as interpretable baselines.
-- **Gate 5 (Navigation):** delivery-robot scenario reaches goal collision-free; log
-  path length, min clearance, replan count, recovery count, failure class, **plus
-  time-to-first-plan, time-in-recovery, semantic/occupancy consistency**.
+### M6 — Autonomy evidence loop + nav gate — 🚧 IN PROGRESS
 
-### M7 — Fixed-wing validation + weather/atmosphere
-- Validate `FixedWingModel` against **NASA 6-DOF check cases**; adopt **AIAA S-119**
-  variable naming for logged data.
-- First-class acceptance: trimmed flight, coordinated turn, crosswind, climb/descent,
-  stall entry/recovery, deterministic replay under a recorded weather preset.
-- Weather preset schema (UTC, sun/moon ephemeris, visibility, cloud layers, wind
-  ground/aloft, precip, temp/pressure, wetness). Deterministic first, live later.
-- Atmosphere v1: analytic sky (Preetham) + aerial perspective + visibility haze.
-  v2 Bruneton-class deferred. Night lighting from road hierarchy + POI scaffold.
+**Batch 1 — city occupancy + Gate 5 (path-level) — ✅ DONE (commit 1adf6f4)**
+- `nav/CityEvidence`: building footprints (the same geometry the sensor observes)
+  rasterized into an occupancy costmap via even-odd scanline fill (holes/courtyards
+  left free, street corridors traversable) + separable Chebyshev inflation.
+- `run_evidence_loop`: A* global plan start→goal, arc-length-midpoint recovery probe
+  (block midpoint → replan), nearest-free-cell goal tolerance (snap blocked
+  endpoints), reason-coded failure (`start_blocked`/`goal_blocked`/`no_initial_plan`/
+  `no_recovery_plan`).
+- `EvidencePlanResult` reports length, euclidean, min clearance, replan/recovery
+  counts, lethal-cell count, collision-free, failure class.
+- **Gate 5:** robot routes ~3060 m collision-free over Lower Manhattan occupancy
+  (2997 m euclidean), 3 m clearance, recovers once. Asserted in `world_demo --check`;
+  unit tests in `nav/city_evidence_tests`.
+
+**Batch 2 (remaining) — sensor-derived occupancy + local control**
+- Feed the occupancy grid from **sensor evidence** (offscreen RGB + linear depth +
+  semantic mask + LiDAR ray hits) rather than footprint AABBs, so the costmap is
+  what the robot *perceives*. Reuse `render/OffscreenRenderer` + `nav/Perception`/
+  `Mapping`. Add the **semantic↔occupancy consistency** metric (agreement between
+  semantic-depth edges and occupancy obstacles).
+- Wire the full pipeline through `NavigationPipeline`: global (A*/Hybrid-A*) →
+  **local MPPI** controller → recovery/replan behavior. Keep **Pure Pursuit /
+  Stanley** as interpretable baselines.
+- Add **time-to-first-plan** and **time-in-recovery** as deterministic step-count
+  proxies (planner expansions / recovery ticks — not wall clock).
+- Extend Gate 5 to assert the sensor-derived costmap agrees with the footprint
+  occupancy within tolerance, and log the new metrics.
+
+### M7 — Fixed-wing validation + weather/atmosphere — ⬜ NOT STARTED
+Greenfield (no weather/atmosphere/ephemeris module exists yet). Sequenced sub-steps:
+
+**Batch 1 — flight-dynamics validation harness**
+- Adopt **AIAA S-119** variable naming for the fixed-wing state/force log
+  (`vehicles/FixedWingModel` already produces the state; add a named-channel logger).
+- Encode **NASA 6-DOF check cases** as fixtures; add a `cessna_tests`-style suite that
+  replays fixed IC + control inputs and compares trajectory channels within tolerance.
+- First-class acceptance cases: trimmed flight, coordinated turn, crosswind response,
+  climb/descent, **stall entry/recovery** (tie stall to critical AoA + load factor,
+  not airspeed alone). Deterministic replay asserted.
+
+**Batch 2 — deterministic weather presets**
+- Weather-preset schema (UTC timestamp, sun/moon ephemeris inputs, visibility, cloud
+  layers, wind ground+aloft, precip class/rate, temp/pressure, road/roof wetness).
+- NOAA solar-position equations for deterministic sun/sky; presets first, live
+  METAR/TAF assimilation deferred. Wire the preset wind into `FixedWingModel`.
+
+**Batch 3 — atmosphere + night lighting (visual, non-blocking for Gate 6)**
+- Atmosphere v1: analytic **Preetham** sky + aerial perspective + visibility haze.
+  v2 Bruneton-class deferred. Night lighting generated from road hierarchy +
+  intersection density + POI scaffold (not random bloom).
+
 - **Gate 6 (Flight dynamics):** deterministic replay under fixed weather/IC/inputs,
-  checked against 6-DOF cases.
+  checked against the 6-DOF cases; stall/crosswind cases pass.
 
 ## 4. Decisions the user should make (not discoverable locally)
 
 1. **Renderer backend for M5+:** bgfx (lowest-risk native migration, multi-backend) vs
    Dawn/WebGPU (browser parity, more infra to own). Recommendation: **bgfx** unless a
    browser client is a near-term product goal.
-2. **Data acquisition:** 3DEP/NYC-DEM, DSM, 6-inch land cover, NYC-3D model, and
-   Overture snapshots must be fetched + version-pinned. Confirm we may script these
-   downloads and store snapshots (licenses: NYC Open Data terms, OSM/Overture ODbL vs
-   CDLA — the report flags this as a real risk to resolve early).
+2. **Data acquisition:** 3DEP DEM is fetched + pinned. DSM + 6-inch land-cover
+   ingest scripts exist (`fetch_nyc_dsm.sh` / `fetch_nyc_landcover.sh`, GDAL reproject)
+   but the NYC snapshots are **not yet fetched** — the demo runs in fallback until they
+   are. NYC-3D model and Overture snapshots still pending. Confirm we may store the
+   reprojected snapshots (licenses: NYC Open Data terms; OSM/Overture ODbL vs CDLA —
+   the report flags this as a real risk to resolve before ingesting Overture).
 3. **Scope of first vertical slice:** recommend Lower Manhattan (the demo's existing
    AOI, `40.700..40.740, -74.020..-73.980`) through Gates 1–3 before widening.
 
 ## 5. Immediate next step
 
-Start **M1**: lift the compiler out of `world_demo_main.cpp` into a `worldgen`
-library API with the `.agbworld` manifest + per-tile provenance, and stand up Gate 1
-as a deterministic-hash test. This unblocks every later milestone and converts the
-current demo into a reproducible build.
+M1–M5 and M3-batch-3 are done and committed; M6 batch 1 (city occupancy + Gate 5)
+is committed. The next step is **M6 batch 2**: drive the occupancy grid from sensor
+evidence (offscreen RGB + linear depth + semantic mask + LiDAR) instead of footprint
+AABBs, wire the full `NavigationPipeline` (global → MPPI local → recovery), and add
+the semantic↔occupancy consistency + time-to-first-plan / time-in-recovery metrics to
+Gate 5. Then M7 (fixed-wing 6-DOF validation → weather presets → atmosphere).
