@@ -178,25 +178,27 @@ void test_param_variants() {
 
 void test_height_resolver() {
     const agbot::worldgen::HeightResolverParams params{0.3048, 3.0, 4.0};
-    const auto from_attr = agbot::worldgen::resolve_height(100.0, 5.0, params);
-    expect(
-        near(from_attr.height_m, 30.48, 1e-9) &&
-            from_attr.source == agbot::worldgen::HeightSource::Attribute,
-        "resolver prefers attribute");
-    const auto from_levels = agbot::worldgen::resolve_height(std::nullopt, 5.0, params);
-    expect(
-        near(from_levels.height_m, 15.0, 1e-9) &&
-            from_levels.source == agbot::worldgen::HeightSource::Levels,
-        "resolver falls back to levels");
-    const auto from_default = agbot::worldgen::resolve_height(std::nullopt, std::nullopt, params);
-    expect(
-        near(from_default.height_m, 4.0, 1e-9) &&
-            from_default.source == agbot::worldgen::HeightSource::Default,
-        "resolver falls back to default");
-    const auto zero_attr = agbot::worldgen::resolve_height(0.0, 2.0, params);
-    expect(
-        zero_attr.source == agbot::worldgen::HeightSource::Levels,
-        "non-positive attribute falls through");
+    using agbot::worldgen::HeightSource;
+    const auto measured =
+        agbot::worldgen::resolve_height(42.0, 100.0, 5.0, params);
+    expect(near(measured.height_m, 42.0, 1e-9) && measured.source == HeightSource::Measured,
+           "resolver prefers measured height (metres, no unit scale)");
+    const auto from_attr =
+        agbot::worldgen::resolve_height(std::nullopt, 100.0, 5.0, params);
+    expect(near(from_attr.height_m, 30.48, 1e-9) && from_attr.source == HeightSource::Attribute,
+           "resolver prefers attribute when no measured height");
+    const auto from_levels =
+        agbot::worldgen::resolve_height(std::nullopt, std::nullopt, 5.0, params);
+    expect(near(from_levels.height_m, 15.0, 1e-9) && from_levels.source == HeightSource::Levels,
+           "resolver falls back to levels");
+    const auto from_default =
+        agbot::worldgen::resolve_height(std::nullopt, std::nullopt, std::nullopt, params);
+    expect(near(from_default.height_m, 4.0, 1e-9) && from_default.source == HeightSource::Default,
+           "resolver falls back to default");
+    const auto zero_measured =
+        agbot::worldgen::resolve_height(0.0, std::nullopt, 2.0, params);
+    expect(zero_measured.source == HeightSource::Levels,
+           "non-positive measured height falls through");
 }
 
 void test_scene_bridge() {
@@ -658,6 +660,30 @@ void test_elevation_state_authoritative() {
            "manifest serializes the authoritative elevation state");
 }
 
+void test_gate3_building_quality() {
+    namespace wg = agbot::worldgen;
+    // The building fixture yields 5 features spanning all height sources
+    // (attr/levels/default) with one holed footprint (a courtyard).
+    const auto world = wg::compile_world(gate1_spec());
+    expect(world.ok, "gate3 compile succeeds");
+    if (!world.ok) {
+        return;
+    }
+    const auto& q = world.manifest.quality;
+    expect(q.building_count == 5, "gate3 building count");
+    expect(q.height_from_measured + q.height_from_attribute + q.height_from_levels +
+                   q.height_from_default ==
+               q.building_count,
+           "gate3 every building has a ranked height provenance");
+    expect(q.height_from_attribute >= 1 && q.height_from_levels >= 1 && q.height_from_default >= 1,
+           "gate3 fixture exercises attr/levels/default height sources");
+    expect(q.building_with_courtyard_count >= 1, "gate3 courtyard (hole) preserved and counted");
+    expect(q.building_footprint_area_m2 > 0.0, "gate3 footprint area accumulated");
+    expect(q.median_building_height_m > 0.0, "gate3 median height computed");
+    expect(world.manifest.to_json().find("\"height_source\": {\"measured\":") != std::string::npos,
+           "gate3 manifest serializes the height-source breakdown");
+}
+
 } // namespace
 
 int main() {
@@ -674,6 +700,7 @@ int main() {
     test_datum_discipline();
     test_2263_ingest();
     test_elevation_state_authoritative();
+    test_gate3_building_quality();
 
     if (failures > 0) {
         std::cout << failures << " test(s) failed\n";

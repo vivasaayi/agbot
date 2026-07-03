@@ -89,6 +89,14 @@ struct WorldQuality {
     std::size_t terrain_nodata_cells = 0;        // cells with no elevation (kept nodata)
     std::size_t building_count = 0;
     double max_building_height_m = 0.0;
+    double median_building_height_m = 0.0;
+    double building_footprint_area_m2 = 0.0;    // sum of exterior-minus-hole areas
+    std::size_t building_with_courtyard_count = 0;
+    // LoD1 height-source breakdown (ranked stack provenance).
+    std::size_t height_from_measured = 0;
+    std::size_t height_from_attribute = 0;
+    std::size_t height_from_levels = 0;
+    std::size_t height_from_default = 0;
     std::size_t city_vertex_count = 0;
     std::size_t city_triangle_count = 0;
     std::size_t city_batch_count = 0;

@@ -10,6 +10,9 @@ namespace agbot::worldgen {
 //   path                    string  required; GeoJSON file path
 //   height_attr             string  property carrying roof height ("" = off)
 //   height_units            string  "feet" | "meters" (default "meters")
+//   measured_attr           string  property carrying a measured height in
+//                           metres (e.g. LiDAR DSM-DEM residual); outranks
+//                           height_attr in the ranked stack ("" = off)
 //   base_elev_attr          string  property carrying base elevation ("" = off)
 //   base_units              string  "feet" | "meters" (default "meters")
 //   levels_attr             string  property carrying storey count ("" = off)

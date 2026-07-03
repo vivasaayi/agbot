@@ -5,8 +5,12 @@
 
 namespace agbot::worldgen {
 
-// Where a resolved building height came from, in precedence order.
+// Where a resolved building height came from, in precedence order. Measured
+// heights (e.g. LiDAR DSM-DEM residual, or a photogrammetric measurement column)
+// outrank tabular attributes, which outrank storey-count estimates, which
+// outrank the configured default.
 enum class HeightSource {
+    Measured,
     Attribute,
     Levels,
     Default,
@@ -26,10 +30,12 @@ struct HeightResolverParams {
     double default_height_m = 3.0;
 };
 
-// Resolves a height with precedence: explicit attribute > levels x storey
-// height > configured default. Non-finite or non-positive candidates fall
-// through to the next source.
+// Resolves a height with precedence: measured (metres) > explicit attribute >
+// levels x storey height > configured default. Non-finite or non-positive
+// candidates fall through to the next source. `measured_value` is already in
+// metres (no unit scaling applied).
 [[nodiscard]] HeightResolution resolve_height(
+    const std::optional<double>& measured_value,
     const std::optional<double>& height_attr_value,
     const std::optional<double>& levels_value,
     const HeightResolverParams& params);

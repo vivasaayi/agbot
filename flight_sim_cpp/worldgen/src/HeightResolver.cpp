@@ -7,6 +7,8 @@ namespace agbot::worldgen {
 
 const char* to_string(HeightSource source) {
     switch (source) {
+        case HeightSource::Measured:
+            return "measured";
         case HeightSource::Attribute:
             return "attr";
         case HeightSource::Levels:
@@ -18,9 +20,16 @@ const char* to_string(HeightSource source) {
 }
 
 HeightResolution resolve_height(
+    const std::optional<double>& measured_value,
     const std::optional<double>& height_attr_value,
     const std::optional<double>& levels_value,
     const HeightResolverParams& params) {
+    if (measured_value.has_value()) {
+        const double height = *measured_value;
+        if (std::isfinite(height) && height > 0.0) {
+            return {height, HeightSource::Measured};
+        }
+    }
     if (height_attr_value.has_value()) {
         const double height = *height_attr_value * params.attr_unit_scale_m;
         if (std::isfinite(height) && height > 0.0) {

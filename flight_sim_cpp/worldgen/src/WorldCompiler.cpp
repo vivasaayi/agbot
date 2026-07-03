@@ -454,6 +454,14 @@ std::string WorldManifest::to_json() const {
         << ", \"terrain_nodata_cells\": " << quality.terrain_nodata_cells
         << ", \"building_count\": " << quality.building_count
         << ", \"max_building_height_m\": " << fmt_double(quality.max_building_height_m, 3)
+        << ", \"median_building_height_m\": " << fmt_double(quality.median_building_height_m, 3)
+        << ", \"building_footprint_area_m2\": "
+        << fmt_double(quality.building_footprint_area_m2, 1)
+        << ", \"building_with_courtyard_count\": " << quality.building_with_courtyard_count
+        << ", \"height_source\": {\"measured\": " << quality.height_from_measured
+        << ", \"attribute\": " << quality.height_from_attribute
+        << ", \"levels\": " << quality.height_from_levels
+        << ", \"default\": " << quality.height_from_default << "}"
         << ", \"city_vertex_count\": " << quality.city_vertex_count
         << ", \"city_triangle_count\": " << quality.city_triangle_count
         << ", \"city_batch_count\": " << quality.city_batch_count << "},\n";
@@ -594,11 +602,35 @@ WorldCompileResult compile_world(const WorldCompileSpec& spec) {
         elevation_reason = "NO_AUTHORITATIVE_SOURCE";
     }
     manifest.quality.building_count = result.buildings.size();
+    std::vector<double> building_heights;
+    building_heights.reserve(result.buildings.size());
     for (const ExtractedFeature& feature : result.buildings) {
         if (feature.height_m.has_value()) {
             manifest.quality.max_building_height_m =
                 std::max(manifest.quality.max_building_height_m, *feature.height_m);
+            building_heights.push_back(*feature.height_m);
         }
+        manifest.quality.building_footprint_area_m2 +=
+            feature_area_m2(feature, result.origin);
+        if (!feature.holes.empty()) {
+            ++manifest.quality.building_with_courtyard_count;
+        }
+        const auto source_it = feature.attributes.find("height_source");
+        const std::string source = source_it != feature.attributes.end() ? source_it->second : "";
+        if (source == "measured") {
+            ++manifest.quality.height_from_measured;
+        } else if (source == "attr") {
+            ++manifest.quality.height_from_attribute;
+        } else if (source == "levels") {
+            ++manifest.quality.height_from_levels;
+        } else if (source == "default") {
+            ++manifest.quality.height_from_default;
+        }
+    }
+    if (!building_heights.empty()) {
+        std::sort(building_heights.begin(), building_heights.end());
+        manifest.quality.median_building_height_m =
+            building_heights[building_heights.size() / 2];
     }
     manifest.quality.city_vertex_count = result.city.vertices.size();
     manifest.quality.city_triangle_count = result.city.indices.size() / 3;

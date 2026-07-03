@@ -27,6 +27,7 @@ struct ImportParams {
     double height_unit_scale_m = 1.0;
     std::string base_elev_attr;
     double base_unit_scale_m = 1.0;
+    std::string measured_attr;
     std::string levels_attr;
     double default_level_height_m = 3.0;
     double default_height_m = 3.0;
@@ -54,6 +55,7 @@ ImportParams read_params(const agbot::config::ParamTable& table) {
     params.height_unit_scale_m = unit_scale_for(cfg::string_or(table, "height_units", "meters"));
     params.base_elev_attr = cfg::string_or(table, "base_elev_attr", "");
     params.base_unit_scale_m = unit_scale_for(cfg::string_or(table, "base_units", "meters"));
+    params.measured_attr = cfg::string_or(table, "measured_attr", "");
     params.levels_attr = cfg::string_or(table, "levels_attr", "");
     params.default_level_height_m = cfg::double_or(table, "default_level_height_m", 3.0);
     params.default_height_m = cfg::double_or(table, "default_height_m", 3.0);
@@ -359,10 +361,13 @@ ExtractionResult VectorImportExtractor::extract(const ExtractionContext& context
             string_property(properties, params.class_attr).value_or(params.default_class);
         const std::string base_id =
             string_property(properties, params.id_attr).value_or("f" + std::to_string(ordinal));
+        const std::optional<double> raw_measured =
+            numeric_property(properties, params.measured_attr);
         const std::optional<double> raw_height = numeric_property(properties, params.height_attr);
         const std::optional<double> raw_levels = numeric_property(properties, params.levels_attr);
         const std::optional<double> raw_base = numeric_property(properties, params.base_elev_attr);
-        const HeightResolution height = resolve_height(raw_height, raw_levels, height_params);
+        const HeightResolution height =
+            resolve_height(raw_measured, raw_height, raw_levels, height_params);
 
         for (std::size_t polygon_index = 0; polygon_index < polygons.size(); ++polygon_index) {
             if (params.max_features > 0 &&

@@ -296,7 +296,12 @@ int main(int argc, char** argv) {
               << ", Gate 2 RMSE vs authoritative DEM: " << q.terrain_rmse_m << " m (MAE "
               << q.terrain_mae_m << ", bias " << q.terrain_bias_m << ")\n"
               << "  buildings " << q.building_count << ", max height "
-              << q.max_building_height_m << " m\n"
+              << q.max_building_height_m << " m, median " << q.median_building_height_m
+              << " m, footprint area " << q.building_footprint_area_m2 << " m2, courtyards "
+              << q.building_with_courtyard_count << "\n"
+              << "  height source: measured " << q.height_from_measured << ", attr "
+              << q.height_from_attribute << ", levels " << q.height_from_levels << ", default "
+              << q.height_from_default << "\n"
               << "  city mesh " << q.city_vertex_count << " verts, " << q.city_triangle_count
               << " tris, " << q.city_batch_count << " batches\n"
               << "  terrain basemap: "
@@ -357,9 +362,20 @@ int main(int argc, char** argv) {
         expect(!authoritative || (q.terrain_nodata_cells == 0 &&
                                   q.terrain_authoritative_cells == q.terrain_cell_count),
                "authoritative AOI has full DEM coverage (no silent-zero gaps)");
+        // Gate 3 (buildings): geometry + height sanity vs the authoritative NYC source.
         expect(q.building_count > 1000, "more than 1000 buildings imported");
         expect(q.max_building_height_m > 150.0 && q.max_building_height_m < 400.0,
                "tallest building 150-400 m");
+        expect(q.median_building_height_m > 5.0 && q.median_building_height_m < 120.0,
+               "Gate 3: median building height plausible");
+        expect(q.building_footprint_area_m2 > 100000.0,
+               "Gate 3: total footprint area is substantial");
+        expect(q.height_from_attribute > q.building_count / 2,
+               "Gate 3: most heights come from the authoritative height attribute");
+        expect(q.height_from_measured + q.height_from_attribute + q.height_from_levels +
+                       q.height_from_default ==
+                   q.building_count,
+               "Gate 3: every building has a ranked height provenance");
         expect(q.city_triangle_count > 50000, "city mesh has >50k triangles");
         expect(q.city_batch_count > 10, "spatial batching active");
         expect(world.manifest.world_hash != 0, "world manifest carries a content hash");
