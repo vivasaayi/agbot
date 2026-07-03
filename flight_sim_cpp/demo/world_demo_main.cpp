@@ -12,6 +12,7 @@
 
 #include "agbot_config/Params.hpp"
 #include "agbot_nav/AerialPlanner.hpp"
+#include "agbot_nav/CityEvidence.hpp"
 #include "agbot_nav/RoadGraphPlanner.hpp"
 #include "agbot_render/OffscreenRenderer.hpp"
 #include "agbot_render/SceneFile.hpp"
@@ -270,6 +271,11 @@ int main(int argc, char** argv) {
     const FlythroughResult flight = fly_circuit(400.0, 55.0);
     const StreetRouteResult street = plan_street_route(world.roads, world.origin);
 
+    // M6: delivery-robot evidence loop over the same compiled building geometry
+    // the sensor path observes (Gate 5).
+    const agbot::nav::EvidencePlanResult evidence =
+        agbot::nav::run_evidence_loop(world.buildings, world.origin);
+
     world.scene.markers.push_back({0.0f, 320.0f, 0.0f, 1.0f, 0.25f, 0.2f, 12.0f});
     world.scene.markers.insert(world.scene.markers.end(), flight.trail.begin(),
                                flight.trail.end());
@@ -321,7 +327,14 @@ int main(int argc, char** argv) {
               << "\n"
               << "  cessna circuit: " << (flight.completed ? "completed" : "incomplete") << " in "
               << flight.elapsed_s << " s, max altitude error " << flight.max_altitude_error_m
-              << " m, trail markers " << flight.trail.size() << "\n";
+              << " m, trail markers " << flight.trail.size() << "\n"
+              << "  robot evidence loop: "
+              << (evidence.ok ? "reached goal" : std::string("FAILED (") +
+                                                     agbot::nav::to_string(evidence.failure) + ")")
+              << ", path " << evidence.length_m << " m (" << evidence.euclidean_m
+              << " m euclidean), min clearance " << evidence.min_clearance_m << " m, replans "
+              << evidence.replan_count << ", recoveries " << evidence.recovery_count
+              << ", lethal cells " << evidence.lethal_cells << "\n";
 
     if (check_mode) {
         int failures = 0;
@@ -396,6 +409,22 @@ int main(int argc, char** argv) {
         expect(flight.completed, "cessna completes the Dubins circuit over the city");
         expect(flight.max_altitude_error_m < 30.0, "cessna altitude held within 30 m");
         expect(flight.trail.size() > 30, "flight trail traced into the scene");
+
+        // Gate 5 (navigation): the delivery robot routes across an occupancy
+        // costmap built from the same footprints the sensor observes, stays
+        // collision-free, keeps clearance, and recovers when the plan is blocked.
+        expect(evidence.ok, "Gate 5: robot reaches the goal over the city occupancy grid");
+        expect(evidence.failure == agbot::nav::EvidenceFailure::None,
+               "Gate 5: no navigation failure class on success");
+        expect(evidence.collision_free, "Gate 5: robot path is collision-free");
+        expect(evidence.lethal_cells > 0,
+               "Gate 5: building footprints rasterize into lethal occupancy cells");
+        expect(evidence.length_m >= evidence.euclidean_m &&
+                   evidence.length_m < 3.0 * evidence.euclidean_m,
+               "Gate 5: robot path length plausible (1..3x euclidean)");
+        expect(evidence.recovery_count == 1 && evidence.replan_count == 1,
+               "Gate 5: robot replans once when the plan is blocked (recovery)");
+        expect(evidence.min_clearance_m >= 0.0, "Gate 5: path clearance is defined");
         const auto readback = agbot::render::read_scene_file(written.scene_path);
         expect(readback.ok() &&
                    readback.scene.static_meshes.size() + readback.scene.textured_meshes.size() == 2,

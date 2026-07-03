@@ -14,6 +14,7 @@ add_library(agbot_nav
     src/Controller.cpp
     src/NavigationPipeline.cpp
     src/AerialPlanner.cpp
+    src/CityEvidence.cpp
 )
 
 target_include_directories(agbot_nav
@@ -63,6 +64,13 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(agbot_nav_road_tests PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 add_test(NAME agbot_nav_road_tests COMMAND agbot_nav_road_tests)
+
+add_executable(agbot_nav_city_evidence_tests tests/city_evidence_tests.cpp)
+target_link_libraries(agbot_nav_city_evidence_tests PRIVATE agbot_nav)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(agbot_nav_city_evidence_tests PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+add_test(NAME agbot_nav_city_evidence_tests COMMAND agbot_nav_city_evidence_tests)
 
 add_executable(agbot_nav_dynamic_tests tests/dynamic_tests.cpp)
 target_link_libraries(agbot_nav_dynamic_tests PRIVATE agbot_nav)
