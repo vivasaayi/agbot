@@ -2,6 +2,7 @@
 #include "agbot_terrain/ElevationEstimator.hpp"
 #include "agbot_terrain/Fusion.hpp"
 #include "agbot_terrain/GeoTiff.hpp"
+#include "agbot_terrain/WaterMask.hpp"
 #include "agbot_terrain/MonoDepth.hpp"
 #include "agbot_terrain/Png.hpp"
 #include "agbot_terrain/Raster.hpp"
@@ -430,6 +431,24 @@ void test_geotiff_dem_reader() {
     expect(result.ok && result.field.source_algorithm == "dem_fusion:geotiff",
            "dem_fusion geotiff source estimates onto the AOI grid");
     expect(result.ok && result.field.elevation.width == 32, "geotiff estimate resampled to grid");
+}
+
+// A below-sea channel reaching the edge is water; an interior pit at the same
+// depth is NOT (no invented harbor holes).
+void test_water_mask_boundary_connected() {
+    const terrain::GeoBounds bounds{40.0, -74.0, 40.01, -73.99};
+    terrain::Raster elev = terrain::Raster::filled(5, 5, bounds, 10.0f);   // land at 10 m
+    elev.set(2, 0, -1.0f);   // channel entering from the left edge...
+    elev.set(2, 1, -1.0f);   // ...stopping at column 1 (column 2 stays land)
+    elev.set(2, 3, -5.0f);   // deep interior pit, walled off from the channel
+
+    const terrain::WaterMask mask = terrain::compute_water_mask(elev, 0.0f);
+    expect(mask.at(2, 0) && mask.at(2, 1), "boundary-connected channel is water");
+    expect(!mask.at(2, 3), "interior below-sea pit is NOT invented as water");
+    expect(mask.water_cells == 2, "only sea-connected cells are masked");
+
+    const terrain::WaterMask dry = terrain::compute_water_mask(elev, -100.0f);
+    expect(dry.water_cells == 0, "nothing masked when threshold is below all cells");
 }
 
 void test_inflate_stored_and_png_synthetic() {
@@ -909,6 +928,7 @@ int main() {
     test_validation_json();
     test_inflate_stored_and_png_synthetic();
     test_geotiff_dem_reader();
+    test_water_mask_boundary_connected();
     test_real_tile_decode();
     test_affine_fit();
 #if defined(AGBOT_TERRAIN_HAS_ONNX)

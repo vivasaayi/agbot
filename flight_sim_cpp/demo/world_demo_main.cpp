@@ -227,6 +227,7 @@ int main(int argc, char** argv) {
         spec.terrain_version = "3DEP exportImage 512px";
         spec.terrain_vertical_datum = "NAVD88";
         spec.terrain_authoritative = true;
+        spec.water_mask = true;
     } else {
         spec.terrain_license = "AWS Terrarium (mixed source licenses)";
         spec.terrain_uri = "s3://elevation-tiles-prod/terrarium";
@@ -295,6 +296,10 @@ int main(int argc, char** argv) {
               << "  terrain datum: " << world.manifest.crs_policy.vertical_datum
               << ", Gate 2 RMSE vs authoritative DEM: " << q.terrain_rmse_m << " m (MAE "
               << q.terrain_mae_m << ", bias " << q.terrain_bias_m << ")\n"
+              << "  terrain cells: " << q.terrain_cell_count << " ("
+              << q.terrain_authoritative_cells << " authoritative, " << q.terrain_water_cells
+              << " water, " << q.terrain_nodata_cells << " nodata), state "
+              << to_string(world.manifest.tiles.front().elevation_state) << "\n"
               << "  buildings " << q.building_count << ", max height "
               << q.max_building_height_m << " m, median " << q.median_building_height_m
               << " m, footprint area " << q.building_footprint_area_m2 << " m2, courtyards "

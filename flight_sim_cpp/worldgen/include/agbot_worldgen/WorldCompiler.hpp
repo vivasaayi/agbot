@@ -87,6 +87,7 @@ struct WorldQuality {
     std::size_t terrain_cell_count = 0;          // total heightfield cells
     std::size_t terrain_authoritative_cells = 0; // cells backed by an authoritative DEM
     std::size_t terrain_nodata_cells = 0;        // cells with no elevation (kept nodata)
+    std::size_t terrain_water_cells = 0;         // sea-connected water cells (masked, intentional)
     std::size_t building_count = 0;
     double max_building_height_m = 0.0;
     double median_building_height_m = 0.0;
@@ -135,6 +136,9 @@ struct WorldCompileSpec {
     // True when the terrain base layer is an authoritative DEM (e.g. USGS 3DEP)
     // rather than a fallback source. Drives the tile ElevationState.
     bool terrain_authoritative = false;
+    // Enable sea-connected water masking (no invented interior holes).
+    bool water_mask = false;
+    float sea_level_m = 0.5f;   // NAVD88 threshold for water candidacy
 
     std::string buildings_path;                         // required GeoJSON
     agbot::config::ParamTable building_params;

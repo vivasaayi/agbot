@@ -109,11 +109,18 @@ Multi-batch (needs external data; user authorized acquisition).
 - Tests: authoritative state from the 3DEP fixture (full coverage, no gaps);
   fallback state from synthetic terrain; demo asserts cell accounting + state class.
 
-**Batch 3 (remaining) — enrichment layers**
-- DSM−DEM surface residual, 6-inch land-cover semantic mask, topobathy waterfront +
-  `masked_water` state. Deferred: NYC DSM/land-cover are LAS-derived tile downloads and
-  NLCD is Albers-projected WCS — neither is a clean lon/lat float `exportImage` like 3DEP,
-  so each needs its own ingest adapter (a fetch+reproject step at the compiler boundary).
+**Batch 3 — water masking + masked_water — ✅ DONE (water)**
+- `terrain_engine/WaterMask`: sea-connected flood fill (4-neighbourhood from the grid
+  boundary over sub-sea-level/nodata cells). Interior below-sea depressions are left as
+  land — the "no invented harbor holes" rule. Compiler counts water cells and promotes a
+  predominantly-water tile to `masked_water` (`WATER_MASK_ONLY`).
+- Lower Manhattan: 3822/16384 cells (~23%) masked as the Hudson + East rivers.
+- Tests: boundary-connected channel is water, interior pit is not, threshold sweeps.
+
+**Batch 3 (still remaining) — DSM residual + land-cover semantic classes**
+- DSM−DEM surface residual (feeds the `measured` height tier) and 6-inch land-cover
+  classes need NYC LAS-derived rasters / Albers NLCD — each an ingest adapter
+  (fetch+reproject at the compiler boundary), not a clean lon/lat float `exportImage`.
 
 ### M4 — Buildings LoD1 ranked height + hole preservation — ✅ DONE
 - `HeightResolver` extended into a ranked, provenance-tagged stack:

@@ -6,6 +6,7 @@
 #include "agbot_render/SceneFile.hpp"
 #include "agbot_terrain/Png.hpp"
 #include "agbot_terrain/TerrainPipeline.hpp"
+#include "agbot_terrain/WaterMask.hpp"
 #include "agbot_worldgen/extractors/RoadImport.hpp"
 #include "agbot_worldgen/extractors/VectorImport.hpp"
 
@@ -452,6 +453,7 @@ std::string WorldManifest::to_json() const {
         << ", \"terrain_cell_count\": " << quality.terrain_cell_count
         << ", \"terrain_authoritative_cells\": " << quality.terrain_authoritative_cells
         << ", \"terrain_nodata_cells\": " << quality.terrain_nodata_cells
+        << ", \"terrain_water_cells\": " << quality.terrain_water_cells
         << ", \"building_count\": " << quality.building_count
         << ", \"max_building_height_m\": " << fmt_double(quality.max_building_height_m, 3)
         << ", \"median_building_height_m\": " << fmt_double(quality.median_building_height_m, 3)
@@ -586,12 +588,25 @@ WorldCompileResult compile_world(const WorldCompileSpec& spec) {
     manifest.quality.terrain_nodata_cells = nodata_cells;
     manifest.quality.terrain_authoritative_cells = spec.terrain_authoritative ? data_cells : 0;
 
+    // Sea-connected water masking: intentional water, never invented holes.
+    std::size_t water_cells = 0;
+    if (spec.water_mask) {
+        const agbot::terrain::WaterMask mask =
+            agbot::terrain::compute_water_mask(terrain.fused.elevation, spec.sea_level_m);
+        water_cells = mask.water_cells;
+    }
+    manifest.quality.terrain_water_cells = water_cells;
+
     // No-silent-zero: classify the tile's elevation provenance explicitly.
     ElevationState elevation_state = ElevationState::Missing;
     std::string elevation_reason;
     if (!terrain.fused.elevation.valid() || data_cells == 0) {
         elevation_state = ElevationState::Missing;
         elevation_reason = "NO_TERRAIN";
+    } else if (terrain_cells > 0 && water_cells * 2 > terrain_cells) {
+        // Predominantly water tile.
+        elevation_state = ElevationState::MaskedWater;
+        elevation_reason = "WATER_MASK_ONLY";
     } else if (spec.terrain_authoritative) {
         elevation_state = ElevationState::Authoritative;
         if (nodata_cells > 0) {
