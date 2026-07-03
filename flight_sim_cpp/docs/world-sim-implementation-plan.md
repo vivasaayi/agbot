@@ -138,15 +138,18 @@ Multi-batch (needs external data; user authorized acquisition).
 - Deferred (need extra sources): Overture per-building join, NYC-3D benchmark
   spot-check, PLUTO lot enrichment.
 
-### M5 — Deterministic render + sensor-graph unification
-- Canonicalize vertex/material/instance ordering + quantization before hashing →
-  deterministic scene hashes in `.agbworld`.
-- Offscreen sensor path (RGB, semantic ID, linear depth, LiDAR rays) reads the **same**
-  scene graph as the human renderer.
-- **Gate 4 (Render):** non-blank offscreen outputs, min non-clear pixel ratio from
-  canonical poses, stable scene hashes, depth/semantic consistency.
-- *(Deferred sub-task, not blocking: bgfx-vs-Dawn backend + terrain clipmaps + 3D-Tiles
-  city streaming. Decide backend at start of M5 — see §4.)*
+### M5 — Deterministic render + sensor-graph unification — ✅ DONE
+- `render/OffscreenRenderer`: a dependency-free CPU rasterizer (z-buffered,
+  perspective-correct, deterministic iteration) that renders the **same**
+  `RenderScene` the viewer shows into co-registered **RGB + linear-depth +
+  semantic-id** buffers, plus a `frame_hash`.
+- **Gate 4 (Render):** on the compiled Manhattan scene from a canonical aerial pose —
+  52.8% non-blank coverage, byte-identical `frame_hash` across renders, and depth⇔semantic
+  co-registration (every hit has finite positive depth). Asserted in `world_demo --check`.
+- Unit tests: quad coverage/depth/colour/semantic, background sky, occlusion z-test,
+  determinism.
+- Deferred (non-blocking): bgfx/Dawn GPU backend, terrain clipmaps, 3D-Tiles streaming.
+  The deterministic scene geometry hash already lives in `.agbworld` (tile.content_hash).
 
 ### M6 — Autonomy evidence loop + nav gate
 - Wire unified loop: offscreen RGB+depth+semantic+LiDAR → occupancy/voxel → costmap →

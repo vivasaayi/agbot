@@ -4,6 +4,7 @@
 #include "agbot_render/Camera.hpp"
 #include "agbot_render/DemoScene.hpp"
 #include "agbot_render/Mat4.hpp"
+#include "agbot_render/OffscreenRenderer.hpp"
 #include "agbot_render/RenderScene.hpp"
 #include "agbot_render/SceneFile.hpp"
 
@@ -557,6 +558,62 @@ void test_value_noise() {
     check(std::fabs(c - d) < 0.05F, "value noise continuous");
 }
 
+agbot::render::RenderMesh quad_mesh(float z, float r, float g, float b, float half) {
+    agbot::render::RenderMesh mesh;
+    const auto vtx = [&](float x, float y) {
+        agbot::render::RenderVertex v;
+        v.px = x; v.py = y; v.pz = z;
+        v.r = r; v.g = g; v.b = b; v.a = 1.0F;
+        return v;
+    };
+    mesh.vertices = {vtx(-half, -half), vtx(half, -half), vtx(half, half), vtx(-half, half)};
+    mesh.indices = {0, 1, 2, 0, 2, 3};
+    return mesh;
+}
+
+void test_offscreen_rasterizer() {
+    using namespace agbot::render;
+    RenderScene scene;
+    scene.static_meshes.push_back(quad_mesh(-10.0F, 1.0F, 0.0F, 0.0F, 2.0F));  // red at 10 m
+
+    OffscreenCamera cam;  // at origin looking down -Z
+    const int w = 64;
+    const int h = 64;
+    const SensorFrame frame = render_offscreen(scene, cam, w, h);
+
+    const std::size_t center = static_cast<std::size_t>(h / 2) * w + (w / 2);
+    check(frame.covered_pixels > 0 && frame.coverage_ratio() > 0.05 &&
+              frame.coverage_ratio() < 0.9,
+          "offscreen: quad covers a plausible central fraction");
+    check(std::fabs(frame.depth[center] - 10.0F) < 0.1F, "offscreen: centre linear depth ~10 m");
+    check(frame.semantic[center] == 1, "offscreen: centre carries mesh semantic id 1");
+    check(frame.rgb[center * 3] > 200 && frame.rgb[center * 3 + 1] < 40,
+          "offscreen: centre colour is red");
+    // Corner is background sky: no hit, negative depth, semantic 0.
+    check(frame.semantic[0] == 0 && frame.depth[0] < 0.0F && frame.rgb[2] == 60,
+          "offscreen: corner is background sky");
+    // Depth/semantic co-registration: every hit has finite positive depth.
+    bool consistent = true;
+    for (std::size_t i = 0; i < frame.semantic.size(); ++i) {
+        if ((frame.semantic[i] != 0) != (frame.depth[i] > 0.0F)) {
+            consistent = false;
+            break;
+        }
+    }
+    check(consistent, "offscreen: semantic and depth are co-registered");
+
+    // Determinism: identical scene+camera => identical frame hash.
+    const SensorFrame again = render_offscreen(scene, cam, w, h);
+    check(frame_hash(frame) == frame_hash(again), "offscreen: frame hash is deterministic");
+
+    // Occlusion: a nearer quad with a different id wins the z-test.
+    scene.static_meshes.push_back(quad_mesh(-5.0F, 0.0F, 1.0F, 0.0F, 1.0F));  // green at 5 m
+    const SensorFrame occluded = render_offscreen(scene, cam, w, h);
+    check(std::fabs(occluded.depth[center] - 5.0F) < 0.1F, "offscreen: nearer quad wins depth");
+    check(occluded.semantic[center] == 2, "offscreen: nearer quad wins semantic id");
+    check(frame_hash(occluded) != frame_hash(frame), "offscreen: occlusion changes the frame");
+}
+
 } // namespace
 
 int main() {
@@ -573,6 +630,7 @@ int main() {
     test_scene_file_bad_magic();
     test_demo_scene();
     test_value_noise();
+    test_offscreen_rasterizer();
 
     if (g_failures == 0) {
         std::printf("agbot_render_tests: all %d checks passed\n", g_checks);

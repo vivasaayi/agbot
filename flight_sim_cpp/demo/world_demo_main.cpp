@@ -13,6 +13,7 @@
 #include "agbot_config/Params.hpp"
 #include "agbot_nav/AerialPlanner.hpp"
 #include "agbot_nav/RoadGraphPlanner.hpp"
+#include "agbot_render/OffscreenRenderer.hpp"
 #include "agbot_render/SceneFile.hpp"
 #include "agbot_vehicles/FixedWingAutopilot.hpp"
 #include "agbot_vehicles/FixedWingModel.hpp"
@@ -401,6 +402,30 @@ int main(int argc, char** argv) {
                "scene file round-trips with 2 meshes");
         expect(!world.terrain_textured || readback.scene.textured_meshes.size() == 1,
                "draped basemap terrain survives scene round-trip");
+
+        // Gate 4 (render): the offscreen sensor path reads the same scene graph
+        // as the viewer and produces non-blank, deterministic, co-registered
+        // RGB / linear-depth / semantic frames.
+        agbot::render::OffscreenCamera sensor_cam;
+        sensor_cam.eye = {0.0f, 900.0f, 3000.0f};
+        sensor_cam.target = {0.0f, 60.0f, 0.0f};
+        sensor_cam.up = {0.0f, 1.0f, 0.0f};
+        sensor_cam.far_m = 8000.0f;
+        const auto frame = agbot::render::render_offscreen(world.scene, sensor_cam, 160, 120);
+        const auto frame_again = agbot::render::render_offscreen(world.scene, sensor_cam, 160, 120);
+        std::cout << "  Gate 4 sensor frame: coverage " << frame.coverage_ratio()
+                  << ", hash " << agbot::render::frame_hash(frame) << "\n";
+        expect(frame.coverage_ratio() > 0.25, "Gate 4: offscreen sensor frame is non-blank");
+        expect(agbot::render::frame_hash(frame) == agbot::render::frame_hash(frame_again),
+               "Gate 4: sensor frame hash is deterministic across renders");
+        bool coregistered = true;
+        for (std::size_t i = 0; i < frame.semantic.size(); ++i) {
+            if ((frame.semantic[i] != 0) != (frame.depth[i] > 0.0f)) {
+                coregistered = false;
+                break;
+            }
+        }
+        expect(coregistered, "Gate 4: depth and semantic layers are co-registered");
         if (failures != 0) {
             std::cout << failures << " failing checks\n";
             return 1;
