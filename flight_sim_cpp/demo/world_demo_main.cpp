@@ -31,42 +31,58 @@ namespace {
 namespace cfg = agbot::config;
 namespace fs = agbot::flight_sim;
 
-const char* kTerrainConfig = R"toml(
-[pipeline]
-target_gsd_m = 30.0
-resolution = 128
-aoi = { min_lat = 40.700, min_lon = -74.020, max_lat = 40.740, max_lon = -73.980 }
-
-[[layer]]
-algorithm = "dem_fusion"
-weight = 1.0
-  [layer.params]
-  source = "terrarium"
-  zoom = 13
-  resample = "bilinear"
-  void_fill = "idw"
-  clamp_min_m = -2.0
-
-[[layer]]
-algorithm = "synthetic_detail"
-weight = 1.0
-  [layer.params]
-  amplitude_m = 0.6
-  octaves = 4
-  frequency = 8.0
-  seed = 1337
-  confidence = 0.3
-
-[fusion]
-method = "detail_injection"
-lambda = 0.3
-cutoff_cells = 2
-
-[validation]
-enabled = true
-reference_layer = 0
-output_json = "out/world/terrain_validation.json"
-)toml";
+// Terrain config with the authoritative bare-earth DEM (layer 0, the Gate 2
+// reference) plus subordinate synthetic detail. When the 3DEP GeoTIFF is
+// present it is the ground-truth base (NAVD88 metres); otherwise the compiler
+// falls back to Terrarium tiles so a data-less checkout still builds.
+std::string terrain_config_toml(const std::string& dem_geotiff_path) {
+    std::string base_layer;
+    if (!dem_geotiff_path.empty()) {
+        base_layer =
+            "[[layer]]\n"
+            "algorithm = \"dem_fusion\"\n"
+            "weight = 1.0\n"
+            "  [layer.params]\n"
+            "  source = \"geotiff\"\n"
+            "  path = \"" + dem_geotiff_path + "\"\n"
+            "  resample = \"bilinear\"\n"
+            "  clamp_min_m = -30.0\n";
+    } else {
+        base_layer =
+            "[[layer]]\n"
+            "algorithm = \"dem_fusion\"\n"
+            "weight = 1.0\n"
+            "  [layer.params]\n"
+            "  source = \"terrarium\"\n"
+            "  zoom = 13\n"
+            "  resample = \"bilinear\"\n"
+            "  void_fill = \"idw\"\n"
+            "  clamp_min_m = -2.0\n";
+    }
+    return
+        "[pipeline]\n"
+        "target_gsd_m = 30.0\n"
+        "resolution = 128\n"
+        "aoi = { min_lat = 40.700, min_lon = -74.020, max_lat = 40.740, max_lon = -73.980 }\n\n" +
+        base_layer +
+        "\n[[layer]]\n"
+        "algorithm = \"synthetic_detail\"\n"
+        "weight = 1.0\n"
+        "  [layer.params]\n"
+        "  amplitude_m = 0.6\n"
+        "  octaves = 4\n"
+        "  frequency = 8.0\n"
+        "  seed = 1337\n"
+        "  confidence = 0.3\n\n"
+        "[fusion]\n"
+        "method = \"detail_injection\"\n"
+        "lambda = 0.3\n"
+        "cutoff_cells = 2\n\n"
+        "[validation]\n"
+        "enabled = true\n"
+        "reference_layer = 0\n"
+        "output_json = \"out/world/terrain_validation.json\"\n";
+}
 
 struct FlythroughResult {
     bool completed = false;
@@ -198,15 +214,28 @@ int main(int argc, char** argv) {
     const std::filesystem::path source_dir = AGBOT_FLIGHT_SIM_SOURCE_DIR;
 
     // --- Compile the world artifact ----------------------------------------
+    const std::filesystem::path dem_path = source_dir / "data/terrain/manhattan_3dep_dem.tif";
+    const std::string dem_geotiff = std::filesystem::exists(dem_path) ? dem_path.string() : "";
+
     agbot::worldgen::WorldCompileSpec spec;
     spec.seed = 1337;
-    spec.terrain_config_toml = kTerrainConfig;
-    spec.terrain_license = "AWS Terrarium (mixed source licenses)";
-    spec.terrain_uri = "s3://elevation-tiles-prod/terrarium";
+    spec.terrain_config_toml = terrain_config_toml(dem_geotiff);
+    if (!dem_geotiff.empty()) {
+        spec.terrain_license = "USGS 3DEP (public domain)";
+        spec.terrain_uri =
+            "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer";
+        spec.terrain_version = "3DEP exportImage 512px";
+        spec.terrain_vertical_datum = "NAVD88";
+    } else {
+        spec.terrain_license = "AWS Terrarium (mixed source licenses)";
+        spec.terrain_uri = "s3://elevation-tiles-prod/terrarium";
+    }
 
     spec.buildings_path = (source_dir / "data/worldgen/manhattan_buildings.geojson").string();
     spec.buildings_license = "NYC Open Data (public domain)";
     spec.buildings_uri = "https://data.cityofnewyork.us/Housing-Development/Building-Footprints";
+    // NYC building ground_elevation is referenced to NAVD88, matching 3DEP.
+    spec.buildings_vertical_datum = dem_geotiff.empty() ? "" : "NAVD88";
     spec.building_params["height_attr"] = cfg::ParamValue(std::string("height_roof"));
     spec.building_params["height_units"] = cfg::ParamValue(std::string("feet"));
     spec.building_params["base_elev_attr"] = cfg::ParamValue(std::string("ground_elevation"));
@@ -262,7 +291,9 @@ int main(int argc, char** argv) {
               << "  terrain grid " << world.terrain.elevation.width << "x"
               << world.terrain.elevation.height << ", elevation " << q.terrain_min_m << ".."
               << q.terrain_max_m << " m (source: " << world.terrain.source_algorithm << ")\n"
-              << "  terrain validation RMSE vs DEM: " << q.terrain_rmse_m << " m\n"
+              << "  terrain datum: " << world.manifest.crs_policy.vertical_datum
+              << ", Gate 2 RMSE vs authoritative DEM: " << q.terrain_rmse_m << " m (MAE "
+              << q.terrain_mae_m << ", bias " << q.terrain_bias_m << ")\n"
               << "  buildings " << q.building_count << ", max height "
               << q.max_building_height_m << " m\n"
               << "  city mesh " << q.city_vertex_count << " verts, " << q.city_triangle_count
@@ -286,12 +317,32 @@ int main(int argc, char** argv) {
             std::cout << (condition ? "PASS " : "FAIL ") << label << "\n";
             failures += condition ? 0 : 1;
         };
+        // Authoritative-DEM runs are identified by the recorded NAVD88 datum
+        // (set only when the 3DEP GeoTIFF was consumed).
+        const bool authoritative = world.manifest.crs_policy.vertical_datum == "NAVD88";
+        bool terrain_source_is_3dep = false;
+        for (const auto& source : world.manifest.sources) {
+            if (source.source_id == "terrain") {
+                terrain_source_is_3dep =
+                    source.license.find("3DEP") != std::string::npos &&
+                    source.vertical_datum == "NAVD88";
+            }
+        }
         expect(world.terrain.elevation.width >= 64 && world.terrain.elevation.height >= 64,
                "terrain grid resolved");
-        expect(q.terrain_min_m > -15.0f && q.terrain_max_m < 150.0f &&
+        // Bare-earth 3DEP reaches ~-16 m at native resolution (harbor/excavation);
+        // both sources stay well under Lower Manhattan's high ground.
+        expect(q.terrain_min_m > -30.0f && q.terrain_max_m < 150.0f &&
                    q.terrain_max_m > q.terrain_min_m,
                "manhattan elevation range plausible");
-        expect(q.terrain_rmse_m < 5.0, "detail layer stays anchored to DEM (<5 m RMSE)");
+        expect(!authoritative || terrain_source_is_3dep,
+               "authoritative run records a 3DEP/NAVD88 terrain source");
+        // Gate 2: the compiled terrain must track its authoritative reference DEM.
+        // Authoritative 3DEP is held to a tighter bound than the Terrarium fallback.
+        expect(q.terrain_rmse_m < (authoritative ? 2.0 : 5.0),
+               "Gate 2: fused terrain stays anchored to the reference DEM");
+        expect(dem_geotiff.empty() || authoritative,
+               "3DEP DEM, when present, is compiled as the authoritative terrain");
         expect(q.building_count > 1000, "more than 1000 buildings imported");
         expect(q.max_building_height_m > 150.0 && q.max_building_height_m < 400.0,
                "tallest building 150-400 m");

@@ -2,6 +2,7 @@ add_library(agbot_terrain
     src/Module.cpp
     src/Raster.cpp
     src/Png.cpp
+    src/GeoTiff.cpp
     src/Estimators.cpp
     src/Fusion.cpp
     src/Validation.cpp

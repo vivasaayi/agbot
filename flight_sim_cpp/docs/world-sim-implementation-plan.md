@@ -82,17 +82,28 @@ six acceptance gates.
 - Tests: 2263/UTM18N round-trip + analytic anchor + independent scale checks;
   end-to-end 2263 ingest; datum-mismatch rejection.
 
-### M3 — Authoritative terrain stack + no-silent-zero
-- Ranked terrain sources: 3DEP 1 m DEM / NYC-NYS DEM (authoritative) → Terrarium (fallback).
-- Fuse: height (DEM), surface residual (DSM−DEM), albedo (true ortho), semantic mask
-  (6-inch land cover). DSM/landcover ingest into `terrain_engine`.
-- Topobathy waterfront fusion; water polygons intentional (no resampled harbor holes).
-- Every terrain tile carries one state: `authoritative` | `fallback` | `masked_water`
-  | `missing`, with `fallback_reason` (`NO_SOURCE`/`DATUM_FAILURE`/`NODATA_STRIP`/`WATER_MASK_ONLY`).
-  Extends existing `TerrainTileState`.
-- **Gate 2 (Terrain):** compiled mesh vs source DEM RMSE/MAE/bias, fallback tiles
-  reported explicitly with source lineage. Acceptance tighter than source error
-  (resampling-only, well under the demo's current <5 m).
+### M3 — Authoritative terrain stack + no-silent-zero — 🚧 IN PROGRESS
+Multi-batch (needs external data; user authorized acquisition).
+
+**Batch 1 — authoritative 3DEP DEM + Gate 2 — ✅ DONE**
+- `terrain_engine/GeoTiff.{hpp,cpp}`: minimal uncompressed float32 GeoTIFF reader
+  (tiled/stripped, LE/BE, ModelTiepoint/PixelScale georef, GDAL_NODATA) — targets
+  the USGS 3DEP `exportImage` product, no GDAL dependency.
+- `dem_fusion` gains `source="geotiff"`: authoritative bare-earth DEM resampled onto
+  the AOI grid; cells outside coverage stay nodata (no-silent-zero); confidence 0 there.
+- `fetch_3dep_dem.sh`: version-pinned USGS 3DEP fetcher → `data/terrain/manhattan_3dep_dem.tif`
+  + provenance sidecar (request URL, UTC, sha256, NAVD88).
+- Demo/compiler use 3DEP as the Gate 2 reference layer (Terrarium fallback when absent);
+  manifest records `vertical_datum=NAVD88` + 3DEP-licensed source; mixed-datum guard active.
+- **Gate 2:** compiled terrain RMSE/MAE/bias vs the authoritative DEM — measured
+  **0.96 m RMSE / 0.61 m MAE / ~0 bias** on Lower Manhattan; asserted < 2 m.
+- Tests: GeoTIFF reader pinned to an independent decode of a committed 128² fixture;
+  `dem_fusion:geotiff` estimator path; Gate 2 assertions in `world_demo --check`.
+
+**Batch 2 (remaining) — enrichment layers**
+- DSM−DEM surface residual, 6-inch land-cover semantic mask, topobathy waterfront fusion.
+- Per-tile elevation-state (`authoritative`/`fallback`/`masked_water`/`missing`) +
+  `fallback_reason`; water polygons intentional (no resampled harbor holes).
 
 ### M4 — Buildings LoD1 ranked height + hole preservation
 - Ranked height stack: NYC-3D benchmark → Overture per-building → BES/planimetric →

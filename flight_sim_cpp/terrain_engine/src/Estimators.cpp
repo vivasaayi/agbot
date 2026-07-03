@@ -1,6 +1,7 @@
 #include "agbot_terrain/ElevationEstimator.hpp"
 
 #include "agbot_terrain/Fusion.hpp"
+#include "agbot_terrain/GeoTiff.hpp"
 #include "agbot_terrain/MonoDepth.hpp"
 #include "agbot_terrain/Png.hpp"
 
@@ -176,12 +177,53 @@ public:
         if (source == "terrarium") {
             return estimate_from_tiles(bundle, params);
         }
+        if (source == "geotiff") {
+            return estimate_from_geotiff(bundle, params);
+        }
         EstimateResult result;
         result.error = "dem_fusion_unknown_source:" + source;
         return result;
     }
 
 private:
+    // Authoritative bare-earth DEM from an uncompressed float32 GeoTIFF (e.g.
+    // USGS 3DEP exportImage), resampled onto the AOI grid. Cells outside the
+    // GeoTIFF coverage stay nodata (never coerced to zero); confidence is 1
+    // where authoritative data exists and 0 elsewhere.
+    [[nodiscard]] EstimateResult estimate_from_geotiff(
+        const ImageryBundle& bundle,
+        const cfg::ParamTable& params) const {
+        EstimateResult result;
+        const std::string path = cfg::string_or(params, "path", "");
+        if (path.empty()) {
+            result.error = "geotiff_path_missing";
+            return result;
+        }
+        const GeoTiffResult dem = read_geotiff_dem(path);
+        if (!dem.ok) {
+            result.error = dem.error;
+            return result;
+        }
+        if (!dem.has_georef || !dem.raster.valid()) {
+            result.error = "geotiff_ungeoreferenced";
+            return result;
+        }
+        const int resolution = bundle.resolved_resolution();
+        const std::string resample = cfg::string_or(params, "resample", "bilinear");
+        Raster elevation = resample_to_grid(dem.raster, bundle.aoi, resolution, resample);
+        finalize(elevation, params);
+        result.field.confidence = Raster::filled(resolution, resolution, bundle.aoi, 1.0f);
+        for (std::size_t i = 0; i < elevation.values.size(); ++i) {
+            if (Raster::is_nodata(elevation.values[i])) {
+                result.field.confidence.values[i] = 0.0f;
+            }
+        }
+        result.field.elevation = std::move(elevation);
+        result.field.source_algorithm = "dem_fusion:geotiff";
+        result.ok = true;
+        return result;
+    }
+
     [[nodiscard]] EstimateResult estimate_from_prior(
         const ImageryBundle& bundle,
         const cfg::ParamTable& params) const {

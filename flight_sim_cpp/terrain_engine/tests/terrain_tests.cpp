@@ -1,6 +1,7 @@
 #include "agbot_config/Toml.hpp"
 #include "agbot_terrain/ElevationEstimator.hpp"
 #include "agbot_terrain/Fusion.hpp"
+#include "agbot_terrain/GeoTiff.hpp"
 #include "agbot_terrain/MonoDepth.hpp"
 #include "agbot_terrain/Png.hpp"
 #include "agbot_terrain/Raster.hpp"
@@ -375,6 +376,60 @@ void test_validation_json() {
     second << stream2.rdbuf();
     expect(first.str() == second.str() && !first.str().empty(),
            "validation json byte-identical across runs");
+}
+
+// Reads the committed 3DEP fixture and pins the C++ GeoTIFF reader to the
+// values an independent decode produced (min -16.618, max 13.830, mean 6.421,
+// NW corner 4.089, SE corner 1.592 over 40.705..40.715 / -74.015..-74.005).
+void test_geotiff_dem_reader() {
+    const std::filesystem::path fixture =
+        std::filesystem::path(AGBOT_TERRAIN_SOURCE_DIR) / "tests" / "fixtures" / "dem_128.tif";
+    if (!std::filesystem::exists(fixture)) {
+        std::cout << "SKIP geotiff reader (fixture absent: " << fixture << ")\n";
+        return;
+    }
+    const terrain::GeoTiffResult dem = terrain::read_geotiff_dem(fixture);
+    expect(dem.ok && dem.has_georef, "geotiff fixture reads with georeference");
+    expect(dem.raster.width == 128 && dem.raster.height == 128, "geotiff fixture is 128x128");
+    expect(std::abs(dem.raster.bounds.max_latitude - 40.715) < 1e-6 &&
+               std::abs(dem.raster.bounds.min_latitude - 40.705) < 1e-6 &&
+               std::abs(dem.raster.bounds.min_longitude - (-74.015)) < 1e-6 &&
+               std::abs(dem.raster.bounds.max_longitude - (-74.005)) < 1e-6,
+           "geotiff fixture bounds match ModelTiepoint/PixelScale");
+
+    double min_v = 1e30;
+    double max_v = -1e30;
+    double sum = 0.0;
+    std::size_t n = 0;
+    for (const float value : dem.raster.values) {
+        if (!terrain::Raster::is_nodata(value)) {
+            min_v = std::min(min_v, static_cast<double>(value));
+            max_v = std::max(max_v, static_cast<double>(value));
+            sum += value;
+            ++n;
+        }
+    }
+    expect(n == 128 * 128, "geotiff fixture has no nodata gaps");
+    expect(std::abs(min_v - (-16.618)) < 0.01, "geotiff fixture min matches reference");
+    expect(std::abs(max_v - 13.830) < 0.01, "geotiff fixture max matches reference");
+    expect(std::abs(sum / static_cast<double>(n) - 6.421) < 0.01, "geotiff fixture mean matches");
+    // Row 0 is northernmost; NW corner is at(0,0), SE corner at(127,127).
+    expect(std::abs(dem.raster.at(0, 0) - 4.089) < 0.01, "geotiff NW corner value");
+    expect(std::abs(dem.raster.at(127, 127) - 1.592) < 0.01, "geotiff SE corner value");
+
+    // Feeds the dem_fusion geotiff source onto an AOI grid.
+    const auto estimator = terrain::estimator_registry().create("dem_fusion");
+    terrain::ImageryBundle bundle;
+    bundle.aoi = {40.706, -74.014, 40.714, -74.006};
+    bundle.grid_width = 32;
+    bundle.grid_height = 32;
+    cfg::ParamTable params;
+    params["source"] = std::string("geotiff");
+    params["path"] = fixture.string();
+    const auto result = estimator->estimate(bundle, params);
+    expect(result.ok && result.field.source_algorithm == "dem_fusion:geotiff",
+           "dem_fusion geotiff source estimates onto the AOI grid");
+    expect(result.ok && result.field.elevation.width == 32, "geotiff estimate resampled to grid");
 }
 
 void test_inflate_stored_and_png_synthetic() {
@@ -853,6 +908,7 @@ int main() {
     test_validation_metrics();
     test_validation_json();
     test_inflate_stored_and_png_synthetic();
+    test_geotiff_dem_reader();
     test_real_tile_decode();
     test_affine_fit();
 #if defined(AGBOT_TERRAIN_HAS_ONNX)
