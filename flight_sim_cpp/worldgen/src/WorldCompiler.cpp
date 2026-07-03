@@ -2,6 +2,7 @@
 
 #include "agbot_config/Toml.hpp"
 #include "agbot_flight_sim/Mission.hpp"
+#include "agbot_worldgen/Crs.hpp"
 #include "agbot_render/SceneFile.hpp"
 #include "agbot_terrain/Png.hpp"
 #include "agbot_terrain/TerrainPipeline.hpp"
@@ -475,6 +476,7 @@ WorldCompileResult compile_world(const WorldCompileSpec& spec) {
     }
     cfg::ParamTable building_params = spec.building_params;
     building_params["path"] = cfg::ParamValue(spec.buildings_path);
+    building_params["source_crs"] = cfg::ParamValue(spec.buildings_source_crs);
     const VectorImportExtractor building_extractor;
     const ExtractionResult buildings = building_extractor.extract({aoi, building_params});
     if (!buildings.ok) {
@@ -483,6 +485,21 @@ WorldCompileResult compile_world(const WorldCompileSpec& spec) {
         return result;
     }
     result.buildings = buildings.features;
+
+    // Datum discipline: when the buildings contribute base elevations, their
+    // vertical datum must be compatible with the terrain's. Reject silent
+    // mixing of orthometric and ellipsoidal heights.
+    const VerticalDatum terrain_datum = vertical_datum_from_name(spec.terrain_vertical_datum);
+    const VerticalDatum building_datum = vertical_datum_from_name(spec.buildings_vertical_datum);
+    const bool buildings_carry_z = std::any_of(
+        result.buildings.begin(), result.buildings.end(),
+        [](const ExtractedFeature& feature) { return feature.base_elev_m.has_value(); });
+    if (buildings_carry_z && !vertical_datums_compatible(terrain_datum, building_datum)) {
+        result.error_code = "mixed_vertical_datum";
+        result.error_detail = std::string("terrain=") + to_string(terrain_datum) +
+            " buildings=" + to_string(building_datum);
+        return result;
+    }
 
     // 3. City mesh -----------------------------------------------------------
     result.city = build_city_mesh(buildings.features, result.origin, spec.mesh_params);
@@ -553,7 +570,8 @@ WorldCompileResult compile_world(const WorldCompileSpec& spec) {
     terrain_source.version = spec.terrain_version;
     terrain_source.license = spec.terrain_license;
     terrain_source.crs = "EPSG:4326";
-    terrain_source.vertical_datum = spec.terrain_vertical_datum;
+    terrain_source.vertical_datum =
+        terrain_datum == VerticalDatum::Unknown ? "" : to_string(terrain_datum);
     terrain_source.content_hash = fold_str(kFnvOffset, spec.terrain_config_toml);
     manifest.sources.push_back(terrain_source);
 
@@ -562,7 +580,9 @@ WorldCompileResult compile_world(const WorldCompileSpec& spec) {
     building_source.uri = spec.buildings_uri;
     building_source.version = spec.buildings_version;
     building_source.license = spec.buildings_license;
-    building_source.crs = "EPSG:4326";
+    building_source.crs = epsg_for(horizontal_crs_from_epsg(spec.buildings_source_crs));
+    building_source.vertical_datum =
+        building_datum == VerticalDatum::Unknown ? "" : to_string(building_datum);
     building_source.content_hash = hash_file_bytes(spec.buildings_path);
     manifest.sources.push_back(building_source);
 
@@ -609,7 +629,8 @@ WorldCompileResult compile_world(const WorldCompileSpec& spec) {
     manifest.seed = spec.seed;
     manifest.aoi = aoi;
     manifest.crs_policy.horizontal = "EPSG:4326";
-    manifest.crs_policy.vertical_datum = spec.terrain_vertical_datum;
+    manifest.crs_policy.vertical_datum =
+        terrain_datum == VerticalDatum::Unknown ? "" : to_string(terrain_datum);
     manifest.crs_policy.runtime_frame = "local_enu_m";
     manifest.tiles.push_back(std::move(tile));
     manifest.world_hash = fold_manifest(manifest);

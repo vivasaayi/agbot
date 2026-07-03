@@ -1,5 +1,6 @@
 #include "agbot_worldgen/extractors/VectorImport.hpp"
 
+#include "agbot_worldgen/Crs.hpp"
 #include "agbot_worldgen/HeightResolver.hpp"
 
 #include <nlohmann/json.hpp>
@@ -35,6 +36,7 @@ struct ImportParams {
     double min_area_m2 = 10.0;
     double simplify_tol_m = 0.0;
     std::int64_t max_features = 0;
+    HorizontalCrs source_crs = HorizontalCrs::Wgs84Lonlat;
 };
 
 double unit_scale_for(const std::string& units) {
@@ -61,6 +63,7 @@ ImportParams read_params(const agbot::config::ParamTable& table) {
     params.min_area_m2 = cfg::double_or(table, "min_area_m2", 10.0);
     params.simplify_tol_m = cfg::double_or(table, "simplify_tol_m", 0.0);
     params.max_features = cfg::integer_or(table, "max_features", 0);
+    params.source_crs = horizontal_crs_from_epsg(cfg::string_or(table, "source_crs", "EPSG:4326"));
     return params;
 }
 
@@ -107,10 +110,10 @@ std::optional<std::string> string_property(const json& properties, const std::st
     return std::nullopt;
 }
 
-// Parses a GeoJSON linear ring ([[lon, lat], ...]) into geodetic points,
-// dropping the duplicated closing point. Returns an empty vector when the
-// ring is malformed or degenerate.
-std::vector<GeoCoordinate> parse_ring(const json& ring_json) {
+// Parses a GeoJSON linear ring into geodetic points, normalising each vertex
+// from `source_crs` to WGS84 lon/lat and dropping the duplicated closing point.
+// Returns an empty vector when the ring is malformed or degenerate.
+std::vector<GeoCoordinate> parse_ring(const json& ring_json, HorizontalCrs source_crs) {
     if (!ring_json.is_array()) {
         return {};
     }
@@ -120,7 +123,8 @@ std::vector<GeoCoordinate> parse_ring(const json& ring_json) {
         if (!point.is_array() || point.size() < 2 || !point[0].is_number() || !point[1].is_number()) {
             return {};
         }
-        ring.push_back({point[1].get<double>(), point[0].get<double>(), 0.0});
+        ring.push_back(
+            wgs84_from_source(source_crs, point[0].get<double>(), point[1].get<double>()));
     }
     if (ring.size() >= 2) {
         const GeoCoordinate& first = ring.front();
@@ -231,7 +235,7 @@ struct PolygonRings {
 
 // Extracts each polygon of a Polygon/MultiPolygon geometry; invalid polygons
 // are skipped, invalid holes dropped.
-std::vector<PolygonRings> parse_polygons(const json& geometry) {
+std::vector<PolygonRings> parse_polygons(const json& geometry, HorizontalCrs source_crs) {
     std::vector<PolygonRings> polygons;
     if (!geometry.is_object()) {
         return polygons;
@@ -244,17 +248,17 @@ std::vector<PolygonRings> parse_polygons(const json& geometry) {
     }
     const std::string type = type_it->get<std::string>();
 
-    const auto parse_polygon = [&polygons](const json& rings_json) {
+    const auto parse_polygon = [&polygons, source_crs](const json& rings_json) {
         if (!rings_json.is_array() || rings_json.empty()) {
             return;
         }
         PolygonRings polygon;
-        polygon.exterior = parse_ring(rings_json[0]);
+        polygon.exterior = parse_ring(rings_json[0], source_crs);
         if (polygon.exterior.empty()) {
             return;
         }
         for (std::size_t ring_index = 1; ring_index < rings_json.size(); ++ring_index) {
-            std::vector<GeoCoordinate> hole = parse_ring(rings_json[ring_index]);
+            std::vector<GeoCoordinate> hole = parse_ring(rings_json[ring_index], source_crs);
             if (!hole.empty()) {
                 polygon.holes.push_back(std::move(hole));
             }
@@ -345,7 +349,8 @@ ExtractionResult VectorImportExtractor::extract(const ExtractionContext& context
         const json properties =
             feature_json.contains("properties") ? feature_json["properties"] : json(nullptr);
 
-        const std::vector<PolygonRings> polygons = parse_polygons(feature_json["geometry"]);
+        const std::vector<PolygonRings> polygons =
+            parse_polygons(feature_json["geometry"], params.source_crs);
         if (polygons.empty()) {
             continue;
         }

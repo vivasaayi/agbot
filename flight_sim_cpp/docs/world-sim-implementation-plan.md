@@ -56,7 +56,7 @@ Each milestone is independently committable and ends with a passing gate. Build/
 via `just flight-sim-build` / `just flight-sim-test`. Milestones map to the report's
 six acceptance gates.
 
-### M1 — Extract the world compiler as a library (foundation)
+### M1 — Extract the world compiler as a library (foundation) — ✅ DONE (commit 540cde2)
 **Why first:** everything else needs a real compiler API, not logic buried in `main()`.
 - New `worldgen` compiler entrypoint: `compile_world(AoiSpec, SourceManifest, seed) → WorldArtifact`.
 - Define `.agbworld` manifest struct: compiler version, AOI, source snapshot IDs +
@@ -67,11 +67,20 @@ six acceptance gates.
   stable `.agbworld` + tiles with reproducible content hashes and zero fatal errors.
 - Tests: `worldgen_tests` — deterministic hash stability across two compiles.
 
-### M2 — CRS/datum discipline
-- Add ingest adapter for **EPSG:2263** (NY State Plane LI, feet) → canonical frame.
-- Canonical metric frame **NAD83(2011)/UTM18N + NAVD88**; per-tile local ENU for runtime.
-- Explicit datum tags on every elevation source; reject mixed orthometric/ellipsoidal.
-- Tests: round-trip EPSG:2263 ↔ canonical within tolerance; datum-mismatch rejection.
+### M2 — CRS/datum discipline — ✅ DONE
+- `worldgen/Crs.{hpp,cpp}`: EPSG:2263 (NY State Plane LI, US ft, Lambert Conformal
+  Conic 2SP) and EPSG:26918 (UTM 18N, Transverse Mercator) ↔ WGS84 on GRS80.
+- `VerticalDatum` enum + `vertical_datums_compatible` (orthometric vs ellipsoidal
+  rejected; NAVD88 family compatible).
+- `source_crs` param on `vector_import`: projected footprints normalized to WGS84
+  at ingest; native CRS preserved in source provenance.
+- Compiler rejects mixed vertical datums (`mixed_vertical_datum`) when buildings
+  carry base elevations; manifest policy/sources record the resolved datum.
+- UTM 18N adapter is in place for M3 (3DEP DEM arrives in UTM/NAVD88); the runtime
+  frame remains per-tile local ENU (not yet routed through UTM — deferred to when
+  authoritative metric sources land).
+- Tests: 2263/UTM18N round-trip + analytic anchor + independent scale checks;
+  end-to-end 2263 ingest; datum-mismatch rejection.
 
 ### M3 — Authoritative terrain stack + no-silent-zero
 - Ranked terrain sources: 3DEP 1 m DEM / NYC-NYS DEM (authoritative) → Terrarium (fallback).

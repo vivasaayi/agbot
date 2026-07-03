@@ -21,6 +21,11 @@ namespace agbot::worldgen {
 //   min_area_m2             float   drop smaller footprints (default 10)
 //   simplify_tol_m          float   Douglas-Peucker tolerance, 0 = off (default 0)
 //   max_features            int     0 = unlimited (default 0)
+//   source_crs              string  native CRS of the coordinates; one of
+//                           "EPSG:4326" (default, lon/lat), "EPSG:2263" (NY
+//                           State Plane Long Island, US feet), "EPSG:26918"
+//                           (UTM 18N, metres). Projected inputs are normalized
+//                           to WGS84 lon/lat at ingest.
 //
 // Polygon and MultiPolygon geometries are supported; each polygon of a
 // MultiPolygon becomes its own feature with holes preserved. Features whose

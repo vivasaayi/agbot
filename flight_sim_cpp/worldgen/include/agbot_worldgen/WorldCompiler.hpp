@@ -114,6 +114,13 @@ struct WorldCompileSpec {
     std::string buildings_uri;
     std::string buildings_version;
     std::string buildings_license;
+    // Native horizontal CRS of the building coordinates ("EPSG:4326",
+    // "EPSG:2263", "EPSG:26918"). Projected inputs are normalized to WGS84 at
+    // ingest; the native CRS is preserved in source provenance.
+    std::string buildings_source_crs = "EPSG:4326";
+    // Vertical datum the building base elevations reference (e.g. "NAVD88").
+    // Must be compatible with terrain_vertical_datum when both are declared.
+    std::string buildings_vertical_datum;
 
     std::string roads_path;                             // optional
     agbot::config::ParamTable road_params;

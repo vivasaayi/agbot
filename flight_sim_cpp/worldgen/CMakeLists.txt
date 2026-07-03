@@ -1,5 +1,6 @@
 add_library(agbot_worldgen
     src/Module.cpp
+    src/Crs.cpp
     src/Feature.cpp
     src/FeatureExtractor.cpp
     src/HeightResolver.cpp

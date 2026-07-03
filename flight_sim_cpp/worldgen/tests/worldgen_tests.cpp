@@ -1,6 +1,7 @@
 #include "agbot_worldgen/Feature.hpp"
 #include "agbot_worldgen/FeatureExtractor.hpp"
 #include "agbot_worldgen/HeightResolver.hpp"
+#include "agbot_worldgen/Crs.hpp"
 #include "agbot_worldgen/SceneBridge.hpp"
 #include "agbot_worldgen/SceneMesh.hpp"
 #include "agbot_worldgen/WorldCompiler.hpp"
@@ -11,8 +12,11 @@
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -441,6 +445,156 @@ void test_world_compiler_determinism() {
     expect(provenance_resolves, "gate1 every layer provenance resolves to a source");
 }
 
+// --- M2: CRS / datum discipline --------------------------------------------
+
+void test_crs_conversions() {
+    namespace wg = agbot::worldgen;
+
+    // EPSG string parsing.
+    expect(wg::horizontal_crs_from_epsg("EPSG:2263") ==
+               wg::HorizontalCrs::StatePlaneNyLongIslandFt,
+           "crs parses EPSG:2263");
+    expect(wg::horizontal_crs_from_epsg("epsg:26918") == wg::HorizontalCrs::Utm18N,
+           "crs parses EPSG:26918 case-insensitively");
+    expect(wg::horizontal_crs_from_epsg("") == wg::HorizontalCrs::Wgs84Lonlat,
+           "empty crs defaults to WGS84");
+
+    // EPSG:2263 analytic anchor: the false origin (984250 ft, 0 ft) is the
+    // latitude/central-meridian origin 40°10'N, 74°00'W.
+    const auto origin = wg::wgs84_from_state_plane_li_ft(984250.0, 0.0);
+    expect(near(origin.latitude, 40.0 + 10.0 / 60.0, 1e-5), "2263 false origin -> lat 40d10m");
+    expect(near(origin.longitude, -74.0, 1e-5), "2263 false origin -> lon -74");
+
+    // Independent scale check: one degree of latitude north of the origin along
+    // the central meridian is ~111 km ~ 364k ft of northing (LCC scale ~1 near
+    // the standard parallels). A wrong cone constant would break this badly.
+    double e_deg = 0.0;
+    double n_deg = 0.0;
+    wg::state_plane_li_ft_from_wgs84({40.0 + 10.0 / 60.0 + 1.0, -74.0, 0.0}, e_deg, n_deg);
+    expect(near(e_deg, 984250.0, 1.0), "2263 northing runs up the central meridian");
+    expect(n_deg > 360000.0 && n_deg < 370000.0, "2263 one-degree northing ~364k ft");
+
+    // Round-trip a Manhattan point through EPSG:2263.
+    const agbot::flight_sim::GeoCoordinate manhattan{40.7128, -74.0060, 0.0};
+    double e_ft = 0.0;
+    double n_ft = 0.0;
+    wg::state_plane_li_ft_from_wgs84(manhattan, e_ft, n_ft);
+    expect(e_ft > 975000.0 && e_ft < 990000.0, "2263 manhattan easting plausible");
+    expect(n_ft > 185000.0 && n_ft < 210000.0, "2263 manhattan northing plausible");
+    const auto back_2263 = wg::wgs84_from_state_plane_li_ft(e_ft, n_ft);
+    expect(near(back_2263.latitude, manhattan.latitude, 1e-7) &&
+               near(back_2263.longitude, manhattan.longitude, 1e-7),
+           "2263 round-trips within 1e-7 deg");
+
+    // UTM 18N round-trip + plausibility (zone CM -75, NYC ~1 deg east).
+    const wg::ProjXY utm = wg::utm18n_from_wgs84(manhattan);
+    expect(utm.x > 575000.0 && utm.x < 590000.0, "utm18n manhattan easting plausible");
+    expect(utm.y > 4490000.0 && utm.y < 4520000.0, "utm18n manhattan northing plausible");
+    const auto back_utm = wg::wgs84_from_utm18n(utm);
+    expect(near(back_utm.latitude, manhattan.latitude, 1e-7) &&
+               near(back_utm.longitude, manhattan.longitude, 1e-7),
+           "utm18n round-trips within 1e-7 deg");
+
+    // Independent TM meridian-arc check: one degree of latitude ~110.9 km.
+    const wg::ProjXY utm_n = wg::utm18n_from_wgs84({41.7128, -74.0060, 0.0});
+    expect(near(utm_n.y - utm.y, 111000.0, 600.0), "utm18n one-degree northing ~111 km");
+}
+
+void test_datum_discipline() {
+    namespace wg = agbot::worldgen;
+    using wg::VerticalDatum;
+
+    expect(wg::vertical_datums_compatible(VerticalDatum::Navd88, VerticalDatum::Navd88Geoid18),
+           "NAVD88 family is self-compatible");
+    expect(!wg::vertical_datums_compatible(VerticalDatum::Navd88, VerticalDatum::Ellipsoidal),
+           "orthometric vs ellipsoidal is incompatible");
+    expect(wg::vertical_datums_compatible(VerticalDatum::Unknown, VerticalDatum::Ellipsoidal),
+           "unknown datum defers (compatible)");
+    expect(wg::vertical_datums_compatible(VerticalDatum::None, VerticalDatum::Navd88),
+           "no-z source is compatible with anything");
+
+    // Compiler rejects mixed datums when buildings contribute base elevations.
+    auto spec = gate1_spec();
+    spec.terrain_vertical_datum = "NAVD88";
+    spec.buildings_vertical_datum = "ellipsoidal";
+    const auto rejected = wg::compile_world(spec);
+    expect(!rejected.ok && rejected.error_code == "mixed_vertical_datum",
+           "compiler rejects orthometric terrain + ellipsoidal building base");
+
+    spec.buildings_vertical_datum = "NAVD88";
+    const auto accepted = wg::compile_world(spec);
+    expect(accepted.ok, "compiler accepts compatible NAVD88 datums");
+    expect(accepted.ok && accepted.manifest.crs_policy.vertical_datum == "NAVD88",
+           "manifest records the resolved vertical datum");
+    bool building_source_datum_ok = false;
+    for (const auto& source : accepted.manifest.sources) {
+        if (source.source_id == "buildings") {
+            building_source_datum_ok = source.vertical_datum == "NAVD88";
+        }
+    }
+    expect(building_source_datum_ok, "building source records NAVD88 vertical datum");
+}
+
+void test_2263_ingest() {
+    namespace wg = agbot::worldgen;
+    // A ~50 m square around a Lower Manhattan point, expressed in EPSG:2263 US
+    // survey feet. If the ingest transform is skipped, the feet coordinates
+    // read as absurd lon/lat and the feature is dropped by the AOI filter.
+    const agbot::flight_sim::GeoCoordinate center{40.7075, -74.0050, 0.0};
+    double ec = 0.0;
+    double nc = 0.0;
+    wg::state_plane_li_ft_from_wgs84(center, ec, nc);
+    const double d = 82.0; // ~25 m in feet
+
+    std::ostringstream json;
+    json << std::fixed << std::setprecision(4);
+    json << R"({"type":"FeatureCollection","features":[{"type":"Feature",)"
+         << R"("properties":{"bin":"SP1","height_roof":100.0,"ground_elevation":10.0},)"
+         << R"("geometry":{"type":"Polygon","coordinates":[[)"
+         << "[" << ec - d << "," << nc - d << "],"
+         << "[" << ec + d << "," << nc - d << "],"
+         << "[" << ec + d << "," << nc + d << "],"
+         << "[" << ec - d << "," << nc + d << "],"
+         << "[" << ec - d << "," << nc - d << "]"
+         << "]]}}]}";
+
+    const std::filesystem::path fixture =
+        std::filesystem::temp_directory_path() / "agbot_crs_2263_fixture.geojson";
+    {
+        std::ofstream out(fixture, std::ios::binary);
+        out << json.str();
+    }
+
+    agbot::config::ParamTable params;
+    params["path"] = fixture.string();
+    params["source_crs"] = std::string("EPSG:2263");
+    params["height_attr"] = std::string("height_roof");
+    params["height_units"] = std::string("feet");
+    params["id_attr"] = std::string("bin");
+    params["min_area_m2"] = 10.0;
+
+    const agbot::flight_sim::GeoBounds aoi{center.latitude - 0.002, center.longitude - 0.002,
+                                           center.latitude + 0.002, center.longitude + 0.002};
+    const auto extractor = agbot::worldgen::extractor_registry().create("vector_import");
+    const auto result = extractor->extract({aoi, params});
+    expect(result.ok, "2263 ingest extraction succeeds");
+    expect(result.features.size() == 1, "2263 square lands one feature inside the AOI");
+    if (result.features.size() == 1) {
+        double lat_sum = 0.0;
+        double lon_sum = 0.0;
+        for (const auto& p : result.features.front().exterior) {
+            lat_sum += p.latitude;
+            lon_sum += p.longitude;
+        }
+        const double n = static_cast<double>(result.features.front().exterior.size());
+        expect(near(lat_sum / n, center.latitude, 5e-4) &&
+                   near(lon_sum / n, center.longitude, 5e-4),
+               "2263 ingested footprint centroid matches the source WGS84 point");
+    }
+    std::error_code ec_rm;
+    std::filesystem::remove(fixture, ec_rm);
+}
+
 } // namespace
 
 int main() {
@@ -453,6 +607,9 @@ int main() {
     test_mesh_builder();
     test_manhattan_integration();
     test_world_compiler_determinism();
+    test_crs_conversions();
+    test_datum_discipline();
+    test_2263_ingest();
 
     if (failures > 0) {
         std::cout << failures << " test(s) failed\n";
