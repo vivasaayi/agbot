@@ -150,20 +150,31 @@ mapping) + route + tests/<app>_run.rs + an APPS entry in web/js/panels/findings.
   Reusable alerting fns not yet used: deduplicate_alert_stream,
   classify_alert_severity, route_alert_to_recipients, open/ack/resolve lifecycle.
 
-## Next action (TB-C2)
-Continue Track C using the `alerting` crate's remaining governed steps. Candidate
-next batch (pick one, keep it evidence-backed + lineage-preserving):
-- Alert lifecycle: open->ack->resolve per fired alert (alerting::open_alert_lifecycle
-  / acknowledge_alert / resolve_alert), persisted; routes to transition + list state.
-- Dedup: deduplicate_alert_stream / compute_alert_dedup_key on re-evaluation windows.
-- Severity classification: classify_alert_severity with AlertSeverityEvidence from
-  finding metrics (z_score / deficit) instead of a static rule severity.
-Pattern: geo_hub/src/alert_evaluation.rs + tests/alert_evaluation.rs; add a state
-column/table or a new module. Then TB-C3, then Track D (copilot proposals +
-unified queue), E (governed dispatch: dispatch_collaboration_mission_plan_route
--> guarded_dispatch). Per-batch gate: cargo test -p geo_hub --test <new> --test
-workspace_static; 15 products_api acceptance tests remain pre-existing known-red
-(183 pass).
+- TB-C2 (cace70e): alert lifecycle.
+  geo_hub/src/alert_lifecycle.rs persists fired->acknowledged->resolved per alert
+  via alerting::{open_alert_lifecycle,acknowledge_alert,resolve_alert} (engine
+  enforces order + idempotency). New alert_lifecycle table (state + transition
+  log); alert_evaluation::get_fired_alert reconstructs FiredAlertRecord. Routes
+  GET /api/alerts/:id/lifecycle, POST .../acknowledge, POST .../resolve
+  { actor_id }. tests/alert_lifecycle.rs 4 pass. Web: alerts.js state tag +
+  Ack/Resolve buttons; api.js alertLifecycle/alertAcknowledge/alertResolve.
+
+## Next action (TB-C3) — final Track C step
+Pick one remaining `alerting` capability, evidence-backed + lineage-preserving:
+- RECOMMENDED: evidence-based severity via alerting::classify_alert_severity —
+  build AlertSeverityEvidence from finding metrics (anomaly z_score, water deficit
+  mm) with warning/critical/emergency thresholds; store classified_severity +
+  evidence on the alert (new columns or a classification table), overriding the
+  static rule severity. Acceptance: a high-z anomaly classifies emergency; a
+  marginal one warning; classification persisted + surfaced.
+- OR dedup (deduplicate_alert_stream/compute_alert_dedup_key), routing
+  (route_alert_to_recipients + evaluate_alert_preference), or no-ack escalation
+  (evaluate_no_ack_escalation).
+Pattern: geo_hub/src/alert_evaluation.rs + alert_lifecycle.rs + their tests. Then
+Track D (copilot proposals + unified queue), E (governed dispatch:
+dispatch_collaboration_mission_plan_route -> guarded_dispatch). Per-batch gate:
+cargo test -p geo_hub --test <new> --test workspace_static; 15 products_api
+acceptance tests remain pre-existing known-red (183 pass).
 
 ## (historical) Phase A next action
 Track B (consumption layers) — Track A backbone is complete. Start Phase A (web
