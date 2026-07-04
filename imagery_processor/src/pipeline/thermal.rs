@@ -593,8 +593,11 @@ async fn process_one(metadata_file: &PathBuf, args: &ThermalArgs) -> AgroResult<
     // Emit the L2 product-record sidecar next to the thermal output (Track A
     // phase 7b). Inputs are the identity-bearing thermal band refs.
     let thermal_scene = image.image_id.to_string();
-    let mut thermal_inputs =
-        vec![crate::product_sidecar::band_input_ref(&thermal_scene, "thermal", &args.thermal_band)];
+    let mut thermal_inputs = vec![crate::product_sidecar::band_input_ref(
+        &thermal_scene,
+        "thermal",
+        &args.thermal_band,
+    )];
     if let Some(band2) = &args.thermal_band2 {
         thermal_inputs.push(crate::product_sidecar::band_input_ref(
             &thermal_scene,
@@ -609,7 +612,10 @@ async fn process_one(metadata_file: &PathBuf, args: &ThermalArgs) -> AgroResult<
         thermal_inputs,
         Some(spatial_ref.clone()),
         &image.metadata.timestamp.to_rfc3339(),
-        args.mask.as_ref().map(|path| path.to_string_lossy()).as_deref(),
+        args.mask
+            .as_ref()
+            .map(|path| path.to_string_lossy())
+            .as_deref(),
         None,
     );
     let thermal_sidecar_draft = crate::product_sidecar::draft_from_evidence(

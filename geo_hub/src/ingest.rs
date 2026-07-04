@@ -881,6 +881,7 @@ pub async fn ensure_product(pool: &DbPool, scene_id: &str, kind: &str) -> Result
         band_overrides: Vec::new(),
         out_format: OutputFormat::Png,
         sensor,
+        sensor_profile: imagery_processor::SensorProfileArg::None,
         mask: None,
     };
 

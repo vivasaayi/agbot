@@ -1,0 +1,9 @@
+[package]
+name = "raster_io"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+shared = { path = "../shared" }
+thiserror = { workspace = true }
+tiff = "0.10"

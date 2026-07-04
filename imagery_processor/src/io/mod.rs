@@ -1,5 +1,6 @@
 #[cfg(feature = "gdal-io")]
 pub mod gdal_util;
+pub mod geotiff_ingest;
 
 use crate::{IndicesArgs, SensorPreset};
 use chrono::{DateTime, Utc};
@@ -18,7 +19,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-const DEFAULT_VALID_PIXEL_FLOOR: f32 = 0.95;
+pub(crate) const DEFAULT_VALID_PIXEL_FLOOR: f32 = 0.95;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct BandOverrides {
@@ -107,6 +108,9 @@ pub struct RadiometricCalibrationEvidence {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum CalibrationStatus {
     CalibratedReflectance,
+    /// Thermal products calibrated to surface temperature in Kelvin
+    /// (e.g. Landsat C2 L2 ST: K = DN * 0.00341802 + 149.0).
+    CalibratedTemperatureKelvin,
     UncalibratedDn,
 }
 
@@ -686,7 +690,7 @@ fn inspect_band_grids(
     Ok(band_grids)
 }
 
-fn sensor_name(sensor: SensorPreset) -> &'static str {
+pub(crate) fn sensor_name(sensor: SensorPreset) -> &'static str {
     match sensor {
         SensorPreset::Sentinel2 => "sentinel2",
         SensorPreset::Landsat8 => "landsat8",
