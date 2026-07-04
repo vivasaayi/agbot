@@ -176,17 +176,62 @@ alert->finding->L2->L0 gap-free. Unused alerting fns remain for later: dedup,
 routing (route_alert_to_recipients/evaluate_alert_preference), escalation
 (evaluate_no_ack_escalation), delivery adapters.
 
-## Next action (TB-D2) — copilot advisor rules + proposal adapters
-- TB-D1 committed (21c29a2): geo_hub/src/proposal_queue.rs unified accept/reject
-  queue; ArtifactKind::Proposal + provenance_store::get_lineage; proposals table;
-  routes list/field/get/accept/reject; 3 tests. Proposals lineage-close to L0.
-- TB-D2: deterministic advisor rules (copilot crate, pure, no LLM):
-  evaluate_water_stress_rule / evaluate_pest_hotspot_rule producing proposal
-  drafts. Funnel existing CropClosedLoopProposal + copilot drafts into
-  proposal_queue::create_proposal; extend CropClosedLoopApprovalStatus beyond its
-  Pending stub. Approved proposals also materialize as RecommendationRecords.
-  TDD-first. Then D3 workspace review UI, D4 adapters; Track E governed dispatch
-  (wire dispatch_collaboration_mission_plan_route -> guarded_dispatch).
+## TRACK D (proposals) COMPLETE (TB-D1..D4)
+- TB-D1 (21c29a2): geo_hub/src/proposal_queue.rs unified accept/reject queue;
+  ArtifactKind::Proposal + provenance_store::get_lineage; proposals table; routes
+  list/field/get/accept/reject; 3 tests. Proposals lineage-close to L0.
+- TB-D2 (bdf45b5): copilot/src/advisor_rules.rs pure deterministic evaluators
+  (evaluate_water_stress_rule, evaluate_pest_hotspot_rule) -> AdvisorProposal
+  drafts; RemedyKind::action_category. 5 tests.
+- TB-D3 (0377855): web/js/panels/proposals.js field proposal queue with
+  accept/reject (reviewer identity); api.js proposal endpoints; catalog passes
+  fieldId. workspace_static 5.
+- TB-D4 (be8f70c): geo_hub/src/proposal_adapters.rs funnels advisor +
+  CropClosedLoopProposal drafts into the queue (finding-sourced); accepted ->
+  RecommendationRecord (author copilot-advisor). CropClosedLoopApprovalStatus
+  extended (Approved/Rejected + parse). 8 tests.
+
+## TRACK E (governed dispatch) COMPLETE (TB-E1..E4)
+- TB-E1 (1d367b0): geo_hub/src/proposal_mission.rs draft_mission_for_proposal —
+  accepted proposal -> inert MissionPlanDraft (action->MissionKind; desk work not
+  flyable; dispatch_authorized always false). 5 tests.
+- TB-E2 (5baee74): same module — dry_run_mission_dispatch + authorize_mission_
+  dispatch. Separation of duties: operator != accepting reviewer; dispatch_
+  authorized flips true only on distinct affirmative approval. 4 tests.
+- TB-E3 (9a003a1): geo_hub/src/proposal_dispatch.rs governed_dispatch — refuse
+  unless dispatch_authorized (no token/flag bypass), invoke mission_planner::
+  dispatch_guarded_simulation_command, append Action lineage (action:<draft_id>
+  <- source_proposal_id). geo_hub gains mission_planner dep. 3 unit + 2 e2e tests
+  (tests/governed_dispatch.rs: accepted->draft->approve->guarded dispatch, Action
+  traces to L0; unauthorized never dispatches).
+- TB-E4 (d1d48e4): ground_station_ui/src/dispatch_advisory.rs read-only operator
+  advisory (stages: awaiting_review/rejected/accepted_no_mission/awaiting_operator
+  _approval/dispatch_authorized/blocked_operator_conflict). Advisory only — never
+  dispatches; reflects separation-of-duties block. 6 tests.
+
+## Track A wiring follow-ons
+- TA-09b (8f84fa6): post_processor AnalysisResult::to_product_draft +
+  ResultType::product_kind — analysis result self-describes as an L3 draft
+  (delegates to l3_draft_from_request; identity invariant preserved). 2 tests.
+- REMAINING (next batch, a coherent live-route wiring set):
+  - TA-07b: the imagery sidecar API (product_sidecar::draft_from_evidence +
+    write_product_sidecar) is DANGLING (no callers). Wire it into the live
+    pipelines (indices.rs process_one ~line 549-596 builds reproducibility +
+    out_path; call draft_from_evidence+write_product_sidecar before meta move).
+    Design decision: how to derive L1 input refs + ProductScope in the CLI path
+    (no catalog product ids there — derive from evidence.resolved_bands + image_id
+    scene). Also masks/thermal/classify.
+  - TA-05b: route live landsat/Sentinel ingest through commit_ingest.
+  - TA-10b: Finding/Recommendation/Report lineage from live geo_hub create routes
+    + lidar_mapper sidecars.
+  Then full-workspace `cargo check` (use CARGO_INCREMENTAL=0; disk tight) +
+  `just gis-test`.
+
+## Disk note
+Build ran target/ to 100% (No space left on device). Recovered by removing
+target/debug/incremental (24G) — NOT cargo clean; built rlibs in target/debug/deps
+preserved. Use CARGO_INCREMENTAL=0 on cargo runs to avoid regrowth (~18G free).
+
 Per-batch gate: cargo test -p <crate> targeted + workspace_static; 15
 products_api acceptance tests remain pre-existing known-red (183 pass).
 
