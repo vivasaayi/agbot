@@ -19,6 +19,7 @@ pub mod mission_audit;
 pub mod mission_export;
 pub mod mission_optimizer;
 pub mod preflight_checklist;
+pub mod proposal_mission;
 pub mod survey_template;
 pub mod telemetry;
 pub mod waypoint;
