@@ -4,23 +4,58 @@
 import { productTilesUrlTemplate } from "./api.js";
 
 let map = null;
+let compareMap = null;
 const productLayers = new Map(); // "sceneId::kind" -> L.TileLayer
 
-/** Initialize the Leaflet map on `element`. Idempotent. */
-export function initMap(element) {
-  if (map) return map;
-  const L = window.L;
-  map = L.map(element, { center: [40.0, -100.0], zoom: 4, worldCopyJump: true });
-  // A neutral offline-friendly backdrop; product tiles overlay on top. No
-  // external basemap is loaded (field deployments are offline).
-  L.rectangle(
+function backdrop(target) {
+  window.L.rectangle(
     [
       [-85, -180],
       [85, 180],
     ],
     { color: "#2c313a", weight: 0, fillColor: "#12141a", fillOpacity: 1 },
-  ).addTo(map);
+  ).addTo(target);
+}
+
+/** Initialize the primary Leaflet map on `element`. Idempotent. */
+export function initMap(element) {
+  if (map) return map;
+  map = window.L.map(element, { center: [40.0, -100.0], zoom: 4, worldCopyJump: true });
+  // A neutral offline-friendly backdrop; product tiles overlay on top. No
+  // external basemap is loaded (field deployments are offline).
+  backdrop(map);
   return map;
+}
+
+/** Initialize (or return) the compare-pane map on `element`. */
+export function initCompareMap(element) {
+  if (compareMap) return compareMap;
+  compareMap = window.L.map(element, { center: [40.0, -100.0], zoom: 4, worldCopyJump: true });
+  backdrop(compareMap);
+  return compareMap;
+}
+
+/** The compare-pane map instance (null before initCompareMap). */
+export function getCompareMap() {
+  return compareMap;
+}
+
+/**
+ * Keep two maps' center/zoom in lock-step. A guard flag prevents the echo that
+ * would otherwise bounce a `move` event back and forth between the panes.
+ */
+export function syncMaps(a, b) {
+  let syncing = false;
+  const link = (src, dst) => {
+    src.on("move", () => {
+      if (syncing) return;
+      syncing = true;
+      dst.setView(src.getCenter(), src.getZoom(), { animate: false });
+      syncing = false;
+    });
+  };
+  link(a, b);
+  link(b, a);
 }
 
 function layerKey(sceneId, kind) {
@@ -67,6 +102,25 @@ export function setProductLayerOpacity(sceneId, kind, opacity) {
 /** True when the given scene/kind layer is currently shown. */
 export function hasProductLayer(sceneId, kind) {
   return productLayers.has(layerKey(sceneId, kind));
+}
+
+let compareLayer = null;
+
+/** Show a single product tile layer in the compare pane (replaces any prior). */
+export function setCompareProductLayer(sceneId, kind, opacity = 1.0) {
+  if (!compareMap) return;
+  if (compareLayer) {
+    compareMap.removeLayer(compareLayer);
+    compareLayer = null;
+  }
+  compareLayer = window.L.tileLayer(productTilesUrlTemplate(sceneId, kind), {
+    opacity,
+    tileSize: 256,
+    minZoom: 0,
+    maxZoom: 22,
+    noWrap: true,
+  });
+  compareLayer.addTo(compareMap);
 }
 
 /** The Leaflet map instance (null before initMap). */

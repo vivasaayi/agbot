@@ -6,10 +6,21 @@ import { renderLayersPanel } from "./panels/layers.js";
 import { renderAnnotationsPanel } from "./panels/annotations.js";
 import { renderRecommendationsPanel } from "./panels/recommendations.js";
 import { renderProvenancePanel } from "./panels/provenance.js";
+import { setupCompare } from "./panels/compare.js";
 import { initMap } from "./map.js";
 
 function bootstrap() {
-  initMap(document.getElementById("map"));
+  initMap(document.getElementById("map-primary"));
+  setupCompare(
+    document.getElementById("compare-toggle"),
+    document.getElementById("map-compare"),
+    {
+      wrapper: document.getElementById("compare-controls"),
+      form: document.getElementById("compare-controls"),
+      input: document.getElementById("compare-scene"),
+      status: document.getElementById("compare-status"),
+    },
+  );
   const tree = document.getElementById("catalog-tree");
   const detail = document.getElementById("scene-detail");
   const layers = document.getElementById("layers-panel");

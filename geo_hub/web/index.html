@@ -85,10 +85,66 @@
       background: var(--bg);
       border-right: 1px solid var(--panel-border);
       min-height: 0;
+      display: flex;
+    }
+
+    #map-primary,
+    #map-compare {
+      flex: 1;
+      min-width: 0;
+    }
+
+    #map-compare {
+      border-left: 1px solid var(--panel-border);
+    }
+
+    #map-compare[hidden] {
+      display: none;
     }
 
     .leaflet-container {
       background: #12141a;
+    }
+
+    .compare-toggle {
+      margin-left: auto;
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--panel-border);
+      border-radius: 3px;
+      padding: 0.2rem 0.6rem;
+      cursor: pointer;
+      font-size: 0.78rem;
+    }
+
+    .compare-toggle.active {
+      color: var(--accent);
+      border-color: var(--accent);
+    }
+
+    .compare-controls {
+      display: flex;
+      gap: 0.3rem;
+      align-items: center;
+    }
+
+    .compare-controls input {
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--panel-border);
+      border-radius: 3px;
+      padding: 0.2rem 0.4rem;
+      font-size: 0.78rem;
+    }
+
+    .compare-controls button {
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--panel-border);
+      border-radius: 3px;
+      padding: 0.2rem 0.5rem;
+      cursor: pointer;
+      font-size: 0.75rem;
     }
 
     .layer-row {
@@ -263,6 +319,12 @@
   <header>
     <h1>AGBot Workspace</h1>
     <span class="badge">geo_hub</span>
+    <button id="compare-toggle" class="compare-toggle">Compare</button>
+    <form id="compare-controls" class="compare-controls" hidden>
+      <input id="compare-scene" type="text" placeholder="compare scene id" />
+      <button type="submit">Load</button>
+      <span id="compare-status" class="status"></span>
+    </form>
   </header>
   <main>
     <section class="pane" id="catalog" aria-label="Catalog">
@@ -271,7 +333,10 @@
         <p class="status">Loading fields…</p>
       </div>
     </section>
-    <section id="map" aria-label="Map"></section>
+    <section id="map" aria-label="Map">
+      <div id="map-primary"></div>
+      <div id="map-compare" hidden></div>
+    </section>
     <section class="pane" id="inspector" aria-label="Inspector">
       <h2>Inspector</h2>
       <div class="tabs">
