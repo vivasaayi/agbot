@@ -95,7 +95,32 @@ sidecars).
 return 500 on main and every commit — PRE-EXISTING, unrelated to refactor. Not a
 gate. Per-batch verification uses targeted tests + the batch's own test file.
 
-## Next action
+## Track B Phase B (applications) progress
+- TB-B1 (9e179cf): application_runs + findings with provenance (record_run).
+- TB-B2 (2420580): crop_health_app pure composition in post_processor.
+- TB-B3 (7ab05dc): crop_health run trigger + findings panel.
+  Server: geo_hub/src/crop_health_run.rs maps post_processor CropHealthFinding
+  -> ApplicationFinding, records via applications::record_run (new geo_hub->
+  post_processor dep). Route POST /api/applications/crop-health/runs. Run inputs
+  = dedup union of zones' cataloged L2/L3 ids; lineage per-finding to those.
+  kind: declining_zone / unhealthy_zone / healthy_zone; severity from priority.
+  tests/crop_health_run.rs 2 pass (two-scene declining+lineage, reject uncataloged).
+  Web: web/js/panels/findings.js (list field findings + run-trigger form that
+  resolves the field's L2 NDVI products as inputs); api.js fieldFindings +
+  cropHealthRuns; app.js/index.html wired. workspace_static 5 green.
+
+## Next action (TB-B4)
+water_priority application run: add a post_processor water/moisture composition
+(or reuse an existing index/zone stat) -> ApplicationFindings via
+applications::record_run under app_id `water_priority`; new geo_hub route +
+acceptance test (lineage to L2/L3). Then TB-B5 anomaly->alert (bridges to Track C
+alert_evaluation). The generic findings panel already lists any field finding;
+extend the run-trigger to pick an app if water_priority needs distinct inputs.
+Pattern to copy: geo_hub/src/crop_health_run.rs + tests/crop_health_run.rs.
+Per-batch gate: cargo test -p geo_hub --test <new> --test workspace_static; the
+15 products_api acceptance tests remain pre-existing known-red (183 pass).
+
+## (historical) Phase A next action
 Track B (consumption layers) — Track A backbone is complete. Start Phase A (web
 workspace), which is independent and reuses existing geo_hub endpoints + the new
 `GET /api/catalog/products`:
