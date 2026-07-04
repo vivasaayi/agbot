@@ -6892,9 +6892,20 @@ fn decode_field_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<FieldRecord> 
     let boundary = serde_json::from_str::<FieldBoundary>(&boundary_json).map_err(|err| {
         AppError::Anyhow(anyhow::Error::new(err).context("failed to decode field boundary_json"))
     })?;
-    let validated_boundary =
-        validate_field_boundary(&boundary).map_err(|err| AppError::Anyhow(Error::new(err)))?;
-    let extent = validated_boundary.extent;
+    // Read tolerates whatever the (lenient) create path accepted: `build_field_record`
+    // requires only >= 3 in-range coordinates and does not require a CRS or a closed
+    // ring. Re-running the strict `validate_field_boundary` here would 500 on those
+    // loosely-specified-but-accepted boundaries, so instead compute the extent
+    // directly from the stored coordinates, mirroring the create path.
+    let extent = bounds_from_points(&boundary.coordinates).unwrap_or(GeoBounds {
+        min_lon: 0.0,
+        min_lat: 0.0,
+        max_lon: 0.0,
+        max_lat: 0.0,
+    });
+    // Compute the area with the same lenient shoelace the strict validator uses,
+    // so consumers (e.g. demand-forecast field evidence) still get a real area.
+    let area_ha = shared::schemas::polygon_area_hectares(&boundary.coordinates);
 
     Ok(FieldRecord {
         farm_id: row.get("farm_id"),
@@ -6902,7 +6913,7 @@ fn decode_field_record(row: &sqlx::sqlite::SqliteRow) -> AppResult<FieldRecord> 
         org_id: row.get("owner"),
         owner: row.get("owner"),
         name: row.get("name"),
-        area_ha: Some(validated_boundary.area_ha),
+        area_ha: Some(area_ha),
         crop: row.get("crop"),
         season: row.get("season"),
         notes: row.get("notes"),

@@ -17061,7 +17061,10 @@ fn point_on_segment(start: &GeoPoint, point: &GeoPoint, end: &GeoPoint) -> bool 
         && point.latitude <= start.latitude.max(end.latitude) + 1e-12
 }
 
-fn polygon_area_hectares(points: &[GeoPoint]) -> f64 {
+/// Shoelace polygon area in hectares. Lenient — works on any coordinate ring
+/// (open or closed), so read paths can compute a field's area without re-running
+/// the strict boundary validation the write path already gated on.
+pub fn polygon_area_hectares(points: &[GeoPoint]) -> f64 {
     let mean_latitude =
         points.iter().map(|point| point.latitude).sum::<f64>() / points.len() as f64;
     let meters_per_degree_lat = 111_320.0;
