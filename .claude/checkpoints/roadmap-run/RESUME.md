@@ -53,12 +53,30 @@ Plan: /Users/rajanpanneerselvam/Docs/AGBOT/refactor.md (reviewed + expanded 2026
 - TA-08 committed (4b50225): catalog register/read API + sidecar CLI.
   POST/GET `/api/catalog/products` (+ `/:id`) with farm/field/season/scene/
   source/level/kind/status/temporal/bbox filters; `catalog::register_sidecar_dir`
-  (dependency-ordered, idempotent, retry-defer loop) + `geo_hub catalog register
-  <dir>` CLI. RegisteredProduct is Serialize. 3 tests (filters, unknown-input
-  400, sidecar dependency order). All prior suites green.
+  (dependency-ordered, idempotent) + `geo_hub catalog register <dir>` CLI.
+  RegisteredProduct is Serialize. 3 tests.
+- TA-09 committed (3f91cd6): `post_processor/src/l3_product.rs` (to_l3_draft /
+  l3_draft_from_request; L3 inputs = L2 catalog ids; confidence_from_uncertainty).
+  `geo_hub/tests/l0_to_l3_trace.rs`: L0->L1->L2->L3 register + trace_backward
+  reaches L0. 4 tests. Per-module wiring -> TA-09b.
+- TA-10 committed (b6855d1): `ingest_contract::register_source_stub` (weather/
+  iot/equipment sources); `geo_hub/tests/downstream_lineage.rs`: Report traces
+  L0->L1->L2->L3->Finding->Recommendation->Report gap-free (7 records). 2 tests.
+  Recommendation/report live-route lineage + lidar sidecars -> TA-10b.
 
-Track A 1->2->3->4->5(contract)->6->7(mapping)->8 done. Next: TA-09 (post_processor
-L3 productization) or TA-05b/TA-07b wiring or Track B.
+## TRACK A DATA BACKBONE COMPLETE (TA-01..TA-10)
+The declared Phase-0 blocker is done: product graph contract, catalog schema +
+registry, provenance ledger write path + trace API, legacy dual-write bridge,
+normalized ingest (satellite contract + drone route), imagery L1/L2 sidecar
+mapping, catalog register/read API + CLI, L3 productization, downstream lineage
+closure + source stubs. Every layer TDD-tested; full L0->Report trace gap-free.
+
+Open Track A wiring follow-ons (mechanical, non-blocking, split out to keep the
+retry/pipeline hot paths stable): TA-05b (route live landsat/Sentinel through
+commit_ingest), TA-07b (call write_product_sidecar in live run_indices/masks/
+thermal), TA-09b (per-analysis-module to_product_draft call sites), TA-10b
+(Finding/Recommendation/Report lineage from the live create routes + lidar
+sidecars).
 
 ## Known-red (user decision: proceed, track separately)
 ~15 geo_hub products_api acceptance tests (farm/field CRUD, shapefile, geojson)
@@ -66,16 +84,23 @@ return 500 on main and every commit — PRE-EXISTING, unrelated to refactor. Not
 gate. Per-batch verification uses targeted tests + the batch's own test file.
 
 ## Next action
-TA-09: post_processor L3 productization. `AnalysisJobRequest` gains
-`input_product_ids`; each analysis module (ndvi trend, health, thermal anomaly,
-LiDAR change, index anomaly/trend, zonal stats, zone delineation/priority) gains
-`to_product_draft()` producing an L3 ProductRecordDraft whose `inputs` are the L2
-catalog product ids (identity invariant!); confidence from HealthUncertaintyBand
-where present; `zone_recommendations` stays a Recommendation but records L3
-inputs in lineage. Integration test: L3 draft -> register -> trace_backward
-reaches the satellite scene's L0. Needs TA-08 (done). TDD-first
-(`post_processor` tests + a geo_hub trace test). Alternatives: TA-05b / TA-07b
-wiring, or a Track B phase (TB-A2 catalog tree).
+Track B (consumption layers) — Track A backbone is complete. Start Phase A (web
+workspace), which is independent and reuses existing geo_hub endpoints + the new
+`GET /api/catalog/products`:
+- TB-A2: catalog tree panel (farms -> fields -> scenes) + scene detail in
+  `geo_hub/web/js/panels/catalog.js`, wired through `api.js`. Route-manifest test
+  asserts api.js URL literals are all registered (extend batch-A1 test; also
+  forbid non-api.js panel files from hardcoding `/api/` literals).
+- Then TB-A3 map/tile layers, A4 annotations, A5 recommendations/reports+lineage,
+  A6 provenance inspector (uses TA-03 trace API), A7 compare mode.
+- Then Phase B (application_runs + crop_health_app), C (alert_evaluation),
+  D (copilot proposals + unified queue), E (governed dispatch: wire
+  dispatch_collaboration_mission_plan_route -> guarded_dispatch).
+Web is static no-bundler HTML+ESM+vendored Leaflet under `geo_hub/web/`, served
+at `/workspace` (TB-A1 done). Tests are Rust-side (workspace_static + route
+manifest). Per-batch: cargo test -p <crate> targeted, then just gis-test.
+NOTE known-red: ~15 geo_hub products_api acceptance tests fail pre-existing
+(farm/field CRUD, shapefile, geojson) — not a gate; 183 others pass.
 
 ## Resume protocol
 Read CLAUDE.md + this file + checkpoint.sqlite. Verify `git status --short`,
