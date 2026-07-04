@@ -208,17 +208,24 @@ Multi-batch (needs external data; user authorized acquisition).
 - Extend Gate 5 with executed-trajectory metrics (tracking error, controller
   smoothness) on top of the path-level metrics already gated.
 
-### M7 — Fixed-wing validation + weather/atmosphere — ⬜ NOT STARTED
-Greenfield (no weather/atmosphere/ephemeris module exists yet). Sequenced sub-steps:
+### M7 — Fixed-wing validation + weather/atmosphere — 🚧 IN PROGRESS
 
-**Batch 1 — flight-dynamics validation harness**
-- Adopt **AIAA S-119** variable naming for the fixed-wing state/force log
-  (`vehicles/FixedWingModel` already produces the state; add a named-channel logger).
-- Encode **NASA 6-DOF check cases** as fixtures; add a `cessna_tests`-style suite that
-  replays fixed IC + control inputs and compares trajectory channels within tolerance.
-- First-class acceptance cases: trimmed flight, coordinated turn, crosswind response,
-  climb/descent, **stall entry/recovery** (tie stall to critical AoA + load factor,
-  not airspeed alone). Deterministic replay asserted.
+**Batch 1 — flight-dynamics validation harness — ✅ DONE (commit 907d667)**
+- `vehicles/FlightRecorder`: AIAA/ANSI S-119-flavored named flight-state records
+  (trueAirspeed, angleOfAttack, angleOfSideslip, eulerAngle_phi/theta/psi,
+  bodyAngularRate_p/q/r, ...), CSV header/row, and a quantized deterministic
+  `flight_log_hash`.
+- `vehicles/FlightCheckCase`: NASA-6DOF-style check cases (fixed IC + scripted
+  open-loop control deltas from trim, fixed step) → S-119 trajectory log + summary
+  metrics. Standard pack: trimmed cruise, banked turn, climb, descent, crosswind,
+  stall entry/recovery.
+- `FixedWingModel.set_wind`: aerodynamics act on air-relative velocity, so a
+  crosswind induces sideslip (default still air; existing cessna tests unchanged).
+- **Gate 6** (`agbot_flight_checkcase_tests`): every case replays byte-identically
+  (log hash) and meets its analytic predicate — trim holds altitude/airspeed/heading,
+  the banked turn reaches >15° bank / >20° heading change, climb/descent gain/lose
+  altitude, a 12 m/s crosswind induces >2° sideslip, and the stall exceeds the stall
+  AoA, drops altitude, and recovers airspeed after power + release.
 
 **Batch 2 — deterministic weather presets**
 - Weather-preset schema (UTC timestamp, sun/moon ephemeris inputs, visibility, cloud
@@ -250,10 +257,10 @@ Greenfield (no weather/atmosphere/ephemeris module exists yet). Sequenced sub-st
 
 ## 5. Immediate next step
 
-M1–M5, M3-batch-3, and M6 batches 1–2 are done and committed (sensor-derived
-occupancy now cross-checks the compiled footprints at precision 1.0). Two tracks
-remain: **M6 batch 3** — wire the full `NavigationPipeline` (global → MPPI local →
-recovery) to *execute* a trajectory over the sensor costmap and fold in LiDAR hits;
-and **M7** — fixed-wing 6-DOF validation → deterministic weather presets → atmosphere.
-Recommend M7 next (larger, greenfield, unblocks the flight-dynamics gate), with M6
-batch 3 as a parallel autonomy-depth track.
+M1–M5, M3-batch-3, M6 batches 1–2, and **M7 batch 1** (flight-dynamics validation +
+Gate 6) are done and committed. Remaining: **M7 batch 2** — deterministic weather
+presets (UTC, sun/moon ephemeris, visibility, cloud layers, wind ground+aloft, precip,
+temp/pressure, wetness) feeding the model's wind and, later, the atmosphere; **M7
+batch 3** — analytic sky/atmosphere + night lighting; and **M6 batch 3** — full
+`NavigationPipeline` (global → MPPI → recovery) executing over the sensor costmap.
+Recommend M7 batch 2 next (builds directly on the new `set_wind` primitive).
