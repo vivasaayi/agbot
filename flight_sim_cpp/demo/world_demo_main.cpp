@@ -634,6 +634,27 @@ int main(int argc, char** argv) {
             }
         }
         expect(coregistered, "Gate 4: depth and semantic layers are co-registered");
+
+        // Atmosphere (M7 b3) on the sensor render: preset-driven Preetham sky +
+        // aerial haze on RGB only. Depth/semantic (hence coverage) are untouched.
+        agbot::render::SkyParams sky;
+        sky.enabled = true;
+        const agbot::render::LightingState sky_light =
+            agbot::render::lighting_from_preset(lighting_preset);
+        sky.sun_dir = sky_light.sun_dir;
+        sky.turbidity = sky_light.turbidity;
+        sky.visibility_m = lighting_preset.visibility_m;
+        const auto sky_frame =
+            agbot::render::render_offscreen(world.scene, sensor_cam, 160, 120, {}, sky);
+        const auto sky_again =
+            agbot::render::render_offscreen(world.scene, sensor_cam, 160, 120, {}, sky);
+        expect(agbot::render::frame_hash(sky_frame) != agbot::render::frame_hash(frame),
+               "Gate 4: atmosphere changes the rendered RGB (sky + haze)");
+        expect(agbot::render::frame_hash(sky_frame) == agbot::render::frame_hash(sky_again),
+               "Gate 4: atmosphere-applied frame is deterministic");
+        expect(sky_frame.coverage_ratio() == frame.coverage_ratio(),
+               "Gate 4: atmosphere leaves depth/semantic coverage unchanged");
+
         if (failures != 0) {
             std::cout << failures << " failing checks\n";
             return 1;

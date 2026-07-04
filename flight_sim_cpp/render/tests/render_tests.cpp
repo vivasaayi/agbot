@@ -616,6 +616,37 @@ void test_offscreen_rasterizer() {
     check(frame_hash(occluded) != frame_hash(frame), "offscreen: occlusion changes the frame");
 }
 
+void test_offscreen_sky() {
+    using agbot::render::OffscreenCamera;
+    using agbot::render::render_offscreen;
+    using agbot::render::RenderScene;
+    using agbot::render::SkyParams;
+    RenderScene scene; // empty -> every pixel is background sky
+    OffscreenCamera cam;
+    cam.eye = {0.0F, 10.0F, 0.0F};
+    cam.target = {0.0F, 10.0F, -100.0F}; // look toward the horizon
+    cam.up = {0.0F, 1.0F, 0.0F};
+    SkyParams sky;
+    sky.enabled = true;
+    sky.sun_dir = {0.3F, 0.85F, 0.4F};
+    sky.turbidity = 2.5;
+
+    const auto f = render_offscreen(scene, cam, 64, 64, {}, sky);
+    check(!(f.rgb[0] == 30 && f.rgb[1] == 40 && f.rgb[2] == 60),
+          "offscreen sky: analytic sky replaces the flat background");
+    const auto px = [&](int x, int y, int c) {
+        return f.rgb[(static_cast<std::size_t>(y) * 64 + x) * 3 + c];
+    };
+    check(px(32, 2, 2) != px(32, 61, 2) || px(32, 2, 0) != px(32, 61, 0),
+          "offscreen sky: vertical gradient from zenith to horizon");
+    const auto g = render_offscreen(scene, cam, 64, 64, {}, sky);
+    check(agbot::render::frame_hash(f) == agbot::render::frame_hash(g),
+          "offscreen sky: deterministic");
+    const auto no_sky = render_offscreen(scene, cam, 64, 64);
+    check(no_sky.rgb[0] == 30 && no_sky.rgb[1] == 40 && no_sky.rgb[2] == 60,
+          "offscreen sky: default (disabled) keeps the flat background");
+}
+
 // --- M7 batch 3: atmosphere & lighting -------------------------------------
 
 void test_sun_direction() {
@@ -741,6 +772,7 @@ int main() {
     test_demo_scene();
     test_value_noise();
     test_offscreen_rasterizer();
+    test_offscreen_sky();
     test_sun_direction();
     test_preetham_sky();
     test_aerial_perspective();

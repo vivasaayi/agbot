@@ -33,17 +33,34 @@ struct SensorFrame {
     [[nodiscard]] double coverage_ratio() const;
 };
 
+// Optional atmosphere applied to the RGB channel after rasterization (depth and
+// semantic are untouched, so perception paths are unaffected). When enabled,
+// background/miss pixels get the Preetham analytic sky along their view ray, and
+// geometry pixels are blended toward the haze colour by aerial perspective.
+struct SkyParams {
+    bool enabled = false;
+    Vec3f sun_dir{0.0F, 1.0F, 0.0F}; // toward the sun (world frame)
+    double turbidity = 2.5;
+    double visibility_m = 20000.0;
+    float haze_r = 0.70F;
+    float haze_g = 0.75F;
+    float haze_b = 0.82F;
+    float exposure = 1.4F; // applied to the (relative) sky radiance only
+};
+
 // Rasterizes the scene's textured and static meshes into a SensorFrame with a
 // deterministic z-buffered CPU rasterizer. static_meshes[i] is written with
 // semantic id semantic_ids[i] (default i+1); textured meshes get ids 100+j and
 // flat shading. Determinism: fixed mesh/triangle/pixel iteration, integer edge
-// functions, perspective-correct depth.
+// functions, perspective-correct depth. When sky.enabled, atmosphere is applied
+// to RGB only.
 [[nodiscard]] SensorFrame render_offscreen(
     const RenderScene& scene,
     const OffscreenCamera& camera,
     int width,
     int height,
-    const std::vector<std::uint16_t>& semantic_ids = {});
+    const std::vector<std::uint16_t>& semantic_ids = {},
+    const SkyParams& sky = {});
 
 // FNV1a-64 over rgb + quantized depth (mm) + semantic; identical frames hash equal.
 [[nodiscard]] std::uint64_t frame_hash(const SensorFrame& frame);

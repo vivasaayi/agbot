@@ -1,5 +1,7 @@
 #include "agbot_render/OffscreenRenderer.hpp"
 
+#include "agbot_render/Atmosphere.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -103,6 +105,51 @@ void raster_triangle(SensorFrame& frame,
     }
 }
 
+// Apply the Preetham sky to background pixels and aerial-perspective haze to
+// geometry pixels, on the RGB channel only. Deterministic.
+void apply_sky_and_haze(SensorFrame& frame, const OffscreenCamera& camera, const SkyParams& sky) {
+    const Vec3f fwd = vec3_normalize(vec3_sub(camera.target, camera.eye));
+    const Vec3f right = vec3_normalize(vec3_cross(fwd, camera.up));
+    const Vec3f up = vec3_cross(right, fwd);
+    const float aspect = static_cast<float>(frame.width) / static_cast<float>(frame.height);
+    const float tan_half = std::tan(camera.fov_y_rad * 0.5F);
+    const Rgb haze{sky.haze_r, sky.haze_g, sky.haze_b};
+    const auto to_byte = [](float v) {
+        return static_cast<std::uint8_t>(std::clamp(v, 0.0F, 1.0F) * 255.0F + 0.5F);
+    };
+    for (int y = 0; y < frame.height; ++y) {
+        for (int x = 0; x < frame.width; ++x) {
+            const std::size_t idx = static_cast<std::size_t>(y) *
+                    static_cast<std::size_t>(frame.width) +
+                static_cast<std::size_t>(x);
+            const float depth = frame.depth[idx];
+            if (depth <= 0.0F) {
+                // Background: analytic sky along the pixel's view ray.
+                const float ndc_x =
+                    2.0F * (static_cast<float>(x) + 0.5F) / static_cast<float>(frame.width) - 1.0F;
+                const float ndc_y =
+                    1.0F - 2.0F * (static_cast<float>(y) + 0.5F) / static_cast<float>(frame.height);
+                const Vec3f view_dir = vec3_normalize(
+                    vec3_add(vec3_add(fwd, vec3_scale(right, ndc_x * aspect * tan_half)),
+                             vec3_scale(up, ndc_y * tan_half)));
+                const Rgb c = preetham_sky(view_dir, sky.sun_dir, sky.turbidity);
+                frame.rgb[idx * 3 + 0] = to_byte(c.r * sky.exposure);
+                frame.rgb[idx * 3 + 1] = to_byte(c.g * sky.exposure);
+                frame.rgb[idx * 3 + 2] = to_byte(c.b * sky.exposure);
+            } else {
+                // Geometry: haze the shaded colour toward the horizon by depth.
+                const Rgb surf{static_cast<float>(frame.rgb[idx * 3 + 0]) / 255.0F,
+                               static_cast<float>(frame.rgb[idx * 3 + 1]) / 255.0F,
+                               static_cast<float>(frame.rgb[idx * 3 + 2]) / 255.0F};
+                const Rgb hz = aerial_perspective(surf, haze, depth, sky.visibility_m);
+                frame.rgb[idx * 3 + 0] = to_byte(hz.r);
+                frame.rgb[idx * 3 + 1] = to_byte(hz.g);
+                frame.rgb[idx * 3 + 2] = to_byte(hz.b);
+            }
+        }
+    }
+}
+
 ClipVertex make_clip_vertex(const Mat4& view, const Mat4& view_proj, const Vec3f& pos,
                             float r, float g, float b) {
     ClipVertex out;
@@ -121,7 +168,8 @@ SensorFrame render_offscreen(const RenderScene& scene,
                              const OffscreenCamera& camera,
                              int width,
                              int height,
-                             const std::vector<std::uint16_t>& semantic_ids) {
+                             const std::vector<std::uint16_t>& semantic_ids,
+                             const SkyParams& sky) {
     SensorFrame frame;
     frame.width = std::max(width, 1);
     frame.height = std::max(height, 1);
@@ -183,6 +231,9 @@ SensorFrame render_offscreen(const RenderScene& scene,
         if (sem != 0) {
             ++frame.covered_pixels;
         }
+    }
+    if (sky.enabled) {
+        apply_sky_and_haze(frame, camera, sky);
     }
     return frame;
 }
