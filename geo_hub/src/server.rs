@@ -46,6 +46,18 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::get_catalog_product),
         )
         .route(
+            "/api/applications/:app_id/runs",
+            post(routes::create_application_run),
+        )
+        .route(
+            "/api/application-runs/:run_id",
+            get(routes::get_application_run),
+        )
+        .route(
+            "/api/fields/:field_id/findings",
+            get(routes::list_field_findings),
+        )
+        .route(
             "/api/farms",
             get(routes::list_farms).post(routes::create_farm),
         )

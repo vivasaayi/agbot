@@ -6718,6 +6718,54 @@ pub async fn get_catalog_product(
     Ok(Json(product))
 }
 
+fn application_error(err: crate::applications::ApplicationError) -> AppError {
+    use crate::applications::ApplicationError;
+    match err {
+        ApplicationError::InputNotFound(_) | ApplicationError::InputNotL2OrL3 { .. } => {
+            AppError::BadRequest(err.to_string())
+        }
+        other => AppError::Anyhow(Error::new(other)),
+    }
+}
+
+/// Record an application run (Track B phase B1): inputs must be cataloged L2/L3
+/// products; findings are persisted with provenance lineage.
+pub async fn create_application_run(
+    Path(app_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<crate::applications::ApplicationRunRequest>,
+) -> AppResult<Json<crate::applications::ApplicationRunRecord>> {
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let record = crate::applications::record_run(&state.pool, &app_id, &request, &now)
+        .await
+        .map_err(application_error)?;
+    Ok(Json(record))
+}
+
+/// Fetch an application run by id.
+pub async fn get_application_run(
+    Path(run_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<crate::applications::ApplicationRunRecord>> {
+    let run = crate::applications::get_run(&state.pool, &run_id)
+        .await
+        .map_err(application_error)?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(run))
+}
+
+/// List an application's runs are looked up per field; findings for a field are
+/// the workspace-facing read.
+pub async fn list_field_findings(
+    Path(field_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<crate::applications::StoredFinding>>> {
+    let findings = crate::applications::list_field_findings(&state.pool, &field_id)
+        .await
+        .map_err(application_error)?;
+    Ok(Json(findings))
+}
+
 pub async fn list_provenance_audit_entries(
     Query(query): Query<ProvenanceAuditListQuery>,
     State(state): State<AppState>,

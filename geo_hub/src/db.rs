@@ -3153,6 +3153,67 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // Application runs + findings (Track B phase B1): governed analysis runs that
+    // consume cataloged L2/L3 products and emit findings with provenance.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS application_runs (
+            run_id TEXT PRIMARY KEY,
+            app_id TEXT NOT NULL,
+            org_id TEXT,
+            field_id TEXT,
+            input_product_ids_json TEXT NOT NULL,
+            params_json TEXT,
+            params_digest TEXT NOT NULL,
+            status TEXT NOT NULL,
+            output_finding_ids_json TEXT,
+            output_recommendation_ids_json TEXT,
+            provenance_id TEXT,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS application_findings (
+            finding_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            app_id TEXT NOT NULL,
+            field_id TEXT,
+            kind TEXT NOT NULL,
+            severity TEXT,
+            confidence REAL,
+            zone_geometry_json TEXT,
+            metrics_json TEXT,
+            evidence_refs_json TEXT,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_application_findings_field
+        ON application_findings(field_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_application_runs_app
+        ON application_runs(app_id, field_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     info!("database ready");
     Ok(())
 }

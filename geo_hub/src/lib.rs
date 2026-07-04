@@ -1,3 +1,4 @@
+pub mod applications;
 pub mod catalog;
 pub mod config;
 pub mod db;
