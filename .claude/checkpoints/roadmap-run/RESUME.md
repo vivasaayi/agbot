@@ -137,20 +137,33 @@ an app-picker run trigger over all three apps. Pattern (copy for new apps):
 post_processor/src/<app>_app.rs (pure) + geo_hub/src/<app>_run.rs (record_run
 mapping) + route + tests/<app>_run.rs + an APPS entry in web/js/panels/findings.js.
 
-## Next action (TB-C1) — Track C alerting
-Screen application findings into alerts. The anomaly app emits index_anomaly_zone
-findings and water_priority emits water_deficit_zone — these are the alert inputs.
-- Check the existing `alerting` crate (geo_hub already deps ../alerting) for an
-  Alert type / evaluation logic to reuse before writing new domain code.
-- Design an alert_evaluation module: read a field's stored findings
-  (applications::list_field_findings) + a rule set (by kind/severity) -> Alert
-  records persisted with lineage finding->alert (provenance_store::append_lineage,
-  ArtifactKind for alert if one exists, else add). New geo_hub route(s) +
-  acceptance (index_anomaly_zone finding -> alert; trace alert->finding->L2->L0
-  gap-free). Then Track D (copilot proposals + unified queue), E (governed
-  dispatch: wire dispatch_collaboration_mission_plan_route -> guarded_dispatch).
-Per-batch gate: cargo test -p geo_hub --test <new> --test workspace_static;
-15 products_api acceptance tests remain pre-existing known-red (183 pass).
+## Track C (alerting) progress
+- TB-C1 (1aacc92): alert evaluation over findings.
+  geo_hub/src/alert_evaluation.rs screens list_field_findings -> alerts via
+  alerting::evaluate_alert_rules; persists to new fired_alerts table with lineage
+  alert->finding (ArtifactKind::Alert added to provenance). Default ruleset:
+  index_anomaly_zone=critical, water_deficit_zone/declining_zone=warning.
+  Idempotent (alert id + lineage keyed by finding+rule). Routes POST
+  /api/fields/:field_id/alert-evaluation, GET /api/fields/:field_id/alerts.
+  tests/alert_evaluation.rs 3 pass. Web: panels/alerts.js (list + evaluate
+  trigger); api.js fieldAlerts/fieldAlertEvaluation.
+  Reusable alerting fns not yet used: deduplicate_alert_stream,
+  classify_alert_severity, route_alert_to_recipients, open/ack/resolve lifecycle.
+
+## Next action (TB-C2)
+Continue Track C using the `alerting` crate's remaining governed steps. Candidate
+next batch (pick one, keep it evidence-backed + lineage-preserving):
+- Alert lifecycle: open->ack->resolve per fired alert (alerting::open_alert_lifecycle
+  / acknowledge_alert / resolve_alert), persisted; routes to transition + list state.
+- Dedup: deduplicate_alert_stream / compute_alert_dedup_key on re-evaluation windows.
+- Severity classification: classify_alert_severity with AlertSeverityEvidence from
+  finding metrics (z_score / deficit) instead of a static rule severity.
+Pattern: geo_hub/src/alert_evaluation.rs + tests/alert_evaluation.rs; add a state
+column/table or a new module. Then TB-C3, then Track D (copilot proposals +
+unified queue), E (governed dispatch: dispatch_collaboration_mission_plan_route
+-> guarded_dispatch). Per-batch gate: cargo test -p geo_hub --test <new> --test
+workspace_static; 15 products_api acceptance tests remain pre-existing known-red
+(183 pass).
 
 ## (historical) Phase A next action
 Track B (consumption layers) — Track A backbone is complete. Start Phase A (web
