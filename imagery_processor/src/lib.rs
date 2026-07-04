@@ -607,6 +607,7 @@ pub mod pipeline {
 }
 
 pub mod io;
+pub mod product_sidecar;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum IndexStatisticsOutcome {
