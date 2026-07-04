@@ -1,6 +1,8 @@
 // Non-GL unit tests for agbot_render: Mat4 math, camera matrices,
 // scene file round-trip, and demo scene sanity. No GL context required.
 
+#include "agbot_flight_sim/WeatherPreset.hpp"
+#include "agbot_render/Atmosphere.hpp"
 #include "agbot_render/Camera.hpp"
 #include "agbot_render/DemoScene.hpp"
 #include "agbot_render/Mat4.hpp"
@@ -614,6 +616,114 @@ void test_offscreen_rasterizer() {
     check(frame_hash(occluded) != frame_hash(frame), "offscreen: occlusion changes the frame");
 }
 
+// --- M7 batch 3: atmosphere & lighting -------------------------------------
+
+void test_sun_direction() {
+    // Sun due south (azimuth 180) at 30 deg elevation: points +south is -Z?
+    // Repo north is +Z, azimuth clockwise from north, so az=180 => -Z.
+    agbot::flight_sim::SolarPosition sp;
+    sp.elevation_rad = 30.0 * 3.14159265358979323846 / 180.0;
+    sp.azimuth_rad = 3.14159265358979323846; // south
+    const Vec3f d = agbot::render::sun_direction(sp);
+    check(d.y > 0.4F && d.y < 0.6F, "sun_direction: 30 deg elevation gives y ~ 0.5");
+    check(d.z < -0.7F && std::fabs(d.x) < 1e-5F, "sun_direction: south azimuth points -Z");
+    const float len = std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+    check(std::fabs(len - 1.0F) < 1e-5F, "sun_direction: unit length");
+}
+
+void test_preetham_sky() {
+    using agbot::render::preetham_sky;
+    using agbot::render::Rgb;
+    // Sun high in the south-east; a clear daytime sky.
+    const Vec3f sun = agbot::render::sun_direction([] {
+        agbot::flight_sim::SolarPosition s;
+        s.elevation_rad = 1.1; // ~63 deg
+        s.azimuth_rad = 2.6;
+        return s;
+    }());
+    const Vec3f zenith{0.0F, 1.0F, 0.0F};
+    const Rgb sky = preetham_sky(zenith, sun, 2.5);
+    check(sky.b > sky.r && sky.b > 0.0F, "preetham: clear zenith sky is blue-dominant");
+
+    // Brighter looking toward the sun than away from it.
+    const Vec3f away{-sun.x, sun.y, -sun.z};
+    const float lum_near = preetham_sky(sun, sun, 2.5).g;
+    const float lum_away = preetham_sky(away, sun, 2.5).g;
+    check(lum_near > lum_away, "preetham: sky is brighter toward the sun");
+
+    // Determinism.
+    check(preetham_sky(zenith, sun, 2.5).b == sky.b, "preetham: deterministic");
+
+    // Night (sun below horizon) returns a dim sky.
+    const Vec3f night_sun{0.3F, -0.5F, 0.2F};
+    const Rgb night = preetham_sky(zenith, night_sun, 2.5);
+    check(night.r < 0.1F && night.g < 0.1F && night.b < 0.2F, "preetham: night sky is dim");
+}
+
+void test_aerial_perspective() {
+    using agbot::render::aerial_perspective;
+    using agbot::render::Rgb;
+    const Rgb surface{0.2F, 0.5F, 0.2F};
+    const Rgb haze{0.7F, 0.75F, 0.8F};
+    const Rgb close = aerial_perspective(surface, haze, 0.0, 10000.0);
+    check(std::fabs(close.r - surface.r) < 1e-6F, "aerial: distance 0 keeps the surface colour");
+    const Rgb mid = aerial_perspective(surface, haze, 5000.0, 10000.0);
+    check(mid.r > surface.r && mid.r < haze.r, "aerial: mid distance blends toward haze");
+    const Rgb far = aerial_perspective(surface, haze, 60000.0, 10000.0);
+    check(std::fabs(far.b - haze.b) < 0.05F, "aerial: far beyond visibility saturates to haze");
+}
+
+void test_lighting_from_preset() {
+    using agbot::render::lighting_from_preset;
+    const auto day = lighting_from_preset(agbot::flight_sim::preset_clear_noon());
+    check(day.sun_intensity > 0.5 && !day.artificial_lights_on,
+          "lighting: clear noon is bright with lamps off");
+    check(day.sun_dir.y > 0.5F, "lighting: noon sun is high");
+    const auto night = lighting_from_preset(agbot::flight_sim::preset_clear_night());
+    check(night.sun_intensity == 0.0 && night.artificial_lights_on,
+          "lighting: clear night is dark with lamps on");
+    // Hazier air raises the turbidity proxy.
+    const auto hazy = lighting_from_preset(agbot::flight_sim::preset_hazy_afternoon());
+    check(hazy.turbidity > day.turbidity, "lighting: hazy air has higher turbidity than clear");
+}
+
+void test_night_lights_from_roads() {
+    using agbot::render::night_lights_from_roads;
+    using agbot::render::NightLightingParams;
+    // A 400 m straight road along +X at ground level.
+    std::vector<std::vector<Vec3f>> roads = {
+        {Vec3f{0.0F, 0.0F, 0.0F}, Vec3f{400.0F, 0.0F, 0.0F}},
+        {Vec3f{0.0F, 0.0F, 50.0F}, Vec3f{400.0F, 0.0F, 50.0F}},
+    };
+    NightLightingParams p;
+    p.spacing_m = 40.0;
+    p.height_m = 8.0;
+    // Road 0 major (importance 1.0), road 1 minor (0.0).
+    const auto lights = night_lights_from_roads(roads, {1.0, 0.0}, p);
+    check(!lights.empty(), "night lights: lamps placed along roads");
+    // All lamps raised to the lamp height.
+    bool raised = true;
+    for (const auto& l : lights) {
+        if (std::fabs(l.position.y - 8.0F) > 1e-4F) {
+            raised = false;
+        }
+    }
+    check(raised, "night lights: lamps sit at the configured height");
+    // Major road is lit denser than the minor road.
+    int major = 0;
+    int minor = 0;
+    for (const auto& l : lights) {
+        if (std::fabs(l.position.z - 0.0F) < 1e-3F) {
+            ++major;
+        } else {
+            ++minor;
+        }
+    }
+    check(major > minor, "night lights: major roads are lit denser than minor roads");
+    check(night_lights_from_roads(roads, {1.0, 0.0}, p).size() == lights.size(),
+          "night lights: deterministic count");
+}
+
 } // namespace
 
 int main() {
@@ -631,6 +741,11 @@ int main() {
     test_demo_scene();
     test_value_noise();
     test_offscreen_rasterizer();
+    test_sun_direction();
+    test_preetham_sky();
+    test_aerial_perspective();
+    test_lighting_from_preset();
+    test_night_lights_from_roads();
 
     if (g_failures == 0) {
         std::printf("agbot_render_tests: all %d checks passed\n", g_checks);

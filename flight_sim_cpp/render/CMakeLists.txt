@@ -5,6 +5,7 @@
 
 add_library(agbot_render
     src/Module.cpp
+    src/Atmosphere.cpp
     src/Camera.cpp
     src/DemoScene.cpp
     src/OffscreenRenderer.cpp
