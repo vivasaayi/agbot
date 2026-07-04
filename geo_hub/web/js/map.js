@@ -68,3 +68,63 @@ export function setProductLayerOpacity(sceneId, kind, opacity) {
 export function hasProductLayer(sceneId, kind) {
   return productLayers.has(layerKey(sceneId, kind));
 }
+
+/** The Leaflet map instance (null before initMap). */
+export function getMap() {
+  return map;
+}
+
+let annotationLayer = null;
+
+function annotationGroup() {
+  if (!annotationLayer && map) {
+    annotationLayer = window.L.layerGroup().addTo(map);
+  }
+  return annotationLayer;
+}
+
+/** Remove all annotation markers from the map. */
+export function clearAnnotationMarkers() {
+  if (annotationLayer) {
+    annotationLayer.clearLayers();
+  }
+}
+
+/**
+ * Draw an annotation marker (point) or outline (polygon) on the map. Returns
+ * the created Leaflet layer, or null when the geometry is unsupported.
+ */
+export function addAnnotationMarker(annotation) {
+  const group = annotationGroup();
+  if (!group) return null;
+  const geometry = annotation.geometry;
+  const L = window.L;
+  if (geometry?.type === "point" && geometry.coordinate) {
+    const marker = L.marker([geometry.coordinate.latitude, geometry.coordinate.longitude]);
+    marker.bindTooltip(annotation.label ?? annotation.annotation_id ?? "annotation");
+    marker.addTo(group);
+    return marker;
+  }
+  if (geometry?.type === "polygon" && Array.isArray(geometry.coordinates)) {
+    const latlngs = geometry.coordinates.map((p) => [p.latitude, p.longitude]);
+    const poly = L.polygon(latlngs, { color: "#5b9e6f", weight: 2 });
+    poly.bindTooltip(annotation.label ?? annotation.annotation_id ?? "annotation");
+    poly.addTo(group);
+    return poly;
+  }
+  return null;
+}
+
+/**
+ * Capture the next single map click and invoke `callback({ latitude, longitude })`.
+ * Returns a cancel function.
+ */
+export function captureNextClick(callback) {
+  if (!map) return () => {};
+  const handler = (event) => {
+    map.off("click", handler);
+    callback({ latitude: event.latlng.lat, longitude: event.latlng.lng });
+  };
+  map.on("click", handler);
+  return () => map.off("click", handler);
+}

@@ -22,7 +22,21 @@ export const endpoints = {
   scene: "/api/scenes/:scene_id",
   catalogProducts: "/api/catalog/products",
   productTiles: "/api/scenes/:scene_id/products/:kind/tiles/:z/:x/:y.png",
+  sceneAnnotations: "/api/scenes/:scene_id/annotations",
+  sceneAnnotation: "/api/scenes/:scene_id/annotations/:annotation_id",
 };
+
+/** A scene's annotations collection (GET list / POST create). */
+export function sceneAnnotationsPath(sceneId) {
+  return `/api/scenes/${encodeURIComponent(sceneId)}/annotations`;
+}
+
+/** A single annotation (PUT update / DELETE). */
+export function sceneAnnotationPath(sceneId, annotationId) {
+  return `/api/scenes/${encodeURIComponent(sceneId)}/annotations/${encodeURIComponent(
+    annotationId,
+  )}`;
+}
 
 /**
  * Leaflet XYZ tile-url template for a scene product layer. Leaflet fills the

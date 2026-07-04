@@ -104,6 +104,36 @@
       width: 80px;
     }
 
+    .annotation-list {
+      list-style: none;
+      margin-top: 0.4rem;
+    }
+
+    .annotation-list li {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 0.2rem 0;
+      font-size: 0.8rem;
+    }
+
+    button.add-annotation,
+    button.link-button {
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--panel-border);
+      border-radius: 3px;
+      padding: 0.2rem 0.45rem;
+      cursor: pointer;
+      font-size: 0.75rem;
+    }
+
+    button.link-button {
+      color: #c96a5f;
+      border: none;
+      background: none;
+    }
+
     #inspector {
       border-right: none;
     }
@@ -193,6 +223,7 @@
         <span class="tab" data-tab="proposals">Proposals</span>
       </div>
       <div id="layers-panel"></div>
+      <div id="annotations-panel"></div>
       <div id="scene-detail">
         <p class="status">Select a scene to inspect it.</p>
       </div>
