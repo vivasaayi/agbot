@@ -64,6 +64,18 @@ Plan: /Users/rajanpanneerselvam/Docs/AGBOT/refactor.md (reviewed + expanded 2026
   L0->L1->L2->L3->Finding->Recommendation->Report gap-free (7 records). 2 tests.
   Recommendation/report live-route lineage + lidar sidecars -> TA-10b.
 
+## Track B Phase A (web workspace) progress
+- TB-A1 (47f6f10): /workspace static serving + shell + route-manifest test.
+- TB-A2 (5a17861): catalog tree panel (farms->fields->scenes + scene detail);
+  single-URL-file convention test added.
+- TB-A3 (f6bc734): Leaflet 1.9.4 vendored (web/vendor/leaflet); map.js tile-layer
+  factory over the product tile route; layers.js toggle/opacity per scene.
+- TB-A4 (8be8440): annotations.js read/write/link (click-to-place point, delete,
+  markers on map); map.js annotation-marker + captureNextClick helpers.
+Web pattern: all backend URLs in web/js/api.js (enforced by tests); panels in
+web/js/panels/; 5 workspace_static tests. Remaining Phase A: A5 recommendations+
+reports+lineage, A6 provenance inspector, A7 compare mode. Then B/C/D/E.
+
 ## TRACK A DATA BACKBONE COMPLETE (TA-01..TA-10)
 The declared Phase-0 blocker is done: product graph contract, catalog schema +
 registry, provenance ledger write path + trace API, legacy dual-write bridge,
