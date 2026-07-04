@@ -29,7 +29,15 @@ Plan: /Users/rajanpanneerselvam/Docs/AGBOT/refactor.md (reviewed + expanded 2026
   3 pass. catalog_registry(9)/provenance_ledger(5) green; products_api 183 pass /
   15 pre-existing known-red (unchanged).
 
-Track A critical path 1->2->3->4 done. TA-05 next (or parallel with Track B).
+- TA-05 committed (12df53e): `geo_hub/src/ingest_contract.rs` — `NormalizedIngest`
+  + `commit_ingest(pool, ingest, actor, created_at)`: registers source
+  (catalog_sources), upserts scene, registers L0-then-L1 catalog products with
+  lineage. Idempotent; source_kind validated. `tests/ingest_contract.rs` 4 pass
+  (source+scene+products, L1->L0 trace gap-free, idempotent, two-scene distinct).
+  **Split:** live landsat/Sentinel call-site rewiring deferred to TA-05b.
+
+Track A 1->2->3->4->5(contract) done. Next: TA-05b (satellite call-site wiring)
+or TA-06 (drone ingest) or a Track B phase.
 
 ## Known-red (user decision: proceed, track separately)
 ~15 geo_hub products_api acceptance tests (farm/field CRUD, shapefile, geojson)
@@ -37,15 +45,14 @@ return 500 on main and every commit — PRE-EXISTING, unrelated to refactor. Not
 gate. Per-batch verification uses targeted tests + the batch's own test file.
 
 ## Next action
-TA-05: satellite ingest normalization. New `geo_hub/src/ingest_contract.rs`
-with `NormalizedIngest { source_id, scene?, l0_products, l1_products, quality }`
-+ `commit_ingest(pool, ingest, actor)` as the single path into the catalog for
-source data (registers source, scene, catalog rows, lineage; reuses the
-existing scene_ingests state machine). Then route `landsat.rs` + the Sentinel-2
-STAC path through it: SR/L2A assets = L1, raw downloads = L0, cloud cover ->
-quality_summary. Mock M2M/STAC fixtures; the retry state machine must stay green.
-TDD-first (`geo_hub/tests/ingest_contract.rs`). Per plan ordering, a Track B
-phase (e.g. TB-A2 catalog tree) may run as a parallel lane.
+TA-05b (or TA-06 / Track B). The ingest contract (`commit_ingest`) landed in
+TA-05; TA-05b routes the *live* `landsat.rs` + Sentinel-2 STAC ingest call sites
+through it: build a `NormalizedIngest` from the satellite scene (SR/L2A = L1,
+raw downloads = L0, cloud cover -> quality/scene), call `commit_ingest`
+additively so the existing retry state machine stays untouched and green. Mock
+M2M/STAC fixtures. TDD-first. Alternatively proceed TA-06 (drone session ingest:
+`export_ingest_manifest()` -> `POST /api/ingest/drone-session` via commit_ingest)
+or a Track B phase (TB-A2 catalog tree) as a parallel lane.
 
 ## Resume protocol
 Read CLAUDE.md + this file + checkpoint.sqlite. Verify `git status --short`,
