@@ -36,8 +36,16 @@ Plan: /Users/rajanpanneerselvam/Docs/AGBOT/refactor.md (reviewed + expanded 2026
   (source+scene+products, L1->L0 trace gap-free, idempotent, two-scene distinct).
   **Split:** live landsat/Sentinel call-site rewiring deferred to TA-05b.
 
-Track A 1->2->3->4->5(contract) done. Next: TA-05b (satellite call-site wiring)
-or TA-06 (drone ingest) or a Track B phase.
+- TA-06 committed (557e204): drone-session ingest via commit_ingest.
+  `shared/src/drone_ingest.rs` (DroneIngestManifest + validate);
+  `data_collector::export_ingest_manifest` (session records+checksums+health ->
+  manifest); `geo_hub::ingest_contract::commit_drone_ingest` (validate, duplicate
+  rejection, scene + L0 captures via commit_ingest); route
+  `POST /api/ingest/drone-session`. 8 new tests (shared 4, data_collector 1,
+  geo_hub route 3). All prior suites green; data_collector lib 57.
+
+Track A 1->2->3->4->5(contract)->6 done. Next: TA-07 (imagery sidecars, needs
+only TA-01), or TA-05b (satellite wiring), or a Track B phase.
 
 ## Known-red (user decision: proceed, track separately)
 ~15 geo_hub products_api acceptance tests (farm/field CRUD, shapefile, geojson)
@@ -45,14 +53,15 @@ return 500 on main and every commit — PRE-EXISTING, unrelated to refactor. Not
 gate. Per-batch verification uses targeted tests + the batch's own test file.
 
 ## Next action
-TA-05b (or TA-06 / Track B). The ingest contract (`commit_ingest`) landed in
-TA-05; TA-05b routes the *live* `landsat.rs` + Sentinel-2 STAC ingest call sites
-through it: build a `NormalizedIngest` from the satellite scene (SR/L2A = L1,
-raw downloads = L0, cloud cover -> quality/scene), call `commit_ingest`
-additively so the existing retry state machine stays untouched and green. Mock
-M2M/STAC fixtures. TDD-first. Alternatively proceed TA-06 (drone session ingest:
-`export_ingest_manifest()` -> `POST /api/ingest/drone-session` via commit_ingest)
-or a Track B phase (TB-A2 catalog tree) as a parallel lane.
+TA-07: imagery_processor L1/L2 sidecars. Emit `product_record.json` sidecars
+from `imagery_processor` (pipeline/indices.rs, masks.rs, thermal.rs, io/mod.rs):
+map existing evidence (ProductReproducibilityEvidence/BandIngestEvidence) ~1:1
+to ProductRecordDraft fields; masks emitted BEFORE the indices that reference
+them. Golden sidecar for an NDVI fixture; assert digest recomputation matches
+and mask-before-index ordering. Honor the identity invariant: an L2 index MUST
+list its scene's L1 bands in `inputs` or it collapses across scenes. Needs only
+TA-01. Alternatives: TA-05b (satellite call-site wiring, additive, retry machine
+stays green) or a Track B phase (TB-A2 catalog tree).
 
 ## Resume protocol
 Read CLAUDE.md + this file + checkpoint.sqlite. Verify `git status --short`,
