@@ -231,3 +231,36 @@ async fn nominal_findings_do_not_fire_alerts() -> Result<()> {
     );
     Ok(())
 }
+
+/// propose_action (Track C phase C3): firing an alert on an actionable finding
+/// enqueues a Proposed proposal from that finding, traceable to it. Idempotent.
+#[tokio::test]
+async fn actionable_alert_enqueues_a_proposal_from_its_finding() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let (app, pool) = ctx(&tmp).await?;
+    let l2_id = seed_l2(&pool).await?;
+    run_anomaly(&app, &l2_id).await?;
+
+    // No proposals before evaluation.
+    let (_, before) = send(&app, "GET", "/api/fields/field-1/proposals", None).await?;
+    assert_eq!(before.as_array().unwrap().len(), 0);
+
+    // Evaluate: the anomaly alert fires and auto-proposes.
+    let (status, alerts) = send(&app, "POST", "/api/fields/field-1/alert-evaluation", None).await?;
+    assert_eq!(status, StatusCode::OK, "{alerts}");
+    let source_finding_id = alerts[0]["source_finding_id"].as_str().unwrap().to_string();
+
+    // A Proposed proposal now sits in the field's queue, sourced from the finding.
+    let (_, queue) = send(&app, "GET", "/api/fields/field-1/proposals", None).await?;
+    let queue = queue.as_array().unwrap();
+    assert_eq!(queue.len(), 1, "one auto-proposal from the anomaly finding");
+    assert_eq!(queue[0]["status"], "proposed");
+    assert_eq!(queue[0]["source_id"], json!(source_finding_id));
+    assert_eq!(queue[0]["action_category"], "scout");
+
+    // Re-evaluation does not duplicate the proposal (idempotent per finding).
+    send(&app, "POST", "/api/fields/field-1/alert-evaluation", None).await?;
+    let (_, again) = send(&app, "GET", "/api/fields/field-1/proposals", None).await?;
+    assert_eq!(again.as_array().unwrap().len(), 1, "still exactly one proposal");
+    Ok(())
+}

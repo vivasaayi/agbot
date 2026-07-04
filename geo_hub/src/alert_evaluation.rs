@@ -34,6 +34,8 @@ pub enum AlertEvaluationError {
     #[error("severity classification failed: {0}")]
     Classification(#[from] alerting::AlertingError),
     #[error(transparent)]
+    Proposal(#[from] crate::proposal_queue::ProposalError),
+    #[error(transparent)]
     Db(#[from] sqlx::Error),
     #[error("failed to serialize {what}: {source}")]
     Serialize {
@@ -103,10 +105,13 @@ pub async fn evaluate_field_alerts(
     let actor = ActorIdentity::system("geo_hub:alert_evaluation");
     let mut stored = Vec::new();
 
+    let propose = propose_action_event_types();
     for finding in &findings {
         let candidate = finding_to_candidate(finding);
         let outcome = evaluate_alert_rules(&candidate, rules);
+        let mut fired_here = false;
         for alert in outcome.fired_alerts {
+            fired_here = true;
             persist_alert(pool, &alert, &finding.finding_id).await?;
             // Lineage: the alert derives from the finding that produced it, so a
             // backward trace closes alert -> finding -> L2/L3 -> L0.
@@ -142,9 +147,67 @@ pub async fn evaluate_field_alerts(
                 classified.map(|c| c.classified_severity),
             ));
         }
+
+        // propose_action (Track C phase C3): a fired alert on an actionable
+        // finding kind enqueues a Proposed action proposal from that finding —
+        // nothing more. Idempotent per finding, so re-evaluation never
+        // duplicates. Approval/dispatch stay downstream and gated.
+        if fired_here && propose.contains(&finding.finding.kind) {
+            maybe_enqueue_proposal(pool, finding, created_at).await?;
+        }
     }
 
     Ok(stored)
+}
+
+/// Event types whose fired alerts also enqueue a Proposed action proposal (the
+/// plan's opt-in `propose_action`). These are the actionable finding kinds; any
+/// other kind fires an alert without proposing.
+pub fn propose_action_event_types() -> std::collections::BTreeSet<String> {
+    ["index_anomaly_zone", "water_deficit_zone", "declining_zone"]
+        .into_iter()
+        .map(String::from)
+        .collect()
+}
+
+/// The proposal `(action_category, priority)` for an actionable finding kind.
+fn finding_action(kind: &str) -> Option<(&'static str, &'static str)> {
+    match kind {
+        "index_anomaly_zone" => Some(("scout", "high")),
+        "water_deficit_zone" => Some(("irrigation", "medium")),
+        "declining_zone" => Some(("review", "medium")),
+        _ => None,
+    }
+}
+
+/// Enqueue a Proposed proposal from a finding that fired an actionable alert.
+/// Delegates to the unified proposal queue (idempotent per source finding).
+async fn maybe_enqueue_proposal(
+    pool: &DbPool,
+    finding: &StoredFinding,
+    created_at: &str,
+) -> Result<(), AlertEvaluationError> {
+    let Some((action_category, priority)) = finding_action(&finding.finding.kind) else {
+        return Ok(());
+    };
+    crate::proposal_queue::create_proposal(
+        pool,
+        &crate::proposal_queue::ProposalCreateRequest {
+            source_kind: crate::proposal_queue::ProposalSourceKind::Finding,
+            source_id: finding.finding_id.clone(),
+            field_id: finding.field_id.clone(),
+            title: format!("{action_category} — {}", finding.finding.kind),
+            action_category: action_category.to_string(),
+            priority: priority.to_string(),
+            rationale: Some(format!(
+                "Auto-proposed from an alert on {}",
+                finding.finding.kind
+            )),
+        },
+        created_at,
+    )
+    .await?;
+    Ok(())
 }
 
 /// Build severity evidence from a finding's metrics and classify the alert. The
