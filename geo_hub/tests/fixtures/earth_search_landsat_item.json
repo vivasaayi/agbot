@@ -1,0 +1,150 @@
+{
+  "assets": {
+    "blue": {
+      "href": "s3://usgs-landsat/collection02/level-2/standard/etm/2023/028/031/LE07_L2SP_028031_20230721_20230817_02_T1/LE07_L2SP_028031_20230721_20230817_02_T1_SR_B1.TIF",
+      "raster:bands": [
+        {
+          "data_type": "uint16",
+          "nodata": 0,
+          "offset": -0.2,
+          "scale": 2.75e-05,
+          "spatial_resolution": 30
+        }
+      ],
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized"
+    },
+    "green": {
+      "href": "s3://usgs-landsat/collection02/level-2/standard/etm/2023/028/031/LE07_L2SP_028031_20230721_20230817_02_T1/LE07_L2SP_028031_20230721_20230817_02_T1_SR_B2.TIF",
+      "raster:bands": [
+        {
+          "data_type": "uint16",
+          "nodata": 0,
+          "offset": -0.2,
+          "scale": 2.75e-05,
+          "spatial_resolution": 30
+        }
+      ],
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized"
+    },
+    "nir08": {
+      "href": "s3://usgs-landsat/collection02/level-2/standard/etm/2023/028/031/LE07_L2SP_028031_20230721_20230817_02_T1/LE07_L2SP_028031_20230721_20230817_02_T1_SR_B4.TIF",
+      "raster:bands": [
+        {
+          "data_type": "uint16",
+          "nodata": 0,
+          "offset": -0.2,
+          "scale": 2.75e-05,
+          "spatial_resolution": 30
+        }
+      ],
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized"
+    },
+    "qa_pixel": {
+      "href": "s3://usgs-landsat/collection02/level-2/standard/etm/2023/028/031/LE07_L2SP_028031_20230721_20230817_02_T1/LE07_L2SP_028031_20230721_20230817_02_T1_QA_PIXEL.TIF",
+      "raster:bands": [
+        {
+          "data_type": "uint16",
+          "nodata": 1,
+          "spatial_resolution": 30,
+          "unit": "bit index"
+        }
+      ],
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized"
+    },
+    "red": {
+      "href": "s3://usgs-landsat/collection02/level-2/standard/etm/2023/028/031/LE07_L2SP_028031_20230721_20230817_02_T1/LE07_L2SP_028031_20230721_20230817_02_T1_SR_B3.TIF",
+      "raster:bands": [
+        {
+          "data_type": "uint16",
+          "nodata": 0,
+          "offset": -0.2,
+          "scale": 2.75e-05,
+          "spatial_resolution": 30
+        }
+      ],
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized"
+    },
+    "swir16": {
+      "href": "s3://usgs-landsat/collection02/level-2/standard/etm/2023/028/031/LE07_L2SP_028031_20230721_20230817_02_T1/LE07_L2SP_028031_20230721_20230817_02_T1_SR_B5.TIF",
+      "raster:bands": [
+        {
+          "data_type": "uint16",
+          "nodata": 0,
+          "offset": -0.2,
+          "scale": 2.75e-05,
+          "spatial_resolution": 30
+        }
+      ],
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized"
+    },
+    "swir22": {
+      "href": "s3://usgs-landsat/collection02/level-2/standard/etm/2023/028/031/LE07_L2SP_028031_20230721_20230817_02_T1/LE07_L2SP_028031_20230721_20230817_02_T1_SR_B7.TIF",
+      "raster:bands": [
+        {
+          "data_type": "uint16",
+          "nodata": 0,
+          "offset": -0.2,
+          "scale": 2.75e-05,
+          "spatial_resolution": 30
+        }
+      ],
+      "type": "image/tiff; application=geotiff; profile=cloud-optimized"
+    }
+  },
+  "bbox": [
+    -97.987948,
+    40.807475,
+    -95.016667,
+    42.775525
+  ],
+  "collection": "landsat-c2-l2",
+  "geometry": {
+    "coordinates": [
+      [
+        [
+          -97.41955663307418,
+          42.75802015041766
+        ],
+        [
+          -97.90418160873524,
+          41.15466279766222
+        ],
+        [
+          -95.64813390847603,
+          40.83441771509325
+        ],
+        [
+          -95.6323678720296,
+          40.843684763717235
+        ],
+        [
+          -95.59215586039389,
+          40.96165321110792
+        ],
+        [
+          -95.09745255590647,
+          42.42065370979824
+        ],
+        [
+          -95.1168291278492,
+          42.43157742419715
+        ],
+        [
+          -97.41955663307418,
+          42.75802015041766
+        ]
+      ]
+    ],
+    "type": "Polygon"
+  },
+  "id": "LE07_L2SP_028031_20230721_02_T1",
+  "properties": {
+    "created": "2023-12-02T02:09:27.592Z",
+    "datetime": "2023-07-21T14:55:52.707403Z",
+    "eo:cloud_cover": 1,
+    "platform": "landsat-7",
+    "proj:epsg": 32614
+  },
+  "stac_version": "1.0.0",
+  "type": "Feature"
+}

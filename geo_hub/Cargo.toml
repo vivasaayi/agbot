@@ -41,9 +41,12 @@ thiserror = { workspace = true }
 image = { workspace = true }
 csv = { workspace = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+raster_io = { path = "../raster_io", features = ["remote"] }
+url = "2"
 
 [dev-dependencies]
 tempfile = "3.10"
+raster_io = { path = "../raster_io", features = ["remote", "test-util"] }
 tower = { workspace = true, features = ["util"] }
 image = { workspace = true }
 geo = { workspace = true }

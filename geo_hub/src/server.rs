@@ -48,6 +48,7 @@ pub fn build_router(state: AppState) -> Router {
             "/api/catalog/products/:product_id",
             get(routes::get_catalog_product),
         )
+        .route("/api/satellite/derive", post(routes::satellite_derive))
         .route("/api/stac", get(routes::stac_landing_page))
         .route("/api/stac/conformance", get(routes::stac_conformance))
         .route("/api/stac/collections", get(routes::stac_list_collections))

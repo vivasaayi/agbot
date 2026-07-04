@@ -18,10 +18,14 @@ async-trait = { version = "0.1", optional = true }
 bytes = { version = "1", optional = true }
 url = { version = "2", optional = true }
 
+# Tiled-GeoTIFF fixture builder (feature `test-util`): deterministic in-memory
+# COGs for network-free tests here and in downstream crates (geo_hub).
+flate2 = { version = "1", optional = true }
+
 [features]
 default = []
 remote = ["dep:async-tiff", "dep:object_store", "dep:async-trait", "dep:bytes", "dep:url"]
+test-util = ["dep:flate2"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-flate2 = "1"

@@ -37,6 +37,8 @@ mod error;
 mod geotiff;
 #[cfg(feature = "remote")]
 mod remote;
+#[cfg(feature = "test-util")]
+pub mod test_util;
 mod write;
 
 pub use error::RasterIoError;
@@ -44,3 +46,9 @@ pub use geotiff::{GeoTiffInfo, GeoTiffReader, RasterBand, RasterDtype, RasterWin
 #[cfg(feature = "remote")]
 pub use remote::{CogTileLayout, RemoteCogReader, RemoteFetchMetrics};
 pub use write::{write_geotiff_f32, write_geotiff_u16, write_geotiff_u8, GeoTiffTags};
+
+/// Re-export so `remote`-feature consumers construct/parse `ObjectStore`
+/// instances (e.g. an in-memory store in tests) against the exact version
+/// `RemoteCogReader` links.
+#[cfg(feature = "remote")]
+pub use object_store;
