@@ -50,8 +50,15 @@ Plan: /Users/rajanpanneerselvam/Docs/AGBOT/refactor.md (reviewed + expanded 2026
   L1 band refs). 4 tests (golden map, identity, digest match, mask-before-index);
   imagery lib 19 green. **Split:** live run_* pipeline wiring -> TA-07b.
 
-Track A 1->2->3->4->5(contract)->6->7(mapping) done. Next: TA-08 (catalog
-register API + CLI, the viewer read API), or TA-05b/TA-07b wiring, or Track B.
+- TA-08 committed (4b50225): catalog register/read API + sidecar CLI.
+  POST/GET `/api/catalog/products` (+ `/:id`) with farm/field/season/scene/
+  source/level/kind/status/temporal/bbox filters; `catalog::register_sidecar_dir`
+  (dependency-ordered, idempotent, retry-defer loop) + `geo_hub catalog register
+  <dir>` CLI. RegisteredProduct is Serialize. 3 tests (filters, unknown-input
+  400, sidecar dependency order). All prior suites green.
+
+Track A 1->2->3->4->5(contract)->6->7(mapping)->8 done. Next: TA-09 (post_processor
+L3 productization) or TA-05b/TA-07b wiring or Track B.
 
 ## Known-red (user decision: proceed, track separately)
 ~15 geo_hub products_api acceptance tests (farm/field CRUD, shapefile, geojson)
@@ -59,14 +66,16 @@ return 500 on main and every commit — PRE-EXISTING, unrelated to refactor. Not
 gate. Per-batch verification uses targeted tests + the batch's own test file.
 
 ## Next action
-TA-08: catalog register API + CLI (the viewer read API). Add `POST /api/catalog/
-products` (register a ProductRecordDraft) and `GET /api/catalog/products` with
-field/season/level/kind/time/bbox filters over `catalog::list_products`; plus a
-`geo_hub catalog register <dir>` CLI that walks `*.product_record.json` sidecars
-(TA-07 shape) and registers each via `catalog::register_product`. Needs TA-02 +
-TA-07 (both done). TDD-first (`geo_hub/tests/catalog_api.rs`). Alternatives:
-TA-07b (wire sidecar emission into live run_indices/masks/thermal) or TA-05b
-(satellite call-site wiring) or a Track B phase (TB-A2 catalog tree).
+TA-09: post_processor L3 productization. `AnalysisJobRequest` gains
+`input_product_ids`; each analysis module (ndvi trend, health, thermal anomaly,
+LiDAR change, index anomaly/trend, zonal stats, zone delineation/priority) gains
+`to_product_draft()` producing an L3 ProductRecordDraft whose `inputs` are the L2
+catalog product ids (identity invariant!); confidence from HealthUncertaintyBand
+where present; `zone_recommendations` stays a Recommendation but records L3
+inputs in lineage. Integration test: L3 draft -> register -> trace_backward
+reaches the satellite scene's L0. Needs TA-08 (done). TDD-first
+(`post_processor` tests + a geo_hub trace test). Alternatives: TA-05b / TA-07b
+wiring, or a Track B phase (TB-A2 catalog tree).
 
 ## Resume protocol
 Read CLAUDE.md + this file + checkpoint.sqlite. Verify `git status --short`,
