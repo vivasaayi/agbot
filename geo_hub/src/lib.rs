@@ -11,6 +11,7 @@ pub mod ingest;
 pub mod ingest_contract;
 pub mod landsat;
 pub mod product_catalog;
+pub mod proposal_adapters;
 pub mod proposal_queue;
 pub mod provenance_store;
 pub mod routes;

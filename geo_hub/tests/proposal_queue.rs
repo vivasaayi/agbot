@@ -281,6 +281,50 @@ async fn proposal_from_finding_and_reject_flow() -> Result<()> {
 }
 
 #[tokio::test]
+async fn advisor_draft_funnels_into_queue_with_lineage() -> Result<()> {
+    use copilot::advisor_rules::{evaluate_water_stress_rule, WaterStressInputs};
+    use geo_hub::proposal_adapters;
+
+    let tmp = TempDir::new()?;
+    let (app, pool) = ctx(&tmp).await?;
+    let l2 = seed_l2(&pool).await?;
+    // A real, lineage-tracked finding to source the advisor draft from.
+    let (_alert_id, finding_id) = fire_alert(&app, &l2).await?;
+
+    // The deterministic advisor rule produces a draft from that finding.
+    let draft = evaluate_water_stress_rule(&WaterStressInputs {
+        finding_id: finding_id.clone(),
+        field_id: Some("field-1".to_string()),
+        ndvi_declining: true,
+        soil_moisture_pct: Some(12.0),
+        rain_forecast_mm: 1.0,
+    })
+    .expect("water-stress rule should fire");
+
+    // The adapter funnels it into the unified queue.
+    let proposal = proposal_adapters::queue_advisor_proposal(&pool, &draft, T0).await?;
+    assert_eq!(proposal.action_category, "irrigation");
+    assert_eq!(proposal.source_id, finding_id);
+
+    // It appears in the field's queue and traces gap-free back to L0.
+    let (_, queue) = send(&app, "GET", "/api/fields/field-1/proposals", None).await?;
+    assert_eq!(queue.as_array().unwrap().len(), 1);
+    let trace = provenance_store::trace_backward(&pool, &proposal.proposal_id).await?;
+    assert!(trace.gaps.is_empty(), "advisor proposal->L0: {:?}", trace.gaps);
+    assert!(trace.records.iter().any(|r| r.artifact_id == l2));
+
+    // Re-funneling the same draft is idempotent (one proposal per finding).
+    let again = proposal_adapters::queue_advisor_proposal(&pool, &draft, T0).await?;
+    assert_eq!(again.proposal_id, proposal.proposal_id);
+
+    // Accepting it materializes an advisor-authored recommendation draft.
+    let rec = proposal_adapters::recommendation_draft_from_accepted(&proposal, "scene-1", T0);
+    assert_eq!(rec.author_user_id, proposal_adapters::ADVISOR_AUTHOR);
+    assert_eq!(rec.evidence_refs, vec![finding_id]);
+    Ok(())
+}
+
+#[tokio::test]
 async fn proposal_from_unknown_source_is_rejected() -> Result<()> {
     let tmp = TempDir::new()?;
     let (app, _pool) = ctx(&tmp).await?;

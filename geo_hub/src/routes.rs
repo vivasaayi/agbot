@@ -20481,13 +20481,13 @@ fn decode_crop_closed_loop_proposal(
                 Error::new(err).context("failed to decode crop closed-loop proposal action"),
             )
         })?;
-    let approval_status = match row.get::<String, _>("approval_status").as_str() {
-        "pending" => CropClosedLoopApprovalStatus::Pending,
-        value => {
-            return Err(AppError::Anyhow(Error::msg(format!(
-                "unknown crop closed-loop approval status {value}"
-            ))))
-        }
+    let approval_status = {
+        let raw = row.get::<String, _>("approval_status");
+        CropClosedLoopApprovalStatus::parse(&raw).ok_or_else(|| {
+            AppError::Anyhow(Error::msg(format!(
+                "unknown crop closed-loop approval status {raw}"
+            )))
+        })?
     };
     let refly_area = row
         .get::<Option<String>, _>("refly_area_json")
