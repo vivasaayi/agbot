@@ -19652,6 +19652,7 @@ async fn insert_provenance_lineage_fixture(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn insert_provenance_audit_fixture(
     ctx: &TestContext,
     seq: i64,
@@ -20231,6 +20232,7 @@ async fn insert_advisory_field(ctx: &TestContext, field_id: &str, season: &str) 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn insert_advisory_scene(
     ctx: &TestContext,
     scene_id: &str,

@@ -6,6 +6,7 @@ use axum::{
 };
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
+use tower_http::services::ServeDir;
 use tracing::{info, warn};
 
 async fn health_handler() -> &'static str {
@@ -18,6 +19,10 @@ async fn ready_handler() -> &'static str {
 
 pub fn build_router(state: AppState) -> Router {
     Router::new()
+        .nest_service(
+            "/workspace",
+            ServeDir::new(state.config.workspace_web_dir()),
+        )
         .route("/", get(routes::mobile_app))
         .route("/app", get(routes::mobile_app))
         .route(

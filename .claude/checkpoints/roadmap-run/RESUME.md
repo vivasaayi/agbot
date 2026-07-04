@@ -1,17 +1,28 @@
-# Resume — world-sim-run-1
+# Resume — field-intel-run-1
 
-- Branch: simulator-enhancements; last commit d424941 (M5 roads+renderer); prior ce87ab9.
-- ALL plan milestones M0-M4 complete and committed:
-  M0 config core | M1 terrain_engine + worldgen(NYC) + GL4.1 renderer + Manhattan demo |
-  M2 vehicles + nav pipeline | M3 Cessna 6-DOF + Dubins + flythrough |
-  M4 ONNX mono-depth (RMSE 2.38 m vs DEM) + hybrid-A* + MPPI + EKF + ONNX/classical segmentation.
-- Validation: 14/14 ctest suites green, ONNX active, zero warnings.
-- Fresh-clone prerequisites (gitignored): fetch_nyc_buildings.sh, fetch_depth_model.sh,
-  fetch_seg_model.sh, Terrarium tiles z13 x2411-2412 y3079-3080.
-- User's dirty files untouched: src/MissionLoader.cpp, src/macos_opengl_viewer.mm, tests/simulation_tests.cpp.
-- M5 DONE: OSM road import + welded street graph + road_graph planner (real route 5090 m);
-  AGBSCN02 textured meshes, basemap draped over terrain, 4x MSAA, sky gradient.
-- Fresh-clone also needs: fetch_osm_roads.sh; OSM basemap tiles z15 x9646-9650 y12316-12321.
-- M6 DONE (e858ae6): dynamic agents + KF tracker + predictive MPPI/DWA avoidance;
-  corridor + street-delivery scenarios collision-free, deterministic. 17/17 suites.
-- Next: CDLOD streaming terrain, VIO/LIO SLAM, viewer entity animation, ROS2 bridge.
+Refactor: AGBot → layered field-intelligence pipeline.
+Plan: /Users/rajanpanneerselvam/Docs/AGBOT/refactor.md (reviewed + expanded 2026-07-03).
+
+- Branch: field-intelligence-pipeline. Main: main.
+- Two tracks (see plan §"Implementation Sequencing"):
+  - Track A (data backbone): TA-01 … TA-10.
+  - Track B (consumption): Phase A web (TB-A1..A7), B apps, C alerting, D proposals, E dispatch.
+
+## Progress
+- TA-01 committed (250e8dd): `shared/src/product_graph.rs` contract types + tests.
+- TB-A1 tests_passed (about to commit): `/workspace` static serving via ServeDir;
+  `geo_hub/web/{index.html,js/api.js,js/app.js}`; `workspace_web_root` config +
+  `workspace_web_dir()` resolver; route-manifest test `tests/workspace_static.rs`
+  (3 tests pass); geo_hub clippy-clean.
+
+## Next action
+Commit TB-A1, then start TA-02 (catalog schema + registration):
+`geo_hub/src/db.rs` additive migrations (catalog_sources, catalog_products,
+catalog_product_inputs, provenance_evidence), `geo_hub/src/catalog.rs`
+(register_product with mask-first ordering + unknown-input rejection + dedupe),
+`geo_hub/tests/catalog_registry.rs`. TDD-first.
+
+## Resume protocol
+Read CLAUDE.md + this file + checkpoint.sqlite. Verify `git status --short`,
+last commit, roadmap file unchanged. Continue from runs.next_action.
+Checkpoint DB is source of truth; the world-sim-run-1 row is a prior unrelated run.

@@ -578,8 +578,8 @@ async fn discover_metadata(source_dir: &Path) -> Result<PathBuf> {
         if path
             .file_name()
             .and_then(|os| os.to_str())
-            .map_or(false, |name| name.starts_with("metadata_"))
-            && path.extension().map_or(false, |ext| ext == "json")
+            .is_some_and(|name| name.starts_with("metadata_"))
+            && path.extension().is_some_and(|ext| ext == "json")
         {
             metadata_path = Some(path);
             break;
@@ -747,6 +747,7 @@ async fn store_scene_spatial_ref(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn record_ingest_status(
     pool: &DbPool,
     scene_id: &str,

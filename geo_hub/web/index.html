@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AGBot Workspace</title>
+  <style>
+    :root {
+      --bg: #16181d;
+      --panel: #1e2128;
+      --panel-border: #2c313a;
+      --text: #d7dae0;
+      --text-dim: #8b919c;
+      --accent: #5b9e6f;
+    }
+
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+
+    html,
+    body {
+      height: 100%;
+    }
+
+    body {
+      display: flex;
+      flex-direction: column;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      font-size: 14px;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      padding: 0.6rem 1rem;
+      background: var(--panel);
+      border-bottom: 1px solid var(--panel-border);
+    }
+
+    header h1 {
+      font-size: 1rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+
+    header .badge {
+      color: var(--accent);
+      font-size: 0.75rem;
+      border: 1px solid var(--panel-border);
+      border-radius: 3px;
+      padding: 0.1rem 0.4rem;
+    }
+
+    main {
+      flex: 1;
+      display: grid;
+      grid-template-columns: 240px 1fr 300px;
+      min-height: 0;
+    }
+
+    .pane {
+      overflow-y: auto;
+      background: var(--panel);
+      border-right: 1px solid var(--panel-border);
+      padding: 0.75rem;
+    }
+
+    .pane h2 {
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-dim);
+      margin-bottom: 0.6rem;
+    }
+
+    #map {
+      background: var(--bg);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--text-dim);
+      border-right: 1px solid var(--panel-border);
+    }
+
+    #inspector {
+      border-right: none;
+    }
+
+    #inspector .tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.25rem;
+      margin-bottom: 0.75rem;
+    }
+
+    #inspector .tab {
+      font-size: 0.75rem;
+      color: var(--text-dim);
+      background: var(--bg);
+      border: 1px solid var(--panel-border);
+      border-radius: 3px;
+      padding: 0.2rem 0.5rem;
+      cursor: default;
+    }
+
+    #catalog-tree ul {
+      list-style: none;
+    }
+
+    #catalog-tree li {
+      padding: 0.25rem 0.35rem;
+      border-radius: 3px;
+    }
+
+    #catalog-tree li:hover {
+      background: var(--bg);
+    }
+
+    .status {
+      color: var(--text-dim);
+      font-style: italic;
+    }
+
+    .error {
+      color: #c96a5f;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>AGBot Workspace</h1>
+    <span class="badge">geo_hub</span>
+  </header>
+  <main>
+    <section class="pane" id="catalog" aria-label="Catalog">
+      <h2>Catalog</h2>
+      <div id="catalog-tree">
+        <p class="status">Loading fields…</p>
+      </div>
+    </section>
+    <section id="map" aria-label="Map">
+      <p>Map placeholder — Leaflet arrives in a later phase</p>
+    </section>
+    <section class="pane" id="inspector" aria-label="Inspector">
+      <h2>Inspector</h2>
+      <div class="tabs">
+        <span class="tab" data-tab="layers">Layers</span>
+        <span class="tab" data-tab="annotations">Annotations</span>
+        <span class="tab" data-tab="recommendations">Recommendations</span>
+        <span class="tab" data-tab="provenance">Provenance</span>
+        <span class="tab" data-tab="alerts">Alerts</span>
+        <span class="tab" data-tab="proposals">Proposals</span>
+      </div>
+      <p class="status">Select a catalog item to inspect it.</p>
+    </section>
+  </main>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>

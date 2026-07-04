@@ -100,6 +100,7 @@ pub async fn publish_product(
     Ok(context)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn publish_georeferenced_product(
     pool: &DbPool,
     scene_id: &str,

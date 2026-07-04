@@ -3,19 +3,14 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HubRuntimeMode {
+    #[default]
     Local,
     #[serde(alias = "sim")]
     Simulation,
     Live,
-}
-
-impl Default for HubRuntimeMode {
-    fn default() -> Self {
-        Self::Local
-    }
 }
 
 impl HubRuntimeMode {
@@ -41,18 +36,13 @@ impl fmt::Display for HubRuntimeMode {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LandsatCredentialSource {
+    #[default]
     None,
     #[serde(alias = "env")]
     Environment,
-}
-
-impl Default for LandsatCredentialSource {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +68,12 @@ pub struct HubConfig {
     pub bind_address: String,
     pub database_url: String,
     pub data_root: PathBuf,
+    /// Directory holding the static web workspace served at `/workspace`.
+    /// Relative paths are resolved against the current working directory
+    /// first, then against the cargo workspace root (see
+    /// [`HubConfig::workspace_web_dir`]). Override with
+    /// `GEO_HUB__WORKSPACE_WEB_ROOT`.
+    pub workspace_web_root: PathBuf,
     pub landsat: LandsatConfig,
 }
 
@@ -88,6 +84,7 @@ impl Default for HubConfig {
             bind_address: "0.0.0.0:8080".to_string(),
             database_url: "sqlite://geo_hub.db".to_string(),
             data_root: PathBuf::from("data/geo_hub"),
+            workspace_web_root: PathBuf::from("geo_hub/web"),
             landsat: LandsatConfig::default(),
         }
     }
@@ -143,6 +140,21 @@ impl HubConfig {
         std::fs::create_dir_all(&self.data_root)?;
         std::fs::create_dir_all(self.data_root.join("scenes"))?;
         Ok(())
+    }
+
+    /// Resolve the directory of the static web workspace served at
+    /// `/workspace`. Absolute paths are used as-is. A relative path is used
+    /// relative to the current working directory when it exists there (the
+    /// normal case when running from the cargo workspace root); otherwise it
+    /// falls back to the cargo workspace root derived from this crate's
+    /// manifest directory, which keeps tests and crate-local runs working.
+    pub fn workspace_web_dir(&self) -> PathBuf {
+        if self.workspace_web_root.is_absolute() || self.workspace_web_root.exists() {
+            return self.workspace_web_root.clone();
+        }
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = manifest_dir.parent().unwrap_or(manifest_dir);
+        workspace_root.join(&self.workspace_web_root)
     }
 }
 
@@ -206,6 +218,28 @@ source = "landsat"
             config.landsat.credential_source,
             LandsatCredentialSource::Environment
         );
+    }
+
+    #[test]
+    fn hub_config_default_workspace_web_dir_resolves_to_crate_web_directory() {
+        let config = HubConfig::default();
+
+        assert_eq!(config.workspace_web_root, PathBuf::from("geo_hub/web"));
+
+        let resolved = config.workspace_web_dir();
+        assert!(resolved.is_absolute() || resolved.exists());
+        assert!(resolved.ends_with("geo_hub/web"));
+    }
+
+    #[test]
+    fn hub_config_absolute_workspace_web_root_is_used_verbatim() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = HubConfig {
+            workspace_web_root: tmp.path().to_path_buf(),
+            ..HubConfig::default()
+        };
+
+        assert_eq!(config.workspace_web_dir(), tmp.path());
     }
 
     #[test]

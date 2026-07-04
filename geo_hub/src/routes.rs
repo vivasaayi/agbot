@@ -2100,8 +2100,8 @@ fn synthetic_landsat_bands(
             let ny = y as f32 / (height - 1) as f32;
             let rotated_x = (nx * row_angle.cos()) - (ny * row_angle.sin());
             let rotated_y = (nx * row_angle.sin()) + (ny * row_angle.cos());
-            let irrigation = ((rotated_x * 22.0 + lat_seed as f32).sin()
-                * (rotated_y * 17.0 + lon_seed as f32).cos())
+            let irrigation = ((rotated_x * 22.0 + lat_seed).sin()
+                * (rotated_y * 17.0 + lon_seed).cos())
             .max(0.0);
             let field_bands = (((nx * field_scale_x).floor() as i32
                 + (ny * field_scale_y).floor() as i32)
@@ -9566,7 +9566,7 @@ pub async fn list_field_scene_refresh_advisories(
         }
 
         let mut uncertainty = cloud_is_uncertain;
-        if uncertainty == false
+        if !uncertainty
             && !is_scene_spatially_consistent(
                 current_asserted_spatial_ref.as_ref(),
                 current_metadata.as_ref(),
@@ -20307,7 +20307,7 @@ async fn audit_compliance_authority_share_event(
     .bind(&share.share_id)
     .bind(event_type)
     .bind(actor)
-    .bind(created_at.unwrap_or_else(|| share.created_at.as_str()))
+    .bind(created_at.unwrap_or(share.created_at.as_str()))
     .bind(format!(
         "{} share for report {}",
         share.authority_format.as_str(),
@@ -21173,6 +21173,7 @@ async fn report_file_response(report: &ReportRecord) -> AppResult<Response> {
     Ok((headers, body).into_response())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_scene_report_html(
     scene_id: &str,
     sensor: Option<String>,
