@@ -21,8 +21,15 @@ Plan: /Users/rajanpanneerselvam/Docs/AGBOT/refactor.md (reviewed + expanded 2026
   in-tx, load_all, trace_backward/forward). register_product writes lineage in
   the same transaction (SystemService default) + stamps provenance_id.
   GET /api/provenance/trace/:artifact_id. `tests/provenance_ledger.rs` 5 pass.
+- TA-04 committed (2688b97): legacy `products` -> `catalog_products` bridge in
+  `geo_hub/src/product_catalog.rs`. `backfill_products_to_catalog` (idempotent,
+  leaves `products` intact); `publish_product`/`publish_georeferenced_product`
+  dual-write. `legacy_product_draft` folds scene_id into parameters so two
+  scenes' same kind stay distinct (L2, no input graph). `tests/catalog_backfill.rs`
+  3 pass. catalog_registry(9)/provenance_ledger(5) green; products_api 183 pass /
+  15 pre-existing known-red (unchanged).
 
-Track A critical path 1->2->3 done. Batches 4 || 5 can now run in parallel.
+Track A critical path 1->2->3->4 done. TA-05 next (or parallel with Track B).
 
 ## Known-red (user decision: proceed, track separately)
 ~15 geo_hub products_api acceptance tests (farm/field CRUD, shapefile, geojson)
@@ -30,12 +37,15 @@ return 500 on main and every commit — PRE-EXISTING, unrelated to refactor. Not
 gate. Per-batch verification uses targeted tests + the batch's own test file.
 
 ## Next action
-TA-04: backfill `products` -> `catalog_products` + make `publish_product`
-dual-write into the catalog; legacy tile/serving routes must stay unaffected.
-See geo_hub/src/product_catalog.rs (publish_product / publish_georeferenced_product)
-and the `products` table (db.rs:241, UNIQUE(scene_id, kind)). TDD-first;
-after landing run the geo_hub tile/products serving tests (not the known-red set).
-TA-05 (satellite ingest normalization via ingest_contract.rs) may run in parallel.
+TA-05: satellite ingest normalization. New `geo_hub/src/ingest_contract.rs`
+with `NormalizedIngest { source_id, scene?, l0_products, l1_products, quality }`
++ `commit_ingest(pool, ingest, actor)` as the single path into the catalog for
+source data (registers source, scene, catalog rows, lineage; reuses the
+existing scene_ingests state machine). Then route `landsat.rs` + the Sentinel-2
+STAC path through it: SR/L2A assets = L1, raw downloads = L0, cloud cover ->
+quality_summary. Mock M2M/STAC fixtures; the retry state machine must stay green.
+TDD-first (`geo_hub/tests/ingest_contract.rs`). Per plan ordering, a Track B
+phase (e.g. TB-A2 catalog tree) may run as a parallel lane.
 
 ## Resume protocol
 Read CLAUDE.md + this file + checkpoint.sqlite. Verify `git status --short`,
