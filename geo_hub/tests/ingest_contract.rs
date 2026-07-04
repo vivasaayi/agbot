@@ -231,3 +231,65 @@ async fn two_scenes_from_one_source_yield_distinct_products() -> Result<()> {
     assert_eq!(l1.len(), 2, "two scenes -> two distinct L1 products");
     Ok(())
 }
+
+/// A verified USGS scene commits through the same contract: source + scene + an
+/// L0 raw-scene product, with lineage on the ledger (Track A phase 5b).
+#[tokio::test]
+async fn commit_usgs_landsat_ingest_registers_scene_and_l0_with_lineage() -> Result<()> {
+    use geo_hub::landsat::{
+        commit_usgs_landsat_ingest, UsgsIngestVerificationRecord, UsgsSceneSummary,
+    };
+
+    let tmp = TempDir::new()?;
+    let pool = pool(&tmp).await?;
+    let actor = ActorIdentity::system("geo_hub:ingest");
+
+    let record = UsgsIngestVerificationRecord {
+        scene: UsgsSceneSummary {
+            scene_id: "LC80420342026152".to_string(),
+            display_id: Some("LC08_L2SP_042034".to_string()),
+            dataset_name: "landsat_ot_c2_l2".to_string(),
+            provider: "USGS".to_string(),
+            acquired_at: Some(T0.to_string()),
+            cloud_cover: Some(9.0),
+            bbox: None,
+            browse_url: Some("https://example.test/browse.png".to_string()),
+        },
+        metadata_path: tmp.path().join("metadata.json"),
+        downloaded_browse_path: tmp.path().join("browse.png"),
+        stored_at: T0.to_string(),
+    };
+
+    let receipt = commit_usgs_landsat_ingest(&pool, &record, &actor, T0).await?;
+    assert_eq!(receipt.source_id, "usgs:landsat_ot_c2_l2");
+    assert_eq!(receipt.scene_id.as_deref(), Some("LC80420342026152"));
+    assert_eq!(receipt.product_ids.len(), 1, "one L0 raw-scene product");
+
+    // Source registered as satellite.
+    let source_kind: String =
+        sqlx::query("SELECT source_kind FROM catalog_sources WHERE source_id = ?")
+            .bind("usgs:landsat_ot_c2_l2")
+            .fetch_one(&pool)
+            .await?
+            .get("source_kind");
+    assert_eq!(source_kind, "satellite");
+
+    // The L0 product carries lineage on the ledger (registered via commit_ingest).
+    let l0_id = &receipt.product_ids[0];
+    let lineage = provenance_store::get_lineage(&pool, l0_id).await?;
+    assert!(lineage.is_some(), "L0 raw-scene has a lineage record");
+
+    // Re-ingesting the same scene is idempotent (one product, not two).
+    let again = commit_usgs_landsat_ingest(&pool, &record, &actor, T0).await?;
+    assert_eq!(again.product_ids, receipt.product_ids);
+    let raw = catalog::list_products(
+        &pool,
+        &ProductFilter {
+            kind: Some("raw_scene".to_string()),
+            ..ProductFilter::default()
+        },
+    )
+    .await?;
+    assert_eq!(raw.len(), 1, "idempotent: still one raw-scene product");
+    Ok(())
+}

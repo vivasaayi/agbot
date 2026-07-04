@@ -1377,6 +1377,133 @@ struct StacAsset {
     href: String,
 }
 
+// --- Live satellite ingest -> normalized commit_ingest (Track A phase 5b) ---
+//
+// The USGS verification path downloads a scene's metadata + browse artifact.
+// This bridge normalizes that verified scene into the single ingest contract so
+// a live satellite pull registers the source, upserts the scene, and catalogs an
+// L0 raw-scene product with lineage — the same path drone ingest uses.
+
+/// The catalog source id for a USGS dataset (stable per dataset so repeated pulls
+/// share one source row).
+pub fn usgs_source_id(dataset_name: &str) -> String {
+    format!("usgs:{dataset_name}")
+}
+
+fn artifact_format_for(path: &std::path::Path) -> String {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Map a verified USGS scene into an L0 raw-scene catalog draft. Identity is the
+/// scene id + dataset + store time folded into parameters, so distinct scenes
+/// (and re-pulls at different times) stay distinct under
+/// `UNIQUE(kind, parameters_hash)`. The artifact is the downloaded browse image.
+fn usgs_scene_l0_draft(
+    record: &crate::landsat::UsgsIngestVerificationRecord,
+    source_id: &str,
+) -> shared::product_graph::ProductRecordDraft {
+    use shared::product_graph::{ProductArtifact, ProductLevel, ProductRecordDraft, ProductScope};
+    let scene = &record.scene;
+    let acquired_at = scene
+        .acquired_at
+        .clone()
+        .unwrap_or_else(|| record.stored_at.clone());
+    let browse_path = record.downloaded_browse_path.to_string_lossy().to_string();
+    ProductRecordDraft {
+        level: ProductLevel::L0,
+        kind: "raw_scene".to_string(),
+        algorithm_id: "usgs.landsat.ingest".to_string(),
+        algorithm_version: "1.0.0".to_string(),
+        parameters: serde_json::json!({
+            "scene_id": scene.scene_id,
+            "dataset_name": scene.dataset_name,
+            "provider": scene.provider,
+            "display_id": scene.display_id,
+            "stored_at": record.stored_at,
+            "bbox": scene.bbox,
+        }),
+        inputs: Vec::new(),
+        scope: ProductScope {
+            farm_id: None,
+            field_id: None,
+            season_id: None,
+            scene_id: Some(scene.scene_id.clone()),
+            temporal_start: acquired_at.clone(),
+            temporal_end: acquired_at,
+        },
+        spatial_ref: None,
+        gsd_m_per_px: None,
+        artifact: Some(ProductArtifact {
+            format: artifact_format_for(&record.downloaded_browse_path),
+            path: browse_path,
+            checksum_sha256: None,
+        }),
+        quality_mask: None,
+        confidence: None,
+        confidence_method: None,
+        quality_summary: None,
+        evidence_digests: Vec::new(),
+        source_id: Some(source_id.to_string()),
+    }
+}
+
+/// Normalize a verified USGS scene into a [`NormalizedIngest`]. Pure. The scene
+/// summary is stored as the scene's `metadata_json`.
+pub fn normalized_ingest_from_usgs(
+    record: &crate::landsat::UsgsIngestVerificationRecord,
+) -> Result<crate::ingest_contract::NormalizedIngest, crate::ingest_contract::IngestError> {
+    use crate::ingest_contract::{IngestError, IngestScene, NormalizedIngest};
+    let scene = &record.scene;
+    let source_id = usgs_source_id(&scene.dataset_name);
+    let metadata_json =
+        serde_json::to_string(scene).map_err(|source| IngestError::Serialize {
+            what: "usgs scene summary",
+            source,
+        })?;
+    let acquired_at = scene
+        .acquired_at
+        .clone()
+        .unwrap_or_else(|| record.stored_at.clone());
+    let l0 = usgs_scene_l0_draft(record, &source_id);
+    Ok(NormalizedIngest {
+        source_id: source_id.clone(),
+        source_kind: "satellite".to_string(),
+        platform: Some(scene.dataset_name.clone()),
+        sensor: Some(scene.provider.clone()),
+        source_config: None,
+        scene: Some(IngestScene {
+            scene_id: scene.scene_id.clone(),
+            owner: None,
+            sensor: scene.dataset_name.clone(),
+            acquired_at,
+            data_path: record.metadata_path.to_string_lossy().to_string(),
+            metadata_json,
+            cloud_cover: scene.cloud_cover,
+        }),
+        l0_products: vec![l0],
+        l1_products: Vec::new(),
+        quality: scene
+            .cloud_cover
+            .map(|cover| serde_json::json!({ "cloud_cover": cover })),
+    })
+}
+
+/// Commit a verified USGS satellite scene into the catalog via the normalized
+/// ingest contract: register the source, upsert the scene, and catalog the L0
+/// raw-scene product with lineage. Idempotent on re-ingest of the same scene.
+pub async fn commit_usgs_landsat_ingest(
+    pool: &crate::db::DbPool,
+    record: &crate::landsat::UsgsIngestVerificationRecord,
+    actor: &provenance::ActorIdentity,
+    created_at: &str,
+) -> Result<crate::ingest_contract::IngestReceipt, crate::ingest_contract::IngestError> {
+    let ingest = normalized_ingest_from_usgs(record)?;
+    crate::ingest_contract::commit_ingest(pool, &ingest, actor, created_at).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1621,5 +1748,54 @@ mod tests {
         assert!(record.downloaded_browse_path.exists());
         assert!(record.downloaded_browse_path.metadata().unwrap().len() > 0);
         Ok(())
+    }
+
+    fn sample_verification_record(scene_id: &str) -> UsgsIngestVerificationRecord {
+        UsgsIngestVerificationRecord {
+            scene: UsgsSceneSummary {
+                scene_id: scene_id.to_string(),
+                display_id: Some(format!("LC08_{scene_id}")),
+                dataset_name: "landsat_ot_c2_l2".to_string(),
+                provider: "USGS".to_string(),
+                acquired_at: Some("2026-06-01T00:00:00Z".to_string()),
+                cloud_cover: Some(12.5),
+                bbox: None,
+                browse_url: Some("https://example.test/browse.png".to_string()),
+            },
+            metadata_path: std::path::PathBuf::from(format!("/data/{scene_id}/metadata.json")),
+            downloaded_browse_path: std::path::PathBuf::from(format!("/data/{scene_id}/browse.png")),
+            stored_at: "2026-06-02T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn usgs_scene_normalizes_to_satellite_ingest_with_l0_scene() {
+        let record = sample_verification_record("LC80420342026152");
+        let ingest = normalized_ingest_from_usgs(&record).expect("normalizes");
+
+        assert_eq!(ingest.source_kind, "satellite");
+        assert_eq!(ingest.source_id, "usgs:landsat_ot_c2_l2");
+        let scene = ingest.scene.as_ref().expect("scene present");
+        assert_eq!(scene.scene_id, "LC80420342026152");
+        assert_eq!(scene.acquired_at, "2026-06-01T00:00:00Z");
+        assert_eq!(scene.cloud_cover, Some(12.5));
+        // One L0 raw-scene product, artifact = the downloaded browse image.
+        assert_eq!(ingest.l0_products.len(), 1);
+        let l0 = &ingest.l0_products[0];
+        assert_eq!(l0.level, shared::product_graph::ProductLevel::L0);
+        assert_eq!(l0.kind, "raw_scene");
+        assert_eq!(l0.artifact.as_ref().unwrap().format, "png");
+        assert_eq!(l0.source_id.as_deref(), Some("usgs:landsat_ot_c2_l2"));
+    }
+
+    #[test]
+    fn distinct_scenes_get_distinct_l0_identity() {
+        let a = normalized_ingest_from_usgs(&sample_verification_record("scene-a")).unwrap();
+        let b = normalized_ingest_from_usgs(&sample_verification_record("scene-b")).unwrap();
+        assert_ne!(
+            a.l0_products[0].product_id(),
+            b.l0_products[0].product_id(),
+            "distinct scenes must not collapse into one catalog row"
+        );
     }
 }
