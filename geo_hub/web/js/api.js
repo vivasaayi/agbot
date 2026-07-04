@@ -21,7 +21,18 @@ export const endpoints = {
   fieldScenes: "/api/fields/:field_id/scenes",
   scene: "/api/scenes/:scene_id",
   catalogProducts: "/api/catalog/products",
+  productTiles: "/api/scenes/:scene_id/products/:kind/tiles/:z/:x/:y.png",
 };
+
+/**
+ * Leaflet XYZ tile-url template for a scene product layer. Leaflet fills the
+ * `{z}/{x}/{y}` placeholders per tile request.
+ */
+export function productTilesUrlTemplate(sceneId, kind) {
+  return `/api/scenes/${encodeURIComponent(sceneId)}/products/${encodeURIComponent(
+    kind,
+  )}/tiles/{z}/{x}/{y}.png`;
+}
 
 /** Fields belonging to a farm. */
 export function farmFieldsPath(farmId) {

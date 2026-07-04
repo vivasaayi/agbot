@@ -101,7 +101,7 @@ async function expandFarm(container, farm, onSelectScene) {
   container.replaceChildren(list);
 }
 
-async function renderSceneDetail(inspector, sceneId) {
+export async function renderSceneDetail(inspector, sceneId) {
   inspector.replaceChildren(statusLine("Loading scene…"));
   try {
     const scene = await apiGet(scenePath(sceneId));
@@ -127,10 +127,9 @@ async function renderSceneDetail(inspector, sceneId) {
 
 /**
  * Populate `treeContainer` with the farms -> fields -> scenes tree. Selecting a
- * scene renders its detail into `detailContainer`.
+ * scene calls `onSelectScene(sceneId)`.
  */
-export async function initCatalogPanel(treeContainer, detailContainer) {
-  const onSelectScene = (sceneId) => renderSceneDetail(detailContainer, sceneId);
+export async function initCatalogPanel(treeContainer, onSelectScene) {
   treeContainer.replaceChildren(statusLine("Loading farms…"));
   try {
     const farms = asItems(await apiGet(endpoints.farms));

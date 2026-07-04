@@ -95,6 +95,19 @@ async fn workspace_api_module_is_served_as_javascript() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn vendored_leaflet_is_served() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let app = test_router(&tmp).await?;
+    let response = get(app, "/workspace/vendor/leaflet/leaflet.js").await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "vendored Leaflet must be served for offline field deployments"
+    );
+    Ok(())
+}
+
 /// Extract every string literal starting with "/api/" from a source file.
 fn extract_api_literals(source: &str) -> Vec<String> {
     let mut literals = Vec::new();
