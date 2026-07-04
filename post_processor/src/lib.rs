@@ -244,6 +244,53 @@ pub enum ResultType {
     StressIndicators,
 }
 
+impl ResultType {
+    /// The catalog product `kind` this analysis result registers as. Stable
+    /// snake_case identifiers so the same analysis maps to the same catalog kind
+    /// across runs (part of the L3 identity).
+    pub fn product_kind(&self) -> &'static str {
+        match self {
+            ResultType::NdviMap => "ndvi_analysis",
+            ResultType::ElevationModel => "elevation_model",
+            ResultType::ThermalMap => "thermal_analysis",
+            ResultType::HealthIndex => "health_index",
+            ResultType::YieldEstimate => "yield_estimate",
+            ResultType::IrrigationMap => "irrigation_map",
+            ResultType::StressIndicators => "stress_indicators",
+        }
+    }
+}
+
+impl AnalysisResult {
+    /// Self-describe this analysis result as an L3 catalog draft (Track A phase
+    /// 9b). The result's `ResultType` supplies the catalog kind/algorithm, its
+    /// `uncertainty` band supplies confidence, and its `evidence_refs` become the
+    /// evidence digests. The request supplies scope and the identity-bearing L2
+    /// input product refs. Delegates to [`l3_product::l3_draft_from_request`] so
+    /// the identity invariant (an L3 draft lists its L2 inputs) is enforced in
+    /// one place.
+    pub fn to_product_draft(
+        &self,
+        request: &AnalysisJobRequest,
+        algorithm_version: &str,
+    ) -> shared::product_graph::ProductRecordDraft {
+        let kind = self.result_type.product_kind();
+        let parameters = serde_json::json!({
+            "result_type": self.result_type,
+            "statistics": self.statistics,
+        });
+        crate::l3_product::l3_draft_from_request(
+            request,
+            kind,
+            &format!("{kind}.compute"),
+            algorithm_version,
+            parameters,
+            self.uncertainty.as_ref(),
+            self.evidence_refs.clone(),
+        )
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ResultData {
     GridData {
@@ -2664,6 +2711,62 @@ mod tests {
             output_directory: output_directory.to_path_buf(),
             parameters: ProcessingParameters::default(),
         }
+    }
+
+    fn analysis_result_with(result_type: ResultType, uncertainty: Option<HealthUncertaintyBand>) -> AnalysisResult {
+        AnalysisResult {
+            id: Uuid::new_v4(),
+            job_id: Uuid::new_v4(),
+            result_type,
+            data: ResultData::GridData {
+                width: 2,
+                height: 2,
+                values: vec![0.5; 4],
+                bounds: (0.0, 0.0, 1.0, 1.0),
+                units: "index".to_string(),
+            },
+            statistics: AnalysisStatistics::default(),
+            visualizations: Vec::new(),
+            recommendations: Vec::new(),
+            evidence_refs: vec!["digest:abc".to_string()],
+            uncertainty,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn analysis_result_self_describes_as_l3_draft_with_l2_inputs() {
+        let request = analysis_job_request(std::path::Path::new("/tmp/out"));
+        let result = analysis_result_with(
+            ResultType::NdviMap,
+            Some(HealthUncertaintyBand {
+                lower: 0.4,
+                upper: 0.5,
+            }),
+        );
+        let draft = result.to_product_draft(&request, "2.1.0");
+
+        assert_eq!(draft.level, shared::product_graph::ProductLevel::L3);
+        assert_eq!(draft.kind, "ndvi_analysis");
+        assert_eq!(draft.algorithm_id, "ndvi_analysis.compute");
+        assert_eq!(draft.algorithm_version, "2.1.0");
+        // Identity invariant: the L3 draft lists its L2 input as an edge.
+        assert!(draft
+            .inputs
+            .iter()
+            .any(|i| i.product_id == "layer-ndvi" && i.role == "l2_input"));
+        // Uncertainty band (width 0.1) -> confidence 0.9.
+        let confidence = draft.confidence.expect("confidence from uncertainty");
+        assert!((confidence - 0.9).abs() < 1e-6, "confidence was {confidence}");
+        assert_eq!(draft.evidence_digests, vec!["digest:abc".to_string()]);
+        assert_eq!(draft.scope.field_id.as_deref(), Some("field-a"));
+    }
+
+    #[test]
+    fn result_type_kinds_are_stable_snake_case() {
+        assert_eq!(ResultType::ThermalMap.product_kind(), "thermal_analysis");
+        assert_eq!(ResultType::YieldEstimate.product_kind(), "yield_estimate");
+        assert_eq!(ResultType::StressIndicators.product_kind(), "stress_indicators");
     }
 
     fn trend_request() -> IndexTrendRequest {
