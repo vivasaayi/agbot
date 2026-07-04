@@ -260,7 +260,7 @@ async fn commit_usgs_landsat_ingest_registers_scene_and_l0_with_lineage() -> Res
         stored_at: T0.to_string(),
     };
 
-    let receipt = commit_usgs_landsat_ingest(&pool, &record, &actor, T0).await?;
+    let receipt = commit_usgs_landsat_ingest(&pool, &record, &[], &actor, T0).await?;
     assert_eq!(receipt.source_id, "usgs:landsat_ot_c2_l2");
     assert_eq!(receipt.scene_id.as_deref(), Some("LC80420342026152"));
     assert_eq!(receipt.product_ids.len(), 1, "one L0 raw-scene product");
@@ -280,7 +280,7 @@ async fn commit_usgs_landsat_ingest_registers_scene_and_l0_with_lineage() -> Res
     assert!(lineage.is_some(), "L0 raw-scene has a lineage record");
 
     // Re-ingesting the same scene is idempotent (one product, not two).
-    let again = commit_usgs_landsat_ingest(&pool, &record, &actor, T0).await?;
+    let again = commit_usgs_landsat_ingest(&pool, &record, &[], &actor, T0).await?;
     assert_eq!(again.product_ids, receipt.product_ids);
     let raw = catalog::list_products(
         &pool,
@@ -291,5 +291,68 @@ async fn commit_usgs_landsat_ingest_registers_scene_and_l0_with_lineage() -> Res
     )
     .await?;
     assert_eq!(raw.len(), 1, "idempotent: still one raw-scene product");
+    Ok(())
+}
+
+/// A full-band USGS pull registers the L0 raw-scene plus one L1 band per
+/// downloaded file, and each L1 traces back to the L0 (Track A phase 5b polish).
+#[tokio::test]
+async fn commit_usgs_full_band_ingest_registers_l0_and_l1_with_trace() -> Result<()> {
+    use geo_hub::landsat::{
+        commit_usgs_landsat_ingest, UsgsBandFile, UsgsIngestVerificationRecord, UsgsSceneSummary,
+    };
+
+    let tmp = TempDir::new()?;
+    let pool = pool(&tmp).await?;
+    let actor = ActorIdentity::system("geo_hub:ingest");
+
+    let record = UsgsIngestVerificationRecord {
+        scene: UsgsSceneSummary {
+            scene_id: "LC80420342026152".to_string(),
+            display_id: None,
+            dataset_name: "landsat_ot_c2_l2".to_string(),
+            provider: "USGS".to_string(),
+            acquired_at: Some(T0.to_string()),
+            cloud_cover: Some(4.0),
+            bbox: None,
+            browse_url: None,
+        },
+        metadata_path: tmp.path().join("metadata.json"),
+        downloaded_browse_path: tmp.path().join("browse.png"),
+        stored_at: T0.to_string(),
+    };
+    let bands = vec![
+        UsgsBandFile {
+            band: "nir".to_string(),
+            path: tmp.path().join("B05.tif"),
+            checksum_sha256: Some("nir-hash".to_string()),
+        },
+        UsgsBandFile {
+            band: "red".to_string(),
+            path: tmp.path().join("B04.tif"),
+            checksum_sha256: Some("red-hash".to_string()),
+        },
+    ];
+
+    let receipt = commit_usgs_landsat_ingest(&pool, &record, &bands, &actor, T0).await?;
+    assert_eq!(receipt.product_ids.len(), 3, "1 L0 + 2 L1 bands");
+
+    // One L0 and two L1 band products.
+    let products = catalog::list_products(&pool, &ProductFilter::default()).await?;
+    let l0: Vec<_> = products.iter().filter(|p| p.level == ProductLevel::L0).collect();
+    let l1: Vec<_> = products.iter().filter(|p| p.level == ProductLevel::L1).collect();
+    assert_eq!(l0.len(), 1);
+    assert_eq!(l1.len(), 2);
+
+    // Each L1 band traces back to the L0 raw-scene, gap-free.
+    let l0_id = &l0[0].product_id;
+    for band in &l1 {
+        let trace = provenance_store::trace_backward(&pool, &band.product_id).await?;
+        assert!(trace.gaps.is_empty(), "L1 {} -> L0 gap-free", band.product_id);
+        assert!(
+            trace.records.iter().any(|r| &r.artifact_id == l0_id),
+            "L1 band lists the L0 raw-scene as input"
+        );
+    }
     Ok(())
 }
