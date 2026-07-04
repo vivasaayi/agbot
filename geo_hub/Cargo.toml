@@ -34,6 +34,7 @@ fleet_health = { path = "../fleet_health" }
 soil_iot = { path = "../soil_iot" }
 timeseries = { path = "../timeseries" }
 provenance = { path = "../provenance" }
+mission_planner = { path = "../mission_planner" }
 plugin_sdk = { path = "../plugin_sdk" }
 walkdir = { workspace = true }
 thiserror = { workspace = true }
@@ -45,3 +46,5 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 tempfile = "3.10"
 tower = { workspace = true, features = ["util"] }
 image = { workspace = true }
+geo = { workspace = true }
+chrono = { workspace = true }
