@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AGBot Layer Browser</title>
+  <!--
+    MapLibre GL JS pinned to v4.7.1 from the unpkg CDN with SRI (sha384
+    computed from the published artifact, cross-checked against jsdelivr).
+    This is an internal tool; the CDN dependency is deliberate — no npm, no
+    build step. Bump the version and BOTH integrity hashes together.
+  -->
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css"
+    integrity="sha384-MinO0mNliZ3vwppuPOUnGa+iq619pfMhLVUXfC4LHwSCvF9H+6P/KO4Q7qBOYV5V"
+    crossorigin="anonymous"
+  />
+  <script
+    src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"
+    integrity="sha384-SYKAG6cglRMN0RVvhNeBY0r3FYKNOJtznwA0v7B5Vp9tr31xAHsZC0DqkQ/pZDmj"
+    crossorigin="anonymous"
+  ></script>
+  <link rel="stylesheet" href="/browse/style.css" />
+</head>
+<body>
+  <div id="panel">
+    <header>
+      <h1>AGBot Layer Browser</h1>
+      <p class="subtitle">Internal STAC catalog &middot; served by geo_hub</p>
+    </header>
+
+    <section id="filters">
+      <h2>Datetime filter</h2>
+      <label>From <input type="datetime-local" id="filter-from" /></label>
+      <label>To <input type="datetime-local" id="filter-to" /></label>
+      <div class="filter-actions">
+        <button id="filter-apply" type="button">Apply</button>
+        <button id="filter-clear" type="button">Clear</button>
+      </div>
+    </section>
+
+    <section id="overlays">
+      <h2>Overlays</h2>
+      <label class="toggle-row">
+        <input type="checkbox" id="fields-toggle" />
+        Field boundaries <span class="hint">(/api/fields/export/geojson)</span>
+      </label>
+    </section>
+
+    <section>
+      <h2>Collections</h2>
+      <div id="collections"><p class="hint">Loading…</p></div>
+    </section>
+
+    <footer id="status" role="status"></footer>
+  </div>
+  <div id="map"></div>
+
+  <script type="module" src="/browse/app.js"></script>
+</body>
+</html>

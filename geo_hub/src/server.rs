@@ -25,6 +25,9 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/", get(routes::mobile_app))
         .route("/app", get(routes::mobile_app))
+        .route("/browse", get(routes::browse_app))
+        .route("/browse/app.js", get(routes::browse_app_js))
+        .route("/browse/style.css", get(routes::browse_style_css))
         .route(
             "/api/mobile/scenes/search",
             post(routes::mobile_search_scenes),

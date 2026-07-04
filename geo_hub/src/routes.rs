@@ -299,6 +299,7 @@ fn farm_field_list_page<T>(
 mod alert_rules;
 mod alerts;
 mod applications;
+mod browse;
 mod catalog;
 mod collaboration;
 mod compliance_routes;
@@ -325,6 +326,7 @@ mod workspace;
 pub use alert_rules::*;
 pub use alerts::*;
 pub use applications::*;
+pub use browse::*;
 pub use catalog::*;
 pub use collaboration::*;
 pub use compliance_routes::*;
