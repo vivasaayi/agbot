@@ -13,6 +13,7 @@ pub mod routes;
 pub mod server;
 pub mod shapefile;
 pub mod state;
+pub mod water_priority_run;
 
 pub use config::HubConfig;
 pub use ingest::{

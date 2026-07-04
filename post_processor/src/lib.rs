@@ -23,6 +23,7 @@ pub mod report_generator;
 pub mod thermal_analysis;
 pub mod thermal_spots;
 pub mod vegetation_summary;
+pub mod water_priority_app;
 pub mod zonal_statistics;
 pub mod zone_delineation;
 pub mod zone_recommendations;

@@ -1,7 +1,7 @@
-// Findings panel (Track B phase B3): list a field's application findings and
-// trigger a crop-health run over per-zone NDVI stats. The run's inputs are the
-// field's cataloged L2 NDVI products, so its findings trace back to source.
-// Backend URLs come only from api.js.
+// Findings panel (Track B phase B3/B4): list a field's application findings and
+// trigger a crop-health or water-priority run over per-zone stats. Each app's
+// run inputs are the field's cataloged L2 products of the relevant kind, so its
+// findings trace back to source. Backend URLs come only from api.js.
 
 import {
   apiGet,
@@ -9,8 +9,33 @@ import {
   scenePath,
   fieldFindingsPath,
   cropHealthRunsPath,
+  waterPriorityRunsPath,
   catalogProductsPath,
 } from "../api.js";
+
+// The applications the panel can trigger. Each declares the L2 product kind
+// whose catalog ids become the run inputs, the run route, and the editable
+// per-zone numeric fields (besides the always-present zone_id + area_m2).
+const APPS = {
+  crop_health: {
+    label: "Crop health",
+    productKind: "ndvi",
+    runsPath: cropHealthRunsPath,
+    fields: [
+      ["mean_ndvi", "mean NDVI"],
+      ["ndvi_delta", "NDVI Δ"],
+    ],
+  },
+  water_priority: {
+    label: "Water priority",
+    productKind: "soil_moisture",
+    runsPath: waterPriorityRunsPath,
+    fields: [
+      ["mean_soil_moisture", "mean soil moisture"],
+      ["water_deficit_mm", "deficit mm"],
+    ],
+  },
+};
 
 function asItems(page, ...keys) {
   if (Array.isArray(page)) return page;
@@ -57,18 +82,18 @@ function findingRow(stored) {
   return li;
 }
 
-// A single editable zone-stats row for the run trigger.
-function zoneInputRow() {
+// A single editable zone-stats row for the given app. Always has zone_id and
+// area_m2, plus the app's index-specific numeric fields.
+function zoneInputRow(app) {
   const row = document.createElement("div");
   row.className = "zone-input";
-  const fields = [
+  const spec = [
     ["zone_id", "text", "zone id"],
-    ["mean_ndvi", "number", "mean NDVI"],
-    ["ndvi_delta", "number", "NDVI Δ"],
+    ...app.fields.map(([name, placeholder]) => [name, "number", placeholder]),
     ["area_m2", "number", "area m²"],
   ];
   const inputs = {};
-  for (const [name, type, placeholder] of fields) {
+  for (const [name, type, placeholder] of spec) {
     const input = document.createElement("input");
     input.name = name;
     input.type = type;
@@ -80,22 +105,21 @@ function zoneInputRow() {
   row.readZone = (inputProductIds) => {
     const zoneId = inputs.zone_id.value.trim();
     if (!zoneId) return null;
-    return {
-      zone_id: zoneId,
-      mean_ndvi: Number(inputs.mean_ndvi.value) || 0,
-      ndvi_delta: Number(inputs.ndvi_delta.value) || 0,
-      area_m2: Number(inputs.area_m2.value) || 0,
-      input_product_ids: inputProductIds,
-    };
+    const zone = { zone_id: zoneId, input_product_ids: inputProductIds };
+    for (const name of Object.keys(inputs)) {
+      if (name === "zone_id") continue;
+      zone[name] = Number(inputs[name].value) || 0;
+    }
+    return zone;
   };
   return row;
 }
 
-// Resolve the field's cataloged L2 NDVI products; these are the run's inputs so
-// findings trace to source. Returns product-id strings.
-async function fieldNdviProductIds(fieldId) {
+// Resolve the field's cataloged L2 products of `kind`; these are the run's
+// inputs so findings trace to source. Returns product-id strings.
+async function fieldProductIds(fieldId, kind) {
   const page = await apiGet(
-    catalogProductsPath({ field_id: fieldId, level: "L2", kind: "ndvi" }),
+    catalogProductsPath({ field_id: fieldId, level: "L2", kind }),
   );
   return asItems(page, "products")
     .map((p) => p.product_id ?? p.id)
@@ -107,7 +131,7 @@ async function loadFindings(list, fieldId) {
   try {
     const findings = asItems(await apiGet(fieldFindingsPath(fieldId)), "findings");
     if (findings.length === 0) {
-      list.replaceChildren(status("No findings yet. Run crop-health to compose some."));
+      list.replaceChildren(status("No findings yet. Run an application to compose some."));
       return;
     }
     const ul = document.createElement("ul");
@@ -121,32 +145,50 @@ async function loadFindings(list, fieldId) {
 
 function runForm(fieldId, list, note) {
   const form = document.createElement("form");
-  form.className = "crop-health-run";
+  form.className = "application-run";
+
+  const picker = document.createElement("select");
+  picker.className = "app-picker";
+  for (const [id, app] of Object.entries(APPS)) {
+    const option = document.createElement("option");
+    option.value = id;
+    option.textContent = app.label;
+    picker.appendChild(option);
+  }
+  form.appendChild(picker);
+
   const rows = document.createElement("div");
   rows.className = "zone-inputs";
-  rows.appendChild(zoneInputRow());
   form.appendChild(rows);
+
+  const currentApp = () => APPS[picker.value];
+  const resetRows = () => rows.replaceChildren(zoneInputRow(currentApp()));
+  picker.addEventListener("change", resetRows);
+  resetRows();
 
   const addRow = document.createElement("button");
   addRow.type = "button";
   addRow.className = "link-button add-zone";
   addRow.textContent = "+ zone";
-  addRow.addEventListener("click", () => rows.appendChild(zoneInputRow()));
+  addRow.addEventListener("click", () => rows.appendChild(zoneInputRow(currentApp())));
   form.appendChild(addRow);
 
   const submit = document.createElement("button");
   submit.type = "submit";
-  submit.className = "run-crop-health";
-  submit.textContent = "Run crop-health";
+  submit.className = "run-application";
+  submit.textContent = "Run";
   form.appendChild(submit);
 
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
+    const app = currentApp();
     note.replaceChildren(status("Resolving inputs…"));
     try {
-      const inputProductIds = await fieldNdviProductIds(fieldId);
+      const inputProductIds = await fieldProductIds(fieldId, app.productKind);
       if (inputProductIds.length === 0) {
-        note.replaceChildren(status("No cataloged L2 NDVI products for this field.", true));
+        note.replaceChildren(
+          status(`No cataloged L2 ${app.productKind} products for this field.`, true),
+        );
         return;
       }
       const zones = Array.from(rows.querySelectorAll(".zone-input"))
@@ -156,7 +198,7 @@ function runForm(fieldId, list, note) {
         note.replaceChildren(status("Enter at least one zone (with a zone id).", true));
         return;
       }
-      const run = await apiPost(cropHealthRunsPath(), { field_id: fieldId, zones });
+      const run = await apiPost(app.runsPath(), { field_id: fieldId, zones });
       note.replaceChildren(
         status(`Run ${run.run_id} recorded ${run.output_finding_ids.length} finding(s).`),
       );
@@ -170,7 +212,7 @@ function runForm(fieldId, list, note) {
 
 /**
  * Render the findings panel for the field owning `sceneId`: list its findings
- * and expose a crop-health run trigger.
+ * and expose crop-health / water-priority run triggers.
  */
 export async function renderFindingsPanel(container, sceneId) {
   container.replaceChildren(status("Loading field…"));

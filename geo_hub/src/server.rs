@@ -62,6 +62,10 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::run_crop_health_app),
         )
         .route(
+            "/api/applications/water-priority/runs",
+            post(routes::run_water_priority_app),
+        )
+        .route(
             "/api/farms",
             get(routes::list_farms).post(routes::create_farm),
         )

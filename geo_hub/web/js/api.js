@@ -23,6 +23,7 @@ export const endpoints = {
   catalogProducts: "/api/catalog/products",
   fieldFindings: "/api/fields/:field_id/findings",
   cropHealthRuns: "/api/applications/crop-health/runs",
+  waterPriorityRuns: "/api/applications/water-priority/runs",
   productTiles: "/api/scenes/:scene_id/products/:kind/tiles/:z/:x/:y.png",
   sceneAnnotations: "/api/scenes/:scene_id/annotations",
   sceneAnnotation: "/api/scenes/:scene_id/annotations/:annotation_id",
@@ -90,6 +91,11 @@ export function fieldFindingsPath(fieldId) {
 /** Crop-health application run trigger (POST zone stats). */
 export function cropHealthRunsPath() {
   return "/api/applications/crop-health/runs";
+}
+
+/** Water-priority application run trigger (POST zone stats). */
+export function waterPriorityRunsPath() {
+  return "/api/applications/water-priority/runs";
 }
 
 /** Fields belonging to a farm. */

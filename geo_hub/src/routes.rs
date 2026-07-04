@@ -6780,6 +6780,21 @@ pub async fn run_crop_health_app(
     Ok(Json(record))
 }
 
+/// Run the water-priority application (Track B phase B4): compose per-zone
+/// soil-moisture/deficit stats into findings via
+/// `post_processor::water_priority_app`, then record a governed run with lineage
+/// back to the zones' cataloged L2/L3 inputs.
+pub async fn run_water_priority_app(
+    State(state): State<AppState>,
+    Json(request): Json<crate::water_priority_run::WaterPriorityRunRequest>,
+) -> AppResult<Json<crate::applications::ApplicationRunRecord>> {
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let record = crate::water_priority_run::run(&state.pool, &request, &now)
+        .await
+        .map_err(application_error)?;
+    Ok(Json(record))
+}
+
 pub async fn list_provenance_audit_entries(
     Query(query): Query<ProvenanceAuditListQuery>,
     State(state): State<AppState>,
