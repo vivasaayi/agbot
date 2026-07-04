@@ -21,6 +21,8 @@ export const endpoints = {
   fieldScenes: "/api/fields/:field_id/scenes",
   scene: "/api/scenes/:scene_id",
   catalogProducts: "/api/catalog/products",
+  fieldFindings: "/api/fields/:field_id/findings",
+  cropHealthRuns: "/api/applications/crop-health/runs",
   productTiles: "/api/scenes/:scene_id/products/:kind/tiles/:z/:x/:y.png",
   sceneAnnotations: "/api/scenes/:scene_id/annotations",
   sceneAnnotation: "/api/scenes/:scene_id/annotations/:annotation_id",
@@ -78,6 +80,16 @@ export function productTilesUrlTemplate(sceneId, kind) {
   return `/api/scenes/${encodeURIComponent(sceneId)}/products/${encodeURIComponent(
     kind,
   )}/tiles/{z}/{x}/{y}.png`;
+}
+
+/** A field's application findings (most recent first). */
+export function fieldFindingsPath(fieldId) {
+  return `/api/fields/${encodeURIComponent(fieldId)}/findings`;
+}
+
+/** Crop-health application run trigger (POST zone stats). */
+export function cropHealthRunsPath() {
+  return "/api/applications/crop-health/runs";
 }
 
 /** Fields belonging to a farm. */

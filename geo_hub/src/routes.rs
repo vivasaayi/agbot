@@ -6766,6 +6766,20 @@ pub async fn list_field_findings(
     Ok(Json(findings))
 }
 
+/// Run the crop-health application (Track B phase B3): compose per-zone NDVI
+/// stats into findings via `post_processor::crop_health_app`, then record a
+/// governed run with lineage back to the zones' cataloged L2/L3 inputs.
+pub async fn run_crop_health_app(
+    State(state): State<AppState>,
+    Json(request): Json<crate::crop_health_run::CropHealthRunRequest>,
+) -> AppResult<Json<crate::applications::ApplicationRunRecord>> {
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let record = crate::crop_health_run::run(&state.pool, &request, &now)
+        .await
+        .map_err(application_error)?;
+    Ok(Json(record))
+}
+
 pub async fn list_provenance_audit_entries(
     Query(query): Query<ProvenanceAuditListQuery>,
     State(state): State<AppState>,

@@ -1,6 +1,7 @@
 pub mod applications;
 pub mod catalog;
 pub mod config;
+pub mod crop_health_run;
 pub mod db;
 pub mod error;
 pub mod ingest;

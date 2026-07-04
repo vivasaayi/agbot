@@ -58,6 +58,10 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::list_field_findings),
         )
         .route(
+            "/api/applications/crop-health/runs",
+            post(routes::run_crop_health_app),
+        )
+        .route(
             "/api/farms",
             get(routes::list_farms).post(routes::create_farm),
         )

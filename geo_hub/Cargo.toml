@@ -24,6 +24,7 @@ sha2 = "0.10"
 shared = { path = "../shared" }
 alerting = { path = "../alerting" }
 imagery_processor = { path = "../imagery_processor" }
+post_processor = { path = "../post_processor" }
 interop = { path = "../interop" }
 orthomosaic = { path = "../orthomosaic" }
 crop_intelligence = { path = "../crop_intelligence" }
