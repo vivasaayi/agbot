@@ -176,22 +176,19 @@ alert->finding->L2->L0 gap-free. Unused alerting fns remain for later: dedup,
 routing (route_alert_to_recipients/evaluate_alert_preference), escalation
 (evaluate_no_ack_escalation), delivery adapters.
 
-## Next action (TB-D1) — Track D copilot proposals + unified queue
-Turn alerts/findings/recommendations into actionable proposals in a unified queue
-(accept/reject), each proposal carrying lineage to its source alert/finding.
-- Check the `copilot` crate (geo_hub deps ../copilot) for proposal/queue types
-  before writing new domain code. Existing copilot routes already wired:
-  list_copilot_conversations, create_copilot_turn_handler, and
-  create_crop_closed_loop_proposal (grep routes.rs for copilot/proposal).
-- Design a proposal queue: source (alert/finding/recommendation) -> Proposal
-  {status: proposed/accepted/rejected} with lineage (ArtifactKind::Recommendation
-  or a new kind) to the source. Routes to create/list/transition. Acceptance:
-  emergency alert -> proposal in queue; accept -> state change + lineage intact.
-Pattern: geo_hub/src/alert_evaluation.rs + alert_lifecycle.rs + their tests + an
-APPS/panel entry. Then TB-D2..D4, Track E (governed dispatch: wire
-dispatch_collaboration_mission_plan_route -> guarded_dispatch). Per-batch gate:
-cargo test -p geo_hub --test <new> --test workspace_static; 15 products_api
-acceptance tests remain pre-existing known-red (183 pass).
+## Next action (TB-D2) — copilot advisor rules + proposal adapters
+- TB-D1 committed (21c29a2): geo_hub/src/proposal_queue.rs unified accept/reject
+  queue; ArtifactKind::Proposal + provenance_store::get_lineage; proposals table;
+  routes list/field/get/accept/reject; 3 tests. Proposals lineage-close to L0.
+- TB-D2: deterministic advisor rules (copilot crate, pure, no LLM):
+  evaluate_water_stress_rule / evaluate_pest_hotspot_rule producing proposal
+  drafts. Funnel existing CropClosedLoopProposal + copilot drafts into
+  proposal_queue::create_proposal; extend CropClosedLoopApprovalStatus beyond its
+  Pending stub. Approved proposals also materialize as RecommendationRecords.
+  TDD-first. Then D3 workspace review UI, D4 adapters; Track E governed dispatch
+  (wire dispatch_collaboration_mission_plan_route -> guarded_dispatch).
+Per-batch gate: cargo test -p <crate> targeted + workspace_static; 15
+products_api acceptance tests remain pre-existing known-red (183 pass).
 
 ## (historical) Phase A next action
 Track B (consumption layers) — Track A backbone is complete. Start Phase A (web
