@@ -3,6 +3,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod ingest;
+pub mod ingest_contract;
 pub mod landsat;
 pub mod product_catalog;
 pub mod provenance_store;
