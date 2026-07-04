@@ -9272,6 +9272,41 @@ pub async fn create_scene_recommendation(
     )
     .await?;
 
+    // Persist the recommendation's lineage at create time (Track A phase 10b
+    // polish) so a direct trace of `recommendation:<id>` closes to its source
+    // annotations/findings — not only via the report-lineage reconstruction. The
+    // record mirrors the one build_report_lineage_records derives, so the two
+    // agree and push_lineage_record_if_absent stays a no-op there.
+    let recommendation_inputs = unique_lineage_inputs(
+        recommendation
+            .annotation_ids
+            .iter()
+            .map(|annotation_id| annotation_artifact_ref(annotation_id))
+            .chain(recommendation.evidence_refs.iter().cloned())
+            .collect::<Vec<_>>(),
+    );
+    crate::provenance_store::append_lineage(
+        &state.pool,
+        &LineageRecord {
+            artifact_id: recommendation_artifact_ref(&recommendation.recommendation_id),
+            kind: ArtifactKind::Recommendation,
+            inputs: recommendation_inputs,
+            method: "10.recommendation_lifecycle".to_string(),
+            parameters: ProvenanceParameters::from_json(serde_json::json!({
+                "field_id": &recommendation.field_id,
+                "title": &recommendation.title,
+                "category": &recommendation.category,
+                "priority": recommendation.priority,
+                "status": recommendation.status,
+            })),
+            operator: recommendation.author_user_id.clone(),
+            actor: ActorIdentity::system("geo_hub"),
+            created_at: recommendation.created_at.clone(),
+        },
+    )
+    .await
+    .map_err(|err| AppError::Anyhow(err.into()))?;
+
     Ok(Json(recommendation))
 }
 
