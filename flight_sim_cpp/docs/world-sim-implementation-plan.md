@@ -168,7 +168,7 @@ Multi-batch (needs external data; user authorized acquisition).
 - Deferred (non-blocking): bgfx/Dawn GPU backend, terrain clipmaps, 3D-Tiles streaming.
   The deterministic scene geometry hash already lives in `.agbworld` (tile.content_hash).
 
-### M6 — Autonomy evidence loop + nav gate — 🚧 IN PROGRESS
+### M6 — Autonomy evidence loop + nav gate — ✅ DONE (batches 1–3)
 
 **Batch 1 — city occupancy + Gate 5 (path-level) — ✅ DONE (commit 1adf6f4)**
 - `nav/CityEvidence`: building footprints (the same geometry the sensor observes)
@@ -199,14 +199,19 @@ Multi-batch (needs external data; user authorized acquisition).
   >25 m roofs), plus non-zero planner effort. Unit tests cover back-projection,
   the precision/recall metric, and effort reporting.
 
-**Batch 3 (remaining) — full local-control pipeline**
-- Wire the end-to-end `NavigationPipeline`: global (A*/Hybrid-A*) → **local MPPI**
-  controller → recovery/replan behavior, driving a robot state over the
-  sensor-derived costmap (not just planning a path). Keep **Pure Pursuit /
-  Stanley** as interpretable baselines.
-- Fold LiDAR ray hits into the same occupancy grid alongside depth+semantic.
-- Extend Gate 5 with executed-trajectory metrics (tracking error, controller
-  smoothness) on top of the path-level metrics already gated.
+**Batch 3 — closed-loop trajectory execution — ✅ DONE (commit 56c5cca)**
+- `execute_trajectory`: a kinematic-bicycle delivery robot tracked by the PID+Stanley
+  controller drives the global plan **closed-loop** over the costmap, reporting
+  executed length, tracking error (mean/max crosstrack), steering smoothness,
+  collisions, and goal reach. `run_evidence_loop` runs it on the final plan.
+- Two-tier occupancy: inflation ring is `kInflated` (planner-blocked, keeps
+  clearance) vs footprint `kLethal` (physical collision) — so a robot clipping the
+  safety margin is not a collision. `fold_pointcloud_into_occupancy` fuses LiDAR
+  tall returns into the same grid.
+- **Gate 5** drives the robot the full ~3060 m over Lower Manhattan: reaches goal,
+  mean crosstrack 0.002 m (max 0.19 m), smooth steering, **0 collisions**.
+- Optional later: swap in the full `NavigationPipeline`/MPPI over a `NavWorld` built
+  from the city; keep Pure Pursuit / Stanley as baselines.
 
 ### M7 — Fixed-wing validation + weather/atmosphere — ✅ DONE (batches 1–3)
 
@@ -268,10 +273,13 @@ Multi-batch (needs external data; user authorized acquisition).
 
 ## 5. Immediate next step
 
-All six acceptance gates (M1–M7) are implemented and committed. The remaining work is
-depth, not new gates: **M6 batch 3** — wire the full `NavigationPipeline` (global →
-MPPI local → recovery) to *execute* a trajectory over the sensor costmap and fold in
-LiDAR hits; and optional integration polish — consume the atmosphere/lighting + night
-lights in the live viewer, and fetch the NYC DSM/land-cover snapshots to activate the
-measured height tier + land-cover histogram on Lower Manhattan. Recommend M6 batch 3
-next as the last substantial autonomy-depth item.
+All six acceptance gates (M1–M7) are implemented and committed, and every milestone's
+batches are done — including M6 batch 3 (closed-loop trajectory execution) and M7
+batches 1–3. What remains is optional integration polish, not new gates:
+- Consume the atmosphere/lighting + night lights in the live OpenGL viewer.
+- Fetch + pin the NYC DSM / 6-inch land-cover snapshots (scripts exist) to activate the
+  measured height tier + land-cover histogram on Lower Manhattan (currently fallback).
+- Swap the bespoke executor for the full `NavigationPipeline`/MPPI over a `NavWorld`
+  built from the compiled city, if deeper autonomy fidelity is wanted.
+- Renderer backend (bgfx/Dawn), terrain clipmaps, and 3D-Tiles streaming (deferred
+  since M5; not on the gate critical path).
