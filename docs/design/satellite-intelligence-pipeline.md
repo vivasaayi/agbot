@@ -1,0 +1,96 @@
+# Satellite Intelligence Pipeline — Design & Phased Plan
+
+Status: approved research synthesis (2026-07). Owner domains: `05-imagery-remote-sensing`, `07-gis-geospatial-hub`, `17-drought-management`, `16-water-management`, `28-timeseries-change-detection`, `08-geo-viewer-visualization`.
+
+## Goal
+
+Ingest Landsat, Sentinel, and related open satellite datasets; derive Level-2 (surface reflectance) and Level-3 (composites, indices, climatologies, classifications) products ourselves for regions where agencies do not publish them; measure vegetation, crop type, trees, water bodies, water availability, and drought; browse everything through Geo Hub / Geo Viewer.
+
+## What we already have (capability map, 2026-07)
+
+- `geo_hub/src/landsat.rs` — Landsat 8/9 + Sentinel-2 STAC search (Microsoft Planetary Computer), USGS M2M credentialed ingest, product PNG rendering + statistics via the remote PC tiler, and an L0/L1 lineage bridge (`usgs_scene_l0_draft`, `usgs_band_l1_draft`, `commit_usgs_landsat_ingest`).
+- `shared/src/product_graph.rs` — `ProductLevel { L0, L1, L2, L3 }`, content-addressed product IDs, lineage edges. `shared/src/schemas.rs` — `RasterSpatialRef`, `RasterResolution`, `SceneLayerRecord`.
+- `imagery_processor` — 12 spectral indices (NDVI, NDRE, EVI, EVI2, SAVI, MSAVI, VARI, GNDVI, NDWI, MNDWI, NBR, NDMI) with per-pixel reason codes and calibration evidence; Landsat QA_PIXEL masking; thermal→LST; threshold/k-means classification. GDAL behind optional `gdal-io` feature; PNG-first I/O.
+- `post_processor` — the L3 analytics layer (`index_trend`, `index_anomaly`, `zonal_statistics`, `water_priority_app`, `l3_product::to_l3_draft`).
+- `geo_hub` serving — scene-relative XYZ tiles (`/api/scenes/:id/products/:kind/tiles/:z/:x/:y.png`), layer export, catalog/product-graph API, drought/water endpoints (compute is early).
+- `geo_viewer` — Bevy 0.14 + bevy_egui 0.28 native app rendering geo_hub tile layers, boundaries, annotations; CRS-match assertions.
+
+### Gaps
+1. Satellite products are remote-tiler previews; no local COG band read → index → COG write pipeline.
+2. No workspace raster stack (no gdal/proj/tiff at workspace level); CRS is string-compared; no reprojection/resampling (30 m Landsat vs 10 m Sentinel-2).
+3. No Sentinel-2 SCL masking (only Landsat QA_PIXEL); no sensor scale/offset handling (Landsat C2 `DN*0.0000275-0.2`; S2 `(DN-1000)/10000` from baseline 04.00).
+4. No internal STAC API; no temporal compositing (L3), climatologies, or drought-index rasters.
+5. Bevy viewer is 5 majors behind (0.14 vs 0.19).
+
+## Data sources (all free/open)
+
+| Source | What | Access | Auth |
+|---|---|---|---|
+| Earth Search (Element84) `https://earth-search.aws.element84.com/v1` | S2 L2A COGs (`s3://sentinel-cogs`, free, not requester-pays), S2 L1C, S1 GRD, Landsat C2 L2, Copernicus DEM | STAC | **none** |
+| LandsatLook STAC `https://landsatlook.usgs.gov/stac-server` | Landsat C2 L1/L2 (L2 SR/ST is now **global**, L4–9, 1982→) | STAC search free; assets on requester-pays S3 or via Planetary Computer mirror | ERS for HTTPS full-res |
+| Copernicus Data Space `https://stac.dataspace.copernicus.eu/v1` | authoritative S2 L1C+L2A full archive (Collection-1 reprocessed, global) | STAC/OData/S3 | free reg; OAuth2; 12 TB/30d quota |
+| USGS M2M `https://m2m.cr.usgs.gov/api/api/json/stable/` | Landsat search/download (already integrated) | JSON API | ERS + MACHINE role + app token |
+| NASA CMR-STAC LPCLOUD | **HLS v2.0** (harmonized L+S2, 30 m, 2–3 day revisit — best ready-made global ARD), MODIS/VIIRS NDVI/LST | STAC search free | Earthdata login for download |
+| ASF DAAC | Sentinel-1 SAR (water/flood, all-weather) | asf_search API | Earthdata login |
+| CHIRPS `https://data.chc.ucsb.edu/products/CHIRPS-2.0/` | precipitation 1981→ (for SPI) | plain HTTPS dir | **none** |
+| Bootstrap layers | ESA WorldCover 10 m, WorldCereal 10 m, Dynamic World, JRC Global Surface Water, Hansen GFC | various open | mostly none |
+
+Key fact: Landsat C2 **Level-2 is global** now; the US-only products are Level-3/ARD (fractional water, burned area, composites). "Derive L2/L3 for other countries" therefore means: (a) L3 always ours to build; (b) L2 self-derivation needed only for pre-1982/edge scenes or custom correction — via **Sen2Cor v2.12** (`L2A_Process`, clean CLI) or **ACOLITE** (CLI), shelled out from Rust in a containerized step. No Rust-native atmospheric correction exists; do not build one.
+
+## Science layer (per-sensor band math)
+
+Bands: Landsat 8/9 — Blue B2, Green B3, Red B4, NIR B5, SWIR1 B6, SWIR2 B7, TIR B10. Sentinel-2 — Blue B02, Green B03, Red B04, RE1 B05, NIR B08 (10 m) / B8A (20 m narrow), SWIR1 B11, SWIR2 B12, SCL.
+
+Scaling (bug-prone, do first): Landsat C2 L2 SR `refl = DN*0.0000275 - 0.2`, ST `K = DN*0.00341802 + 149.0`. Sentinel-2 L2A `refl = (DN - 1000)/10000` for baseline ≥04.00 (else `DN/10000`). Clamp to valid range; mask before math.
+
+Masking: Landsat QA_PIXEL reject bits {0 fill, 1 dilated cloud, 2 cirrus, 3 cloud, 4 shadow} (`QA & 0x1F == 0` is clear); S2 SCL keep {4 vegetation, 5 bare, 6 water}, reject {0,1,2,3,8,9,10,11}; dilate cloud/shadow ~1–2 px.
+
+Indices (have vs add):
+- Have: NDVI, EVI, EVI2, SAVI, MSAVI, NDRE, GNDVI, VARI, NDWI (McFeeters), MNDWI, NDMI (=NDWI-Gao), NBR.
+- Add: **OSAVI** `(NIR−Red)/(NIR+Red+0.16)`; **AWEI** (nsh: `4(G−SWIR1) − (0.25 NIR + 2.75 SWIR2)`; sh: `B + 2.5G − 1.5(NIR+SWIR1) − 0.25 SWIR2`) for shadow-prone water.
+- Drought (climatology-based): **VCI** `100(NDVI−NDVImin)/(NDVImax−NDVImin)` per-pixel per calendar period, ≥5 yr archive (10+ preferred); **TCI** `100(LSTmax−LST)/(LSTmax−LSTmin)` (Landsat/MODIS thermal only); **VHI** `0.5·VCI + 0.5·TCI`; **SPI** from CHIRPS (gamma fit per period). Single-scene moisture proxy: NDMI (no baseline needed — ship first).
+- L3 compositing: monthly/dekadal **medoid** (preferred, spectrally consistent) or max-NDVI; Whittaker/Savitzky-Golay smoothing; then phenology metrics (SOS/EOS/peak/amplitude/integral/cycle count).
+- Crop/tree/water classification: tier 1 deterministic (NDVI amplitude > ~0.3–0.4 + trough ⇒ annual crop; high NDVI_min + low amplitude ⇒ tree/perennial; MNDWI/AWEI + JRC prior ⇒ water); tier 2 bootstrap from WorldCover/WorldCereal/Dynamic World; tier 3 RF on temporal features (train offline scikit-learn/LightGBM, infer in Rust via smartcore/ONNX). Separable crops with S2 time series: maize, winter cereals, rice, soybean, sunflower/rapeseed, sugar-beet, grassland; wheat-vs-barley is not.
+
+## Rust stack decisions
+
+- **COG reads (local + HTTP/S3 range requests): `async-tiff` + `object_store`** (Development Seed, v0.3, pure Rust). This unlocks reading `sentinel-cogs` band windows without downloading whole scenes.
+- **Warp/reproject/COG write: `gdal` crate (0.19)**, feature-gated (extend the existing `gdal-io` pattern); `gdal-src` static build for deployment. `proj4rs` (pure Rust) for WGS84↔UTM vector math.
+- **Band math: `ndarray` + `rayon`**; zonal stats = `geo-rasterize` mask + masked reductions (deterministic, ~50 lines).
+- **Internal STAC: `rustac`** (`stac` 0.17, `stac-server` 0.5 with axum 0.8 backend — note our axum is 0.7; either use `stac` types with our own axum 0.7 handlers, or bump axum). Every derived product = STAC item with `processing:` lineage, mirroring `ProductRecordDraft`.
+- **Atmospheric correction: subprocess** Sen2Cor/ACOLITE in a container; never in-process.
+- **Tile serving:** keep geo_hub XYZ routes; add a dynamic COG→tile endpoint (async-tiff + `image` PNG encode + sensor_overlay_engine colormaps). Consider martin sidecar later.
+- **Viewer (decided 2026-07):** Satellite/GIS layer browsing moves to a **MapLibre GL JS web UI served by geo_hub** (static assets + existing XYZ tile/catalog/layers routes). Bevy stays **frozen at 0.14** in `geo_viewer` solely for 3D LiDAR/terrain viewing; the 0.14→0.19 migration is deferred and only happens if 3D becomes a P0/P1 requirement — otherwise `geo_viewer` is retired in favor of MapLibre 2.5D (terrain/hillshade). Rationale: MapLibre gives best-in-class 2D GIS UX (layer toggles, time slider, opacity, popups, drawing) with zero new Rust deps; Bevy has no map/GIS ecosystem and its per-release churn is a standing tax.
+
+## Phased implementation plan
+
+### Phase 1 — Correct pixels (foundation)
+1. **Sensor calibration module** in `imagery_processor`: Landsat C2 L2 and S2 L2A scale/offset + valid-range clamping, recorded in `RadiometricCalibrationEvidence`. TDD with known DN→reflectance fixtures.
+2. **Sentinel-2 SCL masking** alongside QA_PIXEL in `pipeline/masks.rs` (keep {4,5,6}, dilation), shared mask contract for indices/stats.
+3. **New indices**: OSAVI, AWEI (nsh/sh) in `IndexKind`.
+4. **Local COG band reader**: new `raster` module (or small crate) on `async-tiff` + `object_store`; read windows from `sentinel-cogs`/Planetary Computer assets; wire `imagery_processor` indices to real satellite bands end-to-end (scene → masked NDVI GeoTIFF/COG with `RasterSpatialRef`), registered as an **L2 product** in the product graph.
+
+### Phase 2 — L3 composites + internal STAC
+5. Monthly/dekadal medoid + max-NDVI compositor in `post_processor` (mask-first), emitted via `to_l3_draft`; per-composite evidence object (input scene IDs, mask rule, method).
+6. Internal STAC catalog in geo_hub (`/api/stac/...`) over the existing catalog/product graph.
+7. Dynamic COG tile endpoint for derived products; **MapLibre GL JS browse UI served by geo_hub** (`/maps` or `/browse`): base map + scene/product layer picker + field boundaries (GeoJSON routes) + time slider over composites. geo_viewer (Bevy) is not extended for satellite browsing.
+
+### Phase 3 — Analytics products
+8. NDVI/LST climatology store (per-pixel, per calendar month) → **VCI, TCI, VHI** rasters wired into the existing `/api/drought-management` routes.
+9. CHIRPS ingestion → **SPI**; water-body extraction (MNDWI/AWEI + Otsu, JRC prior) → water-availability layers into `water_priority_app`.
+10. Phenology metrics + rule-based cropland/tree/water classification; bootstrap masks from WorldCover/WorldCereal.
+
+### Phase 4 — Advanced
+11. Crop-type RF (offline training, Rust inference), Sentinel-1 SAR water for cloudy periods, ΔNBR forest-loss detection, HLS ingestion as densified time-series source, Sen2Cor containerized self-derivation path. Bevy: decide keep-and-migrate (0.19 + big_space) vs retire `geo_viewer` based on 3D priority at that point.
+
+## Progress ledger (update per batch)
+
+- **Batch 1 — DONE (2026-07-04, uncommitted):** `imagery_processor` sensor calibration (`pipeline/calibration.rs`, SensorProfile for Landsat C2 SR/ST + S2 both baselines), Sentinel-2 SCL masking with dilation (shared MaskKind contract with QA_PIXEL), OSAVI/AWEInsh/AWEIsh indices. 82 tests.
+- **Batch 2 — DONE (2026-07-04, uncommitted):** new `raster_io` crate (GeoTIFF read incl. EPSG/geotransform/nodata → `RasterSpatialRef`, striped GeoTIFF write; `tiff` crate backend — async-tiff 0.3 rejected: tiled-only decode; API is backend-agnostic for a later object_store COG backend). `imagery_processor` GeoTIFF band ingest (`io/geotiff_ingest.rs`) + `--sensor-profile` flag; end-to-end DN→reflectance→NDVI with georeferencing evidence. 99 tests across both crates.
+- **Batch 3 — DONE (2026-07-04, uncommitted):** `post_processor/src/temporal_composite.rs` — MaxNdvi/Medoid/Median L3 composites, per-pixel valid-count/selected-index/gap reason codes, monthly+dekadal windowing, `CompositeEvidence`, `composite_l3_draft` → L3 lineage. 106 post_processor tests.
+- **Next (batch 4 candidates, in order):** (a) internal STAC API in geo_hub over catalog/product graph; (b) MapLibre GL JS browse UI served by geo_hub; (c) satellite band download wiring (Earth Search assets → local GeoTIFF → indices → L2 registration); (d) object_store/HTTP COG backend in raster_io; (e) VCI climatology store.
+
+## Doctrine hooks
+- Every derived raster carries an evidence object: input scene IDs, bands, scale/offset applied, mask rule, algorithm + coefficients, valid-range, window. Content-addressed via `ProductRecordDraft::product_id()`.
+- Deterministic first; ML only for crop-type where phenology under-determines class.
+- Roadmap doc updates owed: `05-imagery-remote-sensing` (add satellite ingestion — code exists but docs are drone-only), `17-drought-management` (VCI/TCI/VHI/SPI concretized).
