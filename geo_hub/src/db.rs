@@ -3245,6 +3245,23 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // Alert lifecycle (Track C phase C2): the governed fired->acknowledged->
+    // resolved state machine per fired alert, with an append-only transition log.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS alert_lifecycle (
+            alert_id TEXT PRIMARY KEY,
+            source_event_ref TEXT NOT NULL,
+            state TEXT NOT NULL,
+            fired_at TEXT NOT NULL,
+            transitions_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     info!("database ready");
     Ok(())
 }

@@ -78,6 +78,15 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::list_field_alerts),
         )
         .route(
+            "/api/alerts/:alert_id/lifecycle",
+            get(routes::get_alert_lifecycle),
+        )
+        .route(
+            "/api/alerts/:alert_id/acknowledge",
+            post(routes::acknowledge_alert),
+        )
+        .route("/api/alerts/:alert_id/resolve", post(routes::resolve_alert))
+        .route(
             "/api/farms",
             get(routes::list_farms).post(routes::create_farm),
         )

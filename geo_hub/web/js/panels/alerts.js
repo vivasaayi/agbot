@@ -8,7 +8,13 @@ import {
   scenePath,
   fieldAlertsPath,
   fieldAlertEvaluationPath,
+  alertLifecyclePath,
+  alertAcknowledgePath,
+  alertResolvePath,
 } from "../api.js";
+
+// The operator attributed to lifecycle transitions from the workspace.
+const WORKSPACE_ACTOR = "workspace-operator";
 
 function asItems(page) {
   if (Array.isArray(page)) return page;
@@ -28,6 +34,19 @@ function heading(text) {
   return h;
 }
 
+// Advance an alert's lifecycle, then reflect the new state in `stateTag`.
+async function transitionAlert(pathFn, alertId, stateTag) {
+  stateTag.textContent = "…";
+  try {
+    const action = await apiPost(pathFn(alertId), { actor_id: WORKSPACE_ACTOR });
+    stateTag.textContent = action.state ?? "";
+    stateTag.className = `tag state-${action.state}`;
+  } catch (error) {
+    stateTag.textContent = `error: ${error.message}`;
+    stateTag.className = "tag state-error";
+  }
+}
+
 function alertRow(alert) {
   const li = document.createElement("li");
   li.className = "alert-row";
@@ -45,6 +64,37 @@ function alertRow(alert) {
   rule.className = "alert-rule";
   rule.textContent = alert.matched_rule_id ?? "";
   li.appendChild(rule);
+
+  const alertId = alert.alert_id;
+  const stateTag = document.createElement("span");
+  stateTag.className = "tag state-unknown";
+  stateTag.textContent = "";
+  // Reflect the persisted lifecycle state (opens at `fired` on first read).
+  apiGet(alertLifecyclePath(alertId))
+    .then((life) => {
+      stateTag.textContent = life.state ?? "";
+      stateTag.className = `tag state-${life.state}`;
+    })
+    .catch(() => {});
+  li.appendChild(stateTag);
+
+  const ack = document.createElement("button");
+  ack.type = "button";
+  ack.className = "link-button ack-alert";
+  ack.textContent = "Ack";
+  ack.addEventListener("click", () =>
+    transitionAlert(alertAcknowledgePath, alertId, stateTag),
+  );
+  li.appendChild(ack);
+
+  const resolve = document.createElement("button");
+  resolve.type = "button";
+  resolve.className = "link-button resolve-alert";
+  resolve.textContent = "Resolve";
+  resolve.addEventListener("click", () =>
+    transitionAlert(alertResolvePath, alertId, stateTag),
+  );
+  li.appendChild(resolve);
   return li;
 }
 

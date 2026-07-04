@@ -6857,6 +6857,81 @@ pub async fn list_field_alerts(
     Ok(Json(alerts))
 }
 
+fn alert_lifecycle_error(err: crate::alert_lifecycle::AlertLifecycleError) -> AppError {
+    use crate::alert_lifecycle::AlertLifecycleError;
+    match err {
+        AlertLifecycleError::AlertNotFound(_) => AppError::NotFound,
+        // Illegal transitions / validation are the caller's fault -> 400.
+        AlertLifecycleError::Alerting(_) | AlertLifecycleError::UnknownState(_) => {
+            AppError::BadRequest(err.to_string())
+        }
+        other => AppError::Anyhow(Error::new(other)),
+    }
+}
+
+/// Body for a lifecycle transition (Track C phase C2): the acting operator.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct AlertLifecycleActionRequest {
+    pub actor_id: String,
+}
+
+async fn transition_alert(
+    state: AppState,
+    alert_id: String,
+    transition: crate::alert_lifecycle::LifecycleTransition,
+    actor_id: String,
+) -> AppResult<Json<alerting::AlertLifecycleAction>> {
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let action =
+        crate::alert_lifecycle::transition(&state.pool, &alert_id, transition, &actor_id, &now)
+            .await
+            .map_err(alert_lifecycle_error)?;
+    Ok(Json(action))
+}
+
+/// Acknowledge an alert (Track C phase C2): fired -> acknowledged.
+pub async fn acknowledge_alert(
+    Path(alert_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<AlertLifecycleActionRequest>,
+) -> AppResult<Json<alerting::AlertLifecycleAction>> {
+    transition_alert(
+        state,
+        alert_id,
+        crate::alert_lifecycle::LifecycleTransition::Acknowledge,
+        request.actor_id,
+    )
+    .await
+}
+
+/// Resolve an alert (Track C phase C2): acknowledged -> resolved.
+pub async fn resolve_alert(
+    Path(alert_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<AlertLifecycleActionRequest>,
+) -> AppResult<Json<alerting::AlertLifecycleAction>> {
+    transition_alert(
+        state,
+        alert_id,
+        crate::alert_lifecycle::LifecycleTransition::Resolve,
+        request.actor_id,
+    )
+    .await
+}
+
+/// Fetch an alert's lifecycle record (Track C phase C2), opening it at the
+/// `fired` state if the alert exists but has no lifecycle yet.
+pub async fn get_alert_lifecycle(
+    Path(alert_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<alerting::AlertLifecycleRecord>> {
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let record = crate::alert_lifecycle::get_or_open_lifecycle(&state.pool, &alert_id, &now)
+        .await
+        .map_err(alert_lifecycle_error)?;
+    Ok(Json(record))
+}
+
 pub async fn list_provenance_audit_entries(
     Query(query): Query<ProvenanceAuditListQuery>,
     State(state): State<AppState>,

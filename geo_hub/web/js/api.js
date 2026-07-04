@@ -24,6 +24,9 @@ export const endpoints = {
   fieldFindings: "/api/fields/:field_id/findings",
   fieldAlerts: "/api/fields/:field_id/alerts",
   fieldAlertEvaluation: "/api/fields/:field_id/alert-evaluation",
+  alertLifecycle: "/api/alerts/:alert_id/lifecycle",
+  alertAcknowledge: "/api/alerts/:alert_id/acknowledge",
+  alertResolve: "/api/alerts/:alert_id/resolve",
   cropHealthRuns: "/api/applications/crop-health/runs",
   waterPriorityRuns: "/api/applications/water-priority/runs",
   anomalyRuns: "/api/applications/anomaly/runs",
@@ -99,6 +102,21 @@ export function fieldAlertsPath(fieldId) {
 /** Alert-evaluation trigger for a field (POST optional rule set). */
 export function fieldAlertEvaluationPath(fieldId) {
   return `/api/fields/${encodeURIComponent(fieldId)}/alert-evaluation`;
+}
+
+/** An alert's lifecycle record. */
+export function alertLifecyclePath(alertId) {
+  return `/api/alerts/${encodeURIComponent(alertId)}/lifecycle`;
+}
+
+/** Acknowledge-transition endpoint for an alert (POST { actor_id }). */
+export function alertAcknowledgePath(alertId) {
+  return `/api/alerts/${encodeURIComponent(alertId)}/acknowledge`;
+}
+
+/** Resolve-transition endpoint for an alert (POST { actor_id }). */
+export function alertResolvePath(alertId) {
+  return `/api/alerts/${encodeURIComponent(alertId)}/resolve`;
 }
 
 /** Crop-health application run trigger (POST zone stats). */

@@ -252,3 +252,46 @@ pub async fn list_field_alerts(
     }
     Ok(out)
 }
+
+/// Reconstruct the `alerting::FiredAlertRecord` for a persisted alert, so the
+/// lifecycle engine (Track C phase C2) can act on it. Returns `None` when the
+/// alert id is unknown.
+pub async fn get_fired_alert(
+    pool: &DbPool,
+    alert_id: &str,
+) -> Result<Option<FiredAlertRecord>, AlertEvaluationError> {
+    use sqlx::Row;
+    let Some(row) = sqlx::query("SELECT * FROM fired_alerts WHERE alert_id = ?")
+        .bind(alert_id)
+        .fetch_optional(pool)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let severity: AlertSeverityHint = row
+        .get::<String, _>("severity")
+        .parse()
+        .unwrap_or(AlertSeverityHint::Info);
+    Ok(Some(FiredAlertRecord {
+        alert_id: row.get("alert_id"),
+        matched_rule_id: row.get("matched_rule_id"),
+        source_event_ref: row.get("source_finding_id"),
+        source_domain: SOURCE_DOMAIN.to_string(),
+        event_type: row.get("event_type"),
+        subject_ref: row.get("subject_ref"),
+        field_id: row.get("field_id"),
+        evidence_refs: row
+            .get::<Option<String>, _>("evidence_refs_json")
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default(),
+        severity,
+        channels: row
+            .get::<Option<String>, _>("channels_json")
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default(),
+        fired_at: row.get("fired_at"),
+        explanation: row
+            .get::<Option<String>, _>("explanation")
+            .unwrap_or_default(),
+    }))
+}

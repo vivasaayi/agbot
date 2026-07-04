@@ -1,4 +1,5 @@
 pub mod alert_evaluation;
+pub mod alert_lifecycle;
 pub mod anomaly_run;
 pub mod applications;
 pub mod catalog;
