@@ -1,3 +1,4 @@
+pub mod advisor_rules;
 use serde::{Deserialize, Serialize};
 use shared::schemas::{
     RecommendationLifecycleRegistry, RecommendationPersistenceError, RecommendationPriority,
