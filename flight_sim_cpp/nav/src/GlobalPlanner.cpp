@@ -130,6 +130,7 @@ PlanResult AStarPlanner::plan(const Costmap& costmap, const Vec3& start, const V
             continue;
         }
         closed[current.index] = true;
+        ++result.expanded;
         if (current.index == goal_index) {
             found = true;
             break;

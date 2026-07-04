@@ -5,6 +5,7 @@
 #include "agbot_flight_sim/Mission.hpp"
 #include "agbot_nav/CityEvidence.hpp"
 #include "agbot_nav/NavTypes.hpp"
+#include "agbot_render/OffscreenRenderer.hpp"
 #include "agbot_worldgen/Feature.hpp"
 
 #include <cmath>
@@ -190,6 +191,86 @@ void test_determinism() {
            "evidence loop is deterministic across runs");
 }
 
+void test_sensor_occupancy_backprojects_obstacles() {
+    // Nadir camera 100 m up, looking straight down; depth is eye-space metres
+    // along forward, so world height = 100 - depth.
+    agbot::render::OffscreenCamera cam;
+    cam.eye = {0.0f, 100.0f, 0.0f};
+    cam.target = {0.0f, 0.0f, 0.0f};
+    cam.up = {0.0f, 0.0f, -1.0f};
+
+    agbot::render::SensorFrame frame;
+    frame.width = 40;
+    frame.height = 40;
+    frame.depth.assign(1600, 100.0f);   // ground everywhere (world y = 0)
+    frame.semantic.assign(1600, 1);
+    // Central 16x16 patch is a rooftop at world y = 30 m (depth 70).
+    for (int y = 12; y < 28; ++y) {
+        for (int x = 12; x < 28; ++x) {
+            frame.depth[static_cast<std::size_t>(y) * 40 + x] = 70.0f;
+        }
+    }
+    agbot::nav::SensorOccupancyParams p;
+    p.grid.half_extent_m = 50.0;
+    // Cells wider than the ~2 m synthetic depth-sample spacing so the central
+    // cell is covered (a dense real frame does not need this).
+    p.grid.resolution_m = 4.0;
+    p.grid.inflation_cells = 0;
+    p.min_obstacle_height_m = 3.0f;
+    const agbot::nav::OccupancyGrid grid =
+        agbot::nav::occupancy_from_sensor_frame(frame, cam, p);
+
+    expect(grid.cost_at_world(0.0, 0.0) >= OccupancyGrid::kLethal,
+           "rooftop hit back-projects to a lethal cell near the image center");
+    expect(grid.cost_at_world(45.0, 45.0) < OccupancyGrid::kLethal,
+           "far-field ground stays free");
+    std::size_t lethal = 0;
+    for (auto c : grid.cells) lethal += c >= OccupancyGrid::kLethal ? 1 : 0;
+    expect(lethal > 0, "sensor occupancy has lethal cells from the rooftop patch");
+}
+
+void test_occupancy_consistency_metric() {
+    OccupancyGrid footprint;
+    footprint.width = 10;
+    footprint.height = 10;
+    footprint.resolution_m = 1.0;
+    footprint.reset(0);
+    OccupancyGrid sensor = footprint;
+    // Footprint: 3x3 block at cols/rows 2..4.
+    for (int cz = 2; cz <= 4; ++cz) {
+        for (int cx = 2; cx <= 4; ++cx) {
+            footprint.set(cx, cz, OccupancyGrid::kLethal);
+        }
+    }
+    // Sensor: 2x2 block inside the footprint (all real) + one stray hit at (8,8).
+    for (int cz = 2; cz <= 3; ++cz) {
+        for (int cx = 2; cx <= 3; ++cx) {
+            sensor.set(cx, cz, OccupancyGrid::kLethal);
+        }
+    }
+    sensor.set(8, 8, OccupancyGrid::kLethal);
+
+    const auto c = agbot::nav::occupancy_consistency(sensor, footprint, 0);
+    expect(c.sensor_lethal == 5 && c.footprint_lethal == 9, "consistency counts lethal cells");
+    expect(c.agree_lethal == 4, "4 sensor cells agree with the footprint");
+    expect(std::abs(c.precision - 0.8) < 1e-9, "precision = agree / sensor_lethal = 0.8");
+    expect(std::abs(c.recall - 4.0 / 9.0) < 1e-9, "recall = seen footprint / footprint_lethal");
+}
+
+void test_evidence_loop_reports_planner_effort() {
+    const GeoCoordinate origin{40.71, -74.0, 0.0};
+    std::vector<ExtractedFeature> buildings = {make_box(0.0, 0.0, 20.0, origin)};
+    EvidenceLoopSpec spec;
+    spec.start = {-250.0, 0.0, -250.0};
+    spec.goal = {250.0, 0.0, 250.0};
+    spec.occupancy.half_extent_m = 300.0;
+    spec.occupancy.resolution_m = 4.0;
+    const auto r = agbot::nav::run_evidence_loop(buildings, origin, spec);
+    expect(r.ok, "evidence loop plans around a single block");
+    expect(r.time_to_first_plan > 0, "time-to-first-plan (A* expansions) is reported");
+    expect(r.time_in_recovery > 0, "time-in-recovery (replan expansions) is reported");
+}
+
 } // namespace
 
 int main() {
@@ -199,6 +280,9 @@ int main() {
     test_evidence_loop_routes_and_recovers();
     test_blocked_goal_is_reason_coded();
     test_snap_recovers_blocked_goal();
+    test_sensor_occupancy_backprojects_obstacles();
+    test_occupancy_consistency_metric();
+    test_evidence_loop_reports_planner_effort();
     test_determinism();
 
     if (failures > 0) {

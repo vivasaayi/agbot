@@ -13,6 +13,9 @@ struct PlanResult {
     bool ok = false;
     std::string reason;
     Path path;
+    // Nodes expanded (popped + closed) by the search — a deterministic proxy for
+    // planner effort / time-to-plan. 0 for planners that do not report it.
+    std::size_t expanded = 0;
 };
 
 class IGlobalPlanner {

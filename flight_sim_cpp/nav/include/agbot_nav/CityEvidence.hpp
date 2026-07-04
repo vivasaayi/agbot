@@ -2,6 +2,7 @@
 
 #include "agbot_flight_sim/Mission.hpp"
 #include "agbot_nav/NavTypes.hpp"
+#include "agbot_render/OffscreenRenderer.hpp"
 #include "agbot_worldgen/Feature.hpp"
 
 #include <cstddef>
@@ -42,6 +43,42 @@ struct CityOccupancyParams {
 [[nodiscard]] double path_min_clearance_m(const OccupancyGrid& grid, const Path& path,
                                           int max_ring);
 
+// Parameters for building occupancy from a rendered sensor frame.
+struct SensorOccupancyParams {
+    CityOccupancyParams grid;              // extent/resolution/inflation (shared frame)
+    float min_obstacle_height_m = 3.0f;    // hits below this (ground/road) are free
+    float max_range_m = 6000.0f;           // ignore hits beyond this range
+};
+
+// Back-project a co-registered depth+semantic sensor frame into an occupancy
+// grid on the XZ plane. A pixel with a geometry hit whose reconstructed world
+// height exceeds min_obstacle_height_m marks its XZ cell lethal (a building /
+// vertical obstacle the robot perceives); ground and terrain hits stay free.
+// This is the sensor-evidence costmap, as opposed to the footprint costmap.
+[[nodiscard]] OccupancyGrid occupancy_from_sensor_frame(
+    const agbot::render::SensorFrame& frame, const agbot::render::OffscreenCamera& camera,
+    const SensorOccupancyParams& params = {});
+
+// Agreement between a sensor-derived occupancy grid and the authoritative
+// footprint occupancy grid (must share extent/resolution/origin). Precision =
+// sensor-lethal cells that are also footprint-lethal (the sensor is not
+// hallucinating obstacles); recall = footprint-lethal cells the sensor saw
+// (bounded by FOV/occlusion from a single pose).
+struct OccupancyConsistency {
+    std::size_t sensor_lethal = 0;
+    std::size_t footprint_lethal = 0;
+    std::size_t agree_lethal = 0;
+    double precision = 0.0;
+    double recall = 0.0;
+};
+
+// Compares the two grids cell-by-cell. A footprint cell counts as "seen" within
+// tolerance_cells Chebyshev distance of a sensor-lethal cell (and vice versa),
+// absorbing sub-cell back-projection error.
+[[nodiscard]] OccupancyConsistency occupancy_consistency(const OccupancyGrid& sensor,
+                                                         const OccupancyGrid& footprint,
+                                                         int tolerance_cells = 1);
+
 // Terminal failure class for the evidence loop; None on success.
 enum class EvidenceFailure {
     None,
@@ -77,6 +114,10 @@ struct EvidencePlanResult {
     int replan_count = 0;
     int recovery_count = 0;
     std::size_t lethal_cells = 0;
+    // Deterministic planner-effort proxies (A* nodes expanded): to first plan,
+    // and during recovery replanning.
+    std::size_t time_to_first_plan = 0;
+    std::size_t time_in_recovery = 0;
     EvidenceFailure failure = EvidenceFailure::None;
 };
 

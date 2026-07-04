@@ -1,6 +1,7 @@
 #include "agbot_nav/CityEvidence.hpp"
 
 #include "agbot_nav/GlobalPlanner.hpp"
+#include "agbot_render/Mat4.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -277,6 +278,7 @@ EvidencePlanResult run_evidence_loop(
 
     AStarPlanner planner;
     PlanResult plan = planner.plan(grid, start, goal);
+    r.time_to_first_plan = plan.expanded;
     if (!plan.ok) {
         r.failure = EvidenceFailure::NoInitialPlan;
         return r;
@@ -310,6 +312,7 @@ EvidencePlanResult run_evidence_loop(
             ++r.recovery_count;
             PlanResult replan = planner.plan(grid, start, goal);
             ++r.replan_count;
+            r.time_in_recovery = replan.expanded;
             if (replan.ok) {
                 r.length_m = replan.path.length_m();
                 r.min_clearance_m =
@@ -327,6 +330,116 @@ EvidencePlanResult run_evidence_loop(
         }
     }
     return r;
+}
+
+OccupancyGrid occupancy_from_sensor_frame(const agbot::render::SensorFrame& frame,
+                                          const agbot::render::OffscreenCamera& camera,
+                                          const SensorOccupancyParams& params) {
+    OccupancyGrid grid;
+    grid.resolution_m = params.grid.resolution_m;
+    grid.origin_x = -params.grid.half_extent_m;
+    grid.origin_z = -params.grid.half_extent_m;
+    grid.width =
+        std::max(1, static_cast<int>(2.0 * params.grid.half_extent_m / params.grid.resolution_m));
+    grid.height = grid.width;
+    grid.reset(0);
+    if (frame.width <= 0 || frame.height <= 0) {
+        return grid;
+    }
+
+    // Camera basis matching render's mat4_look_at (forward = target-eye, right =
+    // normalize(cross(forward, up)), true_up = cross(right, forward)).
+    using agbot::render::Vec3f;
+    const Vec3f forward = vec3_normalize(vec3_sub(camera.target, camera.eye));
+    const Vec3f right = vec3_normalize(vec3_cross(forward, camera.up));
+    const Vec3f true_up = vec3_cross(right, forward);
+    const float aspect = static_cast<float>(frame.width) / static_cast<float>(frame.height);
+    const float tan_half = std::tan(camera.fov_y_rad * 0.5f);
+
+    for (int y = 0; y < frame.height; ++y) {
+        for (int x = 0; x < frame.width; ++x) {
+            const std::size_t idx = static_cast<std::size_t>(y) *
+                    static_cast<std::size_t>(frame.width) +
+                static_cast<std::size_t>(x);
+            const float d = frame.depth[idx]; // eye-space metres along forward
+            if (d <= 0.0f || d > params.max_range_m) {
+                continue; // sky/miss or out of range
+            }
+            const float ndc_x = 2.0f * (static_cast<float>(x) + 0.5f) /
+                    static_cast<float>(frame.width) -
+                1.0f;
+            const float ndc_y = 1.0f - 2.0f * (static_cast<float>(y) + 0.5f) /
+                    static_cast<float>(frame.height);
+            const float eye_x = ndc_x * aspect * tan_half * d;
+            const float eye_y = ndc_y * tan_half * d;
+            const Vec3f world = vec3_add(
+                vec3_add(vec3_add(camera.eye, vec3_scale(right, eye_x)),
+                         vec3_scale(true_up, eye_y)),
+                vec3_scale(forward, d));
+            if (world.y <= params.min_obstacle_height_m) {
+                continue; // ground / terrain / road surface, not an obstacle
+            }
+            int cx = 0;
+            int cz = 0;
+            if (grid.world_to_cell(world.x, world.z, cx, cz)) {
+                grid.set(cx, cz, OccupancyGrid::kLethal);
+            }
+        }
+    }
+    return grid;
+}
+
+OccupancyConsistency occupancy_consistency(const OccupancyGrid& sensor,
+                                           const OccupancyGrid& footprint, int tolerance_cells) {
+    OccupancyConsistency c;
+    const bool same_grid = sensor.width == footprint.width && sensor.height == footprint.height;
+    // Is any cell within tolerance of (cx,cz) lethal in `other`?
+    const auto near_lethal = [tolerance_cells](const OccupancyGrid& other, int cx, int cz) {
+        for (int dz = -tolerance_cells; dz <= tolerance_cells; ++dz) {
+            for (int dx = -tolerance_cells; dx <= tolerance_cells; ++dx) {
+                const int nx = cx + dx;
+                const int nz = cz + dz;
+                if (other.in_bounds(nx, nz) && other.at(nx, nz) >= OccupancyGrid::kLethal) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+    if (!same_grid) {
+        return c;
+    }
+    for (int cz = 0; cz < sensor.height; ++cz) {
+        for (int cx = 0; cx < sensor.width; ++cx) {
+            const bool s = sensor.at(cx, cz) >= OccupancyGrid::kLethal;
+            const bool f = footprint.at(cx, cz) >= OccupancyGrid::kLethal;
+            if (s) {
+                ++c.sensor_lethal;
+                if (near_lethal(footprint, cx, cz)) {
+                    ++c.agree_lethal;
+                }
+            }
+            if (f) {
+                ++c.footprint_lethal;
+            }
+        }
+    }
+    if (c.sensor_lethal > 0) {
+        c.precision = static_cast<double>(c.agree_lethal) / static_cast<double>(c.sensor_lethal);
+    }
+    // Recall: footprint cells seen by the sensor (within tolerance).
+    if (c.footprint_lethal > 0) {
+        std::size_t seen = 0;
+        for (int cz = 0; cz < footprint.height; ++cz) {
+            for (int cx = 0; cx < footprint.width; ++cx) {
+                if (footprint.at(cx, cz) >= OccupancyGrid::kLethal && near_lethal(sensor, cx, cz)) {
+                    ++seen;
+                }
+            }
+        }
+        c.recall = static_cast<double>(seen) / static_cast<double>(c.footprint_lethal);
+    }
+    return c;
 }
 
 } // namespace agbot::nav

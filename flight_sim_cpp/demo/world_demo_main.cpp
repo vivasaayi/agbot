@@ -297,6 +297,33 @@ int main(int argc, char** argv) {
     const agbot::nav::EvidencePlanResult evidence =
         agbot::nav::run_evidence_loop(world.buildings, world.origin);
 
+    // M6 batch 2: sensor-derived occupancy vs the footprint occupancy. Render a
+    // near-nadir sensor frame, back-project depth+semantic into an occupancy
+    // grid, and check the robot's *perceived* obstacles agree with the compiled
+    // building footprints (semantic/occupancy consistency).
+    agbot::nav::CityOccupancyParams occ_params;
+    occ_params.half_extent_m = 1350.0;
+    occ_params.resolution_m = 3.0;
+    occ_params.inflation_cells = 1;
+    const agbot::nav::OccupancyGrid footprint_occ =
+        agbot::nav::build_city_occupancy(world.buildings, world.origin, occ_params);
+
+    agbot::render::OffscreenCamera nadir_cam;
+    nadir_cam.eye = {0.0f, 3000.0f, 0.5f};
+    nadir_cam.target = {0.0f, 0.0f, 0.0f};
+    nadir_cam.up = {0.0f, 0.0f, -1.0f};
+    nadir_cam.far_m = 9000.0f;
+    const auto nadir_frame = agbot::render::render_offscreen(world.scene, nadir_cam, 240, 240);
+    agbot::nav::SensorOccupancyParams sensor_occ_params;
+    sensor_occ_params.grid = occ_params;
+    // Above the terrain ceiling (~14 m NAVD88), so only building roofs/facades
+    // register as obstacles, not high ground.
+    sensor_occ_params.min_obstacle_height_m = 25.0f;
+    const agbot::nav::OccupancyGrid sensor_occ =
+        agbot::nav::occupancy_from_sensor_frame(nadir_frame, nadir_cam, sensor_occ_params);
+    const agbot::nav::OccupancyConsistency consistency =
+        agbot::nav::occupancy_consistency(sensor_occ, footprint_occ, 2);
+
     world.scene.markers.push_back({0.0f, 320.0f, 0.0f, 1.0f, 0.25f, 0.2f, 12.0f});
     world.scene.markers.insert(world.scene.markers.end(), flight.trail.begin(),
                                flight.trail.end());
@@ -355,7 +382,13 @@ int main(int argc, char** argv) {
               << ", path " << evidence.length_m << " m (" << evidence.euclidean_m
               << " m euclidean), min clearance " << evidence.min_clearance_m << " m, replans "
               << evidence.replan_count << ", recoveries " << evidence.recovery_count
-              << ", lethal cells " << evidence.lethal_cells << "\n";
+              << ", lethal cells " << evidence.lethal_cells << "\n"
+              << "    planner effort: time-to-first-plan " << evidence.time_to_first_plan
+              << " expansions, time-in-recovery " << evidence.time_in_recovery << "\n"
+              << "  sensor/occupancy consistency: precision " << consistency.precision << " ("
+              << consistency.agree_lethal << "/" << consistency.sensor_lethal
+              << " perceived obstacles are real), recall " << consistency.recall << " ("
+              << consistency.footprint_lethal << " footprint cells)\n";
 
     if (check_mode) {
         int failures = 0;
@@ -446,6 +479,14 @@ int main(int argc, char** argv) {
         expect(evidence.recovery_count == 1 && evidence.replan_count == 1,
                "Gate 5: robot replans once when the plan is blocked (recovery)");
         expect(evidence.min_clearance_m >= 0.0, "Gate 5: path clearance is defined");
+        expect(evidence.time_to_first_plan > 0 && evidence.time_in_recovery > 0,
+               "Gate 5: planner effort (expansions) reported for first plan + recovery");
+        // Sensor/occupancy consistency: the robot's perceived obstacles (from the
+        // offscreen depth+semantic frame) must agree with the compiled footprints.
+        expect(consistency.sensor_lethal > 0,
+               "Gate 5: sensor frame back-projects to perceived obstacle cells");
+        expect(consistency.precision > 0.7,
+               "Gate 5: most perceived obstacles are real building footprints");
         const auto readback = agbot::render::read_scene_file(written.scene_path);
         expect(readback.ok() &&
                    readback.scene.static_meshes.size() + readback.scene.textured_meshes.size() == 2,
