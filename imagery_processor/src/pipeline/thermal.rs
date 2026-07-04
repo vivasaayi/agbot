@@ -607,7 +607,7 @@ async fn process_one(metadata_file: &PathBuf, args: &ThermalArgs) -> AgroResult<
         "thermal",
         env!("CARGO_PKG_VERSION"),
         thermal_inputs,
-        spatial_ref.clone(),
+        Some(spatial_ref.clone()),
         &image.metadata.timestamp.to_rfc3339(),
         args.mask.as_ref().map(|path| path.to_string_lossy()).as_deref(),
         None,

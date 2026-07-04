@@ -238,6 +238,35 @@ async fn process_one(metadata_file: &PathBuf, args: &MasksArgs) -> AgroResult<()
         output_hashes,
     );
 
+    // Emit an L2 product-record sidecar next to each mask output (Track A phase
+    // 10b polish). Every mask derives from the same source QA band, so that band
+    // is the identity-bearing input; the mask kind distinguishes the products.
+    let mask_scene = image.image_id.to_string();
+    let mask_timestamp = image.metadata.timestamp.to_rfc3339();
+    for (kind, output_path) in &outputs {
+        let sidecar_ctx = crate::product_sidecar::l2_sidecar_context(
+            &mask_scene,
+            &format!("qa_mask_{kind}"),
+            env!("CARGO_PKG_VERSION"),
+            vec![crate::product_sidecar::band_input_ref(
+                &mask_scene,
+                "qa",
+                &args.qa_band,
+            )],
+            spatial_ref.clone(),
+            &mask_timestamp,
+            None,
+            None,
+        );
+        let product_path = PathBuf::from(output_path);
+        let sidecar_draft = crate::product_sidecar::draft_from_evidence(
+            &reproducibility,
+            &sidecar_ctx,
+            &product_path,
+        );
+        crate::product_sidecar::write_product_sidecar(&product_path, &sidecar_draft).await?;
+    }
+
     let evidence = MaskEvidence {
         image_id: image.image_id,
         qa_band: args.qa_band.clone(),

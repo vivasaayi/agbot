@@ -272,6 +272,7 @@ pub async fn run_classify(args: &ClassifyArgs) -> AgroResult<()> {
             }),
             output_hashes,
         );
+        emit_classification_sidecar(&provenance, &args.input_image, &args.output_path).await?;
         let meta = serde_json::json!({
             "method": "threshold",
             "threshold": th,
@@ -312,6 +313,7 @@ pub async fn run_classify(args: &ClassifyArgs) -> AgroResult<()> {
             }),
             output_hashes,
         );
+        emit_classification_sidecar(&provenance, &args.input_image, &args.output_path).await?;
         let meta = serde_json::json!({
             "method": "kmeans",
             "k": k,
@@ -329,6 +331,36 @@ pub async fn run_classify(args: &ClassifyArgs) -> AgroResult<()> {
         tokio::fs::write(json_path, serde_json::to_string_pretty(&meta)?).await?;
     }
 
+    Ok(())
+}
+
+/// Emit an L2 product-record sidecar for a classification output (Track A phase
+/// 10b polish). The classify CLI path has no scene, so identity comes from the
+/// input-image ref plus the mode/parameters folded into the evidence.
+async fn emit_classification_sidecar(
+    evidence: &crate::io::ProductReproducibilityEvidence,
+    input_image: &std::path::Path,
+    output_path: &std::path::Path,
+) -> AgroResult<()> {
+    let scene = output_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("classification");
+    let ctx = crate::product_sidecar::l2_sidecar_context(
+        scene,
+        "classification",
+        env!("CARGO_PKG_VERSION"),
+        vec![shared::product_graph::ProductInputRef {
+            product_id: input_image.to_string_lossy().to_string(),
+            role: "classification_input".to_string(),
+        }],
+        None,
+        "",
+        None,
+        None,
+    );
+    let draft = crate::product_sidecar::draft_from_evidence(evidence, &ctx, output_path);
+    crate::product_sidecar::write_product_sidecar(output_path, &draft).await?;
     Ok(())
 }
 
