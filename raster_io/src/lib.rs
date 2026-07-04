@@ -17,17 +17,30 @@
 //! cannot decode, and the local-file path is the only requirement for this
 //! batch. We therefore use the sync `tiff` crate (0.10) for local files.
 //!
-//! The public API is deliberately backend-agnostic so an async
-//! `object_store`-backed COG reader can be added later without breaking
-//! callers: `GeoTiffInfo`, `RasterBand`, `RasterDtype`, and `RasterWindow`
-//! carry no reader state, and windowed reads are already part of the
-//! contract (the local backend materializes the full band internally; a COG
-//! backend will honor the window with range reads).
+//! The public API is deliberately backend-agnostic so multiple backends can
+//! share one contract: `GeoTiffInfo`, `RasterBand`, `RasterDtype`, and
+//! `RasterWindow` carry no reader state, and windowed reads are part of the
+//! contract (the local backend materializes the full band internally; the
+//! remote COG backend honors the window with range reads).
+//!
+//! # Remote COG backend (batch 4b, 2026-07; feature `remote`)
+//!
+//! `RemoteCogReader` reads band windows from tiled Cloud-Optimized GeoTIFFs
+//! on object storage (HTTP/S3, e.g. the `sentinel-cogs` bucket) without
+//! downloading whole files, via `async-tiff` 0.3 + `object_store`. It shares
+//! `GeoTiffInfo`/`RasterBand`/`RasterWindow` and the geokey/geotransform/
+//! nodata parsing contract with the local reader, and instruments every
+//! fetch (`RemoteFetchMetrics`) for deterministic evidence. The feature is
+//! off by default so the sync local path keeps zero async/network deps.
 
 mod error;
 mod geotiff;
+#[cfg(feature = "remote")]
+mod remote;
 mod write;
 
 pub use error::RasterIoError;
 pub use geotiff::{GeoTiffInfo, GeoTiffReader, RasterBand, RasterDtype, RasterWindow};
+#[cfg(feature = "remote")]
+pub use remote::{CogTileLayout, RemoteCogReader, RemoteFetchMetrics};
 pub use write::{write_geotiff_f32, write_geotiff_u16, write_geotiff_u8, GeoTiffTags};

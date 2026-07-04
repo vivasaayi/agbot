@@ -7,3 +7,21 @@ edition = "2021"
 shared = { path = "../shared" }
 thiserror = { workspace = true }
 tiff = "0.10"
+
+# Remote COG backend (feature `remote`): async range-read of tiled
+# Cloud-Optimized GeoTIFFs from HTTP/S3 object storage without downloading
+# whole files. Kept behind a feature so the default sync local-file path
+# stays free of async/network dependencies.
+async-tiff = { version = "0.3", default-features = false, features = ["object_store"], optional = true }
+object_store = { version = "0.13", features = ["http"], optional = true }
+async-trait = { version = "0.1", optional = true }
+bytes = { version = "1", optional = true }
+url = { version = "2", optional = true }
+
+[features]
+default = []
+remote = ["dep:async-tiff", "dep:object_store", "dep:async-trait", "dep:bytes", "dep:url"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+flate2 = "1"

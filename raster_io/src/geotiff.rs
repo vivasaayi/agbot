@@ -160,46 +160,7 @@ impl GeoTiffReader {
     /// Full georeferencing as the workspace-standard `RasterSpatialRef`,
     /// validated through `shared::schemas::assert_raster_spatial_ref`.
     pub fn spatial_ref(&self) -> Result<RasterSpatialRef, RasterIoError> {
-        let crs = self
-            .info
-            .crs()
-            .ok_or_else(|| RasterIoError::MissingGeoreferencing {
-                path: self.path.clone(),
-                missing: "EPSG code (GeoKeyDirectoryTag)",
-            })?;
-        let transform =
-            self.info
-                .geo_transform
-                .ok_or_else(|| RasterIoError::MissingGeoreferencing {
-                    path: self.path.clone(),
-                    missing: "geotransform (ModelPixelScaleTag + ModelTiepointTag)",
-                })?;
-
-        let width = f64::from(self.info.width);
-        let height = f64::from(self.info.height);
-        let min_x = transform[0];
-        let max_x = transform[0] + width * transform[1];
-        let max_y = transform[3];
-        let min_y = transform[3] + height * transform[5];
-        let spatial_ref = RasterSpatialRef {
-            georeferenced: true,
-            crs: Some(crs),
-            bbox: Some(GeoBounds {
-                min_lon: min_x.min(max_x),
-                min_lat: min_y.min(max_y),
-                max_lon: min_x.max(max_x),
-                max_lat: min_y.max(max_y),
-            }),
-            geo_transform: Some(transform),
-            resolution: None,
-        };
-
-        assert_raster_spatial_ref(Some(&spatial_ref), self.info.width, self.info.height).map_err(
-            |source| RasterIoError::SpatialRef {
-                path: self.path.clone(),
-                source,
-            },
-        )
+        spatial_ref_from_info(&self.info, &self.path)
     }
 
     /// Read the whole band into a typed buffer (row-major).
@@ -224,25 +185,10 @@ impl GeoTiffReader {
 
     /// Read a rectangular window into a typed buffer (row-major within the
     /// window). The local-file backend materializes the full band and crops;
-    /// the future COG backend will translate the window into range reads.
+    /// the remote COG backend (`RemoteCogReader`) translates the window into
+    /// range reads instead.
     pub fn read_window(&mut self, window: RasterWindow) -> Result<RasterBand, RasterIoError> {
-        let in_bounds = window.width > 0
-            && window.height > 0
-            && window
-                .x
-                .checked_add(window.width)
-                .is_some_and(|right| right <= self.info.width)
-            && window
-                .y
-                .checked_add(window.height)
-                .is_some_and(|bottom| bottom <= self.info.height);
-        if !in_bounds {
-            return Err(RasterIoError::WindowOutOfBounds {
-                window,
-                width: self.info.width,
-                height: self.info.height,
-            });
-        }
+        validate_window(window, self.info.width, self.info.height)?;
 
         let full = self.read_band()?;
         let row_width = self.info.width as usize;
@@ -252,6 +198,87 @@ impl GeoTiffReader {
             RasterBand::F32(values) => RasterBand::F32(crop(&values, row_width, window)),
         })
     }
+}
+
+/// Validate that `window` is non-empty and fully inside a `width`x`height`
+/// raster. Shared by the local and remote backends so both report the same
+/// reason-coded error.
+pub(crate) fn validate_window(
+    window: RasterWindow,
+    width: u32,
+    height: u32,
+) -> Result<(), RasterIoError> {
+    let in_bounds = window.width > 0
+        && window.height > 0
+        && window
+            .x
+            .checked_add(window.width)
+            .is_some_and(|right| right <= width)
+        && window
+            .y
+            .checked_add(window.height)
+            .is_some_and(|bottom| bottom <= height);
+    if in_bounds {
+        Ok(())
+    } else {
+        Err(RasterIoError::WindowOutOfBounds {
+            window,
+            width,
+            height,
+        })
+    }
+}
+
+/// Build the workspace-standard `RasterSpatialRef` from parsed GeoTIFF
+/// metadata, validated through `shared::schemas::assert_raster_spatial_ref`.
+/// Shared by the local and remote backends.
+pub(crate) fn spatial_ref_from_info(
+    info: &GeoTiffInfo,
+    path: &Path,
+) -> Result<RasterSpatialRef, RasterIoError> {
+    let crs = info
+        .crs()
+        .ok_or_else(|| RasterIoError::MissingGeoreferencing {
+            path: path.to_path_buf(),
+            missing: "EPSG code (GeoKeyDirectoryTag)",
+        })?;
+    let transform = info
+        .geo_transform
+        .ok_or_else(|| RasterIoError::MissingGeoreferencing {
+            path: path.to_path_buf(),
+            missing: "geotransform (ModelPixelScaleTag + ModelTiepointTag)",
+        })?;
+
+    let width = f64::from(info.width);
+    let height = f64::from(info.height);
+    let min_x = transform[0];
+    let max_x = transform[0] + width * transform[1];
+    let max_y = transform[3];
+    let min_y = transform[3] + height * transform[5];
+    let spatial_ref = RasterSpatialRef {
+        georeferenced: true,
+        crs: Some(crs),
+        bbox: Some(GeoBounds {
+            min_lon: min_x.min(max_x),
+            min_lat: min_y.min(max_y),
+            max_lon: min_x.max(max_x),
+            max_lat: min_y.max(max_y),
+        }),
+        geo_transform: Some(transform),
+        resolution: None,
+    };
+
+    assert_raster_spatial_ref(Some(&spatial_ref), info.width, info.height).map_err(|source| {
+        RasterIoError::SpatialRef {
+            path: path.to_path_buf(),
+            source,
+        }
+    })
+}
+
+/// Parse the `GDAL_NODATA` ASCII tag payload (possibly NUL-terminated).
+pub(crate) fn parse_gdal_nodata(raw: &str) -> Option<f64> {
+    raw.trim().trim_end_matches('\0').trim().parse::<f64>().ok()
 }
 
 fn crop<T: Copy>(values: &[T], row_width: usize, window: RasterWindow) -> Vec<T> {
@@ -337,7 +364,7 @@ fn parse_geotiff_info(
         .map(|value| value.into_string())
         .transpose()
         .map_err(decode_error)?
-        .and_then(|raw| raw.trim().trim_end_matches('\0').trim().parse::<f64>().ok());
+        .and_then(|raw| parse_gdal_nodata(&raw));
 
     Ok(GeoTiffInfo {
         width,
@@ -351,7 +378,8 @@ fn parse_geotiff_info(
 
 /// GDAL-order geotransform from ModelPixelScale [sx, sy, sz] and a raster→
 /// model tiepoint [i, j, k, x, y, z]. North-up only (no rotation terms).
-fn geo_transform_from_tags(
+/// Shared by the local and remote backends.
+pub(crate) fn geo_transform_from_tags(
     pixel_scale: Option<&[f64]>,
     tiepoint: Option<&[f64]>,
 ) -> Option<[f64; 6]> {

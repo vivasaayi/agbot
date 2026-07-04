@@ -34,6 +34,8 @@ pub enum RasterIoError {
         width: u32,
         height: u32,
     },
+    #[error("raster {path} is not tiled; the remote COG backend requires a tiled GeoTIFF")]
+    NotTiled { path: PathBuf },
     #[error("failed to write raster {path}: {message}")]
     Write { path: PathBuf, message: String },
     #[error("unsupported georeferencing for GeoTIFF write: {detail}")]
