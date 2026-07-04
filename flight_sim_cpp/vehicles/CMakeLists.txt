@@ -5,6 +5,8 @@ add_library(agbot_vehicles
     src/MultirotorModel.cpp
     src/FixedWingModel.cpp
     src/FixedWingAutopilot.cpp
+    src/FlightRecorder.cpp
+    src/FlightCheckCase.cpp
     src/VehicleRegistry.cpp
 )
 
@@ -35,3 +37,10 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(agbot_cessna_tests PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 add_test(NAME agbot_cessna_tests COMMAND agbot_cessna_tests)
+
+add_executable(agbot_flight_checkcase_tests tests/flight_checkcase_tests.cpp)
+target_link_libraries(agbot_flight_checkcase_tests PRIVATE agbot_vehicles)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(agbot_flight_checkcase_tests PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+add_test(NAME agbot_flight_checkcase_tests COMMAND agbot_flight_checkcase_tests)

@@ -177,6 +177,17 @@ void FixedWingModel::clear_controls() {
     use_direct_controls_ = false;
 }
 
+void FixedWingModel::set_wind(const Vec3& world_wind_mps) {
+    // World (X east, Y up, Z north) -> NED nav (n = +Z, e = +X, d = -Y).
+    wind_nav_[0] = world_wind_mps.z;
+    wind_nav_[1] = world_wind_mps.x;
+    wind_nav_[2] = -world_wind_mps.y;
+}
+
+Vec3 FixedWingModel::wind() const {
+    return {wind_nav_[1], -wind_nav_[2], wind_nav_[0]};
+}
+
 Vec3 FixedWingModel::body_rates() const {
     if (!internal_.has_value()) {
         return {};
@@ -189,6 +200,7 @@ void FixedWingModel::derivatives(
     const FixedWingControls& controls,
     double* out) const {
     const FixedWingParams& p = params_;
+    // Ground velocity in body axes (drives Coriolis + position kinematics).
     const double u = s.vel[0];
     const double v = s.vel[1];
     const double w = s.vel[2];
@@ -196,11 +208,19 @@ void FixedWingModel::derivatives(
     const double qr = s.rate[1];
     const double rr = s.rate[2];
 
-    const double airspeed = std::sqrt(u * u + v * v + w * w);
+    // Air-relative body velocity: ground velocity minus wind resolved into body
+    // axes. Aerodynamics act on the relative wind; a crosswind induces sideslip.
+    double wind_body[3] = {0.0, 0.0, 0.0};
+    nav_to_body(s.quat, wind_nav_, wind_body);
+    const double ur = u - wind_body[0];
+    const double vr = v - wind_body[1];
+    const double wr = w - wind_body[2];
+
+    const double airspeed = std::sqrt(ur * ur + vr * vr + wr * wr);
     const double v_safe = std::max(airspeed, 1.0); // guards rate nondimensionalization
-    const double alpha = std::atan2(w, std::max(u, 1e-6));
+    const double alpha = std::atan2(wr, std::max(ur, 1e-6));
     const double beta =
-        (airspeed > 1e-6) ? std::asin(clamp(v / airspeed, -1.0, 1.0)) : 0.0;
+        (airspeed > 1e-6) ? std::asin(clamp(vr / airspeed, -1.0, 1.0)) : 0.0;
 
     const double qbar = 0.5 * p.rho * airspeed * airspeed;
     const double qbar_s = qbar * p.wing_area_m2;
@@ -434,6 +454,13 @@ EntityState FixedWingModel::set_initial_trim(
     s.rate[2] = 0.0;
     s.time_s = 0.0;
     internal_ = s;
+    // Seed the aero observables so a record captured before the first step()
+    // reports the trimmed condition rather than zeros.
+    aero_debug_.airspeed_mps = airspeed_mps;
+    aero_debug_.alpha_rad = alpha;
+    aero_debug_.beta_rad = 0.0;
+    aero_debug_.cl = cl_req;
+    aero_debug_.cd = cd;
     last_output_ = entity_from_internal();
     return last_output_;
 }
@@ -460,14 +487,18 @@ EntityState FixedWingModel::step(const EntityState& state, const Actuation& inpu
         substep(*internal_, controls, substep_s);
     }
 
-    // Refresh the aero observables from the final state.
+    // Refresh the aero observables from the final state (air-relative velocity).
     const RigidBodyState& s = *internal_;
-    const double airspeed = std::sqrt(s.vel[0] * s.vel[0] + s.vel[1] * s.vel[1]
-                                      + s.vel[2] * s.vel[2]);
+    double wind_body[3] = {0.0, 0.0, 0.0};
+    nav_to_body(s.quat, wind_nav_, wind_body);
+    const double ur = s.vel[0] - wind_body[0];
+    const double vr = s.vel[1] - wind_body[1];
+    const double wr = s.vel[2] - wind_body[2];
+    const double airspeed = std::sqrt(ur * ur + vr * vr + wr * wr);
     aero_debug_.airspeed_mps = airspeed;
-    aero_debug_.alpha_rad = std::atan2(s.vel[2], std::max(s.vel[0], 1e-6));
+    aero_debug_.alpha_rad = std::atan2(wr, std::max(ur, 1e-6));
     aero_debug_.beta_rad =
-        (airspeed > 1e-6) ? std::asin(clamp(s.vel[1] / airspeed, -1.0, 1.0)) : 0.0;
+        (airspeed > 1e-6) ? std::asin(clamp(vr / airspeed, -1.0, 1.0)) : 0.0;
     aero_debug_.cl = blended_cl(params_, aero_debug_.alpha_rad);
     aero_debug_.cd = params_.cd0 + params_.k_induced * aero_debug_.cl * aero_debug_.cl;
 

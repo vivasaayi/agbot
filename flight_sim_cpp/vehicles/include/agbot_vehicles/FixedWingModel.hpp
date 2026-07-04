@@ -133,6 +133,12 @@ public:
     void clear_controls();
     [[nodiscard]] const FixedWingControls& controls() const { return controls_; }
 
+    // Steady wind in the repo world frame (X east, Y up, Z north), m/s. Aero
+    // forces use air-relative velocity (ground velocity minus wind), so a
+    // crosswind induces sideslip/crab; the default is still air.
+    void set_wind(const Vec3& world_wind_mps);
+    [[nodiscard]] Vec3 wind() const;
+
     // Initialize the internal rigid-body state in steady level cruise at the
     // given altitude/airspeed/heading (repo yaw convention). Returns the
     // matching EntityState; trim_controls() then holds the throttle/elevator
@@ -170,6 +176,7 @@ private:
 
     FixedWingParams params_;
     VehicleLimits limits_ = {85.0, 6.0, 6.0, 0.5236, 1.5, 0.0};
+    double wind_nav_[3] = {0.0, 0.0, 0.0}; // steady wind in NED nav frame
     FixedWingControls controls_;
     FixedWingControls trim_controls_;
     bool use_direct_controls_ = false;
