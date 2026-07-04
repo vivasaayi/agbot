@@ -74,7 +74,7 @@ async function expandField(container, field, onSelectScene) {
     row.textContent = label(scene, "scene_id", "id");
     row.addEventListener("click", (event) => {
       event.stopPropagation();
-      onSelectScene(sceneId);
+      onSelectScene(sceneId, fieldId);
     });
     li.appendChild(row);
     container.appendChild(li);

@@ -38,7 +38,25 @@ export const endpoints = {
   sceneReport: "/api/scenes/:scene_id/reports/:report_id",
   sceneReportLineage: "/api/scenes/:scene_id/reports/:report_id/lineage",
   provenanceTrace: "/api/provenance/trace/:artifact_id",
+  fieldProposals: "/api/fields/:field_id/proposals",
+  proposalAccept: "/api/proposals/:proposal_id/accept",
+  proposalReject: "/api/proposals/:proposal_id/reject",
 };
+
+/** A field's proposal queue. */
+export function fieldProposalsPath(fieldId) {
+  return `/api/fields/${encodeURIComponent(fieldId)}/proposals`;
+}
+
+/** Accept a queued proposal. */
+export function proposalAcceptPath(proposalId) {
+  return `/api/proposals/${encodeURIComponent(proposalId)}/accept`;
+}
+
+/** Reject a queued proposal. */
+export function proposalRejectPath(proposalId) {
+  return `/api/proposals/${encodeURIComponent(proposalId)}/reject`;
+}
 
 /** A scene's recommendations. */
 export function sceneRecommendationsPath(sceneId) {

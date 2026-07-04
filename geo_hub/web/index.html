@@ -224,6 +224,64 @@
       text-align: left;
     }
 
+    .proposal-list {
+      list-style: none;
+      margin-top: 0.3rem;
+    }
+
+    .proposal-list li {
+      border: 1px solid var(--panel-border);
+      border-radius: 3px;
+      padding: 0.35rem 0.45rem;
+      margin-bottom: 0.4rem;
+    }
+
+    .proposal-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.82rem;
+    }
+
+    .proposal-meta {
+      color: var(--text-dim);
+      font-size: 0.72rem;
+      margin: 0.15rem 0 0.3rem;
+    }
+
+    .proposal-actions {
+      display: flex;
+      gap: 0.35rem;
+    }
+
+    .proposal-actions .accept,
+    .proposal-actions .reject {
+      border: 1px solid var(--panel-border);
+      border-radius: 3px;
+      background: var(--bg);
+      color: var(--text);
+      padding: 0.15rem 0.5rem;
+      cursor: pointer;
+      font-size: 0.75rem;
+    }
+
+    .proposal-actions .accept {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+
+    .proposal-actions .reject {
+      color: #c96a5f;
+    }
+
+    .badge.status-accepted {
+      color: var(--accent);
+    }
+
+    .badge.status-rejected {
+      color: #c96a5f;
+    }
+
     .provenance-form {
       display: flex;
       gap: 0.3rem;
@@ -352,6 +410,7 @@
       <div id="recommendations-panel"></div>
       <div id="findings-panel"></div>
       <div id="alerts-panel"></div>
+      <div id="proposals-panel"></div>
       <div id="provenance-panel"></div>
       <div id="scene-detail">
         <p class="status">Select a scene to inspect it.</p>

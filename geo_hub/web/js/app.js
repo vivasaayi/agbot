@@ -7,6 +7,7 @@ import { renderAnnotationsPanel } from "./panels/annotations.js";
 import { renderRecommendationsPanel } from "./panels/recommendations.js";
 import { renderFindingsPanel } from "./panels/findings.js";
 import { renderAlertsPanel } from "./panels/alerts.js";
+import { renderProposalsPanel } from "./panels/proposals.js";
 import { renderProvenancePanel } from "./panels/provenance.js";
 import { setupCompare } from "./panels/compare.js";
 import { initMap } from "./map.js";
@@ -30,17 +31,19 @@ function bootstrap() {
   const recommendations = document.getElementById("recommendations-panel");
   const findings = document.getElementById("findings-panel");
   const alerts = document.getElementById("alerts-panel");
+  const proposals = document.getElementById("proposals-panel");
 
   // The provenance inspector is a standing tool (trace any artifact id).
   renderProvenancePanel(document.getElementById("provenance-panel"));
 
-  initCatalogPanel(tree, (sceneId) => {
+  initCatalogPanel(tree, (sceneId, fieldId) => {
     renderSceneDetail(detail, sceneId);
     renderLayersPanel(layers, sceneId);
     renderAnnotationsPanel(annotations, sceneId);
     renderRecommendationsPanel(recommendations, sceneId);
     renderFindingsPanel(findings, sceneId);
     renderAlertsPanel(alerts, sceneId);
+    renderProposalsPanel(proposals, fieldId);
   });
 }
 
