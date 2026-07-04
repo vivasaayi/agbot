@@ -168,6 +168,32 @@
       text-align: left;
     }
 
+    .provenance-form {
+      display: flex;
+      gap: 0.3rem;
+      margin: 0.3rem 0;
+    }
+
+    .provenance-form input {
+      flex: 1;
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--panel-border);
+      border-radius: 3px;
+      padding: 0.2rem 0.4rem;
+      font-size: 0.78rem;
+    }
+
+    .provenance-form button {
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--panel-border);
+      border-radius: 3px;
+      padding: 0.2rem 0.5rem;
+      cursor: pointer;
+      font-size: 0.75rem;
+    }
+
     #inspector {
       border-right: none;
     }
@@ -259,6 +285,7 @@
       <div id="layers-panel"></div>
       <div id="annotations-panel"></div>
       <div id="recommendations-panel"></div>
+      <div id="provenance-panel"></div>
       <div id="scene-detail">
         <p class="status">Select a scene to inspect it.</p>
       </div>
