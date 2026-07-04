@@ -9,6 +9,7 @@ use tokio::sync::watch;
 use tracing::{error, info};
 
 pub mod cli_interface;
+pub mod dispatch_advisory;
 pub mod fleet_operations;
 pub mod link_client;
 pub mod map_state;
