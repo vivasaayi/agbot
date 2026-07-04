@@ -44,8 +44,14 @@ Plan: /Users/rajanpanneerselvam/Docs/AGBOT/refactor.md (reviewed + expanded 2026
   `POST /api/ingest/drone-session`. 8 new tests (shared 4, data_collector 1,
   geo_hub route 3). All prior suites green; data_collector lib 57.
 
-Track A 1->2->3->4->5(contract)->6 done. Next: TA-07 (imagery sidecars, needs
-only TA-01), or TA-05b (satellite wiring), or a Track B phase.
+- TA-07 committed (f9cf06f): `imagery_processor/src/product_sidecar.rs` maps
+  ProductReproducibilityEvidence -> ProductRecordDraft, writes
+  `*.product_record.json` sidecars. Honors identity invariant (draft inputs =
+  L1 band refs). 4 tests (golden map, identity, digest match, mask-before-index);
+  imagery lib 19 green. **Split:** live run_* pipeline wiring -> TA-07b.
+
+Track A 1->2->3->4->5(contract)->6->7(mapping) done. Next: TA-08 (catalog
+register API + CLI, the viewer read API), or TA-05b/TA-07b wiring, or Track B.
 
 ## Known-red (user decision: proceed, track separately)
 ~15 geo_hub products_api acceptance tests (farm/field CRUD, shapefile, geojson)
@@ -53,15 +59,14 @@ return 500 on main and every commit — PRE-EXISTING, unrelated to refactor. Not
 gate. Per-batch verification uses targeted tests + the batch's own test file.
 
 ## Next action
-TA-07: imagery_processor L1/L2 sidecars. Emit `product_record.json` sidecars
-from `imagery_processor` (pipeline/indices.rs, masks.rs, thermal.rs, io/mod.rs):
-map existing evidence (ProductReproducibilityEvidence/BandIngestEvidence) ~1:1
-to ProductRecordDraft fields; masks emitted BEFORE the indices that reference
-them. Golden sidecar for an NDVI fixture; assert digest recomputation matches
-and mask-before-index ordering. Honor the identity invariant: an L2 index MUST
-list its scene's L1 bands in `inputs` or it collapses across scenes. Needs only
-TA-01. Alternatives: TA-05b (satellite call-site wiring, additive, retry machine
-stays green) or a Track B phase (TB-A2 catalog tree).
+TA-08: catalog register API + CLI (the viewer read API). Add `POST /api/catalog/
+products` (register a ProductRecordDraft) and `GET /api/catalog/products` with
+field/season/level/kind/time/bbox filters over `catalog::list_products`; plus a
+`geo_hub catalog register <dir>` CLI that walks `*.product_record.json` sidecars
+(TA-07 shape) and registers each via `catalog::register_product`. Needs TA-02 +
+TA-07 (both done). TDD-first (`geo_hub/tests/catalog_api.rs`). Alternatives:
+TA-07b (wire sidecar emission into live run_indices/masks/thermal) or TA-05b
+(satellite call-site wiring) or a Track B phase (TB-A2 catalog tree).
 
 ## Resume protocol
 Read CLAUDE.md + this file + checkpoint.sqlite. Verify `git status --short`,
