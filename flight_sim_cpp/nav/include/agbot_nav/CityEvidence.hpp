@@ -59,6 +59,12 @@ struct SensorOccupancyParams {
     const agbot::render::SensorFrame& frame, const agbot::render::OffscreenCamera& camera,
     const SensorOccupancyParams& params = {});
 
+// Fold LiDAR-style ray hits into an occupancy grid (union): any point whose
+// world height exceeds min_obstacle_height_m marks its XZ cell lethal. Lets the
+// same costmap fuse back-projected depth+semantic with LiDAR returns.
+void fold_pointcloud_into_occupancy(OccupancyGrid& grid, const PointCloud& cloud,
+                                    double min_obstacle_height_m = 3.0);
+
 // Agreement between a sensor-derived occupancy grid and the authoritative
 // footprint occupancy grid (must share extent/resolution/origin). Precision =
 // sensor-lethal cells that are also footprint-lethal (the sensor is not
@@ -78,6 +84,33 @@ struct OccupancyConsistency {
 [[nodiscard]] OccupancyConsistency occupancy_consistency(const OccupancyGrid& sensor,
                                                          const OccupancyGrid& footprint,
                                                          int tolerance_cells = 1);
+
+// Executed-trajectory metrics from driving a robot along a global plan with a
+// path-tracking controller (closed loop), as opposed to the plan geometry alone.
+struct ExecutedTrajectory {
+    bool reached = false;
+    bool collision_free = true;
+    double length_m = 0.0;
+    double duration_s = 0.0;
+    double max_crosstrack_m = 0.0;    // peak deviation from the reference path
+    double mean_crosstrack_m = 0.0;   // tracking error
+    double steering_smoothness_radps = 0.0; // mean |d(steer)|/dt (lower = smoother)
+    std::size_t collisions = 0;
+    std::size_t steps = 0;
+};
+
+struct ExecutorParams {
+    double dt_s = 0.1;
+    double cruise_speed_mps = 3.0; // delivery-robot cruise
+    double goal_tolerance_m = 4.0;
+    double step_margin = 2.0;      // max steps = margin * path_len / (v*dt)
+};
+
+// Drive a kinematic-bicycle robot with a PID+Stanley path-tracking controller
+// along `path`, over `grid`, closed loop. Reports tracking error, control
+// smoothness, collisions, and whether the goal was reached. Deterministic.
+[[nodiscard]] ExecutedTrajectory execute_trajectory(const OccupancyGrid& grid, const Path& path,
+                                                    const ExecutorParams& params = {});
 
 // Terminal failure class for the evidence loop; None on success.
 enum class EvidenceFailure {
@@ -118,6 +151,8 @@ struct EvidencePlanResult {
     // and during recovery replanning.
     std::size_t time_to_first_plan = 0;
     std::size_t time_in_recovery = 0;
+    // Closed-loop execution of the final plan (controller-tracked trajectory).
+    ExecutedTrajectory executed;
     EvidenceFailure failure = EvidenceFailure::None;
 };
 

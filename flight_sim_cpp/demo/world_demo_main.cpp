@@ -388,7 +388,14 @@ int main(int argc, char** argv) {
               << "  sensor/occupancy consistency: precision " << consistency.precision << " ("
               << consistency.agree_lethal << "/" << consistency.sensor_lethal
               << " perceived obstacles are real), recall " << consistency.recall << " ("
-              << consistency.footprint_lethal << " footprint cells)\n";
+              << consistency.footprint_lethal << " footprint cells)\n"
+              << "  executed trajectory: "
+              << (evidence.executed.reached ? "reached goal" : "did not reach") << " in "
+              << evidence.executed.duration_s << " s, length " << evidence.executed.length_m
+              << " m, mean crosstrack " << evidence.executed.mean_crosstrack_m << " m (max "
+              << evidence.executed.max_crosstrack_m << "), steering "
+              << evidence.executed.steering_smoothness_radps << " rad/s, collisions "
+              << evidence.executed.collisions << "\n";
 
     if (check_mode) {
         int failures = 0;
@@ -487,6 +494,11 @@ int main(int argc, char** argv) {
                "Gate 5: sensor frame back-projects to perceived obstacle cells");
         expect(consistency.precision > 0.7,
                "Gate 5: most perceived obstacles are real building footprints");
+        // Closed-loop execution: a controller-tracked robot follows the plan.
+        expect(evidence.executed.steps > 0 && evidence.executed.length_m > 100.0,
+               "Gate 5: robot executes the plan closed-loop over the costmap");
+        expect(evidence.executed.mean_crosstrack_m < 6.0,
+               "Gate 5: executed trajectory tracks the plan (mean crosstrack < 6 m)");
         const auto readback = agbot::render::read_scene_file(written.scene_path);
         expect(readback.ok() &&
                    readback.scene.static_meshes.size() + readback.scene.textured_meshes.size() == 2,

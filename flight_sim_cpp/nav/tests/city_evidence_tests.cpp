@@ -9,6 +9,7 @@
 #include "agbot_worldgen/Feature.hpp"
 
 #include <cmath>
+#include <cstdint>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -86,16 +87,19 @@ void test_inflation_grows_lethal_region() {
     CityOccupancyParams inflated = base;
     inflated.inflation_cells = 3;
 
+    // Count blocked cells (footprint kLethal + inflation margin), i.e. anything
+    // the planner treats as an obstacle (>= 200).
+    constexpr std::uint8_t kBlocked = 200;
     std::size_t n0 = 0;
     std::size_t n1 = 0;
     for (auto c : agbot::nav::build_city_occupancy(buildings, origin, base).cells) {
-        n0 += c >= OccupancyGrid::kLethal ? 1 : 0;
+        n0 += c >= kBlocked ? 1 : 0;
     }
     for (auto c : agbot::nav::build_city_occupancy(buildings, origin, inflated).cells) {
-        n1 += c >= OccupancyGrid::kLethal ? 1 : 0;
+        n1 += c >= kBlocked ? 1 : 0;
     }
-    expect(n0 > 0, "un-inflated box marks lethal cells");
-    expect(n1 > n0, "inflation grows the lethal region");
+    expect(n0 > 0, "un-inflated box marks obstacle cells");
+    expect(n1 > n0, "inflation grows the blocked region");
 }
 
 void test_hole_is_left_free() {
@@ -229,6 +233,27 @@ void test_sensor_occupancy_backprojects_obstacles() {
     expect(lethal > 0, "sensor occupancy has lethal cells from the rooftop patch");
 }
 
+void test_fold_pointcloud_into_occupancy() {
+    OccupancyGrid grid;
+    grid.width = 40;
+    grid.height = 40;
+    grid.resolution_m = 1.0;
+    grid.origin_x = -20.0;
+    grid.origin_z = -20.0;
+    grid.reset(0);
+    agbot::nav::PointCloud cloud;
+    cloud.points = {{0.0, 10.0, 0.0},  // tall return at origin -> obstacle
+                    {5.0, 0.5, 5.0},   // ground return -> ignored
+                    {-8.0, 6.0, 3.0}}; // tall return -> obstacle
+    agbot::nav::fold_pointcloud_into_occupancy(grid, cloud, 3.0);
+    expect(grid.cost_at_world(0.0, 0.0) >= OccupancyGrid::kLethal,
+           "LiDAR tall return marks an obstacle cell");
+    expect(grid.cost_at_world(5.0, 5.0) < OccupancyGrid::kLethal,
+           "LiDAR ground return stays free");
+    expect(grid.cost_at_world(-8.0, 3.0) >= OccupancyGrid::kLethal,
+           "second tall return marks its cell");
+}
+
 void test_occupancy_consistency_metric() {
     OccupancyGrid footprint;
     footprint.width = 10;
@@ -257,6 +282,29 @@ void test_occupancy_consistency_metric() {
     expect(std::abs(c.recall - 4.0 / 9.0) < 1e-9, "recall = seen footprint / footprint_lethal");
 }
 
+void test_execute_trajectory_tracks_straight_path() {
+    OccupancyGrid grid;
+    grid.width = 220;
+    grid.height = 220;
+    grid.resolution_m = 1.0;
+    grid.origin_x = -110.0;
+    grid.origin_z = -110.0;
+    grid.reset(0);
+    agbot::nav::Path path;
+    path.points = {{-80.0, 0.0, 0.0}, {-40.0, 0.0, 0.0}, {0.0, 0.0, 0.0},
+                   {40.0, 0.0, 0.0},  {80.0, 0.0, 0.0}};
+    const auto tr = agbot::nav::execute_trajectory(grid, path, {});
+    expect(tr.reached, "robot reaches the goal along a straight path");
+    expect(tr.collision_free && tr.collisions == 0, "straight run is collision-free");
+    expect(tr.max_crosstrack_m < 3.0, "robot tracks the reference within 3 m");
+    expect(tr.length_m > 100.0 && tr.steps > 0, "executed trajectory spans the path");
+    expect(tr.steering_smoothness_radps >= 0.0, "steering smoothness is reported");
+    // Determinism.
+    const auto again = agbot::nav::execute_trajectory(grid, path, {});
+    expect(again.steps == tr.steps && again.length_m == tr.length_m,
+           "executed trajectory is deterministic");
+}
+
 void test_evidence_loop_reports_planner_effort() {
     const GeoCoordinate origin{40.71, -74.0, 0.0};
     std::vector<ExtractedFeature> buildings = {make_box(0.0, 0.0, 20.0, origin)};
@@ -269,6 +317,8 @@ void test_evidence_loop_reports_planner_effort() {
     expect(r.ok, "evidence loop plans around a single block");
     expect(r.time_to_first_plan > 0, "time-to-first-plan (A* expansions) is reported");
     expect(r.time_in_recovery > 0, "time-in-recovery (replan expansions) is reported");
+    expect(r.executed.steps > 0 && r.executed.length_m > 0.0,
+           "evidence loop executes the final plan closed-loop");
 }
 
 } // namespace
@@ -282,6 +332,8 @@ int main() {
     test_snap_recovers_blocked_goal();
     test_sensor_occupancy_backprojects_obstacles();
     test_occupancy_consistency_metric();
+    test_fold_pointcloud_into_occupancy();
+    test_execute_trajectory_tracks_straight_path();
     test_evidence_loop_reports_planner_effort();
     test_determinism();
 

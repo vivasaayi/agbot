@@ -1,7 +1,10 @@
 #include "agbot_nav/CityEvidence.hpp"
 
+#include "agbot_config/Params.hpp"
+#include "agbot_nav/Controller.hpp"
 #include "agbot_nav/GlobalPlanner.hpp"
 #include "agbot_render/Mat4.hpp"
+#include "agbot_vehicles/KinematicBicycleModel.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -86,46 +89,40 @@ void rasterize_feature(const agbot::worldgen::ExtractedFeature& feature,
     }
 }
 
-// Grow lethal cells by `cells` in Chebyshev distance. Two-pass separable
-// dilation keeps this O(width*height*cells) rather than O(n*cells^2).
+// Inflation-ring cost: high enough that the A* planner (lethal_threshold ~200)
+// treats it as blocked and keeps clearance, but below kLethal (254) so a
+// collision check against true building footprints ignores the safety margin.
+constexpr std::uint8_t kInflated = 253;
+
+// Grow obstacle cells by `cells` in Chebyshev distance, filling the ring with
+// kInflated (footprint cells keep kLethal). Two-pass separable dilation keeps
+// this O(width*height*cells); each pass seeds from >= kInflated so the second
+// pass extends the first pass's ring.
 void inflate(OccupancyGrid& grid, int cells) {
     if (cells <= 0) {
         return;
     }
-    std::vector<std::uint8_t> src = grid.cells;
-    // Horizontal pass.
-    for (int cz = 0; cz < grid.height; ++cz) {
-        for (int cx = 0; cx < grid.width; ++cx) {
-            bool lethal = false;
-            for (int dx = -cells; dx <= cells && !lethal; ++dx) {
-                const int nx = cx + dx;
-                if (nx >= 0 && nx < grid.width &&
-                    src[grid.index(nx, cz)] >= OccupancyGrid::kLethal) {
-                    lethal = true;
+    const auto pass = [&grid, cells](bool horizontal) {
+        const std::vector<std::uint8_t> src = grid.cells;
+        for (int cz = 0; cz < grid.height; ++cz) {
+            for (int cx = 0; cx < grid.width; ++cx) {
+                bool seed = false;
+                for (int d = -cells; d <= cells && !seed; ++d) {
+                    const int nx = horizontal ? cx + d : cx;
+                    const int nz = horizontal ? cz : cz + d;
+                    if (nx >= 0 && nx < grid.width && nz >= 0 && nz < grid.height &&
+                        src[grid.index(nx, nz)] >= kInflated) {
+                        seed = true;
+                    }
+                }
+                if (seed && grid.at(cx, cz) < kInflated) {
+                    grid.set(cx, cz, kInflated); // preserve footprint kLethal
                 }
             }
-            if (lethal) {
-                grid.set(cx, cz, OccupancyGrid::kLethal);
-            }
         }
-    }
-    // Vertical pass over the horizontally-dilated buffer.
-    src = grid.cells;
-    for (int cz = 0; cz < grid.height; ++cz) {
-        for (int cx = 0; cx < grid.width; ++cx) {
-            bool lethal = false;
-            for (int dz = -cells; dz <= cells && !lethal; ++dz) {
-                const int nz = cz + dz;
-                if (nz >= 0 && nz < grid.height &&
-                    src[grid.index(cx, nz)] >= OccupancyGrid::kLethal) {
-                    lethal = true;
-                }
-            }
-            if (lethal) {
-                grid.set(cx, cz, OccupancyGrid::kLethal);
-            }
-        }
-    }
+    };
+    pass(true);
+    pass(false);
 }
 
 // Point at half the arc length along a path. A* smoothing string-pulls plans
@@ -151,6 +148,29 @@ Vec3 path_midpoint(const Path& path) {
     return path.points.back();
 }
 
+// Perpendicular distance from p to segment a-b on the XZ plane.
+double point_segment_dist(const Vec3& p, const Vec3& a, const Vec3& b) {
+    const double abx = b.x - a.x;
+    const double abz = b.z - a.z;
+    const double denom = abx * abx + abz * abz;
+    double t = denom > 1e-12 ? ((p.x - a.x) * abx + (p.z - a.z) * abz) / denom : 0.0;
+    t = std::clamp(t, 0.0, 1.0);
+    const double cx = a.x + abx * t;
+    const double cz = a.z + abz * t;
+    const double dx = p.x - cx;
+    const double dz = p.z - cz;
+    return std::sqrt(dx * dx + dz * dz);
+}
+
+// Crosstrack error: nearest distance from p to the reference polyline.
+double path_crosstrack(const Path& path, const Vec3& p) {
+    double best = 1e18;
+    for (std::size_t i = 1; i < path.points.size(); ++i) {
+        best = std::min(best, point_segment_dist(p, path.points[i - 1], path.points[i]));
+    }
+    return best;
+}
+
 // Nearest free (non-lethal, in-bounds) world position to `p` within max_ring
 // cells, searched by expanding Chebyshev rings with deterministic ordering.
 // Returns false when the point is off-grid or no free cell is within range.
@@ -160,7 +180,7 @@ bool snap_to_free(const OccupancyGrid& grid, const Vec3& p, int max_ring, Vec3& 
     if (!grid.world_to_cell(p.x, p.z, cx, cz)) {
         return false;
     }
-    if (grid.at(cx, cz) < OccupancyGrid::kLethal) {
+    if (grid.at(cx, cz) < kInflated) {
         out = p;
         return true;
     }
@@ -172,7 +192,7 @@ bool snap_to_free(const OccupancyGrid& grid, const Vec3& p, int max_ring, Vec3& 
                 }
                 const int nx = cx + dx;
                 const int nz = cz + dz;
-                if (grid.in_bounds(nx, nz) && grid.at(nx, nz) < OccupancyGrid::kLethal) {
+                if (grid.in_bounds(nx, nz) && grid.at(nx, nz) < kInflated) {
                     out = grid.cell_to_world(nx, nz);
                     return true;
                 }
@@ -218,9 +238,8 @@ double path_min_clearance_m(const OccupancyGrid& grid, const Path& path, int max
                     }
                     const int nx = cx + dx;
                     const int nz = cz + dz;
-                    if (grid.in_bounds(nx, nz) &&
-                        grid.at(nx, nz) >= OccupancyGrid::kLethal) {
-                        hit = true;
+                    if (grid.in_bounds(nx, nz) && grid.at(nx, nz) >= kInflated) {
+                        hit = true; // nearest planner-obstacle (footprint or margin)
                     }
                 }
             }
@@ -292,6 +311,7 @@ EvidencePlanResult run_evidence_loop(
             r.collision_free = false;
         }
     }
+    Path final_path = plan.path;
 
     // Recovery probe: block the plan midpoint and replan around it.
     if (spec.recovery_block_cells > 0 && plan.path.points.size() >= 2) {
@@ -314,6 +334,7 @@ EvidencePlanResult run_evidence_loop(
             ++r.replan_count;
             r.time_in_recovery = replan.expanded;
             if (replan.ok) {
+                final_path = replan.path;
                 r.length_m = replan.path.length_m();
                 r.min_clearance_m =
                     std::min(r.min_clearance_m, path_min_clearance_m(grid, replan.path, 8));
@@ -328,6 +349,12 @@ EvidencePlanResult run_evidence_loop(
                 r.failure = EvidenceFailure::NoRecoveryPlan;
             }
         }
+    }
+
+    // Close the loop: drive a controller-tracked robot along the final plan over
+    // the (post-recovery) costmap and record executed-trajectory metrics.
+    if (r.ok) {
+        r.executed = execute_trajectory(grid, final_path, {});
     }
     return r;
 }
@@ -387,6 +414,93 @@ OccupancyGrid occupancy_from_sensor_frame(const agbot::render::SensorFrame& fram
         }
     }
     return grid;
+}
+
+ExecutedTrajectory execute_trajectory(const OccupancyGrid& grid, const Path& path,
+                                      const ExecutorParams& params) {
+    ExecutedTrajectory tr;
+    if (path.points.size() < 2) {
+        tr.reached = !path.points.empty();
+        return tr;
+    }
+    namespace cfg = agbot::config;
+
+    // Delivery-robot kinematic bicycle + PID/Stanley path tracker (matches
+    // nav/configs/delivery_robot.toml).
+    cfg::ParamTable vp;
+    vp["max_speed_mps"] = cfg::ParamValue(3.0);
+    vp["max_accel_mps2"] = cfg::ParamValue(2.5);
+    vp["max_brake_mps2"] = cfg::ParamValue(4.0);
+    vp["max_steer_rad"] = cfg::ParamValue(0.6);
+    vp["max_steer_rate_radps"] = cfg::ParamValue(2.5);
+    vp["wheelbase_m"] = cfg::ParamValue(0.8);
+    agbot::vehicles::KinematicBicycleModel model(vp);
+    cfg::ParamTable cp;
+    cp["kp"] = cfg::ParamValue(1.5);
+    cp["ki"] = cfg::ParamValue(0.3);
+    cp["k_e"] = cfg::ParamValue(1.2);
+    cp["k_soft"] = cfg::ParamValue(1.0);
+    PidStanleyController controller(cp);
+
+    agbot::vehicles::EntityState state;
+    state.position = path.points.front();
+    const Vec3 d1 = path.points[1] - path.points.front();
+    state.yaw_rad = std::atan2(d1.z, d1.x);
+
+    const Vec3 goal = path.points.back();
+    const double v_cmd = std::min(params.cruise_speed_mps, model.limits().max_speed_mps);
+    const double path_len = path.length_m();
+    const int max_steps = std::max(
+        50, static_cast<int>(params.step_margin * path_len / std::max(v_cmd * params.dt_s, 1e-3)));
+
+    double prev_steer = 0.0;
+    bool has_prev = false;
+    double total_steer_delta = 0.0;
+    double sum_ct = 0.0;
+    Vec3 prev_pos = state.position;
+    for (int i = 0; i < max_steps; ++i) {
+        const agbot::vehicles::Actuation act =
+            controller.control(state, path, v_cmd, model.limits(), params.dt_s);
+        if (has_prev) {
+            total_steer_delta += std::abs(act.steer_rad - prev_steer);
+        }
+        prev_steer = act.steer_rad;
+        has_prev = true;
+        state = model.step(state, act, params.dt_s);
+        ++tr.steps;
+        tr.length_m += (state.position - prev_pos).horizontal_length();
+        prev_pos = state.position;
+        const double ct = path_crosstrack(path, state.position);
+        tr.max_crosstrack_m = std::max(tr.max_crosstrack_m, ct);
+        sum_ct += ct;
+        if (grid.cost_at_world(state.position.x, state.position.z) >= OccupancyGrid::kLethal) {
+            ++tr.collisions;
+            tr.collision_free = false;
+        }
+        if ((state.position - goal).horizontal_length() <= params.goal_tolerance_m) {
+            tr.reached = true;
+            break;
+        }
+    }
+    tr.duration_s = static_cast<double>(tr.steps) * params.dt_s;
+    tr.mean_crosstrack_m = tr.steps ? sum_ct / static_cast<double>(tr.steps) : 0.0;
+    tr.steering_smoothness_radps =
+        tr.duration_s > 0.0 ? total_steer_delta / tr.duration_s : 0.0;
+    return tr;
+}
+
+void fold_pointcloud_into_occupancy(OccupancyGrid& grid, const PointCloud& cloud,
+                                    double min_obstacle_height_m) {
+    for (const Vec3& p : cloud.points) {
+        if (p.y <= min_obstacle_height_m) {
+            continue; // ground / low return, not a vertical obstacle
+        }
+        int cx = 0;
+        int cz = 0;
+        if (grid.world_to_cell(p.x, p.z, cx, cz)) {
+            grid.set(cx, cz, OccupancyGrid::kLethal);
+        }
+    }
 }
 
 OccupancyConsistency occupancy_consistency(const OccupancyGrid& sensor,
