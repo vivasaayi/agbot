@@ -11,6 +11,7 @@ pub mod fleet_alerts;
 pub mod logging;
 pub mod observability;
 pub mod plugin_extensions;
+pub mod product_graph;
 pub mod resource_budget;
 pub mod schemas;
 pub mod secrets;

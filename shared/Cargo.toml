@@ -16,3 +16,4 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 tokio = { workspace = true }
 nalgebra = { workspace = true }
+sha2 = "0.10"
