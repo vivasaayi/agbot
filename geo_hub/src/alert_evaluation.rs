@@ -95,10 +95,16 @@ pub fn default_ruleset() -> Vec<AlertRule> {
 
 /// Evaluate a field's findings against `rules`, persisting fired alerts with
 /// lineage to their source findings. Returns the alerts fired this run.
+///
+/// `propose_action` is the plan's opt-in flag (Track C phase C3): when true, a
+/// fired alert on an actionable finding kind also enqueues a Proposed proposal
+/// from that finding. Off by default — alert evaluation alone never creates
+/// proposals.
 pub async fn evaluate_field_alerts(
     pool: &DbPool,
     field_id: &str,
     rules: &[AlertRule],
+    propose_action: bool,
     created_at: &str,
 ) -> Result<Vec<StoredAlert>, AlertEvaluationError> {
     let findings = applications::list_field_findings(pool, field_id).await?;
@@ -152,7 +158,7 @@ pub async fn evaluate_field_alerts(
         // finding kind enqueues a Proposed action proposal from that finding —
         // nothing more. Idempotent per finding, so re-evaluation never
         // duplicates. Approval/dispatch stay downstream and gated.
-        if fired_here && propose.contains(&finding.finding.kind) {
+        if propose_action && fired_here && propose.contains(&finding.finding.kind) {
             maybe_enqueue_proposal(pool, finding, created_at).await?;
         }
     }

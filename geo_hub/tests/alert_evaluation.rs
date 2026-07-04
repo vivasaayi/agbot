@@ -245,8 +245,15 @@ async fn actionable_alert_enqueues_a_proposal_from_its_finding() -> Result<()> {
     let (_, before) = send(&app, "GET", "/api/fields/field-1/proposals", None).await?;
     assert_eq!(before.as_array().unwrap().len(), 0);
 
-    // Evaluate: the anomaly alert fires and auto-proposes.
-    let (status, alerts) = send(&app, "POST", "/api/fields/field-1/alert-evaluation", None).await?;
+    // Evaluate with propose_action opted in: the anomaly alert fires and proposes.
+    let propose_body = json!({ "propose_action": true });
+    let (status, alerts) = send(
+        &app,
+        "POST",
+        "/api/fields/field-1/alert-evaluation",
+        Some(propose_body.clone()),
+    )
+    .await?;
     assert_eq!(status, StatusCode::OK, "{alerts}");
     let source_finding_id = alerts[0]["source_finding_id"].as_str().unwrap().to_string();
 
@@ -259,7 +266,13 @@ async fn actionable_alert_enqueues_a_proposal_from_its_finding() -> Result<()> {
     assert_eq!(queue[0]["action_category"], "scout");
 
     // Re-evaluation does not duplicate the proposal (idempotent per finding).
-    send(&app, "POST", "/api/fields/field-1/alert-evaluation", None).await?;
+    send(
+        &app,
+        "POST",
+        "/api/fields/field-1/alert-evaluation",
+        Some(propose_body),
+    )
+    .await?;
     let (_, again) = send(&app, "GET", "/api/fields/field-1/proposals", None).await?;
     assert_eq!(again.as_array().unwrap().len(), 1, "still exactly one proposal");
     Ok(())
