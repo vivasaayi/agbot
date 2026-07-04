@@ -38,6 +38,14 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::ingest_drone_session),
         )
         .route(
+            "/api/catalog/products",
+            get(routes::list_catalog_products).post(routes::register_catalog_product),
+        )
+        .route(
+            "/api/catalog/products/:product_id",
+            get(routes::get_catalog_product),
+        )
+        .route(
             "/api/farms",
             get(routes::list_farms).post(routes::create_farm),
         )

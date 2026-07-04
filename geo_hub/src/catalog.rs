@@ -49,7 +49,7 @@ pub enum CatalogError {
 }
 
 /// A catalog product row as persisted.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RegisteredProduct {
     pub product_id: String,
     pub level: ProductLevel,
@@ -517,4 +517,112 @@ fn row_to_product(row: sqlx::sqlite::SqliteRow) -> Result<RegisteredProduct, Cat
         provenance_id: row.get("provenance_id"),
         created_at: row.get("created_at"),
     })
+}
+
+// --- Sidecar directory registration CLI (Track A batch 8) -------------------
+
+/// Outcome of walking a directory of `*.product_record.json` sidecars and
+/// registering each into the catalog.
+#[derive(Debug, Default)]
+pub struct CatalogRegisterReport {
+    /// Catalog product ids registered (or already present).
+    pub registered: Vec<String>,
+    /// Sidecars that could not be registered: `(sidecar_path, reason)`.
+    pub failed: Vec<(String, String)>,
+}
+
+/// Recursively collect `*.product_record.json` sidecar file paths under `dir`.
+fn collect_sidecar_paths(dir: &std::path::Path) -> std::io::Result<Vec<std::path::PathBuf>> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(current) = stack.pop() {
+        for entry in std::fs::read_dir(&current)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".product_record.json"))
+            {
+                out.push(path);
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+fn is_mask_kind(kind: &str) -> bool {
+    kind.contains("mask")
+}
+
+/// Walk `dir` for `*.product_record.json` sidecars and register each draft into
+/// the catalog. Registration order respects the dependency graph: lower levels
+/// first, masks before the products that reference them, and any draft whose
+/// inputs are not yet present is deferred and retried until the set converges.
+/// Registration is idempotent, so re-running is safe.
+pub async fn register_sidecar_dir(
+    pool: &DbPool,
+    dir: &std::path::Path,
+    created_at: &str,
+) -> Result<CatalogRegisterReport, CatalogError> {
+    let mut report = CatalogRegisterReport::default();
+    let mut pending: Vec<(std::path::PathBuf, ProductRecordDraft)> = Vec::new();
+    for path in collect_sidecar_paths(dir).map_err(sqlx::Error::Io)? {
+        match std::fs::read(&path) {
+            Ok(bytes) => match serde_json::from_slice::<ProductRecordDraft>(&bytes) {
+                Ok(draft) => pending.push((path, draft)),
+                Err(err) => report
+                    .failed
+                    .push((path.to_string_lossy().to_string(), format!("parse: {err}"))),
+            },
+            Err(err) => report
+                .failed
+                .push((path.to_string_lossy().to_string(), format!("read: {err}"))),
+        }
+    }
+
+    // First-pass ordering: level ascending, then masks before non-masks.
+    pending.sort_by(|(_, a), (_, b)| {
+        a.level
+            .cmp(&b.level)
+            .then_with(|| is_mask_kind(&b.kind).cmp(&is_mask_kind(&a.kind)))
+    });
+
+    // Retry loop: defer drafts whose inputs/mask are not yet registered until a
+    // full pass makes no progress.
+    loop {
+        let mut progressed = false;
+        let mut deferred = Vec::new();
+        for (path, draft) in std::mem::take(&mut pending) {
+            match register_product(pool, &draft, created_at).await {
+                Ok(product_id) => {
+                    report.registered.push(product_id);
+                    progressed = true;
+                }
+                Err(CatalogError::InputNotFound { .. })
+                | Err(CatalogError::MaskNotRegistered { .. }) => {
+                    deferred.push((path, draft));
+                }
+                Err(err) => {
+                    report
+                        .failed
+                        .push((path.to_string_lossy().to_string(), err.to_string()));
+                    progressed = true;
+                }
+            }
+        }
+        pending = deferred;
+        if !progressed || pending.is_empty() {
+            break;
+        }
+    }
+    for (path, _) in pending {
+        report.failed.push((
+            path.to_string_lossy().to_string(),
+            "unresolved inputs or mask".to_string(),
+        ));
+    }
+    Ok(report)
 }
