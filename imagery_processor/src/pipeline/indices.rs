@@ -575,6 +575,29 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
         output_hashes,
     );
 
+    // Emit the L2 product-record sidecar next to the index output (Track A phase
+    // 7b). A later `geo_hub catalog register` pass walks these into the catalog.
+    let scene_id = image.image_id.to_string();
+    let index_kind = format!("{:?}", args.index).to_lowercase();
+    let index_timestamp = image.metadata.timestamp.to_rfc3339();
+    let sidecar_mask_ref = args
+        .mask
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string());
+    let sidecar_ctx = crate::product_sidecar::l2_index_sidecar_context(
+        &scene_id,
+        &index_kind,
+        env!("CARGO_PKG_VERSION"),
+        &evidence.resolved_bands,
+        evidence.spatial_ref.clone(),
+        &index_timestamp,
+        sidecar_mask_ref.as_deref(),
+        None,
+    );
+    let sidecar_draft =
+        crate::product_sidecar::draft_from_evidence(&reproducibility, &sidecar_ctx, &out_path);
+    crate::product_sidecar::write_product_sidecar(&out_path, &sidecar_draft).await?;
+
     let meta = IndexResultMeta {
         timestamp: chrono::Utc::now(),
         source_images: vec![image.image_id],

@@ -19,7 +19,92 @@ use shared::product_graph::{
 };
 use shared::schemas::RasterSpatialRef;
 use shared::AgroResult;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+/// Build an L2-index sidecar context in the live CLI processing path, where
+/// catalog product ids have not yet been assigned (registration happens later,
+/// via `geo_hub catalog register`). Two decisions make the draft honest here:
+///
+/// * **Scope is scene-only.** The CLI knows the scene (the source image) but not
+///   the field/season — those are enriched at register time. Leaving them `None`
+///   is truthful rather than guessing.
+/// * **Inputs are derived deterministically from the resolved bands.** Each
+///   resolved band becomes an identity-bearing L1 input ref `scene:role:band`, so
+///   two scenes' same-parameter indices carry distinct inputs and never collapse
+///   into one catalog row (the identity invariant).
+#[allow(clippy::too_many_arguments)]
+pub fn l2_sidecar_context(
+    scene_id: &str,
+    kind: &str,
+    algorithm_version: &str,
+    inputs: Vec<ProductInputRef>,
+    spatial_ref: RasterSpatialRef,
+    timestamp: &str,
+    mask_ref: Option<&str>,
+    source_id: Option<String>,
+) -> SidecarContext {
+    SidecarContext {
+        level: ProductLevel::L2,
+        kind: kind.to_string(),
+        algorithm_version: algorithm_version.to_string(),
+        scope: ProductScope {
+            farm_id: None,
+            field_id: None,
+            season_id: None,
+            scene_id: Some(scene_id.to_string()),
+            temporal_start: timestamp.to_string(),
+            temporal_end: timestamp.to_string(),
+        },
+        inputs,
+        quality_mask: mask_ref.map(|reference| ProductInputRef {
+            product_id: reference.to_string(),
+            role: "mask".to_string(),
+        }),
+        spatial_ref: Some(spatial_ref),
+        gsd_m_per_px: None,
+        source_id,
+    }
+}
+
+/// An identity-bearing L1 input ref for a resolved band in the CLI path:
+/// `scene:role:band`. Two scenes' same band role stay distinct because the scene
+/// and band name are folded in.
+pub fn band_input_ref(scene_id: &str, role: &str, band: &str) -> ProductInputRef {
+    ProductInputRef {
+        product_id: format!("{scene_id}:{role}:{band}"),
+        role: format!("band:{role}"),
+    }
+}
+
+/// [`l2_sidecar_context`] specialized to an index product, deriving the inputs
+/// from the resolved bands map (role -> band name).
+#[allow(clippy::too_many_arguments)]
+pub fn l2_index_sidecar_context(
+    scene_id: &str,
+    kind: &str,
+    algorithm_version: &str,
+    resolved_bands: &BTreeMap<String, String>,
+    spatial_ref: RasterSpatialRef,
+    timestamp: &str,
+    mask_ref: Option<&str>,
+    source_id: Option<String>,
+) -> SidecarContext {
+    let inputs = resolved_bands
+        .iter()
+        .map(|(role, band)| band_input_ref(scene_id, role, band))
+        .collect();
+    l2_sidecar_context(
+        scene_id,
+        kind,
+        algorithm_version,
+        inputs,
+        spatial_ref,
+        timestamp,
+        mask_ref,
+        source_id,
+    )
+}
 
 /// Catalog context the processing evidence does not itself carry: product level,
 /// kind, scope, and the upstream input product refs (identity-bearing).
@@ -248,6 +333,87 @@ mod tests {
             Path::new("a/ndvi.tif"),
         );
         assert_eq!(a.parameters_hash(), a2.parameters_hash());
+    }
+
+    fn resolved_bands(nir: &str) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("red".to_string(), "B04".to_string()),
+            ("nir".to_string(), nir.to_string()),
+        ])
+    }
+
+    fn bare_spatial_ref() -> RasterSpatialRef {
+        RasterSpatialRef {
+            georeferenced: false,
+            crs: None,
+            bbox: None,
+            geo_transform: None,
+            resolution: None,
+        }
+    }
+
+    #[test]
+    fn cli_index_context_is_scene_scoped_with_per_band_inputs() {
+        let ctx = l2_index_sidecar_context(
+            "scene-a",
+            "ndvi",
+            "1.2.3",
+            &resolved_bands("B08"),
+            bare_spatial_ref(),
+            "2026-06-01T00:00:00Z",
+            Some("mask/qa.png"),
+            None,
+        );
+        assert_eq!(ctx.level, ProductLevel::L2);
+        // Scope is scene-only: field/season are enriched later at register time.
+        assert_eq!(ctx.scope.scene_id.as_deref(), Some("scene-a"));
+        assert!(ctx.scope.field_id.is_none());
+        assert!(ctx.scope.season_id.is_none());
+        // One identity-bearing L1 input per resolved band.
+        assert_eq!(ctx.inputs.len(), 2);
+        assert!(ctx
+            .inputs
+            .iter()
+            .any(|i| i.product_id == "scene-a:nir:B08" && i.role == "band:nir"));
+        assert_eq!(ctx.quality_mask.as_ref().unwrap().product_id, "mask/qa.png");
+    }
+
+    #[test]
+    fn cli_index_inputs_keep_scenes_distinct() {
+        let evidence = ndvi_evidence("hash-abc");
+        let draft_a = draft_from_evidence(
+            &evidence,
+            &l2_index_sidecar_context(
+                "scene-a",
+                "ndvi",
+                "1.0.0",
+                &resolved_bands("B08a"),
+                bare_spatial_ref(),
+                "2026-06-01T00:00:00Z",
+                None,
+                None,
+            ),
+            Path::new("a/ndvi.tif"),
+        );
+        let draft_b = draft_from_evidence(
+            &evidence,
+            &l2_index_sidecar_context(
+                "scene-b",
+                "ndvi",
+                "1.0.0",
+                &resolved_bands("B08b"),
+                bare_spatial_ref(),
+                "2026-06-01T00:00:00Z",
+                None,
+                None,
+            ),
+            Path::new("b/ndvi.tif"),
+        );
+        assert_ne!(
+            draft_a.parameters_hash(),
+            draft_b.parameters_hash(),
+            "different scenes' bands must yield distinct catalog identity"
+        );
     }
 
     #[tokio::test]
