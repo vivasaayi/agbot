@@ -184,19 +184,29 @@ Multi-batch (needs external data; user authorized acquisition).
   (2997 m euclidean), 3 m clearance, recovers once. Asserted in `world_demo --check`;
   unit tests in `nav/city_evidence_tests`.
 
-**Batch 2 (remaining) — sensor-derived occupancy + local control**
-- Feed the occupancy grid from **sensor evidence** (offscreen RGB + linear depth +
-  semantic mask + LiDAR ray hits) rather than footprint AABBs, so the costmap is
-  what the robot *perceives*. Reuse `render/OffscreenRenderer` + `nav/Perception`/
-  `Mapping`. Add the **semantic↔occupancy consistency** metric (agreement between
-  semantic-depth edges and occupancy obstacles).
-- Wire the full pipeline through `NavigationPipeline`: global (A*/Hybrid-A*) →
-  **local MPPI** controller → recovery/replan behavior. Keep **Pure Pursuit /
+**Batch 2 — sensor-derived occupancy + consistency — ✅ DONE (commit 5374273)**
+- `occupancy_from_sensor_frame`: back-projects a co-registered depth+semantic
+  offscreen frame into an XZ occupancy grid via the render camera basis (depth is
+  eye-space metres along forward); hits above a height threshold mark obstacles,
+  ground/terrain stays free. The costmap is now what the robot *perceives*.
+- `occupancy_consistency`: precision/recall between the sensor-derived grid and the
+  authoritative footprint grid (Chebyshev tolerance absorbs sub-cell error).
+- `AStarPlanner.PlanResult.expanded` (nodes popped/closed) backs deterministic
+  **time-to-first-plan** / **time-in-recovery** proxies on `EvidencePlanResult`.
+- **Gate 5** renders a near-nadir sensor frame and asserts perceived occupancy
+  agrees with footprints: Lower Manhattan **precision 1.0** (1926/1926 perceived
+  obstacle cells are real buildings), recall 0.44 (single pose / occlusion /
+  >25 m roofs), plus non-zero planner effort. Unit tests cover back-projection,
+  the precision/recall metric, and effort reporting.
+
+**Batch 3 (remaining) — full local-control pipeline**
+- Wire the end-to-end `NavigationPipeline`: global (A*/Hybrid-A*) → **local MPPI**
+  controller → recovery/replan behavior, driving a robot state over the
+  sensor-derived costmap (not just planning a path). Keep **Pure Pursuit /
   Stanley** as interpretable baselines.
-- Add **time-to-first-plan** and **time-in-recovery** as deterministic step-count
-  proxies (planner expansions / recovery ticks — not wall clock).
-- Extend Gate 5 to assert the sensor-derived costmap agrees with the footprint
-  occupancy within tolerance, and log the new metrics.
+- Fold LiDAR ray hits into the same occupancy grid alongside depth+semantic.
+- Extend Gate 5 with executed-trajectory metrics (tracking error, controller
+  smoothness) on top of the path-level metrics already gated.
 
 ### M7 — Fixed-wing validation + weather/atmosphere — ⬜ NOT STARTED
 Greenfield (no weather/atmosphere/ephemeris module exists yet). Sequenced sub-steps:
@@ -240,9 +250,10 @@ Greenfield (no weather/atmosphere/ephemeris module exists yet). Sequenced sub-st
 
 ## 5. Immediate next step
 
-M1–M5 and M3-batch-3 are done and committed; M6 batch 1 (city occupancy + Gate 5)
-is committed. The next step is **M6 batch 2**: drive the occupancy grid from sensor
-evidence (offscreen RGB + linear depth + semantic mask + LiDAR) instead of footprint
-AABBs, wire the full `NavigationPipeline` (global → MPPI local → recovery), and add
-the semantic↔occupancy consistency + time-to-first-plan / time-in-recovery metrics to
-Gate 5. Then M7 (fixed-wing 6-DOF validation → weather presets → atmosphere).
+M1–M5, M3-batch-3, and M6 batches 1–2 are done and committed (sensor-derived
+occupancy now cross-checks the compiled footprints at precision 1.0). Two tracks
+remain: **M6 batch 3** — wire the full `NavigationPipeline` (global → MPPI local →
+recovery) to *execute* a trajectory over the sensor costmap and fold in LiDAR hits;
+and **M7** — fixed-wing 6-DOF validation → deterministic weather presets → atmosphere.
+Recommend M7 next (larger, greenfield, unblocks the flight-dynamics gate), with M6
+batch 3 as a parallel autonomy-depth track.
