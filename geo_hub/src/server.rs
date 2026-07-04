@@ -45,6 +45,25 @@ pub fn build_router(state: AppState) -> Router {
             "/api/catalog/products/:product_id",
             get(routes::get_catalog_product),
         )
+        .route("/api/stac", get(routes::stac_landing_page))
+        .route("/api/stac/conformance", get(routes::stac_conformance))
+        .route("/api/stac/collections", get(routes::stac_list_collections))
+        .route(
+            "/api/stac/collections/:collection_id",
+            get(routes::stac_get_collection),
+        )
+        .route(
+            "/api/stac/collections/:collection_id/items",
+            get(routes::stac_list_collection_items),
+        )
+        .route(
+            "/api/stac/collections/:collection_id/items/:item_id",
+            get(routes::stac_get_collection_item),
+        )
+        .route(
+            "/api/stac/search",
+            get(routes::stac_search_get).post(routes::stac_search_post),
+        )
         .route(
             "/api/applications/:app_id/runs",
             post(routes::create_application_run),

@@ -19,6 +19,7 @@ pub mod provenance_store;
 pub mod routes;
 pub mod server;
 pub mod shapefile;
+pub mod stac_catalog;
 pub mod state;
 pub mod water_priority_run;
 

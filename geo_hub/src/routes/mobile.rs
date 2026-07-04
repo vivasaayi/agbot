@@ -409,7 +409,7 @@ pub async fn mobile_analyze(
     }))
 }
 
-fn normalize_field_geometry(
+pub(crate) fn normalize_field_geometry(
     geometry: Option<&serde_json::Value>,
 ) -> AppResult<Option<serde_json::Value>> {
     let Some(value) = geometry else {
@@ -520,7 +520,7 @@ fn candidate_from_mobile_scene(scene: &MobileSceneCandidate) -> landsat::Landsat
     }
 }
 
-fn cached_landsat_scene_id(
+pub(crate) fn cached_landsat_scene_id(
     candidate: &landsat::LandsatSceneCandidate,
     latitude: f64,
     longitude: f64,
@@ -964,4 +964,3 @@ fn product_label(kind: &str) -> &'static str {
         _ => "Analysis Layer",
     }
 }
-
