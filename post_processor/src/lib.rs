@@ -21,6 +21,7 @@ pub mod lidar_change;
 pub mod ndvi_analysis;
 pub mod product_anomalies;
 pub mod report_generator;
+pub mod temporal_composite;
 pub mod thermal_analysis;
 pub mod thermal_spots;
 pub mod vegetation_summary;
@@ -64,6 +65,12 @@ pub use product_anomalies::{
     ProductAnomalyReasonCode,
 };
 pub use report_generator::ReportGenerator;
+pub use temporal_composite::{
+    compose_temporal, composite_l3_draft, composite_period_for, group_observation_dates,
+    CompositeCadence, CompositeEvidence, CompositeL3Scope, CompositeMethod, CompositeObservation,
+    CompositePeriod, CompositePixelReason, CompositeRequest, CompositeResult,
+    TemporalCompositeError, COMPOSITE_NO_SELECTION,
+};
 pub use thermal_analysis::{ThermalAnalysisConfig, ThermalAnalysisProcessor};
 pub use thermal_spots::{
     detect_thermal_spots, ThermalSpot, ThermalSpotError, ThermalSpotRequest, ThermalSpotSummary,
@@ -2713,7 +2720,10 @@ mod tests {
         }
     }
 
-    fn analysis_result_with(result_type: ResultType, uncertainty: Option<HealthUncertaintyBand>) -> AnalysisResult {
+    fn analysis_result_with(
+        result_type: ResultType,
+        uncertainty: Option<HealthUncertaintyBand>,
+    ) -> AnalysisResult {
         AnalysisResult {
             id: Uuid::new_v4(),
             job_id: Uuid::new_v4(),
@@ -2757,7 +2767,10 @@ mod tests {
             .any(|i| i.product_id == "layer-ndvi" && i.role == "l2_input"));
         // Uncertainty band (width 0.1) -> confidence 0.9.
         let confidence = draft.confidence.expect("confidence from uncertainty");
-        assert!((confidence - 0.9).abs() < 1e-6, "confidence was {confidence}");
+        assert!(
+            (confidence - 0.9).abs() < 1e-6,
+            "confidence was {confidence}"
+        );
         assert_eq!(draft.evidence_digests, vec!["digest:abc".to_string()]);
         assert_eq!(draft.scope.field_id.as_deref(), Some("field-a"));
     }
@@ -2766,7 +2779,10 @@ mod tests {
     fn result_type_kinds_are_stable_snake_case() {
         assert_eq!(ResultType::ThermalMap.product_kind(), "thermal_analysis");
         assert_eq!(ResultType::YieldEstimate.product_kind(), "yield_estimate");
-        assert_eq!(ResultType::StressIndicators.product_kind(), "stress_indicators");
+        assert_eq!(
+            ResultType::StressIndicators.product_kind(),
+            "stress_indicators"
+        );
     }
 
     fn trend_request() -> IndexTrendRequest {
