@@ -184,3 +184,42 @@ async fn api_js_only_references_registered_routes() -> Result<()> {
 
     Ok(())
 }
+
+/// Recursively collect `.js` files under `dir`.
+fn collect_js_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_js_files(&path, out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("js") {
+            out.push(path);
+        }
+    }
+}
+
+/// Single-URL-file convention (phase A follow-up): only `api.js` may contain
+/// `/api/` string literals. Every other panel/module must route its requests
+/// through the `api.js` client, so backend URLs cannot drift across the
+/// front-end.
+#[test]
+fn only_api_js_contains_backend_url_literals() {
+    let js_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("web/js");
+    let mut files = Vec::new();
+    collect_js_files(&js_root, &mut files);
+    assert!(!files.is_empty(), "expected web/js/*.js files");
+
+    for file in files {
+        if file.file_name().and_then(|n| n.to_str()) == Some("api.js") {
+            continue;
+        }
+        let source = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            !source.contains("/api/"),
+            "{} contains a `/api/` literal; route all requests through api.js",
+            file.display()
+        );
+    }
+}

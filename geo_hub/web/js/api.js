@@ -8,12 +8,47 @@
 // Same-origin base URL: the workspace is served by geo_hub itself.
 const BASE_URL = "";
 
-/** Endpoints used by the workspace (phase A1). */
+/**
+ * Endpoints used by the workspace. Every backend path lives here as a string
+ * literal so the route-manifest test can verify it against the router. Path
+ * templates use `:param` placeholders; the builder functions below fill them.
+ */
 export const endpoints = {
   farms: "/api/farms",
   fields: "/api/fields",
   scenes: "/api/scenes",
+  farmFields: "/api/farms/:farm_id/fields",
+  fieldScenes: "/api/fields/:field_id/scenes",
+  scene: "/api/scenes/:scene_id",
+  catalogProducts: "/api/catalog/products",
 };
+
+/** Fields belonging to a farm. */
+export function farmFieldsPath(farmId) {
+  return `/api/farms/${encodeURIComponent(farmId)}/fields`;
+}
+
+/** Scenes linked to a field. */
+export function fieldScenesPath(fieldId) {
+  return `/api/fields/${encodeURIComponent(fieldId)}/scenes`;
+}
+
+/** A single scene's detail. */
+export function scenePath(sceneId) {
+  return `/api/scenes/${encodeURIComponent(sceneId)}`;
+}
+
+/** Catalog products, optionally filtered by a query object. */
+export function catalogProductsPath(query) {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query ?? {})) {
+    if (value !== undefined && value !== null && value !== "") {
+      params.set(key, value);
+    }
+  }
+  const suffix = params.toString();
+  return suffix ? `/api/catalog/products?${suffix}` : "/api/catalog/products";
+}
 
 async function request(method, path, body) {
   const options = { method, headers: { Accept: "application/json" } };

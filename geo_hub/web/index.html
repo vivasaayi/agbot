@@ -112,15 +112,36 @@
 
     #catalog-tree ul {
       list-style: none;
+      margin-left: 0.6rem;
     }
 
-    #catalog-tree li {
-      padding: 0.25rem 0.35rem;
+    #catalog-tree .tree-row {
+      padding: 0.2rem 0.35rem;
       border-radius: 3px;
+      cursor: pointer;
     }
 
-    #catalog-tree li:hover {
+    #catalog-tree .tree-row:hover {
       background: var(--bg);
+    }
+
+    #catalog-tree .tree-row.scene {
+      color: var(--accent);
+    }
+
+    dl.detail {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 0.15rem 0.6rem;
+      font-size: 0.78rem;
+    }
+
+    dl.detail dt {
+      color: var(--text-dim);
+    }
+
+    dl.detail dd {
+      word-break: break-word;
     }
 
     .status {
@@ -158,7 +179,9 @@
         <span class="tab" data-tab="alerts">Alerts</span>
         <span class="tab" data-tab="proposals">Proposals</span>
       </div>
-      <p class="status">Select a catalog item to inspect it.</p>
+      <div id="scene-detail">
+        <p class="status">Select a scene to inspect it.</p>
+      </div>
     </section>
   </main>
   <script type="module" src="js/app.js"></script>
