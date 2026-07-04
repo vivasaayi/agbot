@@ -6795,6 +6795,21 @@ pub async fn run_water_priority_app(
     Ok(Json(record))
 }
 
+/// Run the anomaly-detection application (Track B phase B5): screen per-zone
+/// index values via `post_processor::anomaly_app`, then record a governed run
+/// with lineage back to the zones' cataloged L2/L3 inputs. Its
+/// `index_anomaly_zone` findings feed Track C alert evaluation.
+pub async fn run_anomaly_app(
+    State(state): State<AppState>,
+    Json(request): Json<crate::anomaly_run::AnomalyRunRequest>,
+) -> AppResult<Json<crate::applications::ApplicationRunRecord>> {
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let record = crate::anomaly_run::run(&state.pool, &request, &now)
+        .await
+        .map_err(application_error)?;
+    Ok(Json(record))
+}
+
 pub async fn list_provenance_audit_entries(
     Query(query): Query<ProvenanceAuditListQuery>,
     State(state): State<AppState>,

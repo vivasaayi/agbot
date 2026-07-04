@@ -10,6 +10,7 @@ import {
   fieldFindingsPath,
   cropHealthRunsPath,
   waterPriorityRunsPath,
+  anomalyRunsPath,
   catalogProductsPath,
 } from "../api.js";
 
@@ -34,6 +35,12 @@ const APPS = {
       ["mean_soil_moisture", "mean soil moisture"],
       ["water_deficit_mm", "deficit mm"],
     ],
+  },
+  anomaly_detection: {
+    label: "Anomaly detection",
+    productKind: "ndvi",
+    runsPath: anomalyRunsPath,
+    fields: [["index_value", "index value"]],
   },
 };
 

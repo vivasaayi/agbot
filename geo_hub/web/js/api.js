@@ -24,6 +24,7 @@ export const endpoints = {
   fieldFindings: "/api/fields/:field_id/findings",
   cropHealthRuns: "/api/applications/crop-health/runs",
   waterPriorityRuns: "/api/applications/water-priority/runs",
+  anomalyRuns: "/api/applications/anomaly/runs",
   productTiles: "/api/scenes/:scene_id/products/:kind/tiles/:z/:x/:y.png",
   sceneAnnotations: "/api/scenes/:scene_id/annotations",
   sceneAnnotation: "/api/scenes/:scene_id/annotations/:annotation_id",
@@ -96,6 +97,11 @@ export function cropHealthRunsPath() {
 /** Water-priority application run trigger (POST zone stats). */
 export function waterPriorityRunsPath() {
   return "/api/applications/water-priority/runs";
+}
+
+/** Anomaly-detection application run trigger (POST zone index values). */
+export function anomalyRunsPath() {
+  return "/api/applications/anomaly/runs";
 }
 
 /** Fields belonging to a farm. */

@@ -66,6 +66,10 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::run_water_priority_app),
         )
         .route(
+            "/api/applications/anomaly/runs",
+            post(routes::run_anomaly_app),
+        )
+        .route(
             "/api/farms",
             get(routes::list_farms).post(routes::create_farm),
         )
