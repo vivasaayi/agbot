@@ -11,9 +11,11 @@
 //   agbot_world_demo --check    build scene, assert invariants, exit 0/1
 
 #include "agbot_config/Params.hpp"
+#include "agbot_flight_sim/WeatherPreset.hpp"
 #include "agbot_nav/AerialPlanner.hpp"
 #include "agbot_nav/CityEvidence.hpp"
 #include "agbot_nav/RoadGraphPlanner.hpp"
+#include "agbot_render/Atmosphere.hpp"
 #include "agbot_render/OffscreenRenderer.hpp"
 #include "agbot_render/SceneFile.hpp"
 #include "agbot_vehicles/FixedWingAutopilot.hpp"
@@ -209,10 +211,86 @@ StreetRouteResult plan_street_route(const std::vector<agbot::worldgen::Extracted
     return street;
 }
 
+// --- Weather-preset-driven scene lighting + night lamps --------------------
+
+double highway_importance(const agbot::worldgen::ExtractedFeature& road) {
+    const auto it = road.attributes.find("highway");
+    const std::string h = it != road.attributes.end() ? it->second : "";
+    if (h == "motorway" || h == "trunk" || h == "primary") {
+        return 1.0;
+    }
+    if (h == "secondary") {
+        return 0.75;
+    }
+    if (h == "tertiary") {
+        return 0.5;
+    }
+    return 0.3; // residential / service / unclassified
+}
+
+struct LightingSummary {
+    double sun_elevation_deg = 0.0;
+    bool lights_on = false;
+    std::size_t light_count = 0;
+    float sun_alignment = 0.0f; // dot(scene light dir, toward-sun) — should be ~ -1
+};
+
+// Set the scene sun direction from a recorded weather preset and generate street
+// lamps along the compiled roads (by highway hierarchy). When the preset is at
+// night/dusk the lamps are added to the scene as warm emissive markers.
+LightingSummary apply_scene_lighting(agbot::worldgen::WorldCompileResult& world,
+                                     const agbot::flight_sim::WeatherPreset& preset) {
+    const agbot::render::LightingState lighting = agbot::render::lighting_from_preset(preset);
+    // Scene sun_dir is the light travel direction (from the sun toward the
+    // ground): the negative of the toward-sun vector.
+    world.scene.sun_dir[0] = -lighting.sun_dir.x;
+    world.scene.sun_dir[1] = -lighting.sun_dir.y;
+    world.scene.sun_dir[2] = -lighting.sun_dir.z;
+
+    std::vector<std::vector<agbot::render::Vec3f>> polylines;
+    std::vector<double> importance;
+    for (const auto& road : world.roads) {
+        std::vector<agbot::render::Vec3f> pl;
+        pl.reserve(road.exterior.size());
+        for (const auto& c : road.exterior) {
+            const fs::Vec3 p = fs::local_from_geo(c, world.origin);
+            pl.push_back({static_cast<float>(p.x), 0.0f, static_cast<float>(p.z)});
+        }
+        if (pl.size() < 2) {
+            continue;
+        }
+        polylines.push_back(std::move(pl));
+        importance.push_back(highway_importance(road));
+    }
+    const auto lamps = agbot::render::night_lights_from_roads(polylines, importance);
+
+    if (lighting.artificial_lights_on) {
+        for (const auto& lamp : lamps) {
+            world.scene.markers.push_back({lamp.position.x, lamp.position.y, lamp.position.z,
+                                           lamp.color.r, lamp.color.g, lamp.color.b, 3.0f});
+        }
+    }
+
+    const auto sun = agbot::flight_sim::solar_position(preset);
+    LightingSummary s;
+    s.sun_elevation_deg = sun.elevation_rad * 180.0 / 3.14159265358979323846;
+    s.lights_on = lighting.artificial_lights_on;
+    s.light_count = lamps.size();
+    s.sun_alignment = world.scene.sun_dir[0] * lighting.sun_dir.x +
+        world.scene.sun_dir[1] * lighting.sun_dir.y + world.scene.sun_dir[2] * lighting.sun_dir.z;
+    return s;
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
     const bool check_mode = argc > 1 && std::string(argv[1]) == "--check";
+    bool night_mode = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--night") {
+            night_mode = true;
+        }
+    }
     const std::filesystem::path source_dir = AGBOT_FLIGHT_SIM_SOURCE_DIR;
 
     // --- Compile the world artifact ----------------------------------------
@@ -330,6 +408,14 @@ int main(int argc, char** argv) {
     world.scene.markers.insert(world.scene.markers.end(), street.trail.begin(),
                                street.trail.end());
 
+    // --- Weather-preset lighting (M7 b2/b3): drive the scene sun from a
+    // recorded preset and generate street lamps by road hierarchy. --night uses
+    // a dusk preset (lamps lit); otherwise a clear-noon daytime scene.
+    const agbot::flight_sim::WeatherPreset lighting_preset =
+        night_mode ? agbot::flight_sim::preset_overcast_dusk()
+                   : agbot::flight_sim::preset_clear_noon();
+    const LightingSummary lighting = apply_scene_lighting(world, lighting_preset);
+
     // --- Persist .agbscn + .agbworld ---------------------------------------
     const std::filesystem::path out_dir = source_dir / "out/world";
     const agbot::worldgen::WorldWriteResult written =
@@ -395,7 +481,11 @@ int main(int argc, char** argv) {
               << " m, mean crosstrack " << evidence.executed.mean_crosstrack_m << " m (max "
               << evidence.executed.max_crosstrack_m << "), steering "
               << evidence.executed.steering_smoothness_radps << " rad/s, collisions "
-              << evidence.executed.collisions << "\n";
+              << evidence.executed.collisions << "\n"
+              << "  scene lighting: preset '" << lighting_preset.name << "', sun elevation "
+              << lighting.sun_elevation_deg << " deg, lamps "
+              << (lighting.lights_on ? "ON" : "off") << " (" << lighting.light_count
+              << " generated" << (lighting.lights_on ? ", added to scene" : "") << ")\n";
 
     if (check_mode) {
         int failures = 0;
@@ -499,6 +589,21 @@ int main(int argc, char** argv) {
                "Gate 5: robot executes the plan closed-loop over the costmap");
         expect(evidence.executed.mean_crosstrack_m < 6.0,
                "Gate 5: executed trajectory tracks the plan (mean crosstrack < 6 m)");
+
+        // Weather-preset lighting integration (M7 b2/b3 driving the scene).
+        expect(lighting.sun_alignment < -0.9,
+               "scene sun_dir opposes the preset's toward-sun vector");
+        expect(lighting.light_count > 100,
+               "street lamps generated along the compiled road network");
+        if (night_mode) {
+            expect(lighting.lights_on, "night preset lights the scene");
+        } else {
+            expect(!lighting.lights_on && lighting.sun_elevation_deg > 10.0,
+                   "clear-noon preset keeps lamps off with the sun well up");
+        }
+        expect(agbot::render::lighting_from_preset(agbot::flight_sim::preset_overcast_dusk())
+                   .artificial_lights_on,
+               "a dusk preset turns artificial lighting on");
         const auto readback = agbot::render::read_scene_file(written.scene_path);
         expect(readback.ok() &&
                    readback.scene.static_meshes.size() + readback.scene.textured_meshes.size() == 2,
