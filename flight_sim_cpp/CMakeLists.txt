@@ -33,6 +33,7 @@ add_library(agbot_flight_sim_core
     src/TraceDiff.cpp
     src/TwinBackend.cpp
     src/TwinContractV1.cpp
+    src/WeatherPreset.cpp
 )
 
 target_include_directories(agbot_flight_sim_core
@@ -77,6 +78,10 @@ add_executable(agbot_flight_sim_tests
 target_link_libraries(agbot_flight_sim_tests PRIVATE agbot_flight_sim_core)
 add_test(NAME agbot_flight_sim_tests COMMAND agbot_flight_sim_tests)
 add_test(NAME agbot_flight_sim_golden_regression COMMAND agbot_sim regress)
+
+add_executable(agbot_weather_tests tests/weather_tests.cpp)
+target_link_libraries(agbot_weather_tests PRIVATE agbot_flight_sim_core agbot_vehicles)
+add_test(NAME agbot_weather_tests COMMAND agbot_weather_tests)
 
 if(APPLE)
     enable_language(OBJCXX)
