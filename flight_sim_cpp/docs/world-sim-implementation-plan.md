@@ -227,11 +227,16 @@ Multi-batch (needs external data; user authorized acquisition).
   altitude, a 12 m/s crosswind induces >2° sideslip, and the stall exceeds the stall
   AoA, drops altitude, and recovers airspeed after power + release.
 
-**Batch 2 — deterministic weather presets**
-- Weather-preset schema (UTC timestamp, sun/moon ephemeris inputs, visibility, cloud
-  layers, wind ground+aloft, precip class/rate, temp/pressure, road/roof wetness).
-- NOAA solar-position equations for deterministic sun/sky; presets first, live
-  METAR/TAF assimilation deferred. Wire the preset wind into `FixedWingModel`.
+**Batch 2 — deterministic weather presets — ✅ DONE (commit 2d5abfc)**
+- `flight_sim/WeatherPreset` schema: explicit UTC, site lat/lon, ground+aloft wind
+  (world-frame vectors), visibility, cloud layers, precip class/rate, temperature,
+  pressure, surface wetness.
+- `solar_position_utc`: NOAA solar-position algorithm — verified against the analytic
+  summer-solstice maximum for NYC (72.72° computed vs 72.73° theoretical; local
+  midnight correctly below the horizon).
+- `wind_at_altitude` (ground→aloft blend) feeds `FixedWingModel::set_wind`, so a
+  preset crosswind induces sideslip in flight. Deterministic `to_json` + `hash`;
+  four standard presets. Live METAR/TAF assimilation targets the same schema later.
 
 **Batch 3 — atmosphere + night lighting (visual, non-blocking for Gate 6)**
 - Atmosphere v1: analytic **Preetham** sky + aerial perspective + visibility haze.
@@ -257,10 +262,10 @@ Multi-batch (needs external data; user authorized acquisition).
 
 ## 5. Immediate next step
 
-M1–M5, M3-batch-3, M6 batches 1–2, and **M7 batch 1** (flight-dynamics validation +
-Gate 6) are done and committed. Remaining: **M7 batch 2** — deterministic weather
-presets (UTC, sun/moon ephemeris, visibility, cloud layers, wind ground+aloft, precip,
-temp/pressure, wetness) feeding the model's wind and, later, the atmosphere; **M7
-batch 3** — analytic sky/atmosphere + night lighting; and **M6 batch 3** — full
-`NavigationPipeline` (global → MPPI → recovery) executing over the sensor costmap.
-Recommend M7 batch 2 next (builds directly on the new `set_wind` primitive).
+M1–M5, M3-batch-3, M6 batches 1–2, and **M7 batches 1–2** (flight-dynamics validation
++ Gate 6, deterministic weather presets + solar position) are done and committed.
+Remaining: **M7 batch 3** — analytic sky/atmosphere (Preetham + aerial perspective +
+visibility haze, driven by the preset's solar position + visibility) and data-driven
+night lighting; and **M6 batch 3** — full `NavigationPipeline` (global → MPPI →
+recovery) executing over the sensor costmap. Recommend M7 batch 3 next (the preset now
+supplies sun position, visibility, and cloud layers the atmosphere consumes).
