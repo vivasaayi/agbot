@@ -85,9 +85,9 @@ Indices (have vs add):
 
 ## Progress ledger (update per batch)
 
-- **Batch 1 — DONE (2026-07-04, uncommitted):** `imagery_processor` sensor calibration (`pipeline/calibration.rs`, SensorProfile for Landsat C2 SR/ST + S2 both baselines), Sentinel-2 SCL masking with dilation (shared MaskKind contract with QA_PIXEL), OSAVI/AWEInsh/AWEIsh indices. 82 tests.
-- **Batch 2 — DONE (2026-07-04, uncommitted):** new `raster_io` crate (GeoTIFF read incl. EPSG/geotransform/nodata → `RasterSpatialRef`, striped GeoTIFF write; `tiff` crate backend — async-tiff 0.3 rejected: tiled-only decode; API is backend-agnostic for a later object_store COG backend). `imagery_processor` GeoTIFF band ingest (`io/geotiff_ingest.rs`) + `--sensor-profile` flag; end-to-end DN→reflectance→NDVI with georeferencing evidence. 99 tests across both crates.
-- **Batch 3 — DONE (2026-07-04, uncommitted):** `post_processor/src/temporal_composite.rs` — MaxNdvi/Medoid/Median L3 composites, per-pixel valid-count/selected-index/gap reason codes, monthly+dekadal windowing, `CompositeEvidence`, `composite_l3_draft` → L3 lineage. 106 post_processor tests.
+- **Batch 1 — DONE (2026-07-04, commit e348a8c):** `imagery_processor` sensor calibration (`pipeline/calibration.rs`, SensorProfile for Landsat C2 SR/ST + S2 both baselines), Sentinel-2 SCL masking with dilation (shared MaskKind contract with QA_PIXEL), OSAVI/AWEInsh/AWEIsh indices. 82 tests.
+- **Batch 2 — DONE (2026-07-04, commit e348a8c):** new `raster_io` crate (GeoTIFF read incl. EPSG/geotransform/nodata → `RasterSpatialRef`, striped GeoTIFF write; `tiff` crate backend — async-tiff 0.3 rejected: tiled-only decode; API is backend-agnostic for a later object_store COG backend). `imagery_processor` GeoTIFF band ingest (`io/geotiff_ingest.rs`) + `--sensor-profile` flag; end-to-end DN→reflectance→NDVI with georeferencing evidence. 99 tests across both crates.
+- **Batch 3 — DONE (2026-07-04, commit 85f273b):** `post_processor/src/temporal_composite.rs` — MaxNdvi/Medoid/Median L3 composites, per-pixel valid-count/selected-index/gap reason codes, monthly+dekadal windowing, `CompositeEvidence`, `composite_l3_draft` → L3 lineage. 106 post_processor tests.
 - **Next (batch 4 candidates, in order):** (a) internal STAC API in geo_hub over catalog/product graph; (b) MapLibre GL JS browse UI served by geo_hub; (c) satellite band download wiring (Earth Search assets → local GeoTIFF → indices → L2 registration); (d) object_store/HTTP COG backend in raster_io; (e) VCI climatology store.
 
 ## Doctrine hooks
