@@ -208,7 +208,7 @@ Multi-batch (needs external data; user authorized acquisition).
 - Extend Gate 5 with executed-trajectory metrics (tracking error, controller
   smoothness) on top of the path-level metrics already gated.
 
-### M7 — Fixed-wing validation + weather/atmosphere — 🚧 IN PROGRESS
+### M7 — Fixed-wing validation + weather/atmosphere — ✅ DONE (batches 1–3)
 
 **Batch 1 — flight-dynamics validation harness — ✅ DONE (commit 907d667)**
 - `vehicles/FlightRecorder`: AIAA/ANSI S-119-flavored named flight-state records
@@ -238,13 +238,19 @@ Multi-batch (needs external data; user authorized acquisition).
   preset crosswind induces sideslip in flight. Deterministic `to_json` + `hash`;
   four standard presets. Live METAR/TAF assimilation targets the same schema later.
 
-**Batch 3 — atmosphere + night lighting (visual, non-blocking for Gate 6)**
-- Atmosphere v1: analytic **Preetham** sky + aerial perspective + visibility haze.
-  v2 Bruneton-class deferred. Night lighting generated from road hierarchy +
-  intersection density + POI scaffold (not random bloom).
+**Batch 3 — atmosphere + night lighting — ✅ DONE (commit 4e4e29a)**
+- `render/Atmosphere`: `preetham_sky` (Perez distribution, turbidity coefficients,
+  zenith chromaticity polynomials, xyY→linear RGB — blue clear zenith, brighter
+  toward the sun, dim night), `aerial_perspective` (exponential visibility haze),
+  `lighting_from_preset` (sun dir / intensity / ambient / turbidity proxy / civil-dusk
+  lamp toggle from the preset's solar elevation), and `night_lights_from_roads`
+  (street lamps by arc length, denser/brighter on higher-hierarchy roads).
+- Bruneton-class v2 deferred; all v1 functions are pure/deterministic and tested in
+  `render_tests`.
 
 - **Gate 6 (Flight dynamics):** deterministic replay under fixed weather/IC/inputs,
-  checked against the 6-DOF cases; stall/crosswind cases pass.
+  checked against the 6-DOF cases; stall/crosswind cases pass. ✅ live in
+  `agbot_flight_checkcase_tests`.
 
 ## 4. Decisions the user should make (not discoverable locally)
 
@@ -262,10 +268,10 @@ Multi-batch (needs external data; user authorized acquisition).
 
 ## 5. Immediate next step
 
-M1–M5, M3-batch-3, M6 batches 1–2, and **M7 batches 1–2** (flight-dynamics validation
-+ Gate 6, deterministic weather presets + solar position) are done and committed.
-Remaining: **M7 batch 3** — analytic sky/atmosphere (Preetham + aerial perspective +
-visibility haze, driven by the preset's solar position + visibility) and data-driven
-night lighting; and **M6 batch 3** — full `NavigationPipeline` (global → MPPI →
-recovery) executing over the sensor costmap. Recommend M7 batch 3 next (the preset now
-supplies sun position, visibility, and cloud layers the atmosphere consumes).
+All six acceptance gates (M1–M7) are implemented and committed. The remaining work is
+depth, not new gates: **M6 batch 3** — wire the full `NavigationPipeline` (global →
+MPPI local → recovery) to *execute* a trajectory over the sensor costmap and fold in
+LiDAR hits; and optional integration polish — consume the atmosphere/lighting + night
+lights in the live viewer, and fetch the NYC DSM/land-cover snapshots to activate the
+measured height tier + land-cover histogram on Lower Manhattan. Recommend M6 batch 3
+next as the last substantial autonomy-depth item.
