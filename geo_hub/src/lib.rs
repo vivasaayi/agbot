@@ -1,3 +1,4 @@
+pub mod alert_evaluation;
 pub mod anomaly_run;
 pub mod applications;
 pub mod catalog;

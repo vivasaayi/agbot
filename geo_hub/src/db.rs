@@ -3214,6 +3214,37 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // Fired alerts (Track C phase C1): findings screened into alerts by a rule
+    // set. Each alert carries lineage back to the finding that produced it.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS fired_alerts (
+            alert_id TEXT PRIMARY KEY,
+            matched_rule_id TEXT NOT NULL,
+            source_finding_id TEXT NOT NULL,
+            field_id TEXT,
+            event_type TEXT NOT NULL,
+            subject_ref TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            channels_json TEXT,
+            evidence_refs_json TEXT,
+            explanation TEXT,
+            fired_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_fired_alerts_field
+        ON fired_alerts(field_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     info!("database ready");
     Ok(())
 }

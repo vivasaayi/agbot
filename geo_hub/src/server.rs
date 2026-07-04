@@ -70,6 +70,14 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::run_anomaly_app),
         )
         .route(
+            "/api/fields/:field_id/alert-evaluation",
+            post(routes::evaluate_field_alerts),
+        )
+        .route(
+            "/api/fields/:field_id/alerts",
+            get(routes::list_field_alerts),
+        )
+        .route(
             "/api/farms",
             get(routes::list_farms).post(routes::create_farm),
         )

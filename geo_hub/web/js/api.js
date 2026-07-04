@@ -22,6 +22,8 @@ export const endpoints = {
   scene: "/api/scenes/:scene_id",
   catalogProducts: "/api/catalog/products",
   fieldFindings: "/api/fields/:field_id/findings",
+  fieldAlerts: "/api/fields/:field_id/alerts",
+  fieldAlertEvaluation: "/api/fields/:field_id/alert-evaluation",
   cropHealthRuns: "/api/applications/crop-health/runs",
   waterPriorityRuns: "/api/applications/water-priority/runs",
   anomalyRuns: "/api/applications/anomaly/runs",
@@ -87,6 +89,16 @@ export function productTilesUrlTemplate(sceneId, kind) {
 /** A field's application findings (most recent first). */
 export function fieldFindingsPath(fieldId) {
   return `/api/fields/${encodeURIComponent(fieldId)}/findings`;
+}
+
+/** A field's fired alerts (most recent first). */
+export function fieldAlertsPath(fieldId) {
+  return `/api/fields/${encodeURIComponent(fieldId)}/alerts`;
+}
+
+/** Alert-evaluation trigger for a field (POST optional rule set). */
+export function fieldAlertEvaluationPath(fieldId) {
+  return `/api/fields/${encodeURIComponent(fieldId)}/alert-evaluation`;
 }
 
 /** Crop-health application run trigger (POST zone stats). */

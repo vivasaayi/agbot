@@ -6810,6 +6810,53 @@ pub async fn run_anomaly_app(
     Ok(Json(record))
 }
 
+fn alert_evaluation_error(err: crate::alert_evaluation::AlertEvaluationError) -> AppError {
+    use crate::alert_evaluation::AlertEvaluationError;
+    match err {
+        AlertEvaluationError::Application(inner) => application_error(inner),
+        other => AppError::Anyhow(Error::new(other)),
+    }
+}
+
+/// Body for an alert-evaluation run (Track C phase C1): an optional rule set;
+/// when omitted the default rule set is applied.
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct AlertEvaluationRequest {
+    #[serde(default)]
+    pub rules: Option<Vec<alerting::AlertRule>>,
+}
+
+/// Evaluate a field's findings into alerts (Track C phase C1): screens stored
+/// findings against a rule set, persisting fired alerts with lineage back to the
+/// source finding. Idempotent.
+pub async fn evaluate_field_alerts(
+    Path(field_id): Path<String>,
+    State(state): State<AppState>,
+    body: Option<Json<AlertEvaluationRequest>>,
+) -> AppResult<Json<Vec<crate::alert_evaluation::StoredAlert>>> {
+    let request = body.map(|Json(request)| request).unwrap_or_default();
+    let rules = request
+        .rules
+        .unwrap_or_else(crate::alert_evaluation::default_ruleset);
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let alerts =
+        crate::alert_evaluation::evaluate_field_alerts(&state.pool, &field_id, &rules, &now)
+            .await
+            .map_err(alert_evaluation_error)?;
+    Ok(Json(alerts))
+}
+
+/// List the alerts fired for a field (Track C phase C1).
+pub async fn list_field_alerts(
+    Path(field_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<crate::alert_evaluation::StoredAlert>>> {
+    let alerts = crate::alert_evaluation::list_field_alerts(&state.pool, &field_id)
+        .await
+        .map_err(alert_evaluation_error)?;
+    Ok(Json(alerts))
+}
+
 pub async fn list_provenance_audit_entries(
     Query(query): Query<ProvenanceAuditListQuery>,
     State(state): State<AppState>,
