@@ -9,10 +9,12 @@ use uuid::Uuid;
 
 pub mod anomaly_app;
 pub mod crop_health_app;
+pub mod drought_indices;
 pub mod evidence;
 pub mod findings_export;
 pub mod grower_report;
 pub mod index_anomaly;
+pub mod index_climatology;
 pub mod index_trend;
 pub mod index_vegetation_classification;
 pub mod l3_product;
