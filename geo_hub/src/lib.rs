@@ -5,6 +5,7 @@ pub mod error;
 pub mod ingest;
 pub mod landsat;
 pub mod product_catalog;
+pub mod provenance_store;
 pub mod routes;
 pub mod server;
 pub mod shapefile;

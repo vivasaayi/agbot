@@ -641,6 +641,10 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::get_provenance_lineage_record),
         )
         .route(
+            "/api/provenance/trace/:artifact_id",
+            get(routes::get_provenance_trace),
+        )
+        .route(
             "/api/provenance/audit",
             get(routes::list_provenance_audit_entries),
         )

@@ -153,8 +153,13 @@ async fn quality_mask_must_be_registered_before_the_product() -> Result<()> {
     catalog::register_product(&pool, &mask, T0).await?;
     let ndvi_id = catalog::register_product(&pool, &ndvi, T0).await?;
 
-    let got = catalog::get_product(&pool, &ndvi_id).await?.expect("stored");
-    assert_eq!(got.quality_mask_product_id.as_deref(), Some(mask_id.as_str()));
+    let got = catalog::get_product(&pool, &ndvi_id)
+        .await?
+        .expect("stored");
+    assert_eq!(
+        got.quality_mask_product_id.as_deref(),
+        Some(mask_id.as_str())
+    );
 
     let edges = catalog::trace_inputs(&pool, &ndvi_id).await?;
     assert!(edges

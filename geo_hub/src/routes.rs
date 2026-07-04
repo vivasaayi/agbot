@@ -6552,6 +6552,26 @@ pub async fn get_provenance_lineage_record(
         .ok_or(AppError::NotFound)
 }
 
+/// Backward provenance trace for any artifact id (product, finding, report,
+/// …): the chain of lineage records down to its L0 sources, plus any gaps.
+/// This is the read API behind the workspace provenance inspector.
+pub async fn get_provenance_trace(
+    Path(artifact_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<BackwardProvenanceTrace>> {
+    let artifact_id = normalize_optional_text(Some(artifact_id))
+        .ok_or_else(|| AppError::BadRequest("artifact_id is required".to_string()))?;
+    let trace = crate::provenance_store::trace_backward(&state.pool, &artifact_id)
+        .await
+        .map_err(|err| AppError::Anyhow(Error::new(err)))?;
+    // An unknown target has no lineage record of its own (it surfaces only as a
+    // self-referential gap); treat that as not found.
+    if trace.records.is_empty() {
+        return Err(AppError::NotFound);
+    }
+    Ok(Json(trace))
+}
+
 pub async fn list_provenance_audit_entries(
     Query(query): Query<ProvenanceAuditListQuery>,
     State(state): State<AppState>,

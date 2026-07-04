@@ -16,6 +16,8 @@
 //! invariants (mask-first ordering, unknown-input rejection, dedupe, filters).
 
 use crate::db::DbPool;
+use crate::provenance_store::{self, ProvenanceStoreError};
+use provenance::{lineage_record_for_product_draft, ActorIdentity};
 use shared::product_graph::{ProductLevel, ProductRecordDraft};
 use sqlx::Row;
 use std::str::FromStr;
@@ -40,6 +42,8 @@ pub enum CatalogError {
     },
     #[error("stored product {product_id} has an invalid level: {value}")]
     InvalidLevel { product_id: String, value: String },
+    #[error("failed to persist provenance lineage: {0}")]
+    Lineage(#[from] ProvenanceStoreError),
     #[error(transparent)]
     Db(#[from] sqlx::Error),
 }
@@ -115,11 +119,32 @@ pub struct ProductFilter {
 /// - **dedupe**: identity is `(kind, parameters_hash)`; re-registering an
 ///   identical draft is a no-op that returns the existing id.
 ///
-/// The product row and all its input edges (declared inputs plus the mask edge)
-/// are written in a single transaction.
+/// The product row, all its input edges (declared inputs plus the mask edge),
+/// and its provenance lineage record are written in a single transaction, so a
+/// registered product always has a traceable lineage.
+///
+/// This form attributes the lineage to a default catalog `SystemService`
+/// actor; use [`register_product_with_actor`] to attribute a specific producer.
 pub async fn register_product(
     pool: &DbPool,
     draft: &ProductRecordDraft,
+    created_at: &str,
+) -> Result<String, CatalogError> {
+    register_product_with_actor(
+        pool,
+        draft,
+        &ActorIdentity::system("geo_hub:catalog"),
+        created_at,
+    )
+    .await
+}
+
+/// Register a product attributing its lineage to `actor`. See
+/// [`register_product`] for the enforced invariants.
+pub async fn register_product_with_actor(
+    pool: &DbPool,
+    draft: &ProductRecordDraft,
+    actor: &ActorIdentity,
     created_at: &str,
 ) -> Result<String, CatalogError> {
     let product_id = draft.product_id();
@@ -216,10 +241,10 @@ pub async fn register_product(
             spatial_ref_json, crs, bbox_min_x, bbox_min_y, bbox_max_x, bbox_max_y,
             gsd_m_per_px, temporal_start, temporal_end, farm_id, field_id,
             season_id, scene_id, source_id, quality_mask_product_id, confidence,
-            confidence_method, quality_summary_json, status, created_at
+            confidence_method, quality_summary_json, status, provenance_id, created_at
         ) VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?, ?, ?, 'registered', ?
+            ?, ?, ?, ?, ?, ?, ?, 'registered', ?, ?
         )
         "#,
     )
@@ -251,6 +276,7 @@ pub async fn register_product(
     .bind(draft.confidence)
     .bind(&draft.confidence_method)
     .bind(&quality_summary_json)
+    .bind(&product_id) // provenance_id: the lineage artifact id equals the product id
     .bind(created_at)
     .execute(&mut *tx)
     .await?;
@@ -262,6 +288,11 @@ pub async fn register_product(
     if let Some(mask) = &draft.quality_mask {
         insert_edge(&mut tx, &product_id, &mask.product_id, &mask.role).await?;
     }
+
+    // Provenance lineage, written in the same transaction as the domain row so a
+    // registered product is never left without a traceable lineage.
+    let lineage = lineage_record_for_product_draft(draft, actor.clone(), created_at);
+    provenance_store::append_lineage(&mut *tx, &lineage).await?;
 
     tx.commit().await?;
     Ok(product_id)
