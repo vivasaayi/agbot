@@ -125,6 +125,124 @@ fn status_str(status: ProposalStatus) -> &'static str {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Governed dispatch gate (Track E phase E2): dry-run + operator approval.
+//
+// Mirrors the two-step shape of multi_drone_control::coordinated_approval
+// (dry-run -> operator decision) without coupling to a swarm controller. The
+// governance invariant is separation of duties: the operator who authorizes
+// dispatch must be a *different* identity from the reviewer who accepted the
+// proposal. dispatch_authorized flips true here and *only* here, after a
+// distinct, affirmative operator approval.
+// ---------------------------------------------------------------------------
+
+/// The gate's position awaiting operator sign-off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DispatchGateStatus {
+    WaitingForApproval,
+    Approved,
+    Rejected,
+}
+
+/// A deterministic dry-run of a mission draft: it restates the intended mission
+/// and parks it awaiting a distinct operator's approval. Inert — no dispatch.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MissionDispatchDryRun {
+    pub draft_id: String,
+    pub source_proposal_id: String,
+    pub field_id: String,
+    pub mission_kind: MissionKind,
+    /// The reviewer who accepted the proposal; the operator must differ.
+    pub accepted_by: String,
+    pub status: DispatchGateStatus,
+}
+
+/// An operator's sign-off on a dry-run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OperatorApproval {
+    pub operator_id: String,
+    pub approved: bool,
+    pub approved_at: String,
+}
+
+/// The outcome of the approval gate. `dispatch_authorized` is true only when a
+/// distinct operator affirmatively approved a waiting dry-run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MissionDispatchApproval {
+    pub draft_id: String,
+    pub source_proposal_id: String,
+    pub field_id: String,
+    pub mission_kind: MissionKind,
+    pub accepted_by: String,
+    pub status: DispatchGateStatus,
+    pub authorized_by: Option<String>,
+    pub dispatch_authorized: bool,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum DispatchApprovalError {
+    #[error("dispatch operator {operator_id} is the same identity that accepted the proposal; separation of duties requires a distinct operator")]
+    OperatorIsReviewer { operator_id: String },
+    #[error("dispatch dry-run for {draft_id} is not awaiting approval (status {status:?})")]
+    NotAwaitingApproval {
+        draft_id: String,
+        status: DispatchGateStatus,
+    },
+}
+
+/// Dry-run a mission draft into a gate record awaiting operator approval.
+/// Deterministic and inert.
+pub fn dry_run_mission_dispatch(draft: &MissionPlanDraft) -> MissionDispatchDryRun {
+    MissionDispatchDryRun {
+        draft_id: draft.draft_id.clone(),
+        source_proposal_id: draft.source_proposal_id.clone(),
+        field_id: draft.field_id.clone(),
+        mission_kind: draft.mission_kind,
+        accepted_by: draft.accepted_by.clone(),
+        status: DispatchGateStatus::WaitingForApproval,
+    }
+}
+
+/// Authorize dispatch of a dry-run. Enforces separation of duties (operator must
+/// differ from the accepting reviewer) and requires an affirmative approval. Only
+/// an approved, distinctly-operated dry-run yields `dispatch_authorized = true`;
+/// a non-approving operator produces a `Rejected` gate that never authorizes.
+pub fn authorize_mission_dispatch(
+    dry_run: &MissionDispatchDryRun,
+    operator: &OperatorApproval,
+) -> Result<MissionDispatchApproval, DispatchApprovalError> {
+    if dry_run.status != DispatchGateStatus::WaitingForApproval {
+        return Err(DispatchApprovalError::NotAwaitingApproval {
+            draft_id: dry_run.draft_id.clone(),
+            status: dry_run.status,
+        });
+    }
+    // Separation of duties: the operator cannot be the reviewer who accepted.
+    if operator.operator_id == dry_run.accepted_by {
+        return Err(DispatchApprovalError::OperatorIsReviewer {
+            operator_id: operator.operator_id.clone(),
+        });
+    }
+
+    let (status, dispatch_authorized) = if operator.approved {
+        (DispatchGateStatus::Approved, true)
+    } else {
+        (DispatchGateStatus::Rejected, false)
+    };
+
+    Ok(MissionDispatchApproval {
+        draft_id: dry_run.draft_id.clone(),
+        source_proposal_id: dry_run.source_proposal_id.clone(),
+        field_id: dry_run.field_id.clone(),
+        mission_kind: dry_run.mission_kind,
+        accepted_by: dry_run.accepted_by.clone(),
+        status,
+        authorized_by: Some(operator.operator_id.clone()),
+        dispatch_authorized,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -187,5 +305,82 @@ mod tests {
         let err = draft_mission_for_proposal(&proposal(ProposalStatus::Accepted, "irrigation"))
             .unwrap_err();
         assert!(matches!(err, MissionDraftError::UnflyableAction(_)));
+    }
+
+    fn accepted_draft() -> MissionPlanDraft {
+        draft_mission_for_proposal(&proposal(ProposalStatus::Accepted, "scout")).unwrap()
+    }
+
+    #[test]
+    fn distinct_operator_approval_authorizes_dispatch() {
+        let dry_run = dry_run_mission_dispatch(&accepted_draft());
+        let decision = authorize_mission_dispatch(
+            &dry_run,
+            &OperatorApproval {
+                operator_id: "operator-9".to_string(), // distinct from reviewer agronomist-1
+                approved: true,
+                approved_at: "2026-01-03T00:00:00Z".to_string(),
+            },
+        )
+        .expect("distinct operator approval");
+        assert_eq!(decision.status, DispatchGateStatus::Approved);
+        assert!(decision.dispatch_authorized);
+        assert_eq!(decision.authorized_by.as_deref(), Some("operator-9"));
+    }
+
+    #[test]
+    fn reviewer_cannot_also_operate_dispatch() {
+        let dry_run = dry_run_mission_dispatch(&accepted_draft());
+        // agronomist-1 accepted the proposal, so they cannot also authorize.
+        let err = authorize_mission_dispatch(
+            &dry_run,
+            &OperatorApproval {
+                operator_id: "agronomist-1".to_string(),
+                approved: true,
+                approved_at: "2026-01-03T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            DispatchApprovalError::OperatorIsReviewer { .. }
+        ));
+    }
+
+    #[test]
+    fn non_approving_operator_does_not_authorize() {
+        let dry_run = dry_run_mission_dispatch(&accepted_draft());
+        let decision = authorize_mission_dispatch(
+            &dry_run,
+            &OperatorApproval {
+                operator_id: "operator-9".to_string(),
+                approved: false,
+                approved_at: "2026-01-03T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap();
+        assert_eq!(decision.status, DispatchGateStatus::Rejected);
+        assert!(!decision.dispatch_authorized);
+    }
+
+    #[test]
+    fn a_decided_dry_run_cannot_be_reauthorized() {
+        let dry_run = MissionDispatchDryRun {
+            status: DispatchGateStatus::Approved,
+            ..dry_run_mission_dispatch(&accepted_draft())
+        };
+        let err = authorize_mission_dispatch(
+            &dry_run,
+            &OperatorApproval {
+                operator_id: "operator-9".to_string(),
+                approved: true,
+                approved_at: "2026-01-03T00:00:00Z".to_string(),
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            DispatchApprovalError::NotAwaitingApproval { .. }
+        ));
     }
 }
