@@ -24,7 +24,39 @@ export const endpoints = {
   productTiles: "/api/scenes/:scene_id/products/:kind/tiles/:z/:x/:y.png",
   sceneAnnotations: "/api/scenes/:scene_id/annotations",
   sceneAnnotation: "/api/scenes/:scene_id/annotations/:annotation_id",
+  sceneRecommendations: "/api/scenes/:scene_id/recommendations",
+  sceneReports: "/api/scenes/:scene_id/reports",
+  sceneReport: "/api/scenes/:scene_id/reports/:report_id",
+  sceneReportLineage: "/api/scenes/:scene_id/reports/:report_id/lineage",
+  provenanceTrace: "/api/provenance/trace/:artifact_id",
 };
+
+/** A scene's recommendations. */
+export function sceneRecommendationsPath(sceneId) {
+  return `/api/scenes/${encodeURIComponent(sceneId)}/recommendations`;
+}
+
+/** A scene's reports. */
+export function sceneReportsPath(sceneId) {
+  return `/api/scenes/${encodeURIComponent(sceneId)}/reports`;
+}
+
+/** A single report. */
+export function sceneReportPath(sceneId, reportId) {
+  return `/api/scenes/${encodeURIComponent(sceneId)}/reports/${encodeURIComponent(reportId)}`;
+}
+
+/** A report's provenance lineage. */
+export function sceneReportLineagePath(sceneId, reportId) {
+  return `/api/scenes/${encodeURIComponent(sceneId)}/reports/${encodeURIComponent(
+    reportId,
+  )}/lineage`;
+}
+
+/** Backward provenance trace for any artifact id. */
+export function provenanceTracePath(artifactId) {
+  return `/api/provenance/trace/${encodeURIComponent(artifactId)}`;
+}
 
 /** A scene's annotations collection (GET list / POST create). */
 export function sceneAnnotationsPath(sceneId) {

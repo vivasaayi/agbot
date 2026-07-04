@@ -134,6 +134,40 @@
       background: none;
     }
 
+    .recommendation-list,
+    .report-list,
+    .lineage-list {
+      list-style: none;
+      margin: 0.3rem 0 0.6rem;
+      font-size: 0.8rem;
+    }
+
+    .recommendation-list li {
+      display: flex;
+      justify-content: space-between;
+      gap: 0.5rem;
+      padding: 0.2rem 0;
+    }
+
+    .lineage-list {
+      margin-left: 1rem;
+      list-style: decimal;
+      color: var(--text-dim);
+    }
+
+    .tag {
+      color: var(--accent);
+      font-size: 0.72rem;
+      border: 1px solid var(--panel-border);
+      border-radius: 3px;
+      padding: 0 0.3rem;
+    }
+
+    button.open-report {
+      color: var(--accent);
+      text-align: left;
+    }
+
     #inspector {
       border-right: none;
     }
@@ -224,6 +258,7 @@
       </div>
       <div id="layers-panel"></div>
       <div id="annotations-panel"></div>
+      <div id="recommendations-panel"></div>
       <div id="scene-detail">
         <p class="status">Select a scene to inspect it.</p>
       </div>

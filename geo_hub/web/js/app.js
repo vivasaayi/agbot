@@ -4,6 +4,7 @@
 import { initCatalogPanel, renderSceneDetail } from "./panels/catalog.js";
 import { renderLayersPanel } from "./panels/layers.js";
 import { renderAnnotationsPanel } from "./panels/annotations.js";
+import { renderRecommendationsPanel } from "./panels/recommendations.js";
 import { initMap } from "./map.js";
 
 function bootstrap() {
@@ -12,11 +13,13 @@ function bootstrap() {
   const detail = document.getElementById("scene-detail");
   const layers = document.getElementById("layers-panel");
   const annotations = document.getElementById("annotations-panel");
+  const recommendations = document.getElementById("recommendations-panel");
 
   initCatalogPanel(tree, (sceneId) => {
     renderSceneDetail(detail, sceneId);
     renderLayersPanel(layers, sceneId);
     renderAnnotationsPanel(annotations, sceneId);
+    renderRecommendationsPanel(recommendations, sceneId);
   });
 }
 
