@@ -130,6 +130,33 @@ pub async fn register_source(pool: &DbPool, ingest: &NormalizedIngest) -> Result
     Ok(())
 }
 
+/// Register a source with no scene or products — the "unified source registry"
+/// stub for weather / soil-IoT / equipment feeds whose ingestion pipelines are
+/// not built yet (Track A batch 10). Idempotent on `source_id`.
+pub async fn register_source_stub(
+    pool: &DbPool,
+    source_id: &str,
+    source_kind: &str,
+    platform: Option<String>,
+    sensor: Option<String>,
+) -> Result<(), IngestError> {
+    register_source(
+        pool,
+        &NormalizedIngest {
+            source_id: source_id.to_string(),
+            source_kind: source_kind.to_string(),
+            platform,
+            sensor,
+            source_config: None,
+            scene: None,
+            l0_products: Vec::new(),
+            l1_products: Vec::new(),
+            quality: None,
+        },
+    )
+    .await
+}
+
 /// Upsert the scene into the `scenes` table (the durable scene record read by
 /// the legacy scene/tile routes).
 async fn upsert_scene(pool: &DbPool, scene: &IngestScene) -> Result<(), IngestError> {
