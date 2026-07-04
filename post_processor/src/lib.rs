@@ -7,6 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+pub mod crop_health_app;
 pub mod evidence;
 pub mod findings_export;
 pub mod grower_report;
