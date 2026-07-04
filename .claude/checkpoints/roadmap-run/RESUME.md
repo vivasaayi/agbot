@@ -159,19 +159,36 @@ mapping) + route + tests/<app>_run.rs + an APPS entry in web/js/panels/findings.
   { actor_id }. tests/alert_lifecycle.rs 4 pass. Web: alerts.js state tag +
   Ack/Resolve buttons; api.js alertLifecycle/alertAcknowledge/alertResolve.
 
-## Next action (TB-C3) — final Track C step
-Pick one remaining `alerting` capability, evidence-backed + lineage-preserving:
-- RECOMMENDED: evidence-based severity via alerting::classify_alert_severity —
-  build AlertSeverityEvidence from finding metrics (anomaly z_score, water deficit
-  mm) with warning/critical/emergency thresholds; store classified_severity +
-  evidence on the alert (new columns or a classification table), overriding the
-  static rule severity. Acceptance: a high-z anomaly classifies emergency; a
-  marginal one warning; classification persisted + surfaced.
-- OR dedup (deduplicate_alert_stream/compute_alert_dedup_key), routing
-  (route_alert_to_recipients + evaluate_alert_preference), or no-ack escalation
-  (evaluate_no_ack_escalation).
-Pattern: geo_hub/src/alert_evaluation.rs + alert_lifecycle.rs + their tests. Then
-Track D (copilot proposals + unified queue), E (governed dispatch:
+- TB-C3 (f754a65): evidence-based severity classification.
+  alert_evaluation classifies each fired alert via alerting::classify_alert_severity
+  from finding metrics (anomaly |z_score| 1.5/2.5/4.0; water deficit mm 5/15/30;
+  ndvi decline 0.05/0.10/0.20), overriding the static rule severity for downstream
+  while retaining rule severity for audit. New alert_severity_classification table;
+  StoredAlert.classified_severity (LEFT JOIN); GET /api/alerts/:id/severity.
+  tests/alert_severity.rs 2 pass (35mm->emergency, z~2.0->warning). Web: alerts.js
+  shows classified severity. Note: anomaly z is normalized so max |z| over n zones
+  ~ sqrt(n-1); 5 zones caps at ~2.0 (warning) — emergency needs ~17 zones.
+
+## TRACK C COMPLETE (TB-C1..C3)
+Findings -> alerts (rule engine, lineage) -> governed lifecycle (open/ack/resolve)
+-> evidence-based severity. All reuse the `alerting` crate; alerts trace
+alert->finding->L2->L0 gap-free. Unused alerting fns remain for later: dedup,
+routing (route_alert_to_recipients/evaluate_alert_preference), escalation
+(evaluate_no_ack_escalation), delivery adapters.
+
+## Next action (TB-D1) — Track D copilot proposals + unified queue
+Turn alerts/findings/recommendations into actionable proposals in a unified queue
+(accept/reject), each proposal carrying lineage to its source alert/finding.
+- Check the `copilot` crate (geo_hub deps ../copilot) for proposal/queue types
+  before writing new domain code. Existing copilot routes already wired:
+  list_copilot_conversations, create_copilot_turn_handler, and
+  create_crop_closed_loop_proposal (grep routes.rs for copilot/proposal).
+- Design a proposal queue: source (alert/finding/recommendation) -> Proposal
+  {status: proposed/accepted/rejected} with lineage (ArtifactKind::Recommendation
+  or a new kind) to the source. Routes to create/list/transition. Acceptance:
+  emergency alert -> proposal in queue; accept -> state change + lineage intact.
+Pattern: geo_hub/src/alert_evaluation.rs + alert_lifecycle.rs + their tests + an
+APPS/panel entry. Then TB-D2..D4, Track E (governed dispatch: wire
 dispatch_collaboration_mission_plan_route -> guarded_dispatch). Per-batch gate:
 cargo test -p geo_hub --test <new> --test workspace_static; 15 products_api
 acceptance tests remain pre-existing known-red (183 pass).
