@@ -13,7 +13,8 @@ use crate::applications::{self, ApplicationError, StoredFinding};
 use crate::db::DbPool;
 use crate::provenance_store::{self, ProvenanceStoreError};
 use alerting::{
-    evaluate_alert_rules, AlertCandidateRecord, AlertRule, AlertSeverityHint, FiredAlertRecord,
+    classify_alert_severity, evaluate_alert_rules, AlertCandidateRecord, AlertRule,
+    AlertSeverityClassification, AlertSeverityEvidence, AlertSeverityHint, FiredAlertRecord,
 };
 use provenance::{ActorIdentity, ArtifactKind, LineageRecord, ProvenanceParameters};
 use serde::Serialize;
@@ -22,6 +23,7 @@ use thiserror::Error;
 
 const SOURCE_DOMAIN: &str = "geo_hub.applications";
 const EVALUATION_METHOD: &str = "alert_evaluation_v1";
+const SEVERITY_METHOD_VERSION: &str = "severity_v1";
 
 #[derive(Debug, Error)]
 pub enum AlertEvaluationError {
@@ -29,6 +31,8 @@ pub enum AlertEvaluationError {
     Application(#[from] ApplicationError),
     #[error(transparent)]
     Provenance(#[from] ProvenanceStoreError),
+    #[error("severity classification failed: {0}")]
+    Classification(#[from] alerting::AlertingError),
     #[error(transparent)]
     Db(#[from] sqlx::Error),
     #[error("failed to serialize {what}: {source}")]
@@ -48,6 +52,10 @@ pub struct StoredAlert {
     pub event_type: String,
     pub subject_ref: String,
     pub severity: AlertSeverityHint,
+    /// Evidence-based severity from the source finding's metrics (Track C phase
+    /// C3). `None` when the finding kind carries no classifiable metric.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub classified_severity: Option<AlertSeverityHint>,
     pub channels: Vec<String>,
     pub evidence_refs: Vec<String>,
     pub explanation: String,
@@ -119,11 +127,148 @@ pub async fn evaluate_field_alerts(
                 },
             )
             .await?;
-            stored.push(to_stored_alert(alert, &finding.finding_id));
+
+            // Evidence-based severity (Track C phase C3): classify from the
+            // source finding's metrics, overriding the static rule severity for
+            // downstream decisions. Findings without a classifiable metric keep
+            // the rule severity.
+            let classified = classify_from_finding(&alert, &candidate, finding, created_at)?;
+            if let Some(classification) = &classified {
+                persist_classification(pool, classification, created_at).await?;
+            }
+            stored.push(to_stored_alert(
+                alert,
+                &finding.finding_id,
+                classified.map(|c| c.classified_severity),
+            ));
         }
     }
 
     Ok(stored)
+}
+
+/// Build severity evidence from a finding's metrics and classify the alert. The
+/// evidence metric + thresholds are per finding kind; kinds without a numeric
+/// severity signal return `None` (the rule severity stands).
+fn classify_from_finding(
+    alert: &FiredAlertRecord,
+    candidate: &AlertCandidateRecord,
+    finding: &StoredFinding,
+    _created_at: &str,
+) -> Result<Option<AlertSeverityClassification>, AlertEvaluationError> {
+    let Some(evidence) = severity_evidence(&finding.finding.kind, finding.finding.metrics.as_ref())
+    else {
+        return Ok(None);
+    };
+    // The deterministic evidence/rule engine owns the outcome; the candidate's
+    // severity hint is advisory only.
+    let classification = classify_alert_severity(alert, candidate.severity_hint, evidence)?;
+    Ok(Some(classification))
+}
+
+/// Per-kind severity evidence. Thresholds are ascending (warning < critical <
+/// emergency); the observed value is the finding's actionable magnitude.
+fn severity_evidence(
+    kind: &str,
+    metrics: Option<&serde_json::Value>,
+) -> Option<AlertSeverityEvidence> {
+    let metrics = metrics?;
+    let (metric, observed, warning, critical, emergency) = match kind {
+        // Anomaly magnitude: how many std deviations from the zone-set mean.
+        "index_anomaly_zone" => (
+            "anomaly_zscore",
+            metrics.get("z_score")?.as_f64()?.abs(),
+            1.5,
+            2.5,
+            4.0,
+        ),
+        // Water deficit, in mm below target.
+        "water_deficit_zone" => (
+            "water_deficit_mm",
+            metrics.get("water_deficit_mm")?.as_f64()?,
+            5.0,
+            15.0,
+            30.0,
+        ),
+        // Crop-health decline: magnitude of the negative NDVI delta.
+        "declining_zone" => (
+            "ndvi_decline",
+            (-metrics.get("ndvi_delta")?.as_f64()?).max(0.0),
+            0.05,
+            0.10,
+            0.20,
+        ),
+        _ => return None,
+    };
+    Some(AlertSeverityEvidence {
+        metric: metric.to_string(),
+        observed_value: observed,
+        warning_threshold: warning,
+        critical_threshold: critical,
+        emergency_threshold: emergency,
+        method_version: SEVERITY_METHOD_VERSION.to_string(),
+    })
+}
+
+async fn persist_classification(
+    pool: &DbPool,
+    classification: &AlertSeverityClassification,
+    classified_at: &str,
+) -> Result<(), AlertEvaluationError> {
+    sqlx::query(
+        r#"
+        INSERT OR REPLACE INTO alert_severity_classification
+            (alert_id, rule_severity, classified_severity, hard_override_downstream,
+             metric, observed_value, threshold_value, method_version, explanation, classified_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        "#,
+    )
+    .bind(&classification.alert_id)
+    .bind(classification.rule_severity.as_str())
+    .bind(classification.classified_severity.as_str())
+    .bind(classification.hard_override_downstream as i64)
+    .bind(&classification.metric)
+    .bind(classification.observed_value)
+    .bind(classification.threshold_value)
+    .bind(&classification.method_version)
+    .bind(&classification.explanation)
+    .bind(classified_at)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Fetch the evidence-based severity classification for an alert (Track C C3).
+pub async fn get_severity_classification(
+    pool: &DbPool,
+    alert_id: &str,
+) -> Result<Option<AlertSeverityClassification>, AlertEvaluationError> {
+    use sqlx::Row;
+    let Some(row) = sqlx::query("SELECT * FROM alert_severity_classification WHERE alert_id = ?")
+        .bind(alert_id)
+        .fetch_optional(pool)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let parse = |col: &str| -> AlertSeverityHint {
+        row.get::<String, _>(col)
+            .parse()
+            .unwrap_or(AlertSeverityHint::Info)
+    };
+    Ok(Some(AlertSeverityClassification {
+        alert_id: row.get("alert_id"),
+        matched_rule_id: String::new(),
+        rule_severity: parse("rule_severity"),
+        source_severity_hint: parse("rule_severity"),
+        classified_severity: parse("classified_severity"),
+        hard_override_downstream: row.get::<i64, _>("hard_override_downstream") != 0,
+        metric: row.get("metric"),
+        observed_value: row.get("observed_value"),
+        threshold_value: row.get::<Option<f64>, _>("threshold_value"),
+        method_version: row.get("method_version"),
+        explanation: row.get("explanation"),
+    }))
 }
 
 /// Map a stored finding into an alert candidate. The candidate's evidence ref is
@@ -194,7 +339,11 @@ async fn persist_alert(
     Ok(())
 }
 
-fn to_stored_alert(alert: FiredAlertRecord, source_finding_id: &str) -> StoredAlert {
+fn to_stored_alert(
+    alert: FiredAlertRecord,
+    source_finding_id: &str,
+    classified_severity: Option<AlertSeverityHint>,
+) -> StoredAlert {
     StoredAlert {
         alert_id: alert.alert_id,
         matched_rule_id: alert.matched_rule_id,
@@ -203,6 +352,7 @@ fn to_stored_alert(alert: FiredAlertRecord, source_finding_id: &str) -> StoredAl
         event_type: alert.event_type,
         subject_ref: alert.subject_ref,
         severity: alert.severity,
+        classified_severity,
         channels: alert.channels,
         evidence_refs: alert.evidence_refs,
         explanation: alert.explanation,
@@ -210,14 +360,20 @@ fn to_stored_alert(alert: FiredAlertRecord, source_finding_id: &str) -> StoredAl
     }
 }
 
-/// List the alerts fired for a field, most recent first.
+/// List the alerts fired for a field, most recent first. Each alert's
+/// evidence-based `classified_severity` (Track C C3) is joined in when present.
 pub async fn list_field_alerts(
     pool: &DbPool,
     field_id: &str,
 ) -> Result<Vec<StoredAlert>, AlertEvaluationError> {
     use sqlx::Row;
     let rows = sqlx::query(
-        "SELECT * FROM fired_alerts WHERE field_id = ? ORDER BY fired_at DESC, alert_id ASC",
+        r#"
+        SELECT f.*, c.classified_severity AS classified_severity
+        FROM fired_alerts f
+        LEFT JOIN alert_severity_classification c ON c.alert_id = f.alert_id
+        WHERE f.field_id = ? ORDER BY f.fired_at DESC, f.alert_id ASC
+        "#,
     )
     .bind(field_id)
     .fetch_all(pool)
@@ -228,6 +384,9 @@ pub async fn list_field_alerts(
             .get::<String, _>("severity")
             .parse()
             .unwrap_or(AlertSeverityHint::Info);
+        let classified_severity = row
+            .get::<Option<String>, _>("classified_severity")
+            .and_then(|s| s.parse().ok());
         out.push(StoredAlert {
             alert_id: row.get("alert_id"),
             matched_rule_id: row.get("matched_rule_id"),
@@ -236,6 +395,7 @@ pub async fn list_field_alerts(
             event_type: row.get("event_type"),
             subject_ref: row.get("subject_ref"),
             severity,
+            classified_severity,
             channels: row
                 .get::<Option<String>, _>("channels_json")
                 .and_then(|s| serde_json::from_str(&s).ok())

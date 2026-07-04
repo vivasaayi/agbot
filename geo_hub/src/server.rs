@@ -78,6 +78,10 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::list_field_alerts),
         )
         .route(
+            "/api/alerts/:alert_id/severity",
+            get(routes::get_alert_severity_classification),
+        )
+        .route(
             "/api/alerts/:alert_id/lifecycle",
             get(routes::get_alert_lifecycle),
         )

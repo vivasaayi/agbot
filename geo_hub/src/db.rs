@@ -3245,6 +3245,28 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // Alert severity classification (Track C phase C3): evidence-based severity
+    // derived from the source finding's metrics, overriding the static rule
+    // severity for downstream decisions. Retains the rule severity for audit.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS alert_severity_classification (
+            alert_id TEXT PRIMARY KEY,
+            rule_severity TEXT NOT NULL,
+            classified_severity TEXT NOT NULL,
+            hard_override_downstream INTEGER NOT NULL,
+            metric TEXT NOT NULL,
+            observed_value REAL NOT NULL,
+            threshold_value REAL,
+            method_version TEXT NOT NULL,
+            explanation TEXT NOT NULL,
+            classified_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     // Alert lifecycle (Track C phase C2): the governed fired->acknowledged->
     // resolved state machine per fired alert, with an append-only transition log.
     sqlx::query(

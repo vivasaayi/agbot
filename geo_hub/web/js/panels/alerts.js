@@ -54,10 +54,16 @@ function alertRow(alert) {
   title.className = "alert-event";
   title.textContent = alert.event_type ?? "(alert)";
   li.appendChild(title);
-  if (alert.severity) {
+  // Prefer the evidence-based classified severity (Track C C3); fall back to
+  // the rule severity. Show the classified value with the rule value muted.
+  const shownSeverity = alert.classified_severity ?? alert.severity;
+  if (shownSeverity) {
     const tag = document.createElement("span");
-    tag.className = `tag severity-${alert.severity}`;
-    tag.textContent = alert.severity;
+    tag.className = `tag severity-${shownSeverity}`;
+    tag.textContent = shownSeverity;
+    if (alert.classified_severity && alert.classified_severity !== alert.severity) {
+      tag.title = `classified from evidence (rule: ${alert.severity})`;
+    }
     li.appendChild(tag);
   }
   const rule = document.createElement("span");

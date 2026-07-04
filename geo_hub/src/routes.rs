@@ -6857,6 +6857,19 @@ pub async fn list_field_alerts(
     Ok(Json(alerts))
 }
 
+/// Fetch an alert's evidence-based severity classification (Track C phase C3).
+pub async fn get_alert_severity_classification(
+    Path(alert_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<alerting::AlertSeverityClassification>> {
+    let classification =
+        crate::alert_evaluation::get_severity_classification(&state.pool, &alert_id)
+            .await
+            .map_err(alert_evaluation_error)?
+            .ok_or(AppError::NotFound)?;
+    Ok(Json(classification))
+}
+
 fn alert_lifecycle_error(err: crate::alert_lifecycle::AlertLifecycleError) -> AppError {
     use crate::alert_lifecycle::AlertLifecycleError;
     match err {
