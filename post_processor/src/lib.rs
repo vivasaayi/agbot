@@ -13,6 +13,7 @@ pub mod grower_report;
 pub mod index_anomaly;
 pub mod index_trend;
 pub mod index_vegetation_classification;
+pub mod l3_product;
 pub mod lidar_analysis;
 pub mod lidar_change;
 pub mod ndvi_analysis;
