@@ -90,6 +90,20 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::acknowledge_alert),
         )
         .route("/api/alerts/:alert_id/resolve", post(routes::resolve_alert))
+        .route("/api/proposals", post(routes::create_proposal))
+        .route(
+            "/api/fields/:field_id/proposals",
+            get(routes::list_field_proposals),
+        )
+        .route("/api/proposals/:proposal_id", get(routes::get_proposal))
+        .route(
+            "/api/proposals/:proposal_id/accept",
+            post(routes::accept_proposal),
+        )
+        .route(
+            "/api/proposals/:proposal_id/reject",
+            post(routes::reject_proposal),
+        )
         .route(
             "/api/farms",
             get(routes::list_farms).post(routes::create_farm),

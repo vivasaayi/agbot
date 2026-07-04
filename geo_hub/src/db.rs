@@ -3284,6 +3284,39 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // Proposal queue (Track D phase D1): the unified accept/reject queue over
+    // signals (alerts / findings / recommendations). Each proposal carries
+    // lineage back to its source artifact.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS proposals (
+            proposal_id TEXT PRIMARY KEY,
+            source_kind TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            field_id TEXT,
+            title TEXT NOT NULL,
+            action_category TEXT NOT NULL,
+            priority TEXT NOT NULL,
+            status TEXT NOT NULL,
+            rationale TEXT,
+            created_at TEXT NOT NULL,
+            reviewed_by TEXT,
+            reviewed_at TEXT
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_proposals_field
+        ON proposals(field_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     info!("database ready");
     Ok(())
 }

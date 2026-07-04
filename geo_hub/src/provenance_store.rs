@@ -100,6 +100,29 @@ pub async fn load_all_lineage(pool: &DbPool) -> Result<Vec<LineageRecord>, Prove
     rows.iter().map(decode_lineage_record).collect()
 }
 
+/// Load a single lineage record by artifact id, if one exists. Used to validate
+/// that a referenced artifact is a known, lineage-tracked entity.
+pub async fn get_lineage(
+    pool: &DbPool,
+    artifact_id: &str,
+) -> Result<Option<LineageRecord>, ProvenanceStoreError> {
+    let Some(row) = sqlx::query(
+        r#"
+        SELECT artifact_id, kind, inputs_json, method, parameters_json, operator,
+               actor_id, actor_kind, created_at
+        FROM provenance_lineage_records
+        WHERE artifact_id = ?
+        "#,
+    )
+    .bind(artifact_id)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(decode_lineage_record(&row)?))
+}
+
 /// Backward trace from `artifact_id` down to its L0 sources, with any missing
 /// intermediate records reported as [`provenance::LineageGap`]s.
 pub async fn trace_backward(

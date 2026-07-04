@@ -18,6 +18,7 @@ pub enum ArtifactKind {
     Report,
     Action,
     Alert,
+    Proposal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1512,6 +1513,8 @@ fn entry_artifact_kind(entry: &AuditEntry) -> Option<ArtifactKind> {
         Some(ArtifactKind::Action)
     } else if artifact_ref.starts_with("alert:") {
         Some(ArtifactKind::Alert)
+    } else if artifact_ref.starts_with("proposal:") {
+        Some(ArtifactKind::Proposal)
     } else {
         None
     }
