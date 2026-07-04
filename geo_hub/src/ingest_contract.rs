@@ -11,7 +11,9 @@ use crate::catalog::{self, CatalogError};
 use crate::db::DbPool;
 use provenance::ActorIdentity;
 use serde::{Deserialize, Serialize};
-use shared::product_graph::ProductRecordDraft;
+use shared::drone_ingest::{DroneCapture, DroneIngestManifest, DroneIngestManifestError};
+use shared::product_graph::{ProductArtifact, ProductLevel, ProductRecordDraft, ProductScope};
+use std::path::Path;
 use thiserror::Error;
 
 /// Scene metadata upserted into the `scenes` table as part of an ingest.
@@ -52,7 +54,7 @@ pub struct NormalizedIngest {
 }
 
 /// Outcome of [`commit_ingest`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IngestReceipt {
     pub source_id: String,
     pub scene_id: Option<String>,
@@ -72,6 +74,10 @@ pub enum IngestError {
     },
     #[error("source_kind must be satellite|drone|field_survey|iot|weather|equipment, got {0}")]
     InvalidSourceKind(String),
+    #[error("invalid drone manifest: {0}")]
+    InvalidManifest(#[from] DroneIngestManifestError),
+    #[error("drone session {0} already ingested")]
+    DuplicateSession(String),
 }
 
 const VALID_SOURCE_KINDS: [&str; 6] = [
@@ -184,4 +190,111 @@ pub async fn commit_ingest(
         scene_id: ingest.scene.as_ref().map(|scene| scene.scene_id.clone()),
         product_ids,
     })
+}
+
+// --- Drone-session ingest (Track A batch 6) --------------------------------
+
+fn artifact_format(path: &str) -> String {
+    Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Map one drone capture into an L0 catalog draft. Drone captures carry no
+/// input graph, so `session_id` + `capture_id` + `checksum` go into the
+/// parameters to give each capture a distinct identity under
+/// `UNIQUE(kind, parameters_hash)`.
+fn capture_draft(manifest: &DroneIngestManifest, capture: &DroneCapture) -> ProductRecordDraft {
+    ProductRecordDraft {
+        level: ProductLevel::L0,
+        kind: capture.kind.clone(),
+        algorithm_id: "drone.capture".to_string(),
+        algorithm_version: "1.0.0".to_string(),
+        parameters: serde_json::json!({
+            "session_id": manifest.session_id,
+            "capture_id": capture.capture_id,
+            "checksum": capture.checksum_sha256,
+        }),
+        inputs: Vec::new(),
+        scope: ProductScope {
+            farm_id: None,
+            field_id: None,
+            season_id: None,
+            scene_id: Some(manifest.scene.scene_id.clone()),
+            temporal_start: capture.captured_at.clone(),
+            temporal_end: capture.captured_at.clone(),
+        },
+        spatial_ref: None,
+        gsd_m_per_px: None,
+        artifact: Some(ProductArtifact {
+            format: artifact_format(&capture.file_path),
+            path: capture.file_path.clone(),
+            checksum_sha256: Some(capture.checksum_sha256.clone()),
+        }),
+        quality_mask: None,
+        confidence: None,
+        confidence_method: None,
+        quality_summary: None,
+        evidence_digests: Vec::new(),
+        source_id: Some(manifest.source_id.clone()),
+    }
+}
+
+async fn product_exists(pool: &DbPool, product_id: &str) -> Result<bool, IngestError> {
+    let row = sqlx::query("SELECT 1 FROM catalog_products WHERE product_id = ? LIMIT 1")
+        .bind(product_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.is_some())
+}
+
+/// Commit a drone-session manifest into the catalog: validate integrity
+/// (checksums present), reject a session whose captures are already registered
+/// (duplicate), then register the scene + one L0 product per capture via
+/// [`commit_ingest`]. Calibration/derived products stay in imagery_processor.
+pub async fn commit_drone_ingest(
+    pool: &DbPool,
+    manifest: &DroneIngestManifest,
+    actor: &ActorIdentity,
+    created_at: &str,
+) -> Result<IngestReceipt, IngestError> {
+    manifest.validate()?;
+
+    let l0_products: Vec<ProductRecordDraft> = manifest
+        .captures
+        .iter()
+        .map(|capture| capture_draft(manifest, capture))
+        .collect();
+
+    // Duplicate rejection: if any capture product is already registered, this
+    // session was ingested before. (commit_ingest itself would silently dedupe;
+    // here we surface it as an explicit error.)
+    for draft in &l0_products {
+        if product_exists(pool, &draft.product_id()).await? {
+            return Err(IngestError::DuplicateSession(manifest.session_id.clone()));
+        }
+    }
+
+    let ingest = NormalizedIngest {
+        source_id: manifest.source_id.clone(),
+        source_kind: "drone".to_string(),
+        platform: manifest.platform.clone(),
+        sensor: manifest.sensor.clone(),
+        source_config: None,
+        scene: Some(IngestScene {
+            scene_id: manifest.scene.scene_id.clone(),
+            owner: None,
+            sensor: manifest.scene.sensor.clone(),
+            acquired_at: manifest.scene.acquired_at.clone(),
+            data_path: manifest.scene.data_path.clone(),
+            metadata_json: manifest.scene.metadata_json.clone(),
+            cloud_cover: None,
+        }),
+        l0_products,
+        l1_products: Vec::new(),
+        quality: manifest.quality.clone(),
+    };
+    commit_ingest(pool, &ingest, actor, created_at).await
 }

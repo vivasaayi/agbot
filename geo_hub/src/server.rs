@@ -34,6 +34,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/ready", get(ready_handler))
         .route("/api/ingest/health", get(routes::get_ingest_health))
         .route(
+            "/api/ingest/drone-session",
+            post(routes::ingest_drone_session),
+        )
+        .route(
             "/api/farms",
             get(routes::list_farms).post(routes::create_farm),
         )

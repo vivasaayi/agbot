@@ -3595,3 +3595,137 @@ mod tests {
         ));
     }
 }
+
+// --- Drone-session ingest manifest export (Track A batch 6) -----------------
+
+/// Map a capture's data type onto its catalog product kind.
+fn data_type_capture_kind(data_type: &DataType) -> &'static str {
+    match data_type {
+        DataType::Image => "image_capture",
+        DataType::MultispectralImage => "multispectral_capture",
+        DataType::ThermalImage => "thermal_capture",
+        DataType::LidarScan => "lidar_scan",
+        DataType::Video => "video_capture",
+        _ => "raw_capture",
+    }
+}
+
+/// Serialize a completed capture session into a
+/// [`shared::drone_ingest::DroneIngestManifest`] for catalog ingestion. Only
+/// records backing an actual captured file (with a `file_path`) become L0
+/// captures; each carries its stored integrity checksum. The capture health is
+/// attached as the ingest quality summary.
+pub fn export_ingest_manifest(
+    source_id: &str,
+    session_id: Uuid,
+    scene: shared::drone_ingest::DroneIngestScene,
+    records: &[FlightDataRecord],
+    health: &CaptureHealth,
+) -> shared::drone_ingest::DroneIngestManifest {
+    let captures = records
+        .iter()
+        .filter_map(|record| {
+            let file_path = record.file_path.as_ref()?;
+            Some(shared::drone_ingest::DroneCapture {
+                capture_id: record.id.to_string(),
+                kind: data_type_capture_kind(&record.data_type).to_string(),
+                file_path: file_path.to_string_lossy().to_string(),
+                checksum_sha256: record
+                    .metadata
+                    .get(INTEGRITY_CHECKSUM_KEY)
+                    .cloned()
+                    .unwrap_or_default(),
+                size_bytes: record.size_bytes,
+                captured_at: record.timestamp.to_rfc3339(),
+            })
+        })
+        .collect();
+
+    shared::drone_ingest::DroneIngestManifest {
+        source_id: source_id.to_string(),
+        session_id: session_id.to_string(),
+        platform: None,
+        sensor: Some(scene.sensor.clone()),
+        scene,
+        captures,
+        quality: serde_json::to_value(health).ok(),
+    }
+}
+
+#[cfg(test)]
+mod ingest_manifest_tests {
+    use super::*;
+    use shared::schemas::GpsCoords;
+
+    #[test]
+    fn export_manifest_maps_file_records_with_checksums() {
+        let session_id = Uuid::new_v4();
+        let provenance = FlightDataProvenance::complete(
+            session_id,
+            "ms-1".to_string(),
+            GpsCoords {
+                latitude: 40.0,
+                longitude: -105.0,
+                altitude: 30.0,
+            },
+            Utc::now(),
+            "cal-1".to_string(),
+        );
+        // A capture with a file + checksum, and a telemetry record with neither.
+        let mut image = FlightDataRecord::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            DataType::MultispectralImage,
+            DataPayload::SensorData {
+                sensor_type: "multispectral".to_string(),
+                values: HashMap::new(),
+                calibration_info: None,
+            },
+            provenance.clone(),
+            4096,
+        )
+        .unwrap();
+        image.file_path = Some(std::path::PathBuf::from("scenes/s1/ms.tif"));
+        image
+            .metadata
+            .insert(INTEGRITY_CHECKSUM_KEY.to_string(), "deadbeef".to_string());
+
+        let telemetry = FlightDataRecord::new(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            DataType::Telemetry,
+            DataPayload::Telemetry {
+                position: (40.0, -105.0, 30.0),
+                velocity: (1.0, 0.0, 0.0),
+                orientation: (0.0, 0.0, 0.0),
+                battery_level: 0.9,
+                signal_strength: 0.95,
+            },
+            provenance,
+            256,
+        )
+        .unwrap();
+
+        let scene = shared::drone_ingest::DroneIngestScene {
+            scene_id: "scene-1".to_string(),
+            sensor: "ms-1".to_string(),
+            acquired_at: Utc::now().to_rfc3339(),
+            data_path: "scenes/s1".to_string(),
+            metadata_json: "{}".to_string(),
+        };
+        let manifest = export_ingest_manifest(
+            "drone-1",
+            session_id,
+            scene,
+            &[image, telemetry],
+            &CaptureHealth::default(),
+        );
+
+        // Only the file-backed capture is exported; telemetry is skipped.
+        assert_eq!(manifest.captures.len(), 1);
+        assert_eq!(manifest.captures[0].kind, "multispectral_capture");
+        assert_eq!(manifest.captures[0].checksum_sha256, "deadbeef");
+        assert_eq!(manifest.session_id, session_id.to_string());
+        assert!(manifest.validate().is_ok());
+    }
+}

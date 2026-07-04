@@ -6572,6 +6572,27 @@ pub async fn get_provenance_trace(
     Ok(Json(trace))
 }
 
+/// Ingest a completed drone capture session (Track A batch 6): validate the
+/// manifest's integrity checksums, reject an already-ingested session, and
+/// commit the scene + L0 capture products into the catalog with lineage.
+pub async fn ingest_drone_session(
+    State(state): State<AppState>,
+    Json(manifest): Json<shared::drone_ingest::DroneIngestManifest>,
+) -> AppResult<Json<crate::ingest_contract::IngestReceipt>> {
+    use crate::ingest_contract::IngestError;
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let actor = provenance::ActorIdentity::system("geo_hub:drone-ingest");
+    let receipt = crate::ingest_contract::commit_drone_ingest(&state.pool, &manifest, &actor, &now)
+        .await
+        .map_err(|err| match err {
+            IngestError::InvalidManifest(_)
+            | IngestError::DuplicateSession(_)
+            | IngestError::InvalidSourceKind(_) => AppError::BadRequest(err.to_string()),
+            other => AppError::Anyhow(Error::new(other)),
+        })?;
+    Ok(Json(receipt))
+}
+
 pub async fn list_provenance_audit_entries(
     Query(query): Query<ProvenanceAuditListQuery>,
     State(state): State<AppState>,
