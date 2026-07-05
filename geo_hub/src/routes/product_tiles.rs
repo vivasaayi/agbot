@@ -33,7 +33,7 @@ impl From<TileError> for AppError {
             // The product exists but is not web-tileable as stored: surface
             // the reason code to the caller instead of a blank 500.
             TileError::MissingEpsg
-            | TileError::NotUtm(_)
+            | TileError::UnsupportedCrs(_)
             | TileError::MissingGeotransform
             | TileError::RotatedGrid => AppError::BadRequest(err.to_string()),
             TileError::Raster(_) | TileError::PngEncode(_) => AppError::Anyhow(err.into()),

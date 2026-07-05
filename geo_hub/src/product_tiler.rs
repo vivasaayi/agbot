@@ -45,8 +45,8 @@ pub enum TileError {
     },
     #[error("product raster has no EPSG code; cannot web-tile an ungeoreferenced raster")]
     MissingEpsg,
-    #[error("product raster CRS EPSG:{0} is not a WGS84/UTM code; only UTM-gridded products are web-tileable")]
-    NotUtm(u32),
+    #[error("product raster CRS EPSG:{0} is not supported; web-tileable grids are WGS84/UTM (326xx/327xx) or geographic (4326)")]
+    UnsupportedCrs(u32),
     #[error("product raster has no geotransform")]
     MissingGeotransform,
     #[error("product raster grid is rotated (geotransform shear terms are nonzero); only north-up grids are supported")]
@@ -129,6 +129,11 @@ const RAMP_VEGETATION: &[[u8; 3]] = &[[140, 81, 10], [246, 232, 195], [26, 152, 
 const RAMP_WATER: &[[u8; 3]] = &[[191, 160, 116], [240, 240, 240], [24, 100, 190]];
 /// Red -> yellow -> green: 0-100 condition scores (drought indices).
 const RAMP_CONDITION: &[[u8; 3]] = &[[215, 48, 39], [254, 224, 139], [26, 152, 80]];
+/// Red -> white -> blue: standardized anomalies (SPI; dry negative, wet
+/// positive).
+const RAMP_DIVERGING_DRY_WET: &[[u8; 3]] = &[[178, 24, 43], [247, 247, 247], [33, 102, 172]];
+/// White -> blue: precipitation accumulations (mm).
+const RAMP_PRECIP: &[[u8; 3]] = &[[247, 251, 255], [8, 69, 148]];
 /// Black -> white fallback for unknown kinds.
 const RAMP_GRAY: &[[u8; 3]] = &[[0, 0, 0], [255, 255, 255]];
 
@@ -154,6 +159,16 @@ pub fn colormap_for_kind(kind: &str) -> Colormap {
                 stops: RAMP_CONDITION,
             }
         }
+        // SPI is a standard-normal quantile; McKee classes end at ±2, the
+        // operational range at ~±3.09 (probability floor).
+        "spi" => Colormap {
+            domain: (-3.0, 3.0),
+            stops: RAMP_DIVERGING_DRY_WET,
+        },
+        "precipitation" => Colormap {
+            domain: (0.0, 500.0),
+            stops: RAMP_PRECIP,
+        },
         _ => Colormap {
             domain: (-1.0, 1.0),
             stops: RAMP_GRAY,
@@ -185,11 +200,21 @@ impl Colormap {
 
 // --- Tile source -------------------------------------------------------------
 
-/// A raster product loaded for tiling: one f32 band on a north-up UTM grid.
+/// How grid coordinates relate to WGS84: a projected UTM zone (satellite
+/// scene products) or a plain geographic lat/lon grid (EPSG:4326, e.g.
+/// CHIRPS precipitation and SPI rasters).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GridProjection {
+    Utm(UtmZone),
+    Geographic,
+}
+
+/// A raster product loaded for tiling: one f32 band on a north-up grid.
 #[derive(Debug, Clone)]
 pub struct TileSource {
-    pub zone: UtmZone,
-    /// GDAL geotransform (north-up: shear terms zero).
+    pub projection: GridProjection,
+    /// GDAL geotransform (north-up: shear terms zero). Units are meters for
+    /// UTM grids and degrees for geographic grids.
     pub transform: [f64; 6],
     pub width: u32,
     pub height: u32,
@@ -209,12 +234,18 @@ impl TileSource {
         values: Vec<f32>,
         nodata: Option<f32>,
     ) -> Result<Self, TileError> {
-        let zone = UtmZone::from_epsg(epsg).map_err(|_| TileError::NotUtm(epsg))?;
+        let projection = if epsg == 4326 {
+            GridProjection::Geographic
+        } else {
+            GridProjection::Utm(
+                UtmZone::from_epsg(epsg).map_err(|_| TileError::UnsupportedCrs(epsg))?,
+            )
+        };
         if transform[2] != 0.0 || transform[4] != 0.0 {
             return Err(TileError::RotatedGrid);
         }
         Ok(Self {
-            zone,
+            projection,
             transform,
             width,
             height,
@@ -223,9 +254,19 @@ impl TileSource {
         })
     }
 
-    /// Nearest-neighbor sample at a UTM coordinate; `None` outside the grid
-    /// or on a nodata/non-finite pixel.
-    pub fn sample_utm(&self, easting: f64, northing: f64) -> Option<f32> {
+    /// Grid coordinates (geotransform units) of a WGS84 point; `None` when
+    /// the point is outside the projection's domain (UTM latitude range).
+    fn grid_coords(&self, lat: f64, lon: f64) -> Option<(f64, f64)> {
+        match self.projection {
+            GridProjection::Utm(zone) => wgs84_to_utm(lat, lon, zone).ok(),
+            GridProjection::Geographic => Some((lon, lat)),
+        }
+    }
+
+    /// Nearest-neighbor sample at a grid coordinate (meters for UTM grids,
+    /// degrees for geographic ones); `None` outside the grid or on a
+    /// nodata/non-finite pixel.
+    pub fn sample_grid(&self, easting: f64, northing: f64) -> Option<f32> {
         let col = (easting - self.transform[0]) / self.transform[1];
         let row = (northing - self.transform[3]) / self.transform[5];
         if col < 0.0 || row < 0.0 {
@@ -254,17 +295,22 @@ impl TileSource {
         let max_x = self.transform[0] + f64::from(self.width) * self.transform[1];
         let max_y = self.transform[3];
         let min_y = self.transform[3] + f64::from(self.height) * self.transform[5];
-        let corners = [
-            crate::utm::utm_to_wgs84(min_x, min_y, self.zone),
-            crate::utm::utm_to_wgs84(max_x, min_y, self.zone),
-            crate::utm::utm_to_wgs84(min_x, max_y, self.zone),
-            crate::utm::utm_to_wgs84(max_x, max_y, self.zone),
-        ];
-        let min_lat = corners.iter().map(|(lat, _)| *lat).fold(f64::MAX, f64::min);
-        let max_lat = corners.iter().map(|(lat, _)| *lat).fold(f64::MIN, f64::max);
-        let min_lon = corners.iter().map(|(_, lon)| *lon).fold(f64::MAX, f64::min);
-        let max_lon = corners.iter().map(|(_, lon)| *lon).fold(f64::MIN, f64::max);
-        (min_lat, min_lon, max_lat, max_lon)
+        match self.projection {
+            GridProjection::Geographic => (min_y, min_x, max_y, max_x),
+            GridProjection::Utm(zone) => {
+                let corners = [
+                    crate::utm::utm_to_wgs84(min_x, min_y, zone),
+                    crate::utm::utm_to_wgs84(max_x, min_y, zone),
+                    crate::utm::utm_to_wgs84(min_x, max_y, zone),
+                    crate::utm::utm_to_wgs84(max_x, max_y, zone),
+                ];
+                let min_lat = corners.iter().map(|(lat, _)| *lat).fold(f64::MAX, f64::min);
+                let max_lat = corners.iter().map(|(lat, _)| *lat).fold(f64::MIN, f64::max);
+                let min_lon = corners.iter().map(|(_, lon)| *lon).fold(f64::MAX, f64::min);
+                let max_lon = corners.iter().map(|(_, lon)| *lon).fold(f64::MIN, f64::max);
+                (min_lat, min_lon, max_lat, max_lon)
+            }
+        }
     }
 }
 
@@ -299,10 +345,10 @@ pub struct RenderedTile {
     pub transparent_reasons: BTreeMap<String, usize>,
 }
 
-/// Render one Web Mercator tile from a UTM tile source. Every output pixel
-/// center is projected Mercator -> WGS84 -> UTM and nearest-sampled; pixels
-/// outside the grid, outside the UTM latitude domain, or on nodata stay
-/// fully transparent.
+/// Render one Web Mercator tile from a tile source. Every output pixel
+/// center is projected Mercator -> WGS84 -> the source grid (UTM meters or
+/// geographic degrees) and nearest-sampled; pixels outside the grid, outside
+/// the UTM latitude domain, or on nodata stay fully transparent.
 pub fn render_web_tile(
     source: &TileSource,
     colormap: &Colormap,
@@ -343,12 +389,12 @@ pub fn render_web_tile(
         for px in 0..TILE_SIZE {
             let merc_x = rect.min_x + (f64::from(px) + 0.5) * span_x;
             let (lat, lon) = mercator_to_wgs84(merc_x, merc_y);
-            let Ok((easting, northing)) = wgs84_to_utm(lat, lon, source.zone) else {
+            let Some((easting, northing)) = source.grid_coords(lat, lon) else {
                 transparent("outside_utm_domain", &mut transparent_reasons);
                 continue;
             };
             let offset = ((py * TILE_SIZE + px) * 4) as usize;
-            match source.sample_utm(easting, northing) {
+            match source.sample_grid(easting, northing) {
                 Some(value) => {
                     let rgb = colormap.rgb(value);
                     rgba[offset..offset + 3].copy_from_slice(&rgb);
@@ -392,6 +438,13 @@ pub fn tile_containing(lat: f64, lon: f64, z: u8) -> (u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn zone_43n() -> UtmZone {
+        UtmZone {
+            zone: 43,
+            north: true,
+        }
+    }
 
     /// Sentinel-2 43PFN-style grid: 10 m pixels at (600000, 1300020), EPSG:32643.
     fn source_43pfn(values: Vec<f32>, width: u32, height: u32) -> TileSource {
@@ -470,11 +523,14 @@ mod tests {
     }
 
     #[test]
-    fn non_utm_and_rotated_grids_are_rejected() {
-        assert!(matches!(
-            TileSource::new(4326, [0.0; 6], 1, 1, vec![0.0], None),
-            Err(TileError::NotUtm(4326))
-        ));
+    fn unsupported_and_rotated_grids_are_rejected() {
+        // 3857 (mercator) has no sampling path; 32661 is not a valid UTM code.
+        for epsg in [3857u32, 32661] {
+            assert!(matches!(
+                TileSource::new(epsg, [0.0; 6], 1, 1, vec![0.0], None),
+                Err(TileError::UnsupportedCrs(code)) if code == epsg
+            ));
+        }
         assert!(matches!(
             TileSource::new(
                 32643,
@@ -489,19 +545,19 @@ mod tests {
     }
 
     #[test]
-    fn sample_utm_is_nearest_and_respects_nodata_and_bounds() {
+    fn sample_grid_is_nearest_and_respects_nodata_and_bounds() {
         // 2x2 grid: [[0.1, 0.5], [nodata, 0.9]].
         let source = source_43pfn(vec![0.1, 0.5, -9999.0, 0.9], 2, 2);
         // Pixel centers.
-        assert_eq!(source.sample_utm(600_005.0, 1_300_015.0), Some(0.1));
-        assert_eq!(source.sample_utm(600_015.0, 1_300_015.0), Some(0.5));
-        assert_eq!(source.sample_utm(600_005.0, 1_300_005.0), None); // nodata
-        assert_eq!(source.sample_utm(600_015.0, 1_300_005.0), Some(0.9));
+        assert_eq!(source.sample_grid(600_005.0, 1_300_015.0), Some(0.1));
+        assert_eq!(source.sample_grid(600_015.0, 1_300_015.0), Some(0.5));
+        assert_eq!(source.sample_grid(600_005.0, 1_300_005.0), None); // nodata
+        assert_eq!(source.sample_grid(600_015.0, 1_300_005.0), Some(0.9));
         // Outside the grid on every side.
-        assert_eq!(source.sample_utm(599_999.0, 1_300_015.0), None);
-        assert_eq!(source.sample_utm(600_025.0, 1_300_015.0), None);
-        assert_eq!(source.sample_utm(600_005.0, 1_300_021.0), None);
-        assert_eq!(source.sample_utm(600_005.0, 1_299_999.0), None);
+        assert_eq!(source.sample_grid(599_999.0, 1_300_015.0), None);
+        assert_eq!(source.sample_grid(600_025.0, 1_300_015.0), None);
+        assert_eq!(source.sample_grid(600_005.0, 1_300_021.0), None);
+        assert_eq!(source.sample_grid(600_005.0, 1_299_999.0), None);
     }
 
     #[test]
@@ -511,8 +567,7 @@ mod tests {
         // way; assert both opaque and transparent pixels exist and opaque
         // pixels carry the exact ramp-end color.
         let source = source_43pfn(vec![1.0; 400], 20, 20);
-        let (center_lat, center_lon) =
-            crate::utm::utm_to_wgs84(600_100.0, 1_299_920.0, source.zone);
+        let (center_lat, center_lon) = crate::utm::utm_to_wgs84(600_100.0, 1_299_920.0, zone_43n());
         let z = 14;
         let (x, y) = tile_containing(center_lat, center_lon, z);
         let tile = render_web_tile(&source, &colormap_for_kind("ndvi"), z, x, y).unwrap();
@@ -555,7 +610,7 @@ mod tests {
             }
         }
         let source = source_43pfn(values, width, width);
-        let (lat, lon) = crate::utm::utm_to_wgs84(600_200.0, 1_299_820.0, source.zone);
+        let (lat, lon) = crate::utm::utm_to_wgs84(600_200.0, 1_299_820.0, zone_43n());
         let z = 15;
         let (x, y) = tile_containing(lat, lon, z);
         let tile = render_web_tile(&source, &colormap_for_kind("ndvi"), z, x, y).unwrap();
@@ -572,9 +627,62 @@ mod tests {
     }
 
     #[test]
+    fn geographic_grid_renders_without_utm_projection() {
+        // A CHIRPS-style 0.05 degree grid over ~(76.0..76.2, 11.0..11.2):
+        // 4x4 pixels, EPSG:4326, uniform SPI -2.0 with one nodata pixel.
+        let mut values = vec![-2.0f32; 16];
+        values[5] = -9999.0;
+        let source = TileSource::new(
+            4326,
+            [76.0, 0.05, 0.0, 11.2, 0.0, -0.05],
+            4,
+            4,
+            values,
+            Some(-9999.0),
+        )
+        .unwrap();
+        assert_eq!(source.projection, GridProjection::Geographic);
+
+        // Sampling is direct lon/lat indexing.
+        assert_eq!(source.sample_grid(76.01, 11.19), Some(-2.0));
+        assert_eq!(source.sample_grid(76.06, 11.12), None); // nodata pixel (1,1)
+        assert_eq!(source.sample_grid(75.99, 11.19), None); // west of grid
+
+        let z = 12;
+        let (x, y) = tile_containing(11.1, 76.1, z);
+        let tile = render_web_tile(&source, &colormap_for_kind("spi"), z, x, y).unwrap();
+        assert!(tile.opaque_pixels > 0, "geographic footprint must render");
+        // SPI -2.0 on the (-3, 3) diverging ramp = 1/6 of the way up the
+        // dry->neutral segment: exact deterministic color.
+        let expected = colormap_for_kind("spi").rgb(-2.0);
+        let first_opaque = tile
+            .rgba
+            .chunks_exact(4)
+            .find(|px| px[3] == 255)
+            .expect("an opaque pixel");
+        assert_eq!(&first_opaque[..3], &expected);
+
+        // Far away is fully transparent via the fast path.
+        let (fx, fy) = tile_containing(48.0, 2.0, 8);
+        let far = render_web_tile(&source, &colormap_for_kind("spi"), 8, fx, fy).unwrap();
+        assert_eq!(far.opaque_pixels, 0);
+    }
+
+    #[test]
+    fn spi_and_precipitation_colormaps_are_pinned() {
+        let spi = colormap_for_kind("spi");
+        assert_eq!(spi.domain, (-3.0, 3.0));
+        assert_eq!(spi.rgb(-3.0), [178, 24, 43]);
+        assert_eq!(spi.rgb(0.0), [247, 247, 247]);
+        assert_eq!(spi.rgb(3.0), [33, 102, 172]);
+        let precip = colormap_for_kind("precipitation");
+        assert_eq!(precip.domain, (0.0, 500.0));
+    }
+
+    #[test]
     fn encode_tile_png_produces_a_decodable_256px_png() {
         let source = source_43pfn(vec![0.5; 400], 20, 20);
-        let (lat, lon) = crate::utm::utm_to_wgs84(600_100.0, 1_299_920.0, source.zone);
+        let (lat, lon) = crate::utm::utm_to_wgs84(600_100.0, 1_299_920.0, zone_43n());
         let (x, y) = tile_containing(lat, lon, 14);
         let tile = render_web_tile(&source, &colormap_for_kind("ndvi"), 14, x, y).unwrap();
         let bytes = encode_tile_png(&tile).unwrap();

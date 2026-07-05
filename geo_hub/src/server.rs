@@ -381,6 +381,14 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::derive_drought_raster_route),
         )
         .route(
+            "/api/drought-management/chirps/register",
+            post(routes::register_chirps_route),
+        )
+        .route(
+            "/api/drought-management/spi/derive",
+            post(routes::derive_spi_raster_route),
+        )
+        .route(
             "/api/marketplace/accounts",
             get(routes::list_marketplace_accounts).post(routes::create_marketplace_account),
         )

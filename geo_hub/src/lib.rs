@@ -23,6 +23,7 @@ pub mod routes;
 pub mod satellite_derivation;
 pub mod server;
 pub mod shapefile;
+pub mod spi_rasters;
 pub mod stac_catalog;
 pub mod state;
 pub mod utm;

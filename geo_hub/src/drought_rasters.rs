@@ -150,17 +150,17 @@ pub struct DroughtRasterOutcome {
 }
 
 /// One loaded observation raster.
-struct LoadedRaster {
-    values: Vec<f32>,
-    valid_mask: Vec<bool>,
-    spatial_ref: RasterSpatialRef,
-    epsg: Option<u32>,
-    geo_transform: Option<[f64; 6]>,
-    width: u32,
-    height: u32,
+pub(crate) struct LoadedRaster {
+    pub(crate) values: Vec<f32>,
+    pub(crate) valid_mask: Vec<bool>,
+    pub(crate) spatial_ref: RasterSpatialRef,
+    pub(crate) epsg: Option<u32>,
+    pub(crate) geo_transform: Option<[f64; 6]>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
 }
 
-fn load_raster(path: &Path) -> Result<LoadedRaster, raster_io::RasterIoError> {
+pub(crate) fn load_raster(path: &Path) -> Result<LoadedRaster, raster_io::RasterIoError> {
     let mut reader = GeoTiffReader::open(path)?;
     let info = reader.info().clone();
     let spatial_ref = reader.spatial_ref()?;
@@ -181,7 +181,9 @@ fn load_raster(path: &Path) -> Result<LoadedRaster, raster_io::RasterIoError> {
     })
 }
 
-fn geotiff_artifact_path(product: &RegisteredProduct) -> Result<&str, DroughtRasterError> {
+pub(crate) fn geotiff_artifact_path(
+    product: &RegisteredProduct,
+) -> Result<&str, DroughtRasterError> {
     let path = product
         .path
         .as_deref()
@@ -200,14 +202,14 @@ fn geotiff_artifact_path(product: &RegisteredProduct) -> Result<&str, DroughtRas
 }
 
 /// ISO date from a product's temporal_start (`YYYY-MM-DD` prefix).
-fn observed_on(product: &RegisteredProduct) -> Option<NaiveDate> {
+pub(crate) fn observed_on(product: &RegisteredProduct) -> Option<NaiveDate> {
     let start = product.temporal_start.as_deref()?;
     NaiveDate::parse_from_str(start.get(..10)?, "%Y-%m-%d").ok()
 }
 
 /// Filesystem-safe artifact file component for a product id (mirrors the
 /// tile-cache convention: sanitized prefix + short digest, collision-free).
-fn artifact_file_component(product_id: &str) -> String {
+pub(crate) fn artifact_file_component(product_id: &str) -> String {
     let sanitized: String = product_id
         .chars()
         .map(|ch| {
@@ -222,7 +224,7 @@ fn artifact_file_component(product_id: &str) -> String {
     format!("{}-{}", sanitized.trim_matches('_'), &digest[..12])
 }
 
-fn file_checksum(path: &Path, what: &'static str) -> Result<String, DroughtRasterError> {
+pub(crate) fn file_checksum(path: &Path, what: &'static str) -> Result<String, DroughtRasterError> {
     let bytes = std::fs::read(path).map_err(|source| DroughtRasterError::Store { what, source })?;
     Ok(format!("{:x}", Sha256::digest(&bytes)))
 }

@@ -23,6 +23,7 @@ pub mod lidar_change;
 pub mod ndvi_analysis;
 pub mod product_anomalies;
 pub mod report_generator;
+pub mod spi;
 pub mod temporal_composite;
 pub mod thermal_analysis;
 pub mod thermal_spots;
