@@ -2,7 +2,7 @@
 
 ## CURRENT: satellite intelligence pipeline (2026-07)
 Active plan + per-batch ledger: `docs/design/satellite-intelligence-pipeline.md`
-(the ledger there is authoritative; batches 1-22 committed). Last: batch 22 (a730a44) HLS Fmask cloud masking; batch 21
+(the ledger there is authoritative; batches 1-23 committed). Last: batch 23 (9025ac1) LST/thermal path: post_processor/src/lst.rs pure engine + geo_hub/src/lst_rasters.rs POST /api/thermal/lst/derive (lst L2, Kelvin); lst->tci already mapped so rasters/derive scores TCI; drought_result_from_raster + derive_vhi_raster + POST /api/drought-management/vhi/derive blend VCI+TCI into VHI L3. Before: batch 22 (a730a44) HLS Fmask cloud masking; batch 21
 (25b5491) — Int16 raster support: raster_io RasterDtype::I16/RasterBand::I16
 (both backends) + write_geotiff_i16; HLS reads real Int16 DN via
 load_hls_reflectance (x1e-4 scale). Batch 20
@@ -23,11 +23,9 @@ Batch 8 (dde2610): climatology + VCI. Batch 7 (2bf6464): Web Mercator tiler.
 Phases 1-4 feature-complete incl. tier-3 validation loop + Int16 real-data
 read. Remaining are standing refinement follow-ons. USER DIRECTIVE: carry on
 through the whole backlog safely, one verified+committed batch at a time.
-NEXT: batch 22 = LST/thermal product path to unlock TCI/VHI on real data.
-Backlog after: JP2 decode for sen2cor bands; JRC prior for water extent;
-/browse derive affordances; HLS Fmask masking. Open: JP2 decode for sen2cor bands; LST
-path for TCI/VHI; WorldCover bootstrap validation; /browse derive
-affordances. Everything below is the earlier (completed) Track A/B refactor
+NEXT: batch 24 = JP2 decode for sen2cor L2A bands (needs a JP2 decoder dep).
+Backlog after: JRC Global Surface Water prior for water_extent Otsu flips;
+/browse derive affordances; WorldCover bootstrap validation. Everything below is the earlier (completed) Track A/B refactor
 history.
 
 Refactor: AGBot → layered field-intelligence pipeline.
@@ -292,13 +290,7 @@ Checkpoint DB is source of truth; the world-sim-run-1 row is a prior unrelated r
 ## REMAINING BACKLOG (batch 23+, user directive: carry on safely, one committed batch each)
 Session ran 22 batches (very long context); paused per CLAUDE.md context
 discipline. Resume continues from this compact checkpoint. In order:
-1. LST/thermal path (batch 23): extract DN->radiance->brightness-temp->
-   emissivity-corrected LST from imagery_processor/src/pipeline/thermal.rs
-   (currently CLI-embedded run_thermal/process_one) into a pure fn; add a
-   geo_hub `lst` L2 derivation/registration. drought_rasters ALREADY maps
-   lst->TCI (drought_kind_for, ~line 236), so this lights up TCI. Then add a
-   VHI blend of same-grid VCI+TCI drought products (post_processor
-   compute_vhi already exists) as a new drought_rasters path.
+1. DONE (batch 23, 9025ac1): LST/thermal path + TCI activation + VHI blend.
 2. JP2 decode for sen2cor L2A bands (needs a JP2 decoder dep; unlocks
    sen2cor bands feeding local index derivation).
 3. JRC Global Surface Water prior gating for water_extent Otsu flips.
