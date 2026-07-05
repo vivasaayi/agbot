@@ -2,14 +2,15 @@
 
 ## CURRENT: satellite intelligence pipeline (2026-07)
 Active plan + per-batch ledger: `docs/design/satellite-intelligence-pipeline.md`
-(the ledger there is authoritative; batches 1-8 committed). Last: batch 8
-(dde2610) — catalog-driven drought rasters (`geo_hub/src/drought_rasters.rs`,
-POST /api/drought-management/rasters/derive -> index_climatology + drought_index
-L3s, web-tiled via the batch-7 tiler). Batch 7 (2bf6464): global Web Mercator
-tiler (`product_tiler.rs`, `/api/catalog/products/:id/tiles/...`, STAC
-`tiles_web`, /browse raster source). NEXT: batch 9 = CHIRPS ingestion + SPI
-(see ledger "Next" line). Everything below is the earlier (completed)
-Track A/B refactor history.
+(the ledger there is authoritative; batches 1-9 committed). Last: batch 9
+(b131e4e) — CHIRPS ingestion + SPI (`post_processor/src/spi.rs` pure engine,
+`geo_hub/src/spi_rasters.rs` chirps/register + spi/derive routes, tiler
+EPSG:4326 support). Batch 8 (dde2610): catalog-driven drought rasters
+(climatology + VCI). Batch 7 (2bf6464): global Web Mercator tiler + STAC
+`tiles_web` + /browse raster source. NEXT: batch 10 = phenology metrics +
+rule-based crop/tree/water classification (or SPI-3/6/12 windows; see ledger
+"Next" line). Everything below is the earlier (completed) Track A/B refactor
+history.
 
 Refactor: AGBot → layered field-intelligence pipeline.
 Plan: /Users/rajanpanneerselvam/Docs/AGBOT/refactor.md (reviewed + expanded 2026-07-03).
