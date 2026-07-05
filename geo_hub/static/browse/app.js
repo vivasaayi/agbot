@@ -268,7 +268,157 @@ function renderItem(item) {
   }
 
   li.appendChild(renderMetadata(item));
+  const derive = renderDeriveActions(item);
+  if (derive) li.appendChild(derive);
   return li;
+}
+
+// --- Derive affordances (batch 26) ------------------------------------------------
+// Per-item actions keyed by the product kind, posting to the existing derive
+// routes. The STAC item id IS the catalog product id for catalog products.
+
+const WATER_INDEX_KINDS = ["mndwi", "ndwi", "aweinsh", "aweish", "sar_vv", "sar_vh", "sar_backscatter"];
+
+/** Derive actions available for a product kind. Each action: a label, the
+ *  endpoint, extra form fields ([name, label, placeholder]), and a body
+ *  builder over (productId, values). Empty optional values are omitted so
+ *  server defaults apply. */
+function deriveActionsFor(kind) {
+  const actions = [];
+  if (kind === "ndvi" || kind === "lst" || kind === "thermal_lst") {
+    actions.push({
+      label: kind === "ndvi" ? "derive drought VCI" : "derive drought TCI",
+      endpoint: "/api/drought-management/rasters/derive",
+      extraFields: [["min_years", "min years", "5"]],
+      body: (productId, v) => ({
+        current_product_id: productId,
+        field_id: v.field_id,
+        season_id: v.season_id,
+        ...(v.min_years ? { min_years: Number(v.min_years) } : {}),
+      }),
+    });
+  }
+  if (kind === "precipitation") {
+    actions.push({
+      label: "derive SPI",
+      endpoint: "/api/drought-management/spi/derive",
+      extraFields: [
+        ["min_years", "min years", "5"],
+        ["window_months", "window (months)", "1"],
+      ],
+      body: (productId, v) => ({
+        current_product_id: productId,
+        field_id: v.field_id,
+        season_id: v.season_id,
+        ...(v.min_years ? { min_years: Number(v.min_years) } : {}),
+        ...(v.window_months ? { window_months: Number(v.window_months) } : {}),
+      }),
+    });
+  }
+  if (WATER_INDEX_KINDS.includes(kind)) {
+    actions.push({
+      label: "derive water extent",
+      endpoint: "/api/water-management/extent/derive",
+      extraFields: [["prior_product_id", "JRC prior product id (optional)", ""]],
+      body: (productId, v) => ({
+        product_id: productId,
+        field_id: v.field_id,
+        season_id: v.season_id,
+        ...(v.prior_product_id ? { prior_product_id: v.prior_product_id } : {}),
+      }),
+    });
+  }
+  return actions;
+}
+
+/** Remembered across forms so a scoping pair only has to be typed once. */
+const lastScope = { field_id: "", season_id: "" };
+
+function renderDeriveActions(item) {
+  const kind = (item.properties || {})["agbot:product_kind"];
+  const actions = deriveActionsFor(kind);
+  if (actions.length === 0) return null;
+
+  const details = document.createElement("details");
+  details.className = "derive";
+  const summary = document.createElement("summary");
+  summary.textContent = "derive…";
+  details.appendChild(summary);
+
+  for (const action of actions) {
+    details.appendChild(renderDeriveForm(item.id, action));
+  }
+  return details;
+}
+
+function renderDeriveForm(productId, action) {
+  const form = document.createElement("form");
+  form.className = "derive-form";
+
+  const heading = document.createElement("strong");
+  heading.textContent = action.label;
+  form.appendChild(heading);
+
+  const fields = [
+    ["field_id", "field id", lastScope.field_id],
+    ["season_id", "season id", lastScope.season_id],
+    ...action.extraFields.map(([name, label, placeholder]) => [name, label, "", placeholder]),
+  ];
+  const inputs = {};
+  for (const [name, label, value, placeholder] of fields) {
+    const row = document.createElement("label");
+    row.className = "derive-field";
+    row.textContent = label;
+    const input = document.createElement("input");
+    input.type = "text";
+    input.name = name;
+    input.value = value || "";
+    if (placeholder) input.placeholder = placeholder;
+    row.appendChild(input);
+    form.appendChild(row);
+    inputs[name] = input;
+  }
+
+  const run = document.createElement("button");
+  run.type = "submit";
+  run.textContent = "run";
+  form.appendChild(run);
+
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const values = Object.fromEntries(
+      Object.entries(inputs).map(([name, input]) => [name, input.value.trim()])
+    );
+    if (!values.field_id || !values.season_id) {
+      setStatus("derive needs a field id and a season id", true);
+      return;
+    }
+    lastScope.field_id = values.field_id;
+    lastScope.season_id = values.season_id;
+    run.disabled = true;
+    setStatus(`${action.label}: running…`);
+    try {
+      const outcome = await fetchJson(action.endpoint, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(action.body(productId, values)),
+      });
+      const newId =
+        outcome.drought_product_id ||
+        outcome.spi_product_id ||
+        outcome.water_extent_product_id ||
+        outcome.vhi_product_id ||
+        "(see response)";
+      setStatus(`${action.label}: registered ${newId}`);
+      // New L3s land in their own collections; refresh whatever is open.
+      reloadOpenCollections();
+    } catch (err) {
+      setStatus(`${action.label} failed: ${err.message}`, true);
+    } finally {
+      run.disabled = false;
+    }
+  });
+  return form;
 }
 
 /** Item metadata popover: datetime, processing level, lineage links, etc. */

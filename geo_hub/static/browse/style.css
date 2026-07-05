@@ -214,3 +214,45 @@ button:hover {
   flex: 1;
   height: 100%;
 }
+
+/* Derive affordances (batch 26) */
+details.derive {
+  margin-top: 4px;
+  font-size: 12px;
+}
+
+details.derive > summary {
+  cursor: pointer;
+  color: #175cd3;
+}
+
+.derive-form {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 6px 0;
+  padding: 6px;
+  border: 1px solid #e4e7ec;
+  border-radius: 6px;
+}
+
+.derive-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  color: #667085;
+}
+
+.derive-field input {
+  flex: 1;
+  max-width: 60%;
+  font-size: 12px;
+  padding: 2px 4px;
+}
+
+.derive-form button {
+  align-self: flex-end;
+  padding: 2px 12px;
+  cursor: pointer;
+}

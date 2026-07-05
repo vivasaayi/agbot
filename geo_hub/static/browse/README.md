@@ -42,6 +42,18 @@ same-origin from geo_hub, so no CORS configuration is required.
   (north-up raster assumed).
 - `GET /api/fields/export/geojson` — active field boundaries as a GeoJSON
   FeatureCollection, drawn as an orange line overlay with click popups.
+- Derive affordances (batch 26): items whose `agbot:product_kind` supports a
+  single-product derivation grow a `derive…` form (field id + season id, plus
+  action-specific options), posting to the existing routes:
+  - `ndvi` / `lst` / `thermal_lst` -> `POST /api/drought-management/rasters/derive`
+    (VCI / TCI; optional `min_years`).
+  - `precipitation` -> `POST /api/drought-management/spi/derive`
+    (optional `min_years`, `window_months`).
+  - `mndwi`/`ndwi`/`aweinsh`/`aweish`/`sar_vv`/`sar_vh`/`sar_backscatter` ->
+    `POST /api/water-management/extent/derive` (optional JRC
+    `prior_product_id` gating Otsu flips).
+  Multi-input derivations (dNBR pre/post, VHI VCI+TCI blend) stay API-only —
+  they need two product ids and don't fit a per-item affordance.
 
 ## Files
 

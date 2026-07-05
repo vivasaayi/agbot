@@ -81,11 +81,16 @@ async fn browse_assets_have_correct_content_types() -> Result<()> {
         content_type.starts_with("text/javascript"),
         "{content_type}"
     );
-    // The module consumes the same-origin geo_hub APIs (no CORS required).
+    // The module consumes the same-origin geo_hub APIs (no CORS required),
+    // including the derive affordances (batch 26): VCI/TCI, SPI, and water
+    // extent are triggered per item from the browser.
     for endpoint in [
         "/api/stac/collections",
         "/api/stac/search",
         "/api/fields/export/geojson",
+        "/api/drought-management/rasters/derive",
+        "/api/drought-management/spi/derive",
+        "/api/water-management/extent/derive",
     ] {
         assert!(
             body.contains(endpoint),
@@ -93,9 +98,24 @@ async fn browse_assets_have_correct_content_types() -> Result<()> {
         );
     }
 
+    // The derive kinds are wired: drought from ndvi/lst, SPI from
+    // precipitation, water extent from the optical + SAR water kinds
+    // (with the optional JRC prior).
+    let (_, _, app_js) = get(&app, "/browse/app.js").await?;
+    for marker in [
+        "deriveActionsFor",
+        "prior_product_id",
+        "window_months",
+        "sar_vv",
+        "thermal_lst",
+    ] {
+        assert!(app_js.contains(marker), "app.js missing {marker}");
+    }
+
     let (status, content_type, body) = get(&app, "/browse/style.css").await?;
     assert_eq!(status, StatusCode::OK);
     assert!(content_type.starts_with("text/css"), "{content_type}");
     assert!(body.contains("#map"));
+    assert!(body.contains(".derive-form"), "derive styles missing");
     Ok(())
 }
