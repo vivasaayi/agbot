@@ -2,7 +2,11 @@
 
 ## CURRENT: satellite intelligence pipeline (2026-07)
 Active plan + per-batch ledger: `docs/design/satellite-intelligence-pipeline.md`
-(the ledger there is authoritative; batches 1-15 committed). Last: batch 15
+(the ledger there is authoritative; batches 1-16 committed). Last: batch 16
+(cc1ed4b) — WorldCover reference registration + tier-2 agreement validation
+(post_processor/src/landcover_agreement.rs, POST /api/landcover/reference/
+register + /api/landcover/validate, Cohen's kappa, landcover_agreement L3).
+Batch 15
 (ae96756) — Otsu water-body extraction (post_processor/src/water_extent.rs +
 geo_hub/src/water_extent_rasters.rs, POST /api/water-management/extent/derive,
 binary-mask colormap; closes Phase 3 item 9's water half). Batch 14
@@ -12,9 +16,9 @@ diverging colormap). Batch 13 (224585d): Sen2Cor orchestration. Batch 12
 (51e842b): CHIRPS dekads + fetcher. Batch 11 (a292632): SPI-N windows.
 Batch 10 (ab688b0): phenology + land-cover. Batch 9 (b131e4e): CHIRPS + SPI.
 Batch 8 (dde2610): climatology + VCI. Batch 7 (2bf6464): Web Mercator tiler.
-Phases 1-3 (incl. water extent) + Sen2Cor + dNBR COMPLETE. NEXT: batch 16 =
-remaining Phase 4 (crop-type ML feature export + inference seam — needs
-WorldCover/WorldCereal bootstrap first; Sentinel-1 SAR water; HLS). Open: JP2 decode for sen2cor bands; LST
+Phases 1-3 + Sen2Cor + dNBR + tier-2 validation COMPLETE. NEXT: batch 17 =
+crop-type feature export + inference seam (WorldCover labels now available),
+or Sentinel-1 SAR water / HLS ingestion. Open: JP2 decode for sen2cor bands; LST
 path for TCI/VHI; WorldCover bootstrap validation; /browse derive
 affordances. Everything below is the earlier (completed) Track A/B refactor
 history.
