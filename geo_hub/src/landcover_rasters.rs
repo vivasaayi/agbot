@@ -14,14 +14,19 @@
 
 use std::path::{Path, PathBuf};
 
+use post_processor::landcover_agreement::{
+    compare_landcover, AgreementError, AgreementResult, ReferenceClassMap,
+};
 use post_processor::phenology::{
-    classify_land_cover, compute_phenology, landcover_l3_draft, phenology_l3_draft,
+    classify_land_cover, compute_phenology, landcover_l3_draft, phenology_l3_draft, LandCoverClass,
     LandCoverRuleConfig, PhenologyError, PhenologyL3Scope, PhenologyObservation, PhenologyRequest,
     DEFAULT_MIN_OBSERVATIONS, DEFAULT_SEASON_THRESHOLD_FRACTION,
 };
 use raster_io::{write_geotiff_f32, GeoTiffTags};
 use serde::{Deserialize, Serialize};
-use shared::product_graph::{ProductArtifact, ProductInputRef, ProductLevel};
+use shared::product_graph::{
+    ProductArtifact, ProductInputRef, ProductLevel, ProductRecordDraft, ProductScope,
+};
 use thiserror::Error;
 
 use crate::catalog::{self, CatalogError, ProductFilter, RegisteredProduct};
@@ -33,6 +38,11 @@ use crate::drought_rasters::{
 
 /// Nodata for land-cover GeoTIFFs (invalid pixels).
 pub const LANDCOVER_NODATA: f32 = crate::satellite_derivation::INDEX_NODATA;
+/// Catalog kind + source for registered reference maps.
+pub const REFERENCE_KIND: &str = "landcover_reference";
+pub const WORLDCOVER_SOURCE_ID: &str = "esa-worldcover";
+/// WorldCover raster fill value.
+pub const WORLDCOVER_NODATA: u8 = 0;
 
 #[derive(Debug, Error)]
 pub enum LandCoverError {
@@ -48,6 +58,16 @@ pub enum LandCoverError {
     NoUsableSeries { skipped: usize },
     #[error("phenology computation failed: {0}")]
     Phenology(#[from] PhenologyError),
+    #[error("product {product_id} kind {kind:?} is not {expected:?}")]
+    WrongKind {
+        product_id: String,
+        kind: String,
+        expected: &'static str,
+    },
+    #[error("classification and reference are not on the same grid (no resampling)")]
+    ReferenceGridMismatch,
+    #[error("agreement computation failed: {0}")]
+    Agreement(#[from] AgreementError),
     #[error(transparent)]
     Shared(#[from] DroughtRasterError),
     #[error("raster I/O failed: {0}")]
@@ -68,7 +88,10 @@ impl LandCoverError {
             LandCoverError::BadWindow { .. }
             | LandCoverError::NoSeries { .. }
             | LandCoverError::NoUsableSeries { .. }
-            | LandCoverError::Phenology(_) => true,
+            | LandCoverError::Phenology(_)
+            | LandCoverError::WrongKind { .. }
+            | LandCoverError::ReferenceGridMismatch
+            | LandCoverError::Agreement(_) => true,
             LandCoverError::Shared(shared) => shared.is_client_error(),
             _ => false,
         }
@@ -437,4 +460,300 @@ pub async fn list_landcover_products(
     let phenology = catalog::list_products(pool, &filter("phenology")).await?;
     let landcover = catalog::list_products(pool, &filter("landcover_rule")).await?;
     Ok((phenology, landcover))
+}
+
+// ---------------------------------------------------------------------------
+// Reference maps (ESA WorldCover) + tier-2 agreement validation
+// ---------------------------------------------------------------------------
+
+/// (year, version, tile) parsed from an ESA WorldCover tile filename,
+/// e.g. `ESA_WorldCover_10m_2021_v200_N09E075_Map.tif`.
+pub fn parse_worldcover_filename(name: &str) -> Option<(i32, String, String)> {
+    let stem = name
+        .strip_suffix(".tif")
+        .or_else(|| name.strip_suffix(".tiff"))?;
+    let segments: Vec<&str> = stem.split('_').collect();
+    // ESA WorldCover 10m <year> <version> <tile> Map
+    if segments.len() != 7
+        || segments[0] != "ESA"
+        || segments[1] != "WorldCover"
+        || segments[6] != "Map"
+    {
+        return None;
+    }
+    let year: i32 = segments[3].parse().ok()?;
+    if !(2000..=2100).contains(&year) {
+        return None;
+    }
+    Some((year, segments[4].to_string(), segments[5].to_string()))
+}
+
+/// Build the L2 draft for one WorldCover tile.
+pub fn worldcover_draft(path: &Path, year: i32, version: &str, tile: &str) -> ProductRecordDraft {
+    ProductRecordDraft {
+        level: ProductLevel::L2,
+        kind: REFERENCE_KIND.to_string(),
+        algorithm_id: "worldcover.ingest".to_string(),
+        algorithm_version: version.to_string(),
+        parameters: serde_json::json!({
+            "dataset": "ESA WorldCover 10m",
+            "provider": "ESA",
+            "year": year,
+            "version": version,
+            "tile": tile,
+            "legend": "worldcover_v200_codes",
+        }),
+        inputs: Vec::new(),
+        scope: ProductScope {
+            farm_id: None,
+            field_id: None,
+            season_id: None,
+            scene_id: Some(format!("worldcover-{tile}-{year}")),
+            temporal_start: format!("{year}-01-01T00:00:00Z"),
+            temporal_end: format!("{year}-12-31T23:59:59Z"),
+        },
+        spatial_ref: None,
+        gsd_m_per_px: Some(10.0),
+        artifact: Some(ProductArtifact {
+            format: "tif".to_string(),
+            path: path.to_string_lossy().to_string(),
+            checksum_sha256: None,
+        }),
+        quality_mask: None,
+        confidence: None,
+        confidence_method: None,
+        quality_summary: None,
+        evidence_digests: Vec::new(),
+        source_id: Some(WORLDCOVER_SOURCE_ID.to_string()),
+    }
+}
+
+/// Outcome of a reference directory registration.
+#[derive(Debug, Clone, Serialize)]
+pub struct ReferenceRegisterOutcome {
+    pub registered: Vec<(String, String)>,
+    pub skipped: Vec<String>,
+}
+
+/// Register every WorldCover tile GeoTIFF in a local directory (files are
+/// fetched out-of-band; idempotent; non-matching names skipped).
+pub async fn register_worldcover_dir(
+    pool: &DbPool,
+    dir: &Path,
+) -> Result<ReferenceRegisterOutcome, LandCoverError> {
+    let mut names: Vec<(String, std::path::PathBuf)> = std::fs::read_dir(dir)
+        .map_err(|source| LandCoverError::Store {
+            what: "worldcover directory listing",
+            source,
+        })?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            Some((
+                entry.file_name().to_string_lossy().to_string(),
+                entry.path(),
+            ))
+        })
+        .collect();
+    names.sort();
+    let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let mut outcome = ReferenceRegisterOutcome {
+        registered: Vec::new(),
+        skipped: Vec::new(),
+    };
+    for (name, path) in names {
+        match parse_worldcover_filename(&name) {
+            Some((year, version, tile)) => {
+                let draft = worldcover_draft(&path, year, &version, &tile);
+                let product_id = catalog::register_product_with_actor(
+                    pool,
+                    &draft,
+                    &provenance::ActorIdentity::system("geo_hub:worldcover_ingest"),
+                    &created_at,
+                )
+                .await?;
+                outcome.registered.push((name, product_id));
+            }
+            None => outcome.skipped.push(name),
+        }
+    }
+    Ok(outcome)
+}
+
+/// A tier-2 validation request.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LandCoverValidateRequest {
+    /// Catalog id of the tier-1 `landcover_rule` L3 product.
+    pub landcover_product_id: String,
+    /// Catalog id of the `landcover_reference` product on the same grid.
+    pub reference_product_id: String,
+}
+
+/// Outcome of one validation.
+#[derive(Debug, Clone, Serialize)]
+pub struct LandCoverValidateOutcome {
+    pub agreement_product_id: String,
+    pub landcover_product_id: String,
+    pub reference_product_id: String,
+    pub compared_pixels: u32,
+    pub overall_agreement: f64,
+    pub kappa: f64,
+    pub agreement_artifact: PathBuf,
+    pub result: AgreementResult,
+}
+
+fn expect_kind(product: &RegisteredProduct, expected: &'static str) -> Result<(), LandCoverError> {
+    if product.kind != expected {
+        return Err(LandCoverError::WrongKind {
+            product_id: product.product_id.clone(),
+            kind: product.kind.clone(),
+            expected,
+        });
+    }
+    Ok(())
+}
+
+/// Decode a landcover_rule GeoTIFF band back into classes (codes 1..=6;
+/// anything else, incl. nodata, is Invalid).
+fn classes_from_codes(values: &[f32]) -> Vec<LandCoverClass> {
+    values
+        .iter()
+        .map(|value| match value.round() as i64 {
+            1 => LandCoverClass::Water,
+            2 => LandCoverClass::BareOrSparse,
+            3 => LandCoverClass::AnnualCrop,
+            4 => LandCoverClass::TreeOrPerennial,
+            5 => LandCoverClass::Grassland,
+            6 => LandCoverClass::Unknown,
+            _ => LandCoverClass::Invalid,
+        })
+        .collect()
+}
+
+/// Validate a tier-1 classification against a same-grid reference map and
+/// register the agreement report as a `landcover_agreement` L3 (JSON
+/// artifact, lineage to both inputs). Idempotent.
+pub async fn validate_landcover(
+    pool: &DbPool,
+    data_root: &Path,
+    request: &LandCoverValidateRequest,
+) -> Result<LandCoverValidateOutcome, LandCoverError> {
+    let landcover = catalog::get_product(pool, &request.landcover_product_id)
+        .await?
+        .ok_or_else(|| {
+            LandCoverError::Shared(DroughtRasterError::CurrentNotFound(
+                request.landcover_product_id.clone(),
+            ))
+        })?;
+    expect_kind(&landcover, "landcover_rule")?;
+    let reference = catalog::get_product(pool, &request.reference_product_id)
+        .await?
+        .ok_or_else(|| {
+            LandCoverError::Shared(DroughtRasterError::CurrentNotFound(
+                request.reference_product_id.clone(),
+            ))
+        })?;
+    expect_kind(&reference, REFERENCE_KIND)?;
+
+    let landcover_raster = load_raster(Path::new(geotiff_artifact_path(&landcover)?))?;
+    let reference_raster = load_raster(Path::new(geotiff_artifact_path(&reference)?))?;
+    if !grid_matches(&reference_raster, &landcover_raster) {
+        return Err(LandCoverError::ReferenceGridMismatch);
+    }
+
+    let ours = classes_from_codes(&landcover_raster.values);
+    let reference_codes: Vec<u8> = reference_raster
+        .values
+        .iter()
+        .zip(&reference_raster.valid_mask)
+        .map(|(value, valid)| {
+            if *valid && value.is_finite() && (0.0..=255.0).contains(value) {
+                value.round() as u8
+            } else {
+                WORLDCOVER_NODATA
+            }
+        })
+        .collect();
+    let class_map = ReferenceClassMap::default();
+    let result = compare_landcover(&ours, &reference_codes, WORLDCOVER_NODATA, &class_map)?;
+
+    // --- Agreement L3 (JSON artifact) with lineage to both inputs.
+    let draft = ProductRecordDraft {
+        level: ProductLevel::L3,
+        kind: "landcover_agreement".to_string(),
+        algorithm_id: "landcover.tier2_agreement".to_string(),
+        algorithm_version: "1.0.0".to_string(),
+        parameters: serde_json::json!({
+            "landcover_product_id": landcover.product_id,
+            "reference_product_id": reference.product_id,
+            "compared_pixels": result.compared_pixels,
+            "overall_agreement": result.overall_agreement,
+            "kappa": result.kappa,
+            "excluded": result.excluded,
+        }),
+        inputs: vec![
+            ProductInputRef {
+                product_id: landcover.product_id.clone(),
+                role: "classification".to_string(),
+            },
+            ProductInputRef {
+                product_id: reference.product_id.clone(),
+                role: "reference".to_string(),
+            },
+        ],
+        scope: ProductScope {
+            farm_id: None,
+            field_id: landcover.field_id.clone(),
+            season_id: landcover.season_id.clone(),
+            scene_id: None,
+            temporal_start: landcover.temporal_start.clone().unwrap_or_default(),
+            temporal_end: landcover.temporal_end.clone().unwrap_or_default(),
+        },
+        spatial_ref: Some(landcover_raster.spatial_ref.clone()),
+        gsd_m_per_px: landcover.gsd_m_per_px,
+        artifact: None,
+        quality_mask: None,
+        confidence: Some(result.overall_agreement),
+        confidence_method: Some("reference_overall_agreement".to_string()),
+        quality_summary: None,
+        evidence_digests: vec![result.input_hash.clone()],
+        source_id: reference.source_id.clone(),
+    };
+    let agreement_dir = data_root.join("derived").join("landcover");
+    std::fs::create_dir_all(&agreement_dir).map_err(|source| LandCoverError::Store {
+        what: "landcover directory",
+        source,
+    })?;
+    let agreement_path = agreement_dir.join(format!(
+        "{}.agreement.json",
+        artifact_file_component(&draft.product_id())
+    ));
+    std::fs::write(
+        &agreement_path,
+        serde_json::to_vec(&result).expect("agreement serializes"),
+    )
+    .map_err(|source| LandCoverError::Store {
+        what: "agreement artifact",
+        source,
+    })?;
+    let mut draft = draft;
+    draft.artifact = Some(ProductArtifact {
+        format: "json".to_string(),
+        path: agreement_path.to_string_lossy().to_string(),
+        checksum_sha256: Some(file_checksum(&agreement_path, "agreement readback")?),
+    });
+    let actor = provenance::ActorIdentity::system("geo_hub:landcover_validation");
+    let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let agreement_product_id =
+        catalog::register_product_with_actor(pool, &draft, &actor, &created_at).await?;
+
+    Ok(LandCoverValidateOutcome {
+        agreement_product_id,
+        landcover_product_id: landcover.product_id,
+        reference_product_id: reference.product_id,
+        compared_pixels: result.compared_pixels,
+        overall_agreement: result.overall_agreement,
+        kappa: result.kappa,
+        agreement_artifact: agreement_path,
+        result,
+    })
 }

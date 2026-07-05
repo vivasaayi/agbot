@@ -411,6 +411,14 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/landcover/rasters", get(routes::list_landcover_route))
         .route(
+            "/api/landcover/reference/register",
+            post(routes::register_landcover_reference_route),
+        )
+        .route(
+            "/api/landcover/validate",
+            post(routes::validate_landcover_route),
+        )
+        .route(
             "/api/marketplace/accounts",
             get(routes::list_marketplace_accounts).post(routes::create_marketplace_account),
         )

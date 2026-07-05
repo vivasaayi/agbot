@@ -323,3 +323,165 @@ async fn landcover_error_paths_are_reason_coded() -> Result<()> {
     assert!(String::from_utf8_lossy(&bytes).contains("no cataloged"));
     Ok(())
 }
+
+/// Batch 16: register a WorldCover reference tile on the same grid and
+/// validate the tier-1 classification against it. Hand computation: our
+/// classes are [crop, tree, bare, water] (codes 3,4,2,1); the reference is
+/// [40 crop, 10 tree, 30 grass, 80 water] -> 3 of 4 agree (po = 0.75).
+/// Marginals: ours put 0.25 on each of crop/tree/bare/water; the reference
+/// puts 0.25 on each of crop/tree/grass/water, so
+/// pe = 3 * (0.25 * 0.25) = 0.1875 (bare and grass contribute zero), giving
+/// kappa = (0.75 - 0.1875) / (1 - 0.1875) = 9/13.
+#[tokio::test]
+async fn worldcover_reference_validates_the_tier1_classification() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = ctx(&tmp).await?;
+
+    // Recreate the batch-10 archetype scene.
+    for (stamp, pixels) in SERIES {
+        register_l2(&ctx, &tmp, "ndvi", stamp, pixels.to_vec(), TRANSFORM).await?;
+    }
+    for stamp in ["2026-05-01", "2026-09-01"] {
+        register_l2(
+            &ctx,
+            &tmp,
+            "mndwi",
+            stamp,
+            vec![-0.3, -0.3, -0.2, 0.4],
+            TRANSFORM,
+        )
+        .await?;
+    }
+    let (status, bytes) = send(
+        &ctx.app,
+        "POST",
+        "/api/landcover/derive",
+        Some(derive_body()),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    let derived: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let landcover_id = derived["landcover_product_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // WorldCover tile on the same grid: crop 40, tree 10, grass 30
+    // (disagrees with our bare pixel), water 80.
+    let reference_dir = tmp.path().join("worldcover");
+    std::fs::create_dir_all(&reference_dir)?;
+    write_geotiff_f32(
+        &reference_dir.join("ESA_WorldCover_10m_2021_v200_N09E075_Map.tif"),
+        2,
+        2,
+        &[40.0, 10.0, 30.0, 80.0],
+        &GeoTiffTags {
+            epsg: Some(EPSG),
+            geo_transform: Some(TRANSFORM),
+            nodata: Some(0.0),
+        },
+    )?;
+    std::fs::write(reference_dir.join("readme.txt"), b"not a tile")?;
+
+    let (status, bytes) = send(
+        &ctx.app,
+        "POST",
+        "/api/landcover/reference/register",
+        Some(json!({ "dir": reference_dir.to_string_lossy() })),
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let registered: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(registered["registered"].as_array().unwrap().len(), 1);
+    assert_eq!(registered["skipped"], json!(["readme.txt"]));
+    let reference_id = registered["registered"][0][1].as_str().unwrap().to_string();
+    let reference = catalog::get_product(&ctx.pool, &reference_id)
+        .await?
+        .unwrap();
+    assert_eq!(reference.kind, "landcover_reference");
+    assert_eq!(
+        reference.temporal_start.as_deref(),
+        Some("2021-01-01T00:00:00Z")
+    );
+
+    // --- Validate.
+    let (status, bytes) = send(
+        &ctx.app,
+        "POST",
+        "/api/landcover/validate",
+        Some(json!({
+            "landcover_product_id": landcover_id,
+            "reference_product_id": reference_id,
+        })),
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let outcome: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(outcome["compared_pixels"], 4);
+    assert!((outcome["overall_agreement"].as_f64().unwrap() - 0.75).abs() < 1e-12);
+    assert!((outcome["kappa"].as_f64().unwrap() - 9.0 / 13.0).abs() < 1e-12);
+
+    // The bare pixel is the disagreement: reference says grassland there.
+    let per_class = outcome["result"]["per_class"].as_array().unwrap();
+    let bare = per_class
+        .iter()
+        .find(|line| line["class"] == "bare_or_sparse")
+        .unwrap();
+    assert_eq!(bare["users_accuracy"], 0.0);
+
+    // Agreement product registered with lineage to both inputs and the
+    // agreement JSON artifact on disk.
+    let agreement_id = outcome["agreement_product_id"].as_str().unwrap();
+    let edges = catalog::trace_inputs(&ctx.pool, agreement_id).await?;
+    let mut inputs: Vec<&str> = edges
+        .iter()
+        .map(|edge| edge.input_product_id.as_str())
+        .collect();
+    inputs.sort_unstable();
+    let mut expected = [landcover_id.as_str(), reference_id.as_str()];
+    expected.sort_unstable();
+    assert_eq!(inputs, expected);
+    let artifact: serde_json::Value = serde_json::from_slice(&std::fs::read(
+        outcome["agreement_artifact"].as_str().unwrap(),
+    )?)?;
+    assert_eq!(artifact["compared_pixels"], 4);
+
+    // Idempotent + wrong-kind reason coding.
+    let (status, bytes) = send(
+        &ctx.app,
+        "POST",
+        "/api/landcover/validate",
+        Some(json!({
+            "landcover_product_id": landcover_id,
+            "reference_product_id": reference_id,
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    let again: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(again["agreement_product_id"], json!(agreement_id));
+
+    let (status, bytes) = send(
+        &ctx.app,
+        "POST",
+        "/api/landcover/validate",
+        Some(json!({
+            "landcover_product_id": reference_id, // wrong kind
+            "reference_product_id": reference_id,
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&bytes).contains("landcover_rule"));
+    Ok(())
+}

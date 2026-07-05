@@ -19,6 +19,7 @@ pub mod index_climatology;
 pub mod index_trend;
 pub mod index_vegetation_classification;
 pub mod l3_product;
+pub mod landcover_agreement;
 pub mod lidar_analysis;
 pub mod lidar_change;
 pub mod ndvi_analysis;
