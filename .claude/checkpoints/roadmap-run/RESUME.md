@@ -1,6 +1,15 @@
 # Resume — field-intel-run-1
 
-## CURRENT: satellite intelligence pipeline (2026-07)
+## CURRENT: satellite pipeline ENHANCEMENTS (2026-07, branch enhance-satellite-image-pipeline)
+field-intelligence-pipeline was merged to main via PR #5 (26b084a); work
+continues on enhance-satellite-image-pipeline. Batch 28 (7b6e26e): SCL cloud
+masking for sen2cor local NDVI (scl_clear code table, 20m->10m
+resample_nearest, scl_applied identity-bearing, scl_mask lineage).
+NEXT: batch 29 = multi-index sen2cor derivation (MNDWI B03_10m+B11_20m with
+2x block replication; NDMI B8A_20m+B11_20m on the 20 m grid) -> local
+water-extent/moisture inputs from sen2cor scenes.
+
+## MERGED HISTORY: satellite intelligence pipeline (2026-07)
 Active plan + per-batch ledger: `docs/design/satellite-intelligence-pipeline.md`
 (the ledger there is authoritative; batches 1-27 committed — SATELLITE BACKLOG COMPLETE). Last: batch 27 (322e8e1) WorldCover bootstrap masks: homogeneous_reference_mask + compare_landcover_within + build_training_samples_masked; validate.bootstrap_mask, ml.{bootstrap,max_samples_per_class}. Before: batch 26 (525ac84) /browse derive affordances (per-item forms -> drought/SPI/water-extent derive routes; multi-input derives stay API-only). Before: batch 25 (26f5f25) JRC prior gating: post_processor extract_water_extent_with_prior (occurrence >=75/<=5 informative pixels, <50% agreement -> RejectedOtsuFlip -> fixed fallback; prior in L3 lineage + params) + geo_hub POST /api/water-management/jrc/register (water_occurrence, jrc-gsw) + derive prior_product_id. Before: batch 24 (745cf66) JP2 decode + local Sen2Cor NDVI: raster_io read_jp2_gray (jpeg2k/openjp2 pure-Rust) + test_util write_jp2_gray reference-encoder fixtures; geo_hub sen2cor_derive POST /api/ingest/sen2cor/ndvi/derive (MTD_TL.xml geocoding, SensorProfile calibration, ndvi L2 with red/nir lineage). Before: batch 23 (9025ac1) LST/thermal path: post_processor/src/lst.rs pure engine + geo_hub/src/lst_rasters.rs POST /api/thermal/lst/derive (lst L2, Kelvin); lst->tci already mapped so rasters/derive scores TCI; drought_result_from_raster + derive_vhi_raster + POST /api/drought-management/vhi/derive blend VCI+TCI into VHI L3. Before: batch 22 (a730a44) HLS Fmask cloud masking; batch 21
 (25b5491) — Int16 raster support: raster_io RasterDtype::I16/RasterBand::I16
