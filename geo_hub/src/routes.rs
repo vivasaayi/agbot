@@ -326,6 +326,7 @@ mod scenes_layers;
 mod soil_iot_routes;
 mod stac;
 mod sustainability;
+mod water_extent_routes;
 mod weather;
 mod workspace;
 pub use alert_rules::*;
@@ -358,6 +359,7 @@ pub use scenes_layers::*;
 pub use soil_iot_routes::*;
 pub use stac::*;
 pub use sustainability::*;
+pub use water_extent_routes::*;
 pub use weather::*;
 pub use workspace::*;
 

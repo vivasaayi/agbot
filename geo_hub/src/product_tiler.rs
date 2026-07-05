@@ -149,6 +149,8 @@ const RAMP_DNBR: &[[u8; 3]] = &[
     [215, 48, 39],
     [122, 1, 119],
 ];
+/// Binary water-mask colors: land tan, water blue.
+const RAMP_WATER_MASK: &[[u8; 3]] = &[[210, 180, 140], [24, 100, 190]];
 /// Categorical land-cover class colors, codes 1..=6: water blue, bare tan,
 /// annual crop yellow, tree/perennial dark green, grassland light green,
 /// unknown gray.
@@ -204,6 +206,12 @@ pub fn colormap_for_kind(kind: &str) -> Colormap {
             domain: (-0.5, 1.0),
             stops: RAMP_DNBR,
             categorical: false,
+        },
+        // Binary water mask (0 land, 1 water).
+        "water_extent" => Colormap {
+            domain: (0.0, 1.0),
+            stops: RAMP_WATER_MASK,
+            categorical: true,
         },
         // Tier-1 land-cover classes (codes 1..=6: water, bare, annual crop,
         // tree/perennial, grassland, unknown).
@@ -724,6 +732,14 @@ mod tests {
                                                    // Stops sit every 0.375 across the domain: -0.125 is exact white.
         assert_eq!(dnbr.rgb(-0.125), [247, 247, 247]);
         assert_eq!(dnbr.rgb(1.0), [122, 1, 119]); // high severity
+    }
+
+    #[test]
+    fn water_extent_colormap_is_categorical_binary() {
+        let mask = colormap_for_kind("water_extent");
+        assert!(mask.categorical);
+        assert_eq!(mask.rgb(0.0), [210, 180, 140]); // land
+        assert_eq!(mask.rgb(1.0), [24, 100, 190]); // water
     }
 
     #[test]
