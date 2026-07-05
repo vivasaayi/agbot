@@ -419,6 +419,10 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::validate_landcover_route),
         )
         .route(
+            "/api/landcover/ml/classify",
+            post(routes::classify_landcover_ml_route),
+        )
+        .route(
             "/api/marketplace/accounts",
             get(routes::list_marketplace_accounts).post(routes::create_marketplace_account),
         )

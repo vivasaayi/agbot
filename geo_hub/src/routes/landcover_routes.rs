@@ -7,9 +7,10 @@ use serde::Deserialize;
 
 use crate::error::{AppError, AppResult};
 use crate::landcover_rasters::{
-    derive_landcover, list_landcover_products, register_worldcover_dir, validate_landcover,
-    LandCoverDeriveRequest, LandCoverError, LandCoverOutcome, LandCoverValidateOutcome,
-    LandCoverValidateRequest, ReferenceRegisterOutcome,
+    classify_landcover_ml, derive_landcover, list_landcover_products, register_worldcover_dir,
+    validate_landcover, LandCoverDeriveRequest, LandCoverError, LandCoverMlOutcome,
+    LandCoverMlRequest, LandCoverOutcome, LandCoverValidateOutcome, LandCoverValidateRequest,
+    ReferenceRegisterOutcome,
 };
 use crate::state::AppState;
 
@@ -44,6 +45,14 @@ pub async fn validate_landcover_route(
     Json(request): Json<LandCoverValidateRequest>,
 ) -> AppResult<Json<LandCoverValidateOutcome>> {
     let outcome = validate_landcover(&state.pool, &state.config.data_root, &request).await?;
+    Ok(Json(outcome))
+}
+
+pub async fn classify_landcover_ml_route(
+    State(state): State<AppState>,
+    Json(request): Json<LandCoverMlRequest>,
+) -> AppResult<Json<LandCoverMlOutcome>> {
+    let outcome = classify_landcover_ml(&state.pool, &state.config.data_root, &request).await?;
     Ok(Json(outcome))
 }
 

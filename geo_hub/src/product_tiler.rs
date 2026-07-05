@@ -213,9 +213,10 @@ pub fn colormap_for_kind(kind: &str) -> Colormap {
             stops: RAMP_WATER_MASK,
             categorical: true,
         },
-        // Tier-1 land-cover classes (codes 1..=6: water, bare, annual crop,
-        // tree/perennial, grassland, unknown).
-        "landcover_rule" => Colormap {
+        // Tier-1 rule + tier-3 learned land-cover classes share the code
+        // space (1..=6: water, bare, annual crop, tree/perennial,
+        // grassland, unknown).
+        "landcover_rule" | "landcover_ml" => Colormap {
             domain: (1.0, 6.0),
             stops: RAMP_LANDCOVER,
             categorical: true,

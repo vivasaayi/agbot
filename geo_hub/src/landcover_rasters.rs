@@ -14,9 +14,14 @@
 
 use std::path::{Path, PathBuf};
 
+use post_processor::crop_features::{
+    build_training_samples, classify_raster, extract_features, CropFeatureError,
+    NearestCentroidModel,
+};
 use post_processor::landcover_agreement::{
     compare_landcover, AgreementError, AgreementResult, ReferenceClassMap,
 };
+use post_processor::phenology::PhenologyResult;
 use post_processor::phenology::{
     classify_land_cover, compute_phenology, landcover_l3_draft, phenology_l3_draft, LandCoverClass,
     LandCoverRuleConfig, PhenologyError, PhenologyL3Scope, PhenologyObservation, PhenologyRequest,
@@ -68,6 +73,10 @@ pub enum LandCoverError {
     ReferenceGridMismatch,
     #[error("agreement computation failed: {0}")]
     Agreement(#[from] AgreementError),
+    #[error("phenology artifact could not be read: {0}")]
+    PhenologyArtifact(String),
+    #[error("crop-feature classification failed: {0}")]
+    CropFeature(#[from] CropFeatureError),
     #[error(transparent)]
     Shared(#[from] DroughtRasterError),
     #[error("raster I/O failed: {0}")]
@@ -91,7 +100,9 @@ impl LandCoverError {
             | LandCoverError::Phenology(_)
             | LandCoverError::WrongKind { .. }
             | LandCoverError::ReferenceGridMismatch
-            | LandCoverError::Agreement(_) => true,
+            | LandCoverError::Agreement(_)
+            | LandCoverError::PhenologyArtifact(_)
+            | LandCoverError::CropFeature(_) => true,
             LandCoverError::Shared(shared) => shared.is_client_error(),
             _ => false,
         }
@@ -335,7 +346,8 @@ pub async fn derive_landcover(
         "{}.phenology.json",
         artifact_file_component(&phenology_draft.product_id())
     ));
-    let phenology_json = serde_json::to_vec(&phenology).expect("phenology result serializes");
+    let phenology_json = post_processor::phenology::phenology_to_json(&phenology)
+        .expect("phenology result serializes");
     std::fs::write(&phenology_path, &phenology_json).map_err(|source| LandCoverError::Store {
         what: "phenology artifact",
         source,
@@ -755,5 +767,233 @@ pub async fn validate_landcover(
         kappa: result.kappa,
         agreement_artifact: agreement_path,
         result,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Tier-3 learned classification (phenology features + reference labels)
+// ---------------------------------------------------------------------------
+
+/// A tier-3 learned-classification request.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LandCoverMlRequest {
+    /// Catalog id of a `phenology` L3 product (the feature source).
+    pub phenology_product_id: String,
+    /// Catalog id of a same-grid `landcover_reference` product (training
+    /// labels).
+    pub reference_product_id: String,
+    pub field_id: String,
+    pub season_id: String,
+}
+
+/// Outcome of one learned classification.
+#[derive(Debug, Clone, Serialize)]
+pub struct LandCoverMlOutcome {
+    pub landcover_ml_product_id: String,
+    pub phenology_product_id: String,
+    pub reference_product_id: String,
+    pub training_sample_count: usize,
+    pub feature_pixels: usize,
+    /// (class, pixel count) for every predicted class.
+    pub class_counts: Vec<(String, u32)>,
+    pub landcover_ml_artifact: PathBuf,
+    pub landcover_ml_stac_item_href: String,
+    pub landcover_ml_tiles_href: String,
+}
+
+fn load_phenology(product: &RegisteredProduct) -> Result<PhenologyResult, LandCoverError> {
+    let path = geotiff_artifact_path_json(product)?;
+    let bytes =
+        std::fs::read(path).map_err(|err| LandCoverError::PhenologyArtifact(err.to_string()))?;
+    post_processor::phenology::phenology_from_json(&bytes)
+        .map_err(|err| LandCoverError::PhenologyArtifact(err.to_string()))
+}
+
+/// Phenology artifacts are JSON, not GeoTIFF — accept the .json artifact.
+fn geotiff_artifact_path_json(product: &RegisteredProduct) -> Result<String, LandCoverError> {
+    match product.path.as_deref() {
+        Some(path) if path.to_ascii_lowercase().ends_with(".json") => Ok(path.to_string()),
+        _ => Err(LandCoverError::WrongKind {
+            product_id: product.product_id.clone(),
+            kind: format!("artifact {:?}", product.format),
+            expected: "json phenology artifact",
+        }),
+    }
+}
+
+/// Train a nearest-centroid model on this scene's reference labels and
+/// classify every feature-valid pixel into a `landcover_ml` L3 raster
+/// (codes 1..=6, invalid = nodata) with lineage to the phenology and
+/// reference products and the fitted model embedded in evidence.
+pub async fn classify_landcover_ml(
+    pool: &DbPool,
+    data_root: &Path,
+    request: &LandCoverMlRequest,
+) -> Result<LandCoverMlOutcome, LandCoverError> {
+    let phenology_product = catalog::get_product(pool, &request.phenology_product_id)
+        .await?
+        .ok_or_else(|| {
+            LandCoverError::Shared(DroughtRasterError::CurrentNotFound(
+                request.phenology_product_id.clone(),
+            ))
+        })?;
+    expect_kind(&phenology_product, "phenology")?;
+    let reference_product = catalog::get_product(pool, &request.reference_product_id)
+        .await?
+        .ok_or_else(|| {
+            LandCoverError::Shared(DroughtRasterError::CurrentNotFound(
+                request.reference_product_id.clone(),
+            ))
+        })?;
+    expect_kind(&reference_product, REFERENCE_KIND)?;
+
+    let phenology = load_phenology(&phenology_product)?;
+    let reference_raster = load_raster(Path::new(geotiff_artifact_path(&reference_product)?))?;
+    if phenology.width != reference_raster.width || phenology.height != reference_raster.height {
+        return Err(LandCoverError::ReferenceGridMismatch);
+    }
+
+    let features = extract_features(&phenology);
+    let reference_codes: Vec<u8> = reference_raster
+        .values
+        .iter()
+        .zip(&reference_raster.valid_mask)
+        .map(|(value, valid)| {
+            if *valid && value.is_finite() && (0.0..=255.0).contains(value) {
+                value.round() as u8
+            } else {
+                WORLDCOVER_NODATA
+            }
+        })
+        .collect();
+    let training = build_training_samples(
+        &features,
+        &reference_codes,
+        WORLDCOVER_NODATA,
+        &ReferenceClassMap::default(),
+    )?;
+    let model = NearestCentroidModel::fit(&training.samples)?;
+    let classes = classify_raster(&features, &model)?;
+
+    // --- landcover_ml GeoTIFF + L3 registration.
+    let class_values: Vec<f32> = classes
+        .iter()
+        .map(|class| {
+            class
+                .class_code()
+                .map(f32::from)
+                .unwrap_or(LANDCOVER_NODATA)
+        })
+        .collect();
+    let mut class_counts: Vec<(String, u32)> = Vec::new();
+    for class in post_processor::crop_features::LEARNABLE_CLASSES {
+        let count = classes.iter().filter(|c| **c == class).count() as u32;
+        if count > 0 {
+            class_counts.push((
+                serde_json::to_value(class)
+                    .expect("class serializes")
+                    .as_str()
+                    .expect("class is a string")
+                    .to_string(),
+                count,
+            ));
+        }
+    }
+
+    let draft_scope = ProductScope {
+        farm_id: None,
+        field_id: Some(request.field_id.clone()),
+        season_id: Some(request.season_id.clone()),
+        scene_id: None,
+        temporal_start: phenology_product.temporal_start.clone().unwrap_or_default(),
+        temporal_end: phenology_product.temporal_end.clone().unwrap_or_default(),
+    };
+    let model_json = serde_json::to_value(&model).expect("model serializes");
+    let mut draft = ProductRecordDraft {
+        level: ProductLevel::L3,
+        kind: "landcover_ml".to_string(),
+        algorithm_id: "landcover.tier3_nearest_centroid".to_string(),
+        algorithm_version: "1.0.0".to_string(),
+        parameters: serde_json::json!({
+            "phenology_product_id": phenology_product.product_id,
+            "reference_product_id": reference_product.product_id,
+            "training_sample_count": model.training_sample_count,
+            "training_hash": model.training_hash,
+            "feature_names": model.feature_names,
+            "model": model_json,
+            "excluded": training.excluded,
+            "class_codes": {
+                "water": 1, "bare_or_sparse": 2, "annual_crop": 3,
+                "tree_or_perennial": 4, "grassland": 5, "unknown": 6,
+            },
+        }),
+        inputs: vec![
+            ProductInputRef {
+                product_id: phenology_product.product_id.clone(),
+                role: "phenology".to_string(),
+            },
+            ProductInputRef {
+                product_id: reference_product.product_id.clone(),
+                role: "training_reference".to_string(),
+            },
+        ],
+        scope: draft_scope,
+        spatial_ref: Some(phenology.spatial_ref.clone()),
+        gsd_m_per_px: phenology_product.gsd_m_per_px,
+        artifact: None,
+        quality_mask: None,
+        confidence: None,
+        confidence_method: None,
+        quality_summary: None,
+        evidence_digests: vec![model.training_hash.clone()],
+        source_id: reference_product.source_id.clone(),
+    };
+
+    let derived_dir = data_root.join("derived").join("landcover");
+    std::fs::create_dir_all(&derived_dir).map_err(|source| LandCoverError::Store {
+        what: "landcover directory",
+        source,
+    })?;
+    let ml_path = derived_dir.join(format!(
+        "{}.landcover_ml.tif",
+        artifact_file_component(&draft.product_id())
+    ));
+    write_geotiff_f32(
+        &ml_path,
+        phenology.width,
+        phenology.height,
+        &class_values,
+        &GeoTiffTags {
+            epsg: reference_raster.epsg,
+            geo_transform: reference_raster.geo_transform,
+            nodata: Some(f64::from(LANDCOVER_NODATA)),
+        },
+    )?;
+    let checksum = file_checksum(&ml_path, "landcover_ml readback")?;
+    draft.artifact = Some(ProductArtifact {
+        format: "tif".to_string(),
+        path: ml_path.to_string_lossy().to_string(),
+        checksum_sha256: Some(checksum.clone()),
+    });
+    draft.evidence_digests.push(checksum);
+    let actor = provenance::ActorIdentity::system("geo_hub:landcover_ml");
+    let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let landcover_ml_product_id =
+        catalog::register_product_with_actor(pool, &draft, &actor, &created_at).await?;
+
+    Ok(LandCoverMlOutcome {
+        landcover_ml_stac_item_href: format!(
+            "/api/stac/collections/landcover_ml/items/{landcover_ml_product_id}"
+        ),
+        landcover_ml_tiles_href: format!(
+            "/api/catalog/products/{landcover_ml_product_id}/tiles/{{z}}/{{x}}/{{y}}.png"
+        ),
+        landcover_ml_product_id,
+        phenology_product_id: phenology_product.product_id,
+        reference_product_id: reference_product.product_id,
+        training_sample_count: model.training_sample_count,
+        feature_pixels: features.valid_count(),
+        class_counts,
+        landcover_ml_artifact: ml_path,
     })
 }

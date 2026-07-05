@@ -556,6 +556,52 @@ pub struct PhenologyL3Scope {
     pub source_id: Option<String>,
 }
 
+/// Finite on-disk marker for [`PHENOLOGY_SENTINEL`] (NaN): `serde_json`
+/// writes NaN as `null`, which cannot be read back into `f32`, so the JSON
+/// artifact substitutes a finite value the way the climatology store does.
+const PHENOLOGY_JSON_SENTINEL: f32 = -1.0e30;
+
+fn metric_layers_mut(result: &mut PhenologyResult) -> [&mut Vec<f32>; 8] {
+    [
+        &mut result.ndvi_min,
+        &mut result.ndvi_max,
+        &mut result.amplitude,
+        &mut result.peak_doy,
+        &mut result.sos_doy,
+        &mut result.eos_doy,
+        &mut result.season_length_days,
+        &mut result.season_integral,
+    ]
+}
+
+/// Serialize a phenology result to NaN-safe JSON bytes (sentinels become
+/// [`PHENOLOGY_JSON_SENTINEL`]).
+pub fn phenology_to_json(result: &PhenologyResult) -> Result<Vec<u8>, serde_json::Error> {
+    let mut sanitized = result.clone();
+    for layer in metric_layers_mut(&mut sanitized) {
+        for value in layer.iter_mut() {
+            if !value.is_finite() {
+                *value = PHENOLOGY_JSON_SENTINEL;
+            }
+        }
+    }
+    serde_json::to_vec(&sanitized)
+}
+
+/// Reload a phenology result from NaN-safe JSON bytes (on-disk sentinels
+/// become [`PHENOLOGY_SENTINEL`]).
+pub fn phenology_from_json(bytes: &[u8]) -> Result<PhenologyResult, serde_json::Error> {
+    let mut result: PhenologyResult = serde_json::from_slice(bytes)?;
+    for layer in metric_layers_mut(&mut result) {
+        for value in layer.iter_mut() {
+            if *value == PHENOLOGY_JSON_SENTINEL {
+                *value = PHENOLOGY_SENTINEL;
+            }
+        }
+    }
+    Ok(result)
+}
+
 /// Map a phenology result to an L3 draft (kind `phenology`). Lineage = every
 /// series observation.
 pub fn phenology_l3_draft(
@@ -881,6 +927,26 @@ mod tests {
         assert_eq!(result.rule_ids[0], "invalid_phenology");
         assert_eq!(result.class_counts, vec![(LandCoverClass::Invalid, 1)]);
         assert_eq!(result.valid_fraction, 0.0);
+    }
+
+    #[test]
+    fn phenology_json_round_trips_sentinels() {
+        // A flat pixel has finite min/max/amplitude but sentinel (NaN)
+        // season metrics; the JSON round trip must preserve both.
+        let result = phenology_for(&[
+            (date(2, 1), 0.62),
+            (date(4, 1), 0.60),
+            (date(6, 1), 0.63),
+            (date(8, 1), 0.61),
+        ]);
+        assert!(result.sos_doy[0].is_nan());
+        let bytes = phenology_to_json(&result).unwrap();
+        // The on-disk form is finite JSON (no NaN/null).
+        assert!(!std::str::from_utf8(&bytes).unwrap().contains("null"));
+        let reloaded = phenology_from_json(&bytes).unwrap();
+        assert!(reloaded.sos_doy[0].is_nan());
+        assert!((reloaded.ndvi_min[0] - result.ndvi_min[0]).abs() < 1e-6);
+        assert_eq!(reloaded.reason_codes, result.reason_codes);
     }
 
     #[test]

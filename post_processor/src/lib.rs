@@ -9,6 +9,7 @@ use uuid::Uuid;
 
 pub mod anomaly_app;
 pub mod burn_severity;
+pub mod crop_features;
 pub mod crop_health_app;
 pub mod drought_indices;
 pub mod evidence;
