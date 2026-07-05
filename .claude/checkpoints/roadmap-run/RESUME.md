@@ -2,14 +2,14 @@
 
 ## CURRENT: satellite intelligence pipeline (2026-07)
 Active plan + per-batch ledger: `docs/design/satellite-intelligence-pipeline.md`
-(the ledger there is authoritative; batches 1-10 committed). Last: batch 10
-(ab688b0) — phenology + tier-1 land-cover (`post_processor/src/phenology.rs`,
-`geo_hub/src/landcover_rasters.rs`, POST /api/landcover/derive, categorical
-tiler colormap). Batch 9 (b131e4e): CHIRPS + SPI + tiler EPSG:4326. Batch 8
-(dde2610): climatology + VCI drought rasters. Batch 7 (2bf6464): Web Mercator
-tiler + STAC tiles_web + /browse raster source. NEXT: batch 11 = SPI-3/6/12
-accumulation windows + CHIRPS dekads/fetcher, or Sen2Cor path (see ledger
-"Next" line). Everything below is the earlier (completed) Track A/B refactor
+(the ledger there is authoritative; batches 1-11 committed). Last: batch 11
+(a292632) — SPI-N accumulation windows (window_months on spi/derive; identity,
+lineage, incomplete-window reason codes). Batch 10 (ab688b0): phenology +
+tier-1 land-cover + categorical tiler colormap. Batch 9 (b131e4e): CHIRPS +
+SPI + tiler EPSG:4326. Batch 8 (dde2610): climatology + VCI. Batch 7
+(2bf6464): Web Mercator tiler + STAC tiles_web. NEXT: batch 12 = CHIRPS dekad
+registration + injectable HTTPS fetcher, or Sen2Cor path (see ledger "Next"
+line). Everything below is the earlier (completed) Track A/B refactor
 history.
 
 Refactor: AGBot → layered field-intelligence pipeline.
