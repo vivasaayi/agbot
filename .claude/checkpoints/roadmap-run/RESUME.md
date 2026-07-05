@@ -2,15 +2,17 @@
 
 ## CURRENT: satellite intelligence pipeline (2026-07)
 Active plan + per-batch ledger: `docs/design/satellite-intelligence-pipeline.md`
-(the ledger there is authoritative; batches 1-12 committed). Last: batch 12
-(51e842b) — CHIRPS dekads + injectable HTTPS fetcher (POST /api/drought-
-management/chirps/fetch, ChirpsFetcher seam, gzip inflate, resume, per-file
-failures). Batch 11 (a292632): SPI-N accumulation windows. Batch 10
-(ab688b0): phenology + tier-1 land-cover. Batch 9 (b131e4e): CHIRPS + SPI.
-Batch 8 (dde2610): climatology + VCI. Batch 7 (2bf6464): Web Mercator tiler.
-NEXT: batch 13 = Sen2Cor containerized L1C->L2A path, or Phase 4 (see ledger
-"Next" line). Everything below is the earlier (completed) Track A/B refactor
-history.
+(the ledger there is authoritative; batches 1-13 committed). Last: batch 13
+(224585d) — Sen2Cor L1C->L2A orchestration (geo_hub/src/sen2cor.rs,
+ProcessRunner seam, commit_ingest registration, `geo_hub sen2cor run` CLI;
+JP2 decode still future work). Batch 12 (51e842b): CHIRPS dekads + fetcher.
+Batch 11 (a292632): SPI-N windows. Batch 10 (ab688b0): phenology + land-
+cover. Batch 9 (b131e4e): CHIRPS + SPI. Batch 8 (dde2610): climatology +
+VCI. Batch 7 (2bf6464): Web Mercator tiler. Phases 1-3 + Sen2Cor of the
+satellite plan are COMPLETE. NEXT: batch 14 = Phase 4 (dNBR forest-loss on
+cataloged NBR products is the most self-contained; then crop-type ML on
+phenology features, Sentinel-1 water, HLS). Everything below is the earlier
+(completed) Track A/B refactor history.
 
 Refactor: AGBot → layered field-intelligence pipeline.
 Plan: /Users/rajanpanneerselvam/Docs/AGBOT/refactor.md (reviewed + expanded 2026-07-03).
