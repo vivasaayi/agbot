@@ -17,7 +17,9 @@ use axum::{
 use geo_hub::catalog::{self, ProductFilter};
 use geo_hub::state::AppState;
 use geo_hub::{db, server, HubConfig};
-use raster_io::{write_geotiff_f32, write_geotiff_i16, GeoTiffReader, GeoTiffTags};
+use raster_io::{
+    write_geotiff_f32, write_geotiff_i16, write_geotiff_u8, GeoTiffReader, GeoTiffTags,
+};
 use serde_json::json;
 use shared::product_graph::ProductLevel;
 use std::path::Path;
@@ -122,6 +124,20 @@ async fn hls_l30_and_s30_register_as_one_harmonized_ndvi_series() -> Result<()> 
         0.6,
         Some(15),
     )?;
+    // S30 Fmask (batch 22): pixel 0 is cloud (bit 1 = 2), rest clear.
+    let mut fmask = vec![0u8; 16];
+    fmask[0] = 2;
+    write_geotiff_u8(
+        &hls_dir.join("HLS.S30.T43PFN.2024152T051651.v2.0.Fmask.tif"),
+        4,
+        4,
+        &fmask,
+        &GeoTiffTags {
+            epsg: Some(EPSG),
+            geo_transform: Some(TRANSFORM),
+            nodata: Some(255.0),
+        },
+    )?;
     // L30 granule (Landsat), next day: NIR = B05. Written as REAL HLS Int16
     // DN (red 2000 -> 0.2 refl, nir 6000 -> 0.6 refl after the 1e-4 scale),
     // exercising the batch-21 Int16 read + reflectance scaling.
@@ -192,24 +208,28 @@ async fn hls_l30_and_s30_register_as_one_harmonized_ndvi_series() -> Result<()> 
         .collect();
     assert_eq!(instruments.len(), 2);
 
-    // NDVI values: 0.5 everywhere; the S30 NIR-fill pixel is nodata.
+    // NDVI values: 0.5 everywhere except pixel 0 (Fmask cloud -> nodata) and
+    // pixel 15 (S30 NIR fill -> nodata). Fmask was applied (batch 22).
     let s30 = ndvi
         .iter()
         .find(|p| p.scene_id.as_deref() == Some("HLS.S30.T43PFN.2024152T051651"))
         .unwrap();
+    assert_eq!(s30.parameters["fmask_applied"], true);
     let mut reader = GeoTiffReader::open(s30.path.as_deref().unwrap())?;
     assert_eq!(reader.info().geo_transform, Some(TRANSFORM));
     let values = reader.read_band()?.to_f32();
-    for value in &values[..15] {
+    assert_eq!(values[0], NODATA, "cloud pixel masked");
+    for value in &values[1..15] {
         assert!((value - 0.5).abs() < 1e-6, "NDVI must be 0.5, got {value}");
     }
     assert_eq!(values[15], NODATA);
 
-    // The L30 granule is fully valid.
+    // The L30 granule has no Fmask -> fully valid, fmask not applied.
     let l30 = ndvi
         .iter()
         .find(|p| p.scene_id.as_deref() == Some("HLS.L30.T43PFN.2024153T052015"))
         .unwrap();
+    assert_eq!(l30.parameters["fmask_applied"], false);
     let mut reader = GeoTiffReader::open(l30.path.as_deref().unwrap())?;
     let values = reader.read_band()?.to_f32();
     assert!(values.iter().all(|v| (v - 0.5).abs() < 1e-6));

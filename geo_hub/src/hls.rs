@@ -21,8 +21,10 @@
 //! `load_hls_reflectance` reads it via `raster_io`'s Int16 support (batch
 //! 21) and scales integer bands to reflectance, while f32 bands (already
 //! reflectance) pass through — so pre-downloaded HLS GeoTIFFs feed the local
-//! pipeline directly. Fmask cloud masking is a documented follow-on (mask
-//! before index); here masking is on band fill values only.
+//! pipeline directly. When a granule includes its Fmask QA band (batch 22),
+//! cloud/cirrus/adjacent/shadow pixels are masked before the index; without
+//! Fmask, masking falls back to band fill values only (`fmask_applied` in
+//! the product records which happened).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -36,7 +38,7 @@ use thiserror::Error;
 use crate::catalog::{self, CatalogError};
 use crate::db::DbPool;
 use crate::drought_rasters::{
-    artifact_file_component, file_checksum, DroughtRasterError, LoadedRaster,
+    artifact_file_component, file_checksum, load_raster, DroughtRasterError, LoadedRaster,
 };
 use crate::satellite_derivation::{compute_masked_index, INDEX_NODATA};
 
@@ -186,6 +188,33 @@ fn load_hls_reflectance(path: &Path) -> Result<LoadedRaster, raster_io::RasterIo
     })
 }
 
+/// HLS v2.0 Fmask QA bits rejected for a clear-sky NDVI pixel: bit 0 cirrus,
+/// bit 1 cloud, bit 2 adjacent-to-cloud/shadow, bit 3 cloud shadow. (Water
+/// bit 5 and snow bit 4 are kept — they are valid ground, not obscuration.)
+pub const FMASK_REJECT_BITS: u8 = 0b0000_1111;
+/// Fmask fill value.
+pub const FMASK_FILL: u8 = 255;
+
+/// Build a per-pixel clear-sky mask from an HLS Fmask band (`true` = keep):
+/// reject any pixel with a cloud/cirrus/adjacent/shadow bit set, or fill.
+fn fmask_clear(fmask: &LoadedRaster) -> Vec<bool> {
+    fmask
+        .values
+        .iter()
+        .zip(&fmask.valid_mask)
+        .map(|(value, valid)| {
+            if !*valid || !value.is_finite() {
+                return false;
+            }
+            let code = value.round() as i64;
+            if code == i64::from(FMASK_FILL) || !(0..=255).contains(&code) {
+                return false;
+            }
+            (code as u8) & FMASK_REJECT_BITS == 0
+        })
+        .collect()
+}
+
 fn to_index_pixels(raster: &LoadedRaster) -> Vec<IndexPixelValue> {
     raster
         .values
@@ -276,7 +305,20 @@ pub async fn register_hls_dir(pool: &DbPool, dir: &Path) -> Result<HlsRegisterOu
             (IndexBandRole::Red, to_index_pixels(&red)),
             (IndexBandRole::Nir, to_index_pixels(&nir)),
         ]);
-        let clear_mask = vec![true; red.values.len()];
+        // Clear-sky mask from the granule's Fmask band when present (raw u8
+        // QA, not scaled reflectance); otherwise keep everything.
+        let (clear_mask, fmask_applied) = match granule.bands.get("Fmask") {
+            Some(fmask_path) => {
+                let fmask = load_raster(fmask_path)?;
+                if !same_grid(&fmask, &red) {
+                    return Err(HlsError::GridMismatch {
+                        granule: granule_id,
+                    });
+                }
+                (fmask_clear(&fmask), true)
+            }
+            None => (vec![true; red.values.len()], false),
+        };
         let index = compute_masked_index(IndexKind::Ndvi, &bands, &clear_mask)
             .map_err(|err| HlsError::Index(err.to_string()))?;
 
@@ -321,7 +363,14 @@ pub async fn register_hls_dir(pool: &DbPool, dir: &Path) -> Result<HlsRegisterOu
             "valid_pixels": index.valid_pixels,
             "invalid_pixels": index.invalid_pixels,
             "reasons": index.reason_counts,
+            "fmask_applied": fmask_applied,
         }));
+        if let Some(params) = draft.parameters.as_object_mut() {
+            params.insert(
+                "fmask_applied".to_string(),
+                serde_json::json!(fmask_applied),
+            );
+        }
 
         let product_id =
             catalog::register_product_with_actor(pool, &draft, &actor, &created_at).await?;
@@ -412,5 +461,23 @@ mod tests {
         assert_eq!(ndvi_bands("S30"), Some(("B04", "B08")));
         assert_eq!(ndvi_bands("L30"), Some(("B04", "B05")));
         assert_eq!(ndvi_bands("X30"), None);
+    }
+
+    #[test]
+    fn fmask_clear_rejects_cloud_bits_keeps_water_and_snow() {
+        use shared::schemas::RasterSpatialRef;
+        let raster = |codes: Vec<f32>| LoadedRaster {
+            width: codes.len() as u32,
+            height: 1,
+            valid_mask: codes.iter().map(|c| *c != f32::from(FMASK_FILL)).collect(),
+            values: codes,
+            spatial_ref: RasterSpatialRef::default(),
+            epsg: Some(32643),
+            geo_transform: None,
+        };
+        // 0 clear, 2 cloud(bit1), 8 shadow(bit3), 1 cirrus(bit0),
+        // 32 water(bit5, kept), 16 snow(bit4, kept), 255 fill.
+        let clear = fmask_clear(&raster(vec![0.0, 2.0, 8.0, 1.0, 32.0, 16.0, 255.0]));
+        assert_eq!(clear, vec![true, false, false, false, true, true, false]);
     }
 }
