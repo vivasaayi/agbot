@@ -2,7 +2,7 @@
 
 ## CURRENT: satellite intelligence pipeline (2026-07)
 Active plan + per-batch ledger: `docs/design/satellite-intelligence-pipeline.md`
-(the ledger there is authoritative; batches 1-24 committed). Last: batch 24 (745cf66) JP2 decode + local Sen2Cor NDVI: raster_io read_jp2_gray (jpeg2k/openjp2 pure-Rust) + test_util write_jp2_gray reference-encoder fixtures; geo_hub sen2cor_derive POST /api/ingest/sen2cor/ndvi/derive (MTD_TL.xml geocoding, SensorProfile calibration, ndvi L2 with red/nir lineage). Before: batch 23 (9025ac1) LST/thermal path: post_processor/src/lst.rs pure engine + geo_hub/src/lst_rasters.rs POST /api/thermal/lst/derive (lst L2, Kelvin); lst->tci already mapped so rasters/derive scores TCI; drought_result_from_raster + derive_vhi_raster + POST /api/drought-management/vhi/derive blend VCI+TCI into VHI L3. Before: batch 22 (a730a44) HLS Fmask cloud masking; batch 21
+(the ledger there is authoritative; batches 1-25 committed). Last: batch 25 (26f5f25) JRC prior gating: post_processor extract_water_extent_with_prior (occurrence >=75/<=5 informative pixels, <50% agreement -> RejectedOtsuFlip -> fixed fallback; prior in L3 lineage + params) + geo_hub POST /api/water-management/jrc/register (water_occurrence, jrc-gsw) + derive prior_product_id. Before: batch 24 (745cf66) JP2 decode + local Sen2Cor NDVI: raster_io read_jp2_gray (jpeg2k/openjp2 pure-Rust) + test_util write_jp2_gray reference-encoder fixtures; geo_hub sen2cor_derive POST /api/ingest/sen2cor/ndvi/derive (MTD_TL.xml geocoding, SensorProfile calibration, ndvi L2 with red/nir lineage). Before: batch 23 (9025ac1) LST/thermal path: post_processor/src/lst.rs pure engine + geo_hub/src/lst_rasters.rs POST /api/thermal/lst/derive (lst L2, Kelvin); lst->tci already mapped so rasters/derive scores TCI; drought_result_from_raster + derive_vhi_raster + POST /api/drought-management/vhi/derive blend VCI+TCI into VHI L3. Before: batch 22 (a730a44) HLS Fmask cloud masking; batch 21
 (25b5491) — Int16 raster support: raster_io RasterDtype::I16/RasterBand::I16
 (both backends) + write_geotiff_i16; HLS reads real Int16 DN via
 load_hls_reflectance (x1e-4 scale). Batch 20
@@ -23,9 +23,9 @@ Batch 8 (dde2610): climatology + VCI. Batch 7 (2bf6464): Web Mercator tiler.
 Phases 1-4 feature-complete incl. tier-3 validation loop + Int16 real-data
 read. Remaining are standing refinement follow-ons. USER DIRECTIVE: carry on
 through the whole backlog safely, one verified+committed batch at a time.
-NEXT: batch 25 = JRC Global Surface Water occurrence prior gating water_extent
-Otsu polarity flips. Backlog after: /browse derive affordances; WorldCover
-bootstrap validation. Everything below is the earlier (completed) Track A/B refactor
+NEXT: batch 26 = /browse UI affordances to trigger index/drought/landcover/
+water derives from the catalog browser. Backlog after: WorldCover/WorldCereal
+bootstrap masks for tier-2 validation. Everything below is the earlier (completed) Track A/B refactor
 history.
 
 Refactor: AGBot → layered field-intelligence pipeline.
@@ -292,6 +292,6 @@ Session ran 22 batches (very long context); paused per CLAUDE.md context
 discipline. Resume continues from this compact checkpoint. In order:
 1. DONE (batch 23, 9025ac1): LST/thermal path + TCI activation + VHI blend.
 2. DONE (batch 24, 745cf66): JP2 decode + local Sen2Cor NDVI derivation.
-3. JRC Global Surface Water prior gating for water_extent Otsu flips.
+3. DONE (batch 25, 26f5f25): JRC prior gating for water_extent Otsu flips.
 4. /browse UI affordances to trigger index/drought/landcover/water derives.
 All are refinements; Phases 1-4 of the pipeline are feature-complete.
