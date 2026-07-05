@@ -40,6 +40,7 @@ pub fn build_router(state: AppState) -> Router {
             "/api/ingest/drone-session",
             post(routes::ingest_drone_session),
         )
+        .route("/api/ingest/hls/register", post(routes::register_hls))
         .route(
             "/api/catalog/products",
             get(routes::list_catalog_products).post(routes::register_catalog_product),

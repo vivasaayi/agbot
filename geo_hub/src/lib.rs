@@ -10,6 +10,7 @@ pub mod dnbr_rasters;
 pub mod drought_rasters;
 pub mod earth_search;
 pub mod error;
+pub mod hls;
 pub mod ingest;
 pub mod ingest_contract;
 pub mod landcover_rasters;

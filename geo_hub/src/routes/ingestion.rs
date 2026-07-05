@@ -38,3 +38,35 @@ pub async fn ingest_drone_session(
         })?;
     Ok(Json(receipt))
 }
+
+/// HLS error mapping: registration failures are server-side (bad directory,
+/// unreadable rasters) unless a specific granule grid mismatch, which is
+/// the caller's data problem.
+impl From<crate::hls::HlsError> for AppError {
+    fn from(err: crate::hls::HlsError) -> Self {
+        match &err {
+            crate::hls::HlsError::GridMismatch { .. } | crate::hls::HlsError::Index(_) => {
+                AppError::BadRequest(err.to_string())
+            }
+            _ => AppError::Anyhow(err.into()),
+        }
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
+pub struct HlsRegisterRequest {
+    /// Server-local directory holding downloaded HLS band GeoTIFFs.
+    pub dir: String,
+}
+
+/// Register a directory of HLS v2.0 band GeoTIFFs as harmonized `ndvi` L2
+/// products (batch 19): both HLSL30 and HLSS30 granules land on one grid and
+/// feed a single densified NDVI time series.
+pub async fn register_hls(
+    State(state): State<AppState>,
+    Json(request): Json<HlsRegisterRequest>,
+) -> AppResult<Json<crate::hls::HlsRegisterOutcome>> {
+    let outcome =
+        crate::hls::register_hls_dir(&state.pool, std::path::Path::new(&request.dir)).await?;
+    Ok(Json(outcome))
+}
