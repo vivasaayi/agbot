@@ -2,7 +2,7 @@
 
 ## CURRENT: satellite intelligence pipeline (2026-07)
 Active plan + per-batch ledger: `docs/design/satellite-intelligence-pipeline.md`
-(the ledger there is authoritative; batches 1-21 committed). Last: batch 21
+(the ledger there is authoritative; batches 1-22 committed). Last: batch 22 (a730a44) HLS Fmask cloud masking; batch 21
 (25b5491) — Int16 raster support: raster_io RasterDtype::I16/RasterBand::I16
 (both backends) + write_geotiff_i16; HLS reads real Int16 DN via
 load_hls_reflectance (x1e-4 scale). Batch 20
@@ -288,3 +288,19 @@ NOTE known-red: ~15 geo_hub products_api acceptance tests fail pre-existing
 Read CLAUDE.md + this file + checkpoint.sqlite. Verify `git status --short`,
 last commit, roadmap file unchanged. Continue from runs.next_action.
 Checkpoint DB is source of truth; the world-sim-run-1 row is a prior unrelated run.
+
+## REMAINING BACKLOG (batch 23+, user directive: carry on safely, one committed batch each)
+Session ran 22 batches (very long context); paused per CLAUDE.md context
+discipline. Resume continues from this compact checkpoint. In order:
+1. LST/thermal path (batch 23): extract DN->radiance->brightness-temp->
+   emissivity-corrected LST from imagery_processor/src/pipeline/thermal.rs
+   (currently CLI-embedded run_thermal/process_one) into a pure fn; add a
+   geo_hub `lst` L2 derivation/registration. drought_rasters ALREADY maps
+   lst->TCI (drought_kind_for, ~line 236), so this lights up TCI. Then add a
+   VHI blend of same-grid VCI+TCI drought products (post_processor
+   compute_vhi already exists) as a new drought_rasters path.
+2. JP2 decode for sen2cor L2A bands (needs a JP2 decoder dep; unlocks
+   sen2cor bands feeding local index derivation).
+3. JRC Global Surface Water prior gating for water_extent Otsu flips.
+4. /browse UI affordances to trigger index/drought/landcover/water derives.
+All are refinements; Phases 1-4 of the pipeline are feature-complete.
