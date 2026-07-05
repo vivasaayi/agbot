@@ -17,6 +17,7 @@ use axum::{
 };
 use geo_hub::catalog;
 use geo_hub::product_tiler::{colormap_for_kind, tile_containing};
+use geo_hub::spi_rasters::{ChirpsFetcher, ChirpsFetcherHandle};
 use geo_hub::state::AppState;
 use geo_hub::{db, server, HubConfig};
 use raster_io::{write_geotiff_f32, GeoTiffReader, GeoTiffTags};
@@ -418,5 +419,262 @@ async fn spi3_accumulates_windows_and_gets_a_distinct_identity() -> Result<()> {
         "{}",
         String::from_utf8_lossy(&bytes)
     );
+    Ok(())
+}
+
+/// In-memory fetcher: URL -> bytes; anything else is a 404-style error.
+struct MapFetcher(std::collections::BTreeMap<String, Vec<u8>>);
+
+impl ChirpsFetcher for MapFetcher {
+    fn fetch<'a>(
+        &'a self,
+        url: &'a str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            self.0
+                .get(url)
+                .cloned()
+                .ok_or_else(|| format!("HTTP 404 Not Found: {url}"))
+        })
+    }
+}
+
+fn gzip(bytes: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(bytes).unwrap();
+    encoder.finish().unwrap()
+}
+
+fn small_precip_tif(tmp: &TempDir, value: f32) -> Result<Vec<u8>> {
+    let path = tmp.path().join(format!("fixture_{value}.tif"));
+    write_geotiff_f32(
+        &path,
+        2,
+        2,
+        &[value; 4],
+        &GeoTiffTags {
+            epsg: Some(4326),
+            geo_transform: Some(TRANSFORM),
+            nodata: Some(f64::from(NODATA)),
+        },
+    )?;
+    Ok(std::fs::read(path)?)
+}
+
+#[tokio::test]
+async fn chirps_fetch_downloads_registers_and_resumes() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let base_ctx = ctx(&tmp).await?;
+
+    // Fake archive: Jan+Feb 2024 monthly (gzipped, as CHIRPS serves them)
+    // and the three June 2024 dekads; March is absent -> per-file failure.
+    let base = "https://chirps.test/CHIRPS-2.0";
+    let mut archive = std::collections::BTreeMap::new();
+    for (month, value) in [(1u32, 10.0f32), (2, 20.0)] {
+        archive.insert(
+            format!("{base}/global_monthly/tifs/chirps-v2.0.2024.{month:02}.tif.gz"),
+            gzip(&small_precip_tif(&tmp, value)?),
+        );
+    }
+    for dekad in 1u8..=3 {
+        archive.insert(
+            format!("{base}/global_dekad/tifs/chirps-v2.0.2024.06.{dekad}.tif.gz"),
+            gzip(&small_precip_tif(&tmp, f32::from(dekad))?),
+        );
+    }
+    let app = base_ctx
+        .app
+        .clone()
+        .layer(axum::extract::Extension(ChirpsFetcherHandle(
+            std::sync::Arc::new(MapFetcher(archive)),
+        )));
+
+    // --- Monthly fetch Jan..Mar: two fetched, one failed.
+    let body = json!({
+        "start_year": 2024, "end_year": 2024,
+        "months": [1, 2, 3],
+        "base_url": base,
+    });
+    let (status, bytes) = send(
+        &app,
+        "POST",
+        "/api/drought-management/chirps/fetch",
+        Some(body.clone()),
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let outcome: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(outcome["fetched"].as_array().unwrap().len(), 2);
+    assert!(outcome["already_present"].as_array().unwrap().is_empty());
+    let failed = outcome["failed"].as_array().unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0][0], "chirps-v2.0.2024.03.tif");
+    assert!(failed[0][1].as_str().unwrap().contains("404"));
+
+    // Files landed gunzipped and readable; the January product is a real
+    // catalog product with the right month bounds.
+    let jan_id = outcome["fetched"][0][1].as_str().unwrap();
+    let jan = catalog::get_product(&base_ctx.pool, jan_id).await?.unwrap();
+    assert_eq!(jan.temporal_start.as_deref(), Some("2024-01-01T00:00:00Z"));
+    assert_eq!(jan.temporal_end.as_deref(), Some("2024-01-31T23:59:59Z"));
+    let mut reader = GeoTiffReader::open(jan.path.as_deref().unwrap())?;
+    assert_eq!(reader.read_band()?.to_f32(), vec![10.0; 4]);
+
+    // --- Re-fetch resumes: everything already present, nothing downloaded.
+    let (status, bytes) = send(
+        &app,
+        "POST",
+        "/api/drought-management/chirps/fetch",
+        Some(json!({
+            "start_year": 2024, "end_year": 2024,
+            "months": [1, 2],
+            "base_url": base,
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    let again: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert!(again["fetched"].as_array().unwrap().is_empty());
+    assert_eq!(again["already_present"].as_array().unwrap().len(), 2);
+    assert_eq!(again["already_present"][0][1], json!(jan_id));
+
+    // --- Dekad fetch registers dekad-bounded products.
+    let (status, bytes) = send(
+        &app,
+        "POST",
+        "/api/drought-management/chirps/fetch",
+        Some(json!({
+            "start_year": 2024, "end_year": 2024,
+            "months": [6],
+            "cadence": "dekad",
+            "base_url": base,
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    let dekads: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(dekads["fetched"].as_array().unwrap().len(), 3);
+    let d2_id = dekads["fetched"][1][1].as_str().unwrap();
+    let d2 = catalog::get_product(&base_ctx.pool, d2_id).await?.unwrap();
+    assert_eq!(d2.algorithm_id, "chirps.ingest.dekad");
+    assert_eq!(d2.temporal_start.as_deref(), Some("2024-06-11T00:00:00Z"));
+    assert_eq!(d2.temporal_end.as_deref(), Some("2024-06-20T23:59:59Z"));
+
+    // --- Validation errors are reason-coded.
+    for (bad, needle) in [
+        (
+            json!({"start_year": 2025, "end_year": 2024, "base_url": base}),
+            "after",
+        ),
+        (
+            json!({"start_year": 2024, "end_year": 2024, "months": [13], "base_url": base}),
+            "1..=12",
+        ),
+        (
+            json!({"start_year": 2024, "end_year": 2024, "cadence": "hourly", "base_url": base}),
+            "cadence",
+        ),
+        (
+            json!({"start_year": 1800, "end_year": 2024, "base_url": base}),
+            "ceiling",
+        ),
+    ] {
+        let (status, bytes) = send(
+            &app,
+            "POST",
+            "/api/drought-management/chirps/fetch",
+            Some(bad),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            String::from_utf8_lossy(&bytes).contains(needle),
+            "{needle}: {}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn dekads_register_but_stay_out_of_monthly_spi_records() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = ctx(&tmp).await?;
+    let chirps_dir = tmp.path().join("chirps");
+    std::fs::create_dir_all(&chirps_dir)?;
+    // Six monthly Junes (the SPI-1 fixture) PLUS three June-2024 dekads.
+    for (year, value) in [
+        (2020, 0.0f32),
+        (2021, 0.0),
+        (2022, 10.0),
+        (2023, 20.0),
+        (2024, 30.0),
+        (2025, 0.0),
+    ] {
+        write_chirps(&chirps_dir, year, value)?;
+    }
+    for dekad in 1u8..=3 {
+        std::fs::write(
+            chirps_dir.join(format!("chirps-v2.0.2024.06.{dekad}.tif")),
+            small_precip_tif(&tmp, 10.0)?,
+        )?;
+    }
+    let (status, bytes) = send(
+        &ctx.app,
+        "POST",
+        "/api/drought-management/chirps/register",
+        Some(json!({ "dir": chirps_dir.to_string_lossy() })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    let registered: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(
+        registered["registered"].as_array().unwrap().len(),
+        9,
+        "6 monthlies + 3 dekads"
+    );
+    let current = registered["registered"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry[0] == "chirps-v2.0.2025.06.tif")
+        .unwrap()[1]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Monthly SPI must use exactly the six monthlies — dekads neither enter
+    // the record nor pollute the skip report.
+    let (status, bytes) = send(
+        &ctx.app,
+        "POST",
+        "/api/drought-management/spi/derive",
+        Some(json!({
+            "current_product_id": current,
+            "field_id": "field-1",
+            "season_id": "season-2025",
+            "min_years": 5,
+        })),
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let outcome: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(outcome["observations_used"].as_array().unwrap().len(), 6);
+    assert!(outcome["observations_skipped"]
+        .as_array()
+        .unwrap()
+        .is_empty());
     Ok(())
 }

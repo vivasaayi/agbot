@@ -385,6 +385,10 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::register_chirps_route),
         )
         .route(
+            "/api/drought-management/chirps/fetch",
+            post(routes::fetch_chirps_route),
+        )
+        .route(
             "/api/drought-management/spi/derive",
             post(routes::derive_spi_raster_route),
         )

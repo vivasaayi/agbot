@@ -16,7 +16,8 @@ use crate::drought_rasters::{
 };
 use crate::error::{AppError, AppResult};
 use crate::spi_rasters::{
-    derive_spi_raster, list_spi_products, register_chirps_dir, ChirpsRegisterOutcome,
+    derive_spi_raster, fetch_chirps, list_spi_products, register_chirps_dir, ChirpsFetchOutcome,
+    ChirpsFetchRequest, ChirpsFetcherHandle, ChirpsRegisterOutcome, HttpChirpsFetcher,
     SpiDeriveOutcome, SpiDeriveRequest, SpiRasterError,
 };
 use crate::state::AppState;
@@ -84,6 +85,23 @@ pub async fn register_chirps_route(
     Json(request): Json<ChirpsRegisterRequest>,
 ) -> AppResult<Json<ChirpsRegisterOutcome>> {
     let outcome = register_chirps_dir(&state.pool, std::path::Path::new(&request.dir)).await?;
+    Ok(Json(outcome))
+}
+
+/// Download a CHIRPS archive slice and register it. Tests inject an
+/// in-memory fetcher through the optional [`ChirpsFetcherHandle`] extension;
+/// production falls back to plain HTTPS.
+pub async fn fetch_chirps_route(
+    State(state): State<AppState>,
+    fetcher: Option<axum::extract::Extension<ChirpsFetcherHandle>>,
+    Json(request): Json<ChirpsFetchRequest>,
+) -> AppResult<Json<ChirpsFetchOutcome>> {
+    let default_fetcher = HttpChirpsFetcher::default();
+    let fetcher: &dyn crate::spi_rasters::ChirpsFetcher = match &fetcher {
+        Some(axum::extract::Extension(ChirpsFetcherHandle(inner))) => inner.as_ref(),
+        None => &default_fetcher,
+    };
+    let outcome = fetch_chirps(&state.pool, &state.config.data_root, fetcher, &request).await?;
     Ok(Json(outcome))
 }
 

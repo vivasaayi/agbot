@@ -13,9 +13,11 @@
 //!   web-tile through the catalog tiler (geographic-grid support) and appear
 //!   in `/api/stac` + `/browse`.
 //!
-//! Cadence note: monthly only — CHIRPS dekad files and multi-month
-//! accumulation windows (SPI-3/6/12) are future work; the engine itself is
-//! window-agnostic (it scores whatever accumulations it is given).
+//! Cadence note: SPI derivation is monthly (with SPI-N accumulation
+//! windows). CHIRPS dekad files register as `precipitation` L2s with dekad
+//! temporal bounds for downstream use, but are deterministically excluded
+//! from monthly SPI windows (they do not span a full calendar month);
+//! dekad-cadence SPI is future work.
 
 use std::path::{Path, PathBuf};
 
@@ -40,6 +42,11 @@ use crate::drought_rasters::{
 pub const PRECIPITATION_KIND: &str = "precipitation";
 /// Source id stamped on CHIRPS registrations.
 pub const CHIRPS_SOURCE_ID: &str = "chirps-v2.0";
+/// Algorithm ids distinguishing CHIRPS cadences in the catalog.
+pub const CHIRPS_MONTHLY_ALGORITHM: &str = "chirps.ingest.monthly";
+pub const CHIRPS_DEKAD_ALGORITHM: &str = "chirps.ingest.dekad";
+/// Default CHIRPS v2.0 HTTPS root (plain directory listing, no auth).
+pub const CHIRPS_BASE_URL: &str = "https://data.chc.ucsb.edu/products/CHIRPS-2.0";
 /// Nodata for SPI GeoTIFFs (workspace index-nodata convention).
 pub const SPI_NODATA: f32 = crate::satellite_derivation::INDEX_NODATA;
 
@@ -73,6 +80,8 @@ pub enum SpiRasterError {
         #[source]
         source: std::io::Error,
     },
+    #[error("chirps fetch request invalid: {0}")]
+    InvalidFetchRequest(String),
 }
 
 impl SpiRasterError {
@@ -82,7 +91,8 @@ impl SpiRasterError {
             | SpiRasterError::NotPrecipitation { .. }
             | SpiRasterError::NoUsableRecord { .. }
             | SpiRasterError::InvalidWindowMonths(_)
-            | SpiRasterError::MissingWindowMonth { .. } => true,
+            | SpiRasterError::MissingWindowMonth { .. }
+            | SpiRasterError::InvalidFetchRequest(_) => true,
             SpiRasterError::Shared(shared) => shared.is_client_error(),
             _ => false,
         }
@@ -113,6 +123,28 @@ pub fn parse_chirps_monthly_filename(name: &str) -> Option<(i32, u32)> {
     Some((year, month))
 }
 
+/// (year, month, dekad) parsed from a CHIRPS v2.0 dekad filename
+/// (`chirps-v2.0.YYYY.MM.D.tif`, D in 1..=3).
+pub fn parse_chirps_dekad_filename(name: &str) -> Option<(i32, u32, u8)> {
+    let lower = name.to_ascii_lowercase();
+    let stem = lower
+        .strip_suffix(".tif")
+        .or_else(|| lower.strip_suffix(".tiff"))?;
+    let rest = stem.strip_prefix("chirps-v2.0.")?;
+    let mut parts = rest.split('.');
+    let (year, month, dekad) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || year.len() != 4 || month.len() != 2 || dekad.len() != 1 {
+        return None;
+    }
+    let year: i32 = year.parse().ok()?;
+    let month: u32 = month.parse().ok()?;
+    let dekad: u8 = dekad.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=3).contains(&dekad) {
+        return None;
+    }
+    Some((year, month, dekad))
+}
+
 /// Last day of a month (proleptic Gregorian).
 fn last_day_of_month(year: i32, month: u32) -> u32 {
     for day in (28..=31).rev() {
@@ -129,7 +161,7 @@ pub fn chirps_monthly_draft(path: &Path, year: i32, month: u32) -> ProductRecord
     ProductRecordDraft {
         level: ProductLevel::L2,
         kind: PRECIPITATION_KIND.to_string(),
-        algorithm_id: "chirps.ingest.monthly".to_string(),
+        algorithm_id: CHIRPS_MONTHLY_ALGORITHM.to_string(),
         algorithm_version: "2.0".to_string(),
         parameters: serde_json::json!({
             "dataset": "CHIRPS-2.0 monthly",
@@ -161,6 +193,29 @@ pub fn chirps_monthly_draft(path: &Path, year: i32, month: u32) -> ProductRecord
         evidence_digests: Vec::new(),
         source_id: Some(CHIRPS_SOURCE_ID.to_string()),
     }
+}
+
+/// Build the L2 draft for one CHIRPS dekad GeoTIFF (dekad 1 = days 1-10,
+/// 2 = 11-20, 3 = 21-end of month).
+pub fn chirps_dekad_draft(path: &Path, year: i32, month: u32, dekad: u8) -> ProductRecordDraft {
+    let (first_day, last_day) = match dekad {
+        1 => (1, 10),
+        2 => (11, 20),
+        _ => (21, last_day_of_month(year, month)),
+    };
+    let mut draft = chirps_monthly_draft(path, year, month);
+    draft.algorithm_id = CHIRPS_DEKAD_ALGORITHM.to_string();
+    draft.parameters = serde_json::json!({
+        "dataset": "CHIRPS-2.0 dekad",
+        "provider": "UCSB Climate Hazards Center",
+        "year": year,
+        "month": month,
+        "dekad": dekad,
+        "units": "mm",
+    });
+    draft.scope.temporal_start = format!("{year}-{month:02}-{first_day:02}T00:00:00Z");
+    draft.scope.temporal_end = format!("{year}-{month:02}-{last_day:02}T23:59:59Z");
+    draft
 }
 
 /// Outcome of a CHIRPS directory registration.
@@ -196,25 +251,238 @@ pub async fn register_chirps_dir(
     let mut registered = Vec::new();
     let mut skipped = Vec::new();
     for (name, path) in names {
-        match parse_chirps_monthly_filename(&name) {
-            Some((year, month)) => {
-                let draft = chirps_monthly_draft(&path, year, month);
-                let product_id = catalog::register_product_with_actor(
-                    pool,
-                    &draft,
-                    &provenance::ActorIdentity::system("geo_hub:chirps_ingest"),
-                    &created_at,
-                )
-                .await?;
-                registered.push((name, product_id));
-            }
-            None => skipped.push(name),
-        }
+        let draft = if let Some((year, month)) = parse_chirps_monthly_filename(&name) {
+            chirps_monthly_draft(&path, year, month)
+        } else if let Some((year, month, dekad)) = parse_chirps_dekad_filename(&name) {
+            chirps_dekad_draft(&path, year, month, dekad)
+        } else {
+            skipped.push(name);
+            continue;
+        };
+        let product_id = catalog::register_product_with_actor(
+            pool,
+            &draft,
+            &provenance::ActorIdentity::system("geo_hub:chirps_ingest"),
+            &created_at,
+        )
+        .await?;
+        registered.push((name, product_id));
     }
     Ok(ChirpsRegisterOutcome {
         registered,
         skipped,
     })
+}
+
+// ---------------------------------------------------------------------------
+// CHIRPS HTTPS fetcher
+// ---------------------------------------------------------------------------
+
+/// Ceiling on files per fetch request (a 40-year dekad archive is 1440;
+/// anything larger is almost certainly a malformed request).
+pub const MAX_FETCH_FILES: usize = 1500;
+
+type FetchFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + Send + 'a>>;
+
+/// Seam for downloading CHIRPS files so tests run network-free (mirrors the
+/// satellite `CogStoreResolver` pattern). Production is [`HttpChirpsFetcher`].
+pub trait ChirpsFetcher: Send + Sync {
+    fn fetch<'a>(&'a self, url: &'a str) -> FetchFuture<'a>;
+}
+
+/// Plain reqwest GET; non-2xx statuses are errors.
+#[derive(Default)]
+pub struct HttpChirpsFetcher {
+    client: reqwest::Client,
+}
+
+impl ChirpsFetcher for HttpChirpsFetcher {
+    fn fetch<'a>(&'a self, url: &'a str) -> FetchFuture<'a> {
+        Box::pin(async move {
+            let response = self
+                .client
+                .get(url)
+                .send()
+                .await
+                .map_err(|err| err.to_string())?;
+            if !response.status().is_success() {
+                return Err(format!("HTTP {}", response.status()));
+            }
+            response
+                .bytes()
+                .await
+                .map(|bytes| bytes.to_vec())
+                .map_err(|err| err.to_string())
+        })
+    }
+}
+
+/// Shareable fetcher handle carried as an axum request extension so route
+/// tests can inject an in-memory fetcher.
+#[derive(Clone)]
+pub struct ChirpsFetcherHandle(pub std::sync::Arc<dyn ChirpsFetcher>);
+
+/// A CHIRPS archive fetch request. Files land in `<data_root>/chirps/` and
+/// register through the same idempotent path as directory registration.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChirpsFetchRequest {
+    pub start_year: i32,
+    pub end_year: i32,
+    /// Calendar months to fetch (default: all twelve).
+    #[serde(default)]
+    pub months: Option<Vec<u32>>,
+    /// `monthly` (default) or `dekad`.
+    #[serde(default = "default_cadence")]
+    pub cadence: String,
+    /// Override the CHIRPS root (tests point at their fake fetcher's URLs).
+    #[serde(default = "default_base_url")]
+    pub base_url: String,
+}
+
+fn default_cadence() -> String {
+    "monthly".to_string()
+}
+
+fn default_base_url() -> String {
+    CHIRPS_BASE_URL.to_string()
+}
+
+/// Outcome of one archive fetch.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChirpsFetchOutcome {
+    /// (filename, product_id) for files downloaded this call.
+    pub fetched: Vec<(String, String)>,
+    /// (filename, product_id) for files already on disk (registered anyway,
+    /// idempotently — a resumed fetch converges).
+    pub already_present: Vec<(String, String)>,
+    /// (filename, error) for downloads that failed; the fetch continues.
+    pub failed: Vec<(String, String)>,
+}
+
+/// Gunzip if the payload has the gzip magic, else pass through.
+fn maybe_gunzip(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    if bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b {
+        use std::io::Read;
+        let mut decoder = flate2::read::GzDecoder::new(bytes.as_slice());
+        let mut out = Vec::new();
+        decoder
+            .read_to_end(&mut out)
+            .map_err(|err| format!("gunzip failed: {err}"))?;
+        Ok(out)
+    } else {
+        Ok(bytes)
+    }
+}
+
+/// Fetch a CHIRPS archive slice over HTTPS and register every file. Files
+/// already on disk are not re-downloaded. Individual download failures are
+/// reported per file, not fatal.
+pub async fn fetch_chirps(
+    pool: &DbPool,
+    data_root: &Path,
+    fetcher: &dyn ChirpsFetcher,
+    request: &ChirpsFetchRequest,
+) -> Result<ChirpsFetchOutcome, SpiRasterError> {
+    if request.start_year > request.end_year {
+        return Err(SpiRasterError::InvalidFetchRequest(format!(
+            "start_year {} is after end_year {}",
+            request.start_year, request.end_year
+        )));
+    }
+    let months = match &request.months {
+        Some(months) => {
+            if months.is_empty() || months.iter().any(|m| !(1..=12).contains(m)) {
+                return Err(SpiRasterError::InvalidFetchRequest(format!(
+                    "months must be nonempty values in 1..=12, got {months:?}"
+                )));
+            }
+            months.clone()
+        }
+        None => (1..=12).collect(),
+    };
+    let dekads: &[Option<u8>] = match request.cadence.as_str() {
+        "monthly" => &[None],
+        "dekad" => &[Some(1), Some(2), Some(3)],
+        other => {
+            return Err(SpiRasterError::InvalidFetchRequest(format!(
+                "cadence must be \"monthly\" or \"dekad\", got {other:?}"
+            )))
+        }
+    };
+    let year_count = (request.end_year - request.start_year + 1) as usize;
+    let file_count = year_count * months.len() * dekads.len();
+    if file_count > MAX_FETCH_FILES {
+        return Err(SpiRasterError::InvalidFetchRequest(format!(
+            "{file_count} files requested exceeds the {MAX_FETCH_FILES} per-request ceiling"
+        )));
+    }
+
+    let chirps_dir = data_root.join("chirps");
+    std::fs::create_dir_all(&chirps_dir).map_err(|source| SpiRasterError::Store {
+        what: "chirps directory",
+        source,
+    })?;
+    let base = request.base_url.trim_end_matches('/');
+    let subdir = match request.cadence.as_str() {
+        "dekad" => "global_dekad",
+        _ => "global_monthly",
+    };
+
+    let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let actor = provenance::ActorIdentity::system("geo_hub:chirps_fetch");
+    let mut outcome = ChirpsFetchOutcome {
+        fetched: Vec::new(),
+        already_present: Vec::new(),
+        failed: Vec::new(),
+    };
+    for year in request.start_year..=request.end_year {
+        for month in &months {
+            for dekad in dekads {
+                let (filename, draft_builder): (String, _) = match dekad {
+                    None => (format!("chirps-v2.0.{year}.{month:02}.tif"), None),
+                    Some(dekad) => (
+                        format!("chirps-v2.0.{year}.{month:02}.{dekad}.tif"),
+                        Some(*dekad),
+                    ),
+                };
+                let target = chirps_dir.join(&filename);
+                let downloaded = if target.exists() {
+                    false
+                } else {
+                    // CHIRPS serves gzipped tifs in the global directories.
+                    let url = format!("{base}/{subdir}/tifs/{filename}.gz");
+                    match fetcher.fetch(&url).await.and_then(maybe_gunzip) {
+                        Ok(bytes) => {
+                            if let Err(source) = std::fs::write(&target, bytes) {
+                                return Err(SpiRasterError::Store {
+                                    what: "fetched chirps file",
+                                    source,
+                                });
+                            }
+                            true
+                        }
+                        Err(error) => {
+                            outcome.failed.push((filename, error));
+                            continue;
+                        }
+                    }
+                };
+                let draft = match draft_builder {
+                    None => chirps_monthly_draft(&target, year, *month),
+                    Some(dekad) => chirps_dekad_draft(&target, year, *month, dekad),
+                };
+                let product_id =
+                    catalog::register_product_with_actor(pool, &draft, &actor, &created_at).await?;
+                if downloaded {
+                    outcome.fetched.push((filename, product_id));
+                } else {
+                    outcome.already_present.push((filename, product_id));
+                }
+            }
+        }
+    }
+    Ok(outcome)
 }
 
 // ---------------------------------------------------------------------------
@@ -356,6 +624,12 @@ pub async fn derive_spi_raster(
     let mut months: std::collections::BTreeMap<(i32, u32), MonthRaster> =
         std::collections::BTreeMap::new();
     for candidate in &candidates {
+        if candidate.algorithm_id == CHIRPS_DEKAD_ALGORITHM {
+            // Dekads are a different cadence, not record noise: excluded
+            // without a per-product skip entry (an archive can hold
+            // thousands of them).
+            continue;
+        }
         let Some(key) = monthly_span(candidate) else {
             skip(
                 &candidate.product_id,
@@ -637,6 +911,54 @@ mod tests {
         ] {
             assert_eq!(parse_chirps_monthly_filename(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn chirps_dekad_filename_parsing_is_pinned() {
+        assert_eq!(
+            parse_chirps_dekad_filename("chirps-v2.0.2024.06.1.tif"),
+            Some((2024, 6, 1))
+        );
+        assert_eq!(
+            parse_chirps_dekad_filename("CHIRPS-v2.0.1981.12.3.TIFF"),
+            Some((1981, 12, 3))
+        );
+        for bad in [
+            "chirps-v2.0.2024.06.tif",   // monthly, not dekad
+            "chirps-v2.0.2024.06.4.tif", // dekad out of range
+            "chirps-v2.0.2024.06.1.2.tif",
+            "chirps-v2.0.2024.13.1.tif",
+        ] {
+            assert_eq!(parse_chirps_dekad_filename(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn dekad_draft_spans_its_dekad_and_has_distinct_identity() {
+        let d1 = chirps_dekad_draft(Path::new("/data/chirps-v2.0.2024.02.1.tif"), 2024, 2, 1);
+        assert_eq!(d1.algorithm_id, CHIRPS_DEKAD_ALGORITHM);
+        assert_eq!(d1.scope.temporal_start, "2024-02-01T00:00:00Z");
+        assert_eq!(d1.scope.temporal_end, "2024-02-10T23:59:59Z");
+        let d3 = chirps_dekad_draft(Path::new("/data/chirps-v2.0.2024.02.3.tif"), 2024, 2, 3);
+        // Leap February: third dekad runs to the 29th.
+        assert_eq!(d3.scope.temporal_end, "2024-02-29T23:59:59Z");
+        // Dekads are distinct from each other and from the month product.
+        let monthly = chirps_monthly_draft(Path::new("/data/chirps-v2.0.2024.02.tif"), 2024, 2);
+        assert_ne!(d1.product_id(), d3.product_id());
+        assert_ne!(d1.product_id(), monthly.product_id());
+    }
+
+    #[test]
+    fn maybe_gunzip_inflates_gzip_and_passes_plain_bytes() {
+        use std::io::Write;
+        let payload = b"agbot chirps fixture".to_vec();
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&payload).unwrap();
+        let gzipped = encoder.finish().unwrap();
+        assert_eq!(maybe_gunzip(gzipped).unwrap(), payload);
+        assert_eq!(maybe_gunzip(payload.clone()).unwrap(), payload);
+        // Corrupt gzip is an error, not silence.
+        assert!(maybe_gunzip(vec![0x1f, 0x8b, 0x00]).is_err());
     }
 
     #[test]
