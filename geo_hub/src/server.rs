@@ -373,6 +373,14 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::compute_drought_index_route),
         )
         .route(
+            "/api/drought-management/rasters",
+            get(routes::list_drought_rasters_route),
+        )
+        .route(
+            "/api/drought-management/rasters/derive",
+            post(routes::derive_drought_raster_route),
+        )
+        .route(
             "/api/marketplace/accounts",
             get(routes::list_marketplace_accounts).post(routes::create_marketplace_account),
         )

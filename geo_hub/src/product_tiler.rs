@@ -148,10 +148,12 @@ pub fn colormap_for_kind(kind: &str) -> Colormap {
             domain: (-1.0, 1.0),
             stops: RAMP_WATER,
         },
-        "drought.vci" | "drought.tci" | "drought.vhi" | "vci" | "tci" | "vhi" => Colormap {
-            domain: (0.0, 100.0),
-            stops: RAMP_CONDITION,
-        },
+        "drought_index" | "drought.vci" | "drought.tci" | "drought.vhi" | "vci" | "tci" | "vhi" => {
+            Colormap {
+                domain: (0.0, 100.0),
+                stops: RAMP_CONDITION,
+            }
+        }
         _ => Colormap {
             domain: (-1.0, 1.0),
             stops: RAMP_GRAY,
