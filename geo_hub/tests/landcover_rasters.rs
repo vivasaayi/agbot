@@ -642,5 +642,42 @@ async fn ml_classify_learns_from_reference_and_registers_a_raster() -> Result<()
     assert_eq!(status, StatusCode::OK);
     let again: serde_json::Value = serde_json::from_slice(&bytes)?;
     assert_eq!(again["landcover_ml_product_id"], json!(ml_id));
+
+    // Batch 20: the tier-3 learned map validates against the reference
+    // through the same agreement engine as the tier-1 rule map — the
+    // outcome records which tier was evaluated.
+    let (status, bytes) = send(
+        &ctx.app,
+        "POST",
+        "/api/landcover/validate",
+        Some(json!({
+            "landcover_product_id": ml_id,
+            "reference_product_id": reference_id,
+        })),
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let validation: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(validation["classification_kind"], "landcover_ml");
+    assert!(validation["overall_agreement"].as_f64().unwrap() >= 0.0);
+    // Self-trained on the reference labels -> perfect agreement on the
+    // three feature-valid pixels.
+    assert_eq!(validation["compared_pixels"], 3);
+    assert!((validation["overall_agreement"].as_f64().unwrap() - 1.0).abs() < 1e-12);
+    let agreement_product = catalog::get_product(
+        &ctx.pool,
+        validation["agreement_product_id"].as_str().unwrap(),
+    )
+    .await?
+    .unwrap();
+    assert_eq!(
+        agreement_product.parameters["classification_kind"],
+        "landcover_ml"
+    );
     Ok(())
 }

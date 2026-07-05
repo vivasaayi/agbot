@@ -591,10 +591,17 @@ pub async fn register_worldcover_dir(
     Ok(outcome)
 }
 
+/// Classification product kinds that can be validated against a reference:
+/// tier-1 rule map (`landcover_rule`) or tier-3 learned map (`landcover_ml`).
+/// Both use the same 1..=6 class codes, so the agreement engine treats them
+/// identically — the outcome records which tier was evaluated.
+pub const CLASSIFICATION_KINDS: &[&str] = &["landcover_rule", "landcover_ml"];
+
 /// A tier-2 validation request.
 #[derive(Debug, Clone, Deserialize)]
 pub struct LandCoverValidateRequest {
-    /// Catalog id of the tier-1 `landcover_rule` L3 product.
+    /// Catalog id of a classification L3 product (`landcover_rule` or
+    /// `landcover_ml`).
     pub landcover_product_id: String,
     /// Catalog id of the `landcover_reference` product on the same grid.
     pub reference_product_id: String,
@@ -605,6 +612,8 @@ pub struct LandCoverValidateRequest {
 pub struct LandCoverValidateOutcome {
     pub agreement_product_id: String,
     pub landcover_product_id: String,
+    /// The evaluated classification kind (`landcover_rule` / `landcover_ml`).
+    pub classification_kind: String,
     pub reference_product_id: String,
     pub compared_pixels: u32,
     pub overall_agreement: f64,
@@ -619,6 +628,18 @@ fn expect_kind(product: &RegisteredProduct, expected: &'static str) -> Result<()
             product_id: product.product_id.clone(),
             kind: product.kind.clone(),
             expected,
+        });
+    }
+    Ok(())
+}
+
+/// Accept any tier-1/tier-3 classification kind.
+fn expect_classification_kind(product: &RegisteredProduct) -> Result<(), LandCoverError> {
+    if !CLASSIFICATION_KINDS.contains(&product.kind.as_str()) {
+        return Err(LandCoverError::WrongKind {
+            product_id: product.product_id.clone(),
+            kind: product.kind.clone(),
+            expected: "landcover_rule or landcover_ml",
         });
     }
     Ok(())
@@ -656,7 +677,7 @@ pub async fn validate_landcover(
                 request.landcover_product_id.clone(),
             ))
         })?;
-    expect_kind(&landcover, "landcover_rule")?;
+    expect_classification_kind(&landcover)?;
     let reference = catalog::get_product(pool, &request.reference_product_id)
         .await?
         .ok_or_else(|| {
@@ -696,6 +717,7 @@ pub async fn validate_landcover(
         algorithm_version: "1.0.0".to_string(),
         parameters: serde_json::json!({
             "landcover_product_id": landcover.product_id,
+            "classification_kind": landcover.kind,
             "reference_product_id": reference.product_id,
             "compared_pixels": result.compared_pixels,
             "overall_agreement": result.overall_agreement,
@@ -760,6 +782,7 @@ pub async fn validate_landcover(
 
     Ok(LandCoverValidateOutcome {
         agreement_product_id,
+        classification_kind: landcover.kind.clone(),
         landcover_product_id: landcover.product_id,
         reference_product_id: reference.product_id,
         compared_pixels: result.compared_pixels,
