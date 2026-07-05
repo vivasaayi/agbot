@@ -23,6 +23,7 @@ pub mod l3_product;
 pub mod landcover_agreement;
 pub mod lidar_analysis;
 pub mod lidar_change;
+pub mod lst;
 pub mod ndvi_analysis;
 pub mod phenology;
 pub mod product_anomalies;

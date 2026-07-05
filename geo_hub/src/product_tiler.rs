@@ -149,6 +149,8 @@ const RAMP_DNBR: &[[u8; 3]] = &[
     [215, 48, 39],
     [122, 1, 119],
 ];
+/// Blue -> pale yellow -> red: land surface temperature (Kelvin).
+const RAMP_THERMAL: &[[u8; 3]] = &[[49, 54, 149], [255, 255, 191], [165, 0, 38]];
 /// Binary water-mask colors: land tan, water blue.
 const RAMP_WATER_MASK: &[[u8; 3]] = &[[210, 180, 140], [24, 100, 190]];
 /// Categorical land-cover class colors, codes 1..=6: water blue, bare tan,
@@ -188,6 +190,13 @@ pub fn colormap_for_kind(kind: &str) -> Colormap {
                 categorical: false,
             }
         }
+        // LST in Kelvin: cool blue -> pale yellow -> hot red over the
+        // terrestrial 250-330 K range (matches the CLI thermal viz range).
+        "lst" | "thermal_lst" => Colormap {
+            domain: (250.0, 330.0),
+            stops: RAMP_THERMAL,
+            categorical: false,
+        },
         // SPI is a standard-normal quantile; McKee classes end at ±2, the
         // operational range at ~±3.09 (probability floor).
         "spi" => Colormap {

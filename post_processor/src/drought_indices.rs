@@ -204,6 +204,8 @@ pub enum DroughtIndexError {
     SpatialRef { reason: RasterSpatialRefError },
     #[error("VHI alpha must be within [0, 1] (got {alpha})")]
     InvalidAlpha { alpha: f64 },
+    #[error("rehydrated drought raster pixel {pixel} is {value}, outside the [0, 100] percent domain (not a drought raster?)")]
+    RehydratedValueOutOfRange { pixel: usize, value: f32 },
     #[error("VHI requires VCI and TCI computed on the same grid ({field} differ)")]
     ComponentGridMismatch { field: &'static str },
     #[error("evidence metadata failed: {0}")]
@@ -394,6 +396,92 @@ pub fn compute_vhi(
             alpha,
             &vci.evidence.input_hash,
             &tci.evidence.input_hash,
+        ),
+    )
+}
+
+/// A persisted drought-index raster read back from its registered GeoTIFF,
+/// ready to rehydrate into a [`DroughtIndexResult`] so stored VCI/TCI L3
+/// products can feed [`compute_vhi`] without recomputing their climatology.
+#[derive(Debug, Clone)]
+pub struct RehydratedDroughtRaster {
+    pub kind: DroughtIndexKind,
+    /// Catalog product id of the persisted drought product itself (it is
+    /// the current-period input from the blend's point of view).
+    pub product_id: String,
+    pub width: u32,
+    pub height: u32,
+    pub spatial_ref: RasterSpatialRef,
+    /// Index percent values, row-major (nodata already mapped out of
+    /// `valid_mask`).
+    pub values: Vec<f32>,
+    pub valid_mask: Vec<bool>,
+}
+
+/// Rehydrate a persisted drought raster into a [`DroughtIndexResult`].
+/// Severity is re-derived from the values; invalid pixels are reason-coded
+/// [`DroughtPixelReason::NoCurrentObservation`]. Valid values must be in
+/// the drought percent domain `[0, 100]` — anything else means the artifact
+/// is not a drought raster and is refused.
+pub fn drought_result_from_raster(
+    raster: &RehydratedDroughtRaster,
+) -> Result<DroughtIndexResult, DroughtIndexError> {
+    assert_raster_spatial_ref(Some(&raster.spatial_ref), raster.width, raster.height)
+        .map_err(|reason| DroughtIndexError::SpatialRef { reason })?;
+    let pixel_count = raster.width as usize * raster.height as usize;
+    if raster.values.len() != pixel_count {
+        return Err(DroughtIndexError::CurrentLengthMismatch {
+            expected: pixel_count,
+            actual: raster.values.len(),
+        });
+    }
+    if raster.valid_mask.len() != pixel_count {
+        return Err(DroughtIndexError::MaskLengthMismatch {
+            expected: pixel_count,
+            actual: raster.valid_mask.len(),
+        });
+    }
+
+    let mut values = vec![DROUGHT_SENTINEL; pixel_count];
+    let mut reason_codes = vec![DroughtPixelReason::Computed; pixel_count];
+    let mut severity = vec![DroughtSeverity::Invalid; pixel_count];
+    let mut valid = 0u32;
+    for pixel in 0..pixel_count {
+        let value = raster.values[pixel];
+        if !raster.valid_mask[pixel] || !value.is_finite() {
+            reason_codes[pixel] = DroughtPixelReason::NoCurrentObservation;
+            continue;
+        }
+        if !(0.0..=100.0).contains(&value) {
+            return Err(DroughtIndexError::RehydratedValueOutOfRange { pixel, value });
+        }
+        values[pixel] = value;
+        severity[pixel] = classify_severity(value);
+        valid += 1;
+    }
+
+    finish_result(
+        FinishContext {
+            kind: raster.kind,
+            current_product_id: raster.product_id.clone(),
+            climatology_product_ids: Vec::new(),
+            spatial_ref: raster.spatial_ref.clone(),
+            alpha: DEFAULT_VHI_ALPHA,
+            width: raster.width,
+            height: raster.height,
+        },
+        values,
+        reason_codes,
+        severity,
+        0,
+        valid,
+        &(
+            "drought_rehydrate_v1",
+            raster.kind,
+            &raster.product_id,
+            &raster.values,
+            &raster.valid_mask,
+            &raster.spatial_ref,
         ),
     )
 }
@@ -925,6 +1013,85 @@ mod tests {
         assert_eq!(
             compute_vci(&raster, &climatology, &period).expect_err("foreign CRS"),
             DroughtIndexError::ClimatologySpatialRefMismatch
+        );
+    }
+
+    fn rehydrated(
+        kind: DroughtIndexKind,
+        id: &str,
+        values: Vec<f32>,
+        valid_mask: Vec<bool>,
+    ) -> RehydratedDroughtRaster {
+        RehydratedDroughtRaster {
+            kind,
+            product_id: id.to_string(),
+            width: 2,
+            height: 1,
+            spatial_ref: spatial_ref_2x1(),
+            values,
+            valid_mask,
+        }
+    }
+
+    #[test]
+    fn rehydrated_rasters_blend_into_vhi() {
+        // Persisted VCI [80, 20] and TCI [40, nodata]: severity re-derived
+        // (80 no_drought, 20 moderate), then the equal-weight blend gives
+        // pixel 0 = 0.5*80 + 0.5*40 = 60 and pixel 1 component-invalid.
+        let vci = drought_result_from_raster(&rehydrated(
+            DroughtIndexKind::Vci,
+            "l3:vci",
+            vec![80.0, 20.0],
+            vec![true, true],
+        ))
+        .expect("vci rehydrates");
+        assert_eq!(vci.severity_counts.no_drought, 1);
+        assert_eq!(vci.severity_counts.moderate, 1);
+        assert_eq!(vci.valid_fraction, 1.0);
+
+        let tci = drought_result_from_raster(&rehydrated(
+            DroughtIndexKind::Tci,
+            "l3:tci",
+            vec![40.0, -9999.0],
+            vec![true, false],
+        ))
+        .expect("tci rehydrates");
+        assert_eq!(
+            tci.reason_codes[1],
+            DroughtPixelReason::NoCurrentObservation
+        );
+
+        let vhi = compute_vhi(&vci, &tci, 0.5).expect("vhi");
+        assert!((vhi.values[0] - 60.0).abs() < 1.0e-4);
+        assert_eq!(vhi.severity[0], DroughtSeverity::NoDrought);
+        assert_eq!(vhi.reason_codes[1], DroughtPixelReason::ComponentInvalid);
+        // VHI lineage inputs are the two persisted component products.
+        assert_eq!(vhi.current_product_id, "l3:vci,l3:tci");
+    }
+
+    #[test]
+    fn rehydration_refuses_values_outside_the_percent_domain() {
+        // A valid pixel at 0.4 percent is fine; 300 (e.g. an LST raster
+        // passed by mistake) is refused as not-a-drought-raster.
+        assert!(drought_result_from_raster(&rehydrated(
+            DroughtIndexKind::Vci,
+            "l3:vci",
+            vec![0.4, 100.0],
+            vec![true, true],
+        ))
+        .is_ok());
+        assert_eq!(
+            drought_result_from_raster(&rehydrated(
+                DroughtIndexKind::Tci,
+                "l3:tci",
+                vec![300.0, 40.0],
+                vec![true, true],
+            ))
+            .expect_err("out of domain"),
+            DroughtIndexError::RehydratedValueOutOfRange {
+                pixel: 0,
+                value: 300.0
+            }
         );
     }
 }

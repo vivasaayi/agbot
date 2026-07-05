@@ -394,6 +394,11 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::derive_spi_raster_route),
         )
         .route(
+            "/api/drought-management/vhi/derive",
+            post(routes::derive_vhi_raster_route),
+        )
+        .route("/api/thermal/lst/derive", post(routes::derive_lst_route))
+        .route(
             "/api/change-detection/dnbr/derive",
             post(routes::derive_dnbr_route),
         )

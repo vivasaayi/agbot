@@ -21,8 +21,9 @@ use std::path::{Path, PathBuf};
 
 use chrono::NaiveDate;
 use post_processor::drought_indices::{
-    compute_tci, compute_vci, drought_l3_draft, DroughtCurrentRaster, DroughtIndexError,
-    DroughtIndexResult, DroughtL3Scope, SeverityClassCounts,
+    compute_tci, compute_vci, compute_vhi, drought_l3_draft, drought_result_from_raster,
+    DroughtCurrentRaster, DroughtIndexError, DroughtIndexKind, DroughtIndexResult, DroughtL3Scope,
+    RehydratedDroughtRaster, SeverityClassCounts, DEFAULT_VHI_ALPHA,
 };
 use post_processor::index_climatology::{
     build_index_climatology, calendar_period_for, climatology_l3_draft, write_climatology_json,
@@ -80,6 +81,13 @@ pub enum DroughtRasterError {
     },
     #[error("catalog registration failed: {0}")]
     Catalog(#[from] CatalogError),
+    #[error("product {product_id} is not a {expected} drought_index L3 (kind {kind:?}, index_kind {index_kind:?})")]
+    NotADroughtComponent {
+        product_id: String,
+        expected: &'static str,
+        kind: String,
+        index_kind: Option<String>,
+    },
 }
 
 impl DroughtRasterError {
@@ -93,6 +101,12 @@ impl DroughtRasterError {
                 | DroughtRasterError::BadTemporal { .. }
                 | DroughtRasterError::NoUsableObservations { .. }
                 | DroughtRasterError::MissingPeriod(_)
+                | DroughtRasterError::NotADroughtComponent { .. }
+                | DroughtRasterError::Drought(
+                    DroughtIndexError::InvalidAlpha { .. }
+                        | DroughtIndexError::ComponentGridMismatch { .. }
+                        | DroughtIndexError::RehydratedValueOutOfRange { .. }
+                )
         )
     }
 }
@@ -471,6 +485,162 @@ pub async fn derive_drought_raster(
         observations_skipped: skipped,
         climatology_artifact: climatology_path,
         drought_artifact: drought_path,
+    })
+}
+
+/// A VHI blend request over two registered drought-index L3 products.
+#[derive(Debug, Clone, Deserialize)]
+pub struct VhiDeriveRequest {
+    /// Catalog id of a registered `drought_index` L3 with index_kind `vci`.
+    pub vci_product_id: String,
+    /// Catalog id of a registered `drought_index` L3 with index_kind `tci`,
+    /// on the same grid.
+    pub tci_product_id: String,
+    /// Vegetation weight `α` in [0, 1] (Kogan default 0.5).
+    #[serde(default = "default_vhi_alpha")]
+    pub alpha: f64,
+    pub field_id: String,
+    pub season_id: String,
+}
+
+fn default_vhi_alpha() -> f64 {
+    DEFAULT_VHI_ALPHA
+}
+
+/// Outcome of one VHI derivation.
+#[derive(Debug, Clone, Serialize)]
+pub struct VhiDeriveOutcome {
+    pub vhi_product_id: String,
+    pub alpha: f64,
+    pub valid_fraction: f32,
+    pub severity_counts: SeverityClassCounts,
+    pub vhi_artifact: PathBuf,
+    pub stac_item_href: String,
+    pub tiles_href: String,
+}
+
+/// Load a registered drought-index L3 component, verifying it really is the
+/// expected VCI/TCI, and rehydrate it for the blend.
+async fn load_drought_component(
+    pool: &DbPool,
+    product_id: &str,
+    expected: &'static str,
+    kind: DroughtIndexKind,
+) -> Result<(RegisteredProduct, LoadedRaster, DroughtIndexResult), DroughtRasterError> {
+    let product = catalog::get_product(pool, product_id)
+        .await?
+        .ok_or_else(|| DroughtRasterError::CurrentNotFound(product_id.to_string()))?;
+    let index_kind = product
+        .parameters
+        .get("index_kind")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    if product.kind != "drought_index" || index_kind.as_deref() != Some(expected) {
+        return Err(DroughtRasterError::NotADroughtComponent {
+            product_id: product_id.to_string(),
+            expected,
+            kind: product.kind.clone(),
+            index_kind,
+        });
+    }
+    let raster = load_raster(Path::new(geotiff_artifact_path(&product)?))?;
+    let result = drought_result_from_raster(&RehydratedDroughtRaster {
+        kind,
+        product_id: product_id.to_string(),
+        width: raster.width,
+        height: raster.height,
+        spatial_ref: raster.spatial_ref.clone(),
+        values: raster.values.clone(),
+        valid_mask: raster.valid_mask.clone(),
+    })?;
+    Ok((product, raster, result))
+}
+
+/// Blend two registered same-grid VCI + TCI drought products into a VHI
+/// (`α·VCI + (1−α)·TCI`) and register it as a `drought_index` L3 with
+/// lineage to both components. Idempotent (content-addressed ids).
+pub async fn derive_vhi_raster(
+    pool: &DbPool,
+    data_root: &Path,
+    request: &VhiDeriveRequest,
+) -> Result<VhiDeriveOutcome, DroughtRasterError> {
+    let (vci_product, vci_raster, vci) =
+        load_drought_component(pool, &request.vci_product_id, "vci", DroughtIndexKind::Vci).await?;
+    let (tci_product, _, tci) =
+        load_drought_component(pool, &request.tci_product_id, "tci", DroughtIndexKind::Tci).await?;
+
+    let result = compute_vhi(&vci, &tci, request.alpha)?;
+
+    let temporal_start = vci_product
+        .temporal_start
+        .clone()
+        .or_else(|| tci_product.temporal_start.clone())
+        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+    let temporal_end = vci_product
+        .temporal_end
+        .clone()
+        .or_else(|| tci_product.temporal_end.clone())
+        .unwrap_or_else(|| temporal_start.clone());
+    let mut draft = drought_l3_draft(
+        &result,
+        &DroughtL3Scope {
+            field_id: request.field_id.clone(),
+            season_id: request.season_id.clone(),
+            scene_id: None,
+            temporal_start,
+            temporal_end,
+            source_id: vci_product.source_id.clone().or(tci_product.source_id),
+        },
+    );
+
+    let drought_dir = data_root.join("derived").join("drought");
+    std::fs::create_dir_all(&drought_dir).map_err(|source| DroughtRasterError::Store {
+        what: "drought directory",
+        source,
+    })?;
+    let vhi_path = drought_dir.join(format!(
+        "{}.tif",
+        artifact_file_component(&draft.product_id())
+    ));
+    let disk_values: Vec<f32> = result
+        .values
+        .iter()
+        .map(|v| if v.is_finite() { *v } else { DROUGHT_NODATA })
+        .collect();
+    write_geotiff_f32(
+        &vhi_path,
+        result.width,
+        result.height,
+        &disk_values,
+        &GeoTiffTags {
+            epsg: vci_raster.epsg,
+            geo_transform: vci_raster.geo_transform,
+            nodata: Some(f64::from(DROUGHT_NODATA)),
+        },
+    )?;
+    let checksum = file_checksum(&vhi_path, "vhi raster readback")?;
+    draft.spatial_ref = Some(vci_raster.spatial_ref.clone());
+    draft.gsd_m_per_px = vci_product.gsd_m_per_px;
+    draft.artifact = Some(ProductArtifact {
+        format: "tif".to_string(),
+        path: vhi_path.to_string_lossy().to_string(),
+        checksum_sha256: Some(checksum.clone()),
+    });
+    draft.evidence_digests.push(checksum);
+
+    let actor = provenance::ActorIdentity::system("geo_hub:drought_rasters");
+    let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let vhi_product_id =
+        catalog::register_product_with_actor(pool, &draft, &actor, &created_at).await?;
+
+    Ok(VhiDeriveOutcome {
+        stac_item_href: format!("/api/stac/collections/drought_index/items/{vhi_product_id}"),
+        tiles_href: format!("/api/catalog/products/{vhi_product_id}/tiles/{{z}}/{{x}}/{{y}}.png"),
+        vhi_product_id,
+        alpha: request.alpha,
+        valid_fraction: result.valid_fraction,
+        severity_counts: result.severity_counts,
+        vhi_artifact: vhi_path,
     })
 }
 

@@ -11,8 +11,8 @@ use axum::Json;
 use serde::Deserialize;
 
 use crate::drought_rasters::{
-    derive_drought_raster, list_drought_raster_products, DroughtRasterError, DroughtRasterOutcome,
-    DroughtRasterRequest,
+    derive_drought_raster, derive_vhi_raster, list_drought_raster_products, DroughtRasterError,
+    DroughtRasterOutcome, DroughtRasterRequest, VhiDeriveOutcome, VhiDeriveRequest,
 };
 use crate::error::{AppError, AppResult};
 use crate::spi_rasters::{
@@ -37,6 +37,15 @@ pub async fn derive_drought_raster_route(
     Json(request): Json<DroughtRasterRequest>,
 ) -> AppResult<Json<DroughtRasterOutcome>> {
     let outcome = derive_drought_raster(&state.pool, &state.config.data_root, &request).await?;
+    Ok(Json(outcome))
+}
+
+/// Blend two registered same-grid VCI + TCI drought products into a VHI L3.
+pub async fn derive_vhi_raster_route(
+    State(state): State<AppState>,
+    Json(request): Json<VhiDeriveRequest>,
+) -> AppResult<Json<VhiDeriveOutcome>> {
+    let outcome = derive_vhi_raster(&state.pool, &state.config.data_root, &request).await?;
     Ok(Json(outcome))
 }
 
