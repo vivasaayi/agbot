@@ -2,13 +2,12 @@
 
 ## CURRENT: satellite intelligence pipeline (2026-07)
 Active plan + per-batch ledger: `docs/design/satellite-intelligence-pipeline.md`
-(the ledger there is authoritative; batches 1-19 committed). Last: batch 19
-(24e40f3) — HLS ingestion (geo_hub/src/hls.rs: parse HLSL30/HLSS30 band
-filenames, instrument-specific NDVI band roles, register_hls_dir -> harmonized
-ndvi L2s; POST /api/ingest/hls/register). Batch 18 (85e0e4b): Sentinel-1 SAR
-all-weather water (polarity-generalized water_extent engine). Batch 17
-(6f61dc5): tier-3 learned classifier. Batch 16 (cc1ed4b): WorldCover tier-2
-agreement. Batch 15
+(the ledger there is authoritative; batches 1-20 committed). Last: batch 20
+(360b55e) — tier-3 validation loop closed: POST /api/landcover/validate
+accepts landcover_ml (not just landcover_rule); classification_kind recorded
+in outcome + agreement L3. Batch 19 (24e40f3): HLS ingestion. Batch 18
+(85e0e4b): Sentinel-1 SAR water. Batch 17 (6f61dc5): tier-3 learned classifier.
+Batch 16 (cc1ed4b): WorldCover tier-2 agreement. Batch 15
 (ae96756) — Otsu water-body extraction (post_processor/src/water_extent.rs +
 geo_hub/src/water_extent_rasters.rs, POST /api/water-management/extent/derive,
 binary-mask colormap; closes Phase 3 item 9's water half). Batch 14
@@ -18,10 +17,10 @@ diverging colormap). Batch 13 (224585d): Sen2Cor orchestration. Batch 12
 (51e842b): CHIRPS dekads + fetcher. Batch 11 (a292632): SPI-N windows.
 Batch 10 (ab688b0): phenology + land-cover. Batch 9 (b131e4e): CHIRPS + SPI.
 Batch 8 (dde2610): climatology + VCI. Batch 7 (2bf6464): Web Mercator tiler.
-Phases 1-4 substantially COMPLETE (Sen2Cor, dNBR, classification tiers 1-3,
-SAR water, HLS). NEXT: batch 20 = validate landcover_ml via batch-16 engine
-(small, closes tier-3 loop). Standing: JP2 decode for sen2cor; LST for
-TCI/VHI; JRC prior; /browse derive affordances; HLS Fmask+Int16. Open: JP2 decode for sen2cor bands; LST
+Phases 1-4 COMPLETE incl. tier-3 validation loop. Remaining are the standing
+follow-ons only. NEXT: batch 21 = a standing follow-on — best candidates:
+LST/thermal product path (unlocks TCI/VHI on real data), or /browse derive
+affordances, or Int16/JP2 band read (unlocks sen2cor/HLS local derivation). Open: JP2 decode for sen2cor bands; LST
 path for TCI/VHI; WorldCover bootstrap validation; /browse derive
 affordances. Everything below is the earlier (completed) Track A/B refactor
 history.
