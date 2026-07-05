@@ -50,6 +50,16 @@ pub fn write_geotiff_u8(
     write_geotiff::<colortype::Gray8>(path.as_ref(), width, height, pixels, tags)
 }
 
+pub fn write_geotiff_i16(
+    path: impl AsRef<Path>,
+    width: u32,
+    height: u32,
+    pixels: &[i16],
+    tags: &GeoTiffTags,
+) -> Result<(), RasterIoError> {
+    write_geotiff::<colortype::GrayI16>(path.as_ref(), width, height, pixels, tags)
+}
+
 pub fn write_geotiff_f32(
     path: impl AsRef<Path>,
     width: u32,

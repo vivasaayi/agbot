@@ -460,6 +460,10 @@ fn band_to_u16(band: RasterBand, name: &str) -> Result<Vec<u16>, DerivationError
     match band {
         RasterBand::U16(values) => Ok(values),
         RasterBand::U8(values) => Ok(values.into_iter().map(u16::from).collect()),
+        // Landsat C2 / Sentinel-2 Int16 SR: negative values are the -9999
+        // fill (nonphysical reflectance), clamped to 0 — the nodata sentinel
+        // the SCL masking + calibration downstream already treats as fill.
+        RasterBand::I16(values) => Ok(values.into_iter().map(|v| v.max(0) as u16).collect()),
         RasterBand::F32(_) => Err(DerivationError::UnsupportedBandDtype {
             band: name.to_string(),
             dtype: "f32",

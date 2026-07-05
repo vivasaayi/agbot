@@ -45,7 +45,9 @@ pub use error::RasterIoError;
 pub use geotiff::{GeoTiffInfo, GeoTiffReader, RasterBand, RasterDtype, RasterWindow};
 #[cfg(feature = "remote")]
 pub use remote::{CogTileLayout, RemoteCogReader, RemoteFetchMetrics};
-pub use write::{write_geotiff_f32, write_geotiff_u16, write_geotiff_u8, GeoTiffTags};
+pub use write::{
+    write_geotiff_f32, write_geotiff_i16, write_geotiff_u16, write_geotiff_u8, GeoTiffTags,
+};
 
 /// Re-export so `remote`-feature consumers construct/parse `ObjectStore`
 /// instances (e.g. an in-memory store in tests) against the exact version

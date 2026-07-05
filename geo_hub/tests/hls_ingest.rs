@@ -17,7 +17,7 @@ use axum::{
 use geo_hub::catalog::{self, ProductFilter};
 use geo_hub::state::AppState;
 use geo_hub::{db, server, HubConfig};
-use raster_io::{write_geotiff_f32, GeoTiffReader, GeoTiffTags};
+use raster_io::{write_geotiff_f32, write_geotiff_i16, GeoTiffReader, GeoTiffTags};
 use serde_json::json;
 use shared::product_graph::ProductLevel;
 use std::path::Path;
@@ -65,6 +65,24 @@ fn write_band(dir: &Path, name: &str, value: f32, fill_pixel: Option<usize>) -> 
     Ok(())
 }
 
+/// Write a real-HLS-style Int16 surface-reflectance band (scaled DN, -9999
+/// fill), so the ingest path exercises the Int16 read + 1e-4 reflectance
+/// scaling rather than pre-scaled f32.
+fn write_band_i16(dir: &Path, name: &str, dn: i16) -> Result<()> {
+    write_geotiff_i16(
+        &dir.join(name),
+        4,
+        4,
+        &[dn; 16],
+        &GeoTiffTags {
+            epsg: Some(EPSG),
+            geo_transform: Some(TRANSFORM),
+            nodata: Some(-9999.0),
+        },
+    )?;
+    Ok(())
+}
+
 async fn send(
     app: &Router,
     method: &str,
@@ -104,19 +122,11 @@ async fn hls_l30_and_s30_register_as_one_harmonized_ndvi_series() -> Result<()> 
         0.6,
         Some(15),
     )?;
-    // L30 granule (Landsat), next day: NIR = B05.
-    write_band(
-        &hls_dir,
-        "HLS.L30.T43PFN.2024153T052015.v2.0.B04.tif",
-        0.2,
-        None,
-    )?;
-    write_band(
-        &hls_dir,
-        "HLS.L30.T43PFN.2024153T052015.v2.0.B05.tif",
-        0.6,
-        None,
-    )?;
+    // L30 granule (Landsat), next day: NIR = B05. Written as REAL HLS Int16
+    // DN (red 2000 -> 0.2 refl, nir 6000 -> 0.6 refl after the 1e-4 scale),
+    // exercising the batch-21 Int16 read + reflectance scaling.
+    write_band_i16(&hls_dir, "HLS.L30.T43PFN.2024153T052015.v2.0.B04.tif", 2000)?;
+    write_band_i16(&hls_dir, "HLS.L30.T43PFN.2024153T052015.v2.0.B05.tif", 6000)?;
     // An incomplete S30 granule (red only) and a non-HLS file.
     write_band(
         &hls_dir,

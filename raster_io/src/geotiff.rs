@@ -22,6 +22,9 @@ const GEOKEY_USER_DEFINED: u16 = 32767;
 pub enum RasterDtype {
     U8,
     U16,
+    /// Signed 16-bit — Landsat C2, Sentinel-2, and HLS surface reflectance
+    /// are Int16 (scaled DN with a signed fill, e.g. -9999).
+    I16,
     F32,
 }
 
@@ -30,8 +33,15 @@ impl RasterDtype {
         match self {
             RasterDtype::U8 => "u8",
             RasterDtype::U16 => "u16",
+            RasterDtype::I16 => "i16",
             RasterDtype::F32 => "f32",
         }
+    }
+
+    /// True for the integer dtypes (scaled DN products that a caller may
+    /// need to convert to physical units with a scale/offset).
+    pub fn is_integer(self) -> bool {
+        matches!(self, RasterDtype::U8 | RasterDtype::U16 | RasterDtype::I16)
     }
 }
 
@@ -40,6 +50,7 @@ impl RasterDtype {
 pub enum RasterBand {
     U8(Vec<u8>),
     U16(Vec<u16>),
+    I16(Vec<i16>),
     F32(Vec<f32>),
 }
 
@@ -48,6 +59,7 @@ impl RasterBand {
         match self {
             RasterBand::U8(_) => RasterDtype::U8,
             RasterBand::U16(_) => RasterDtype::U16,
+            RasterBand::I16(_) => RasterDtype::I16,
             RasterBand::F32(_) => RasterDtype::F32,
         }
     }
@@ -56,6 +68,7 @@ impl RasterBand {
         match self {
             RasterBand::U8(values) => values.len(),
             RasterBand::U16(values) => values.len(),
+            RasterBand::I16(values) => values.len(),
             RasterBand::F32(values) => values.len(),
         }
     }
@@ -76,15 +89,17 @@ impl RasterBand {
         match self {
             RasterBand::U8(values) => values.get(index).map(|value| f64::from(*value)),
             RasterBand::U16(values) => values.get(index).map(|value| f64::from(*value)),
+            RasterBand::I16(values) => values.get(index).map(|value| f64::from(*value)),
             RasterBand::F32(values) => values.get(index).map(|value| f64::from(*value)),
         }
     }
 
-    /// All pixel values widened to f32 (u8/u16 are exact in f32).
+    /// All pixel values widened to f32 (u8/u16/i16 are exact in f32).
     pub fn to_f32(&self) -> Vec<f32> {
         match self {
             RasterBand::U8(values) => values.iter().map(|value| f32::from(*value)).collect(),
             RasterBand::U16(values) => values.iter().map(|value| f32::from(*value)).collect(),
+            RasterBand::I16(values) => values.iter().map(|value| f32::from(*value)).collect(),
             RasterBand::F32(values) => values.clone(),
         }
     }
@@ -175,10 +190,11 @@ impl GeoTiffReader {
         match decoded {
             DecodingResult::U8(values) => Ok(RasterBand::U8(values)),
             DecodingResult::U16(values) => Ok(RasterBand::U16(values)),
+            DecodingResult::I16(values) => Ok(RasterBand::I16(values)),
             DecodingResult::F32(values) => Ok(RasterBand::F32(values)),
             other => Err(RasterIoError::UnsupportedDtype {
                 path: self.path.clone(),
-                detail: format!("decoded buffer variant {other:?} is not u8/u16/f32"),
+                detail: format!("decoded buffer variant {other:?} is not u8/u16/i16/f32"),
             }),
         }
     }
@@ -195,6 +211,7 @@ impl GeoTiffReader {
         Ok(match full {
             RasterBand::U8(values) => RasterBand::U8(crop(&values, row_width, window)),
             RasterBand::U16(values) => RasterBand::U16(crop(&values, row_width, window)),
+            RasterBand::I16(values) => RasterBand::I16(crop(&values, row_width, window)),
             RasterBand::F32(values) => RasterBand::F32(crop(&values, row_width, window)),
         })
     }
@@ -322,9 +339,11 @@ fn parse_geotiff_info(
         .map_err(decode_error)?
         .and_then(|formats: Vec<u16>| formats.first().copied())
         .unwrap_or(1);
+    // TIFF SampleFormat: 1 = unsigned int, 2 = signed int, 3 = IEEE float.
     let dtype = match (sample_format, bits_per_sample) {
         (1, 8) => RasterDtype::U8,
         (1, 16) => RasterDtype::U16,
+        (2, 16) => RasterDtype::I16,
         (3, 32) => RasterDtype::F32,
         (format, bits) => {
             return Err(RasterIoError::UnsupportedDtype {
@@ -428,6 +447,51 @@ fn epsg_from_geokey_directory(directory: &[u16]) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{write_geotiff_i16, GeoTiffTags};
+
+    #[test]
+    fn int16_geotiff_round_trips_signed_values_and_widens_to_f32() {
+        // Landsat/Sentinel/HLS-style Int16 surface reflectance with a signed
+        // -9999 fill: read back the exact signed values, and to_f32() widens
+        // them losslessly.
+        let dir = std::env::temp_dir().join("raster_io_i16_roundtrip");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("i16.tif");
+        let pixels: [i16; 4] = [2000, 6000, -9999, 0];
+        write_geotiff_i16(
+            &path,
+            2,
+            2,
+            &pixels,
+            &GeoTiffTags {
+                epsg: Some(32643),
+                geo_transform: Some([600_000.0, 30.0, 0.0, 1_300_020.0, 0.0, -30.0]),
+                nodata: Some(-9999.0),
+            },
+        )
+        .unwrap();
+
+        let mut reader = GeoTiffReader::open(&path).unwrap();
+        assert_eq!(reader.info().epsg, Some(32643));
+        assert_eq!(reader.info().nodata, Some(-9999.0));
+        let band = reader.read_band().unwrap();
+        assert_eq!(band.dtype(), RasterDtype::I16);
+        assert!(band.dtype().is_integer());
+        assert_eq!(band, RasterBand::I16(pixels.to_vec()));
+        assert_eq!(band.value_as_f64(2), Some(-9999.0));
+        assert_eq!(band.to_f32(), vec![2000.0, 6000.0, -9999.0, 0.0]);
+
+        // Windowed read crops the signed buffer.
+        let window = reader
+            .read_window(RasterWindow {
+                x: 1,
+                y: 0,
+                width: 1,
+                height: 1,
+            })
+            .unwrap();
+        assert_eq!(window, RasterBand::I16(vec![6000]));
+    }
 
     #[test]
     fn geokey_directory_prefers_projected_crs_and_skips_user_defined() {

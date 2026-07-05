@@ -17,11 +17,12 @@
 //!
 //! Band roles are instrument-specific — this is exactly the harmonization
 //! the module encapsulates: HLSS30 red=B04 / NIR=B08, HLSL30 red=B04 /
-//! NIR=B05. Fixtures/inputs are f32 surface-reflectance GeoTIFFs; real HLS
-//! is Int16 scaled by 1e-4, so an i16 read/scale step (or `gdal_translate`
-//! to f32) is the one documented prerequisite before these feed the local
-//! pipeline. Fmask cloud masking is a documented follow-on (mask before
-//! index); here masking is on band fill values only.
+//! NIR=B05. Real HLS is **Int16 scaled DN** (× 1e-4, signed -9999 fill);
+//! `load_hls_reflectance` reads it via `raster_io`'s Int16 support (batch
+//! 21) and scales integer bands to reflectance, while f32 bands (already
+//! reflectance) pass through — so pre-downloaded HLS GeoTIFFs feed the local
+//! pipeline directly. Fmask cloud masking is a documented follow-on (mask
+//! before index); here masking is on band fill values only.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -35,12 +36,14 @@ use thiserror::Error;
 use crate::catalog::{self, CatalogError};
 use crate::db::DbPool;
 use crate::drought_rasters::{
-    artifact_file_component, file_checksum, load_raster, DroughtRasterError, LoadedRaster,
+    artifact_file_component, file_checksum, DroughtRasterError, LoadedRaster,
 };
 use crate::satellite_derivation::{compute_masked_index, INDEX_NODATA};
 
 /// Source id stamped on HLS registrations.
 pub const HLS_SOURCE_ID: &str = "hls-v2.0";
+/// HLS v2.0 surface-reflectance scale factor: Int16 DN * 1e-4 = reflectance.
+pub const HLS_REFLECTANCE_SCALE: f32 = 1.0e-4;
 
 #[derive(Debug, Error)]
 pub enum HlsError {
@@ -149,6 +152,40 @@ struct GranuleBands {
     bands: BTreeMap<String, PathBuf>,
 }
 
+/// Load an HLS band as surface reflectance. Real HLS is Int16 scaled DN
+/// (× 1e-4); the fill value is a negative -9999 masked by the GeoTIFF
+/// nodata tag. Integer dtypes (Int16/U16) are scaled to reflectance; f32
+/// bands are already reflectance and pass through. `valid_mask` reflects the
+/// original DN before scaling, so the fill never leaks into the index math.
+fn load_hls_reflectance(path: &Path) -> Result<LoadedRaster, raster_io::RasterIoError> {
+    let mut reader = raster_io::GeoTiffReader::open(path)?;
+    let info = reader.info().clone();
+    let spatial_ref = reader.spatial_ref()?;
+    let band = reader.read_band()?;
+    let is_integer = band.dtype().is_integer();
+    let raw = band.to_f32();
+    let nodata = info.nodata.map(|n| n as f32);
+    let valid_mask: Vec<bool> = raw
+        .iter()
+        .map(|v| v.is_finite() && Some(*v) != nodata)
+        .collect();
+    let scale = if is_integer {
+        HLS_REFLECTANCE_SCALE
+    } else {
+        1.0
+    };
+    let values = raw.iter().map(|v| v * scale).collect();
+    Ok(LoadedRaster {
+        values,
+        valid_mask,
+        spatial_ref,
+        epsg: info.epsg,
+        geo_transform: info.geo_transform,
+        width: info.width,
+        height: info.height,
+    })
+}
+
 fn to_index_pixels(raster: &LoadedRaster) -> Vec<IndexPixelValue> {
     raster
         .values
@@ -227,8 +264,8 @@ pub async fn register_hls_dir(pool: &DbPool, dir: &Path) -> Result<HlsRegisterOu
             continue;
         };
 
-        let red = load_raster(red_path)?;
-        let nir = load_raster(nir_path)?;
+        let red = load_hls_reflectance(red_path)?;
+        let nir = load_hls_reflectance(nir_path)?;
         if !same_grid(&red, &nir) {
             return Err(HlsError::GridMismatch {
                 granule: granule_id,

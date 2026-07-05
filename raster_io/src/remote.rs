@@ -237,6 +237,7 @@ impl RemoteCogReader {
         let dtype = match (sample_format, bits_per_sample) {
             (SampleFormat::Uint, 8) => RasterDtype::U8,
             (SampleFormat::Uint, 16) => RasterDtype::U16,
+            (SampleFormat::Int, 16) => RasterDtype::I16,
             (SampleFormat::Float, 32) => RasterDtype::F32,
             (format, bits) => {
                 return Err(RasterIoError::UnsupportedDtype {
@@ -359,6 +360,7 @@ impl RemoteCogReader {
         let mut band = match self.info.dtype {
             RasterDtype::U8 => RasterBand::U8(vec![0; pixel_count]),
             RasterDtype::U16 => RasterBand::U16(vec![0; pixel_count]),
+            RasterDtype::I16 => RasterBand::I16(vec![0; pixel_count]),
             RasterDtype::F32 => RasterBand::F32(vec![0.0; pixel_count]),
         };
 
@@ -383,6 +385,15 @@ impl RemoteCogReader {
                     tile_height,
                 ),
                 (TypedArray::UInt16(values), RasterBand::U16(out)) => copy_tile_into_window(
+                    out,
+                    values,
+                    window,
+                    tile_x,
+                    tile_y,
+                    tile_width,
+                    tile_height,
+                ),
+                (TypedArray::Int16(values), RasterBand::I16(out)) => copy_tile_into_window(
                     out,
                     values,
                     window,
