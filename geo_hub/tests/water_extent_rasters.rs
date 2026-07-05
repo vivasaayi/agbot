@@ -266,3 +266,95 @@ async fn water_extent_error_paths_are_reason_coded() -> Result<()> {
     assert_eq!(outcome["water_pixels"], 0);
     Ok(())
 }
+
+/// Batch 18: register a calibrated Sentinel-1 VV backscatter tile and derive
+/// water extent with low-value polarity. Fixture: 4x4 VV sigma0 (dB), 6 dark
+/// water pixels at -20, 10 bright land at -6. The dark pixels must classify
+/// as water (Otsu cut in dB, water = value < threshold).
+#[tokio::test]
+async fn sentinel1_backscatter_registers_and_extracts_water_low_polarity() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = ctx(&tmp).await?;
+    let sar_dir = tmp.path().join("s1");
+    std::fs::create_dir_all(&sar_dir)?;
+
+    let mut values = vec![-6.0f32; 16];
+    for pixel in 0..6 {
+        values[pixel] = -20.0;
+    }
+    write_geotiff_f32(
+        &sar_dir.join("S1A_IW_GRDH_1SDV_20240601T051651_20240601T051716_054321_069ABC_VV.tif"),
+        4,
+        4,
+        &values,
+        &GeoTiffTags {
+            epsg: Some(EPSG),
+            geo_transform: Some(TRANSFORM),
+            nodata: Some(-9999.0),
+        },
+    )?;
+    std::fs::write(sar_dir.join("manifest.txt"), b"not a tile")?;
+
+    // --- Register.
+    let (status, bytes) = send(
+        &ctx.app,
+        "POST",
+        "/api/water-management/sentinel1/register",
+        Some(json!({ "dir": sar_dir.to_string_lossy() })),
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let registered: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(registered["registered"].as_array().unwrap().len(), 1);
+    assert_eq!(registered["skipped"], json!(["manifest.txt"]));
+    let sar_id = registered["registered"][0][1].as_str().unwrap().to_string();
+    let sar = catalog::get_product(&ctx.pool, &sar_id).await?.unwrap();
+    assert_eq!(sar.kind, "sar_vv");
+    assert_eq!(sar.temporal_start.as_deref(), Some("2024-06-01T05:16:51Z"));
+
+    // --- Derive water extent (low-value polarity).
+    let (status, bytes) = send(
+        &ctx.app,
+        "POST",
+        "/api/water-management/extent/derive",
+        Some(derive_body(&sar_id)),
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let outcome: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(outcome["method"], "otsu");
+    let threshold = outcome["threshold"].as_f64().unwrap();
+    assert!(
+        threshold > -20.0 && threshold < -6.0,
+        "dB threshold {threshold}"
+    );
+    // The dark pixels are water.
+    assert_eq!(outcome["water_pixels"], 6);
+    assert_eq!(outcome["water_area_m2"], 600.0);
+
+    // Mask GeoTIFF: dark water pixels = 1, bright land = 0.
+    let mask_path = outcome["water_extent_artifact"].as_str().unwrap();
+    let mut reader = GeoTiffReader::open(mask_path)?;
+    let mask = reader.read_band()?.to_f32();
+    assert_eq!(&mask[..6], &[1.0; 6]);
+    assert_eq!(&mask[6..], &[0.0; 10]);
+
+    // Evidence records the SAR polarity.
+    let extent_id = outcome["water_extent_product_id"].as_str().unwrap();
+    let product = catalog::get_product(&ctx.pool, extent_id).await?.unwrap();
+    assert_eq!(product.parameters["polarity"], "low_value_is_water");
+    let edges = catalog::trace_inputs(&ctx.pool, extent_id).await?;
+    assert_eq!(edges.len(), 1);
+    assert_eq!(edges[0].input_product_id, sar_id);
+    Ok(())
+}

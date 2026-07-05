@@ -12,12 +12,12 @@
 use std::path::{Path, PathBuf};
 
 use post_processor::water_extent::{
-    extract_water_extent, water_extent_l3_draft, ThresholdMethod, WaterClass, WaterExtentError,
-    WaterExtentL3Scope, WaterIndexRaster,
+    extract_water_extent, water_extent_l3_draft, ThresholdMethod, WaterClass, WaterExtentConfig,
+    WaterExtentError, WaterExtentL3Scope, WaterIndexRaster,
 };
 use raster_io::{write_geotiff_f32, GeoTiffTags};
 use serde::{Deserialize, Serialize};
-use shared::product_graph::ProductArtifact;
+use shared::product_graph::{ProductArtifact, ProductLevel, ProductRecordDraft, ProductScope};
 use thiserror::Error;
 
 use crate::catalog::{self, CatalogError, ProductFilter, RegisteredProduct};
@@ -28,14 +28,30 @@ use crate::drought_rasters::{
 
 /// Nodata for water-extent GeoTIFFs (invalid pixels).
 pub const WATER_EXTENT_NODATA: f32 = crate::satellite_derivation::INDEX_NODATA;
-/// Index kinds accepted as water indices.
-pub const WATER_INDEX_KINDS: &[&str] = &["mndwi", "ndwi", "aweinsh", "aweish"];
+/// Optical index kinds (high value = water).
+pub const OPTICAL_WATER_INDEX_KINDS: &[&str] = &["mndwi", "ndwi", "aweinsh", "aweish"];
+/// SAR backscatter kinds (low value = water; VV/VH sigma0 in dB).
+pub const SAR_WATER_KINDS: &[&str] = &["sar_vv", "sar_vh", "sar_backscatter"];
+/// Source id stamped on Sentinel-1 backscatter registrations.
+pub const SENTINEL1_SOURCE_ID: &str = "sentinel-1-grd";
+
+/// Pick the extraction config for a product kind, or `None` if the kind is
+/// not a supported water source.
+pub fn config_for_kind(kind: &str) -> Option<WaterExtentConfig> {
+    if OPTICAL_WATER_INDEX_KINDS.contains(&kind) {
+        Some(WaterExtentConfig::optical())
+    } else if SAR_WATER_KINDS.contains(&kind) {
+        Some(WaterExtentConfig::sar_backscatter())
+    } else {
+        None
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum WaterExtentRasterError {
     #[error("product {0} is not in the catalog")]
     NotFound(String),
-    #[error("product {product_id} kind {kind:?} is not a water index (expected one of {WATER_INDEX_KINDS:?})")]
+    #[error("product {product_id} kind {kind:?} is not a water index or SAR backscatter (optical {OPTICAL_WATER_INDEX_KINDS:?} / SAR {SAR_WATER_KINDS:?})")]
     NotWaterIndex { product_id: String, kind: String },
     #[error("water-extent computation failed: {0}")]
     Extent(#[from] WaterExtentError),
@@ -100,24 +116,26 @@ pub async fn derive_water_extent(
     let product = catalog::get_product(pool, &request.product_id)
         .await?
         .ok_or_else(|| WaterExtentRasterError::NotFound(request.product_id.clone()))?;
-    if !WATER_INDEX_KINDS.contains(&product.kind.as_str()) {
-        return Err(WaterExtentRasterError::NotWaterIndex {
+    let config =
+        config_for_kind(&product.kind).ok_or_else(|| WaterExtentRasterError::NotWaterIndex {
             product_id: product.product_id.clone(),
             kind: product.kind.clone(),
-        });
-    }
+        })?;
     let raster = load_raster(Path::new(geotiff_artifact_path(&product)?))?;
 
-    let result = extract_water_extent(&WaterIndexRaster {
-        product_id: product.product_id.clone(),
-        index_kind: product.kind.clone(),
-        width: raster.width,
-        height: raster.height,
-        spatial_ref: raster.spatial_ref.clone(),
-        values: raster.values.clone(),
-        valid_mask: raster.valid_mask.clone(),
-        gsd_m_per_px: product.gsd_m_per_px,
-    })?;
+    let result = extract_water_extent(
+        &WaterIndexRaster {
+            product_id: product.product_id.clone(),
+            index_kind: product.kind.clone(),
+            width: raster.width,
+            height: raster.height,
+            spatial_ref: raster.spatial_ref.clone(),
+            values: raster.values.clone(),
+            valid_mask: raster.valid_mask.clone(),
+            gsd_m_per_px: product.gsd_m_per_px,
+        },
+        &config,
+    )?;
 
     // --- Mask GeoTIFF + L3 registration.
     let mut draft = water_extent_l3_draft(
@@ -217,4 +235,138 @@ pub async fn list_water_extent_products(
         },
     )
     .await
+}
+
+// ---------------------------------------------------------------------------
+// Sentinel-1 backscatter registration
+// ---------------------------------------------------------------------------
+//
+// Raw S1 GRD -> calibrated VV/VH sigma0 (dB) needs SNAP/pyroSAR (calibration
+// + speckle filter + terrain flattening), run out-of-band as a subprocess
+// like Sen2Cor. This registers those pre-processed GeoTIFFs; deriving water
+// extent over them (low-value polarity) is the all-weather water layer.
+
+/// (scene_id, polarization kind, acquired_at) parsed from a calibrated S1
+/// backscatter filename, e.g.
+/// `S1A_IW_GRDH_1SDV_20240601T051651_..._VV.tif` -> the `sar_vv` kind.
+pub fn parse_sentinel1_filename(name: &str) -> Option<(String, &'static str, String)> {
+    let stem = name
+        .strip_suffix(".tif")
+        .or_else(|| name.strip_suffix(".tiff"))?;
+    let (base, kind) = if let Some(base) = stem.strip_suffix("_VV") {
+        (base, "sar_vv")
+    } else if let Some(base) = stem.strip_suffix("_VH") {
+        (base, "sar_vh")
+    } else {
+        return None;
+    };
+    if !base.starts_with("S1") {
+        return None;
+    }
+    // First YYYYMMDDTHHMMSS segment is the sensing start.
+    let stamp = base.split('_').find(|segment| {
+        segment.len() == 15
+            && segment.as_bytes()[8] == b'T'
+            && segment[..8].chars().all(|c| c.is_ascii_digit())
+    })?;
+    let datetime = chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%dT%H%M%S").ok()?;
+    Some((
+        stem.to_string(),
+        kind,
+        format!("{}Z", datetime.format("%Y-%m-%dT%H:%M:%S")),
+    ))
+}
+
+/// Build the L2 draft for one calibrated S1 backscatter GeoTIFF.
+pub fn sentinel1_draft(
+    path: &Path,
+    scene_id: &str,
+    kind: &str,
+    acquired_at: &str,
+) -> ProductRecordDraft {
+    ProductRecordDraft {
+        level: ProductLevel::L2,
+        kind: kind.to_string(),
+        algorithm_id: "sentinel1.backscatter.ingest".to_string(),
+        algorithm_version: "1.0.0".to_string(),
+        parameters: serde_json::json!({
+            "dataset": "Sentinel-1 GRD calibrated backscatter",
+            "provider": "ESA / ASF (calibrated out-of-band)",
+            "polarization": kind.strip_prefix("sar_").unwrap_or(kind).to_uppercase(),
+            "units": "dB (sigma0)",
+        }),
+        inputs: Vec::new(),
+        scope: ProductScope {
+            farm_id: None,
+            field_id: None,
+            season_id: None,
+            scene_id: Some(scene_id.to_string()),
+            temporal_start: acquired_at.to_string(),
+            temporal_end: acquired_at.to_string(),
+        },
+        spatial_ref: None,
+        gsd_m_per_px: Some(10.0),
+        artifact: Some(ProductArtifact {
+            format: "tif".to_string(),
+            path: path.to_string_lossy().to_string(),
+            checksum_sha256: None,
+        }),
+        quality_mask: None,
+        confidence: None,
+        confidence_method: None,
+        quality_summary: None,
+        evidence_digests: Vec::new(),
+        source_id: Some(SENTINEL1_SOURCE_ID.to_string()),
+    }
+}
+
+/// Outcome of a Sentinel-1 directory registration.
+#[derive(Debug, Clone, Serialize)]
+pub struct SarRegisterOutcome {
+    pub registered: Vec<(String, String)>,
+    pub skipped: Vec<String>,
+}
+
+/// Register every calibrated S1 backscatter GeoTIFF in a local directory
+/// (files calibrated out-of-band; idempotent; non-matching names skipped).
+pub async fn register_sentinel1_dir(
+    pool: &DbPool,
+    dir: &Path,
+) -> Result<SarRegisterOutcome, WaterExtentRasterError> {
+    let mut names: Vec<(String, PathBuf)> = std::fs::read_dir(dir)
+        .map_err(|source| WaterExtentRasterError::Store {
+            what: "sentinel-1 directory listing",
+            source,
+        })?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            Some((
+                entry.file_name().to_string_lossy().to_string(),
+                entry.path(),
+            ))
+        })
+        .collect();
+    names.sort();
+    let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let mut outcome = SarRegisterOutcome {
+        registered: Vec::new(),
+        skipped: Vec::new(),
+    };
+    for (name, path) in names {
+        match parse_sentinel1_filename(&name) {
+            Some((scene_id, kind, acquired_at)) => {
+                let draft = sentinel1_draft(&path, &scene_id, kind, &acquired_at);
+                let product_id = catalog::register_product_with_actor(
+                    pool,
+                    &draft,
+                    &provenance::ActorIdentity::system("geo_hub:sentinel1_ingest"),
+                    &created_at,
+                )
+                .await?;
+                outcome.registered.push((name, product_id));
+            }
+            None => outcome.skipped.push(name),
+        }
+    }
+    Ok(outcome)
 }

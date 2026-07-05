@@ -398,6 +398,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/change-detection/dnbr", get(routes::list_dnbr_route))
         .route(
+            "/api/water-management/sentinel1/register",
+            post(routes::register_sentinel1_route),
+        )
+        .route(
             "/api/water-management/extent/derive",
             post(routes::derive_water_extent_route),
         )

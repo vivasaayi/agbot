@@ -8,8 +8,8 @@ use serde::Deserialize;
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 use crate::water_extent_rasters::{
-    derive_water_extent, list_water_extent_products, WaterExtentDeriveOutcome,
-    WaterExtentDeriveRequest, WaterExtentRasterError,
+    derive_water_extent, list_water_extent_products, register_sentinel1_dir, SarRegisterOutcome,
+    WaterExtentDeriveOutcome, WaterExtentDeriveRequest, WaterExtentRasterError,
 };
 
 impl From<WaterExtentRasterError> for AppError {
@@ -20,6 +20,20 @@ impl From<WaterExtentRasterError> for AppError {
             _ => AppError::Anyhow(err.into()),
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SarRegisterRequest {
+    /// Server-local directory of calibrated S1 backscatter GeoTIFFs.
+    pub dir: String,
+}
+
+pub async fn register_sentinel1_route(
+    State(state): State<AppState>,
+    Json(request): Json<SarRegisterRequest>,
+) -> AppResult<Json<SarRegisterOutcome>> {
+    let outcome = register_sentinel1_dir(&state.pool, std::path::Path::new(&request.dir)).await?;
+    Ok(Json(outcome))
 }
 
 pub async fn derive_water_extent_route(

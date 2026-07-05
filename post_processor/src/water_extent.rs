@@ -1,23 +1,27 @@
-//! Water-body extraction from water-index rasters (satellite pipeline
-//! batch 15 — the water-availability half of Phase 3 item 9).
+//! Water-body extraction from water-index and SAR-backscatter rasters
+//! (satellite pipeline Phase 3 item 9 + batch 18 all-weather SAR).
 //!
-//! A water index (MNDWI, AWEI) separates water (positive) from land
-//! (negative), but the optimal cut shifts per scene with turbidity,
-//! atmosphere, and shadows. This module picks the threshold with **Otsu's
-//! method** (1979): maximize the between-class variance over a 256-bin
-//! histogram of the valid index values. Otsu assumes a bimodal histogram;
-//! when a scene is effectively unimodal — either Otsu class carries
-//! < [`MIN_CLASS_FRACTION`] of the pixels (all-land / all-water), or the
-//! class means sit closer than [`MIN_MODE_SEPARATION`] index units (a cut
-//! through a narrow noise cluster) — the method is reason-coded as
-//! degenerate and the classification falls back to the physical
-//! [`FIXED_WATER_THRESHOLD`] (index > 0 = water) instead of amplifying
-//! noise.
+//! A water index (MNDWI, AWEI) separates water (high) from land (low); SAR
+//! backscatter is the opposite (smooth water is specular and dark). Either
+//! way the optimal cut shifts per scene, so this module picks the threshold
+//! with **Otsu's method** (1979): maximize the between-class variance over a
+//! 256-bin histogram spanning the data's own value range (bounded optical
+//! ratios and unbounded SAR dB alike). A [`WaterExtentConfig`] carries the
+//! polarity ([`WaterPolarity`]), a physical fallback threshold, and the
+//! minimum class-mean separation (in the raster's value units) below which
+//! Otsu is degenerate.
+//!
+//! Otsu assumes a bimodal histogram; when a scene is effectively unimodal —
+//! either Otsu class carries < [`MIN_CLASS_FRACTION`] of the pixels
+//! (all-land / all-water), or the class means sit closer than the config's
+//! `min_mode_separation` (a cut through a narrow noise/speckle cluster) —
+//! the method is reason-coded as degenerate and classification falls back to
+//! the config's physical threshold instead of amplifying noise.
 //!
 //! Output is a binary water mask with per-pixel classes, the water fraction
-//! and area (when the GSD is known), and evidence recording which method
-//! actually chose the threshold. JRC global-surface-water priors are future
-//! work (they would gate Otsu flips against a long-term reference).
+//! and area (when the GSD is known), and evidence recording the polarity and
+//! which method chose the threshold. JRC global-surface-water priors are
+//! future work (they would gate Otsu flips against a long-term reference).
 
 use crate::evidence::{deterministic_fingerprint, AnalysisEvidenceError};
 use crate::l3_product::{to_l3_draft, L3DraftContext};
@@ -26,21 +30,71 @@ use shared::product_graph::ProductRecordDraft;
 use shared::schemas::{assert_raster_spatial_ref, RasterSpatialRef, RasterSpatialRefError};
 use thiserror::Error;
 
-/// Water-index domain the histogram spans (MNDWI/NDWI are ratios in
-/// [-1, 1]; AWEI values are clamped into it for thresholding).
-pub const WATER_INDEX_MIN: f32 = -1.0;
-pub const WATER_INDEX_MAX: f32 = 1.0;
 /// Histogram resolution for Otsu.
 pub const HISTOGRAM_BINS: usize = 256;
-/// Physical fallback: index above zero reads as water.
+/// Physical fallback for optical indices: index above zero reads as water.
 pub const FIXED_WATER_THRESHOLD: f32 = 0.0;
 /// Otsu is trusted only when both classes hold at least this fraction of
 /// the valid pixels — below it the histogram is effectively unimodal.
 pub const MIN_CLASS_FRACTION: f64 = 0.01;
-/// ... and only when the class means are at least this far apart in index
-/// units. An Otsu cut through a narrow noise cluster separates means by
+/// Default minimum class-mean separation for optical indices (ratios in
+/// [-1, 1]). An Otsu cut through a narrow noise cluster separates means by
 /// far less than any real land/water contrast.
-pub const MIN_MODE_SEPARATION: f32 = 0.1;
+pub const DEFAULT_OPTICAL_MODE_SEPARATION: f32 = 0.1;
+/// Default minimum separation for SAR backscatter (dB): water and land
+/// backscatter differ by ~10 dB, in-class speckle by ~1-2 dB.
+pub const DEFAULT_SAR_MODE_SEPARATION: f32 = 3.0;
+/// Physical SAR water fallback (VV sigma0, dB): smooth water is specular
+/// and dark, so backscatter BELOW this reads as water.
+pub const FIXED_SAR_WATER_THRESHOLD: f32 = -15.0;
+
+/// Which side of the threshold is water: high values (optical water indices,
+/// where water > land) or low values (SAR backscatter, where smooth water
+/// is dark).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaterPolarity {
+    /// Water is the high-value class (MNDWI, NDWI, AWEI).
+    HighValueIsWater,
+    /// Water is the low-value class (SAR VV/VH backscatter).
+    LowValueIsWater,
+}
+
+/// Extraction configuration: polarity, the physical fallback threshold, and
+/// the minimum class-mean separation (in the raster's own value units) below
+/// which Otsu is treated as degenerate.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct WaterExtentConfig {
+    pub polarity: WaterPolarity,
+    pub fixed_threshold: f32,
+    pub min_mode_separation: f32,
+}
+
+impl Default for WaterExtentConfig {
+    fn default() -> Self {
+        Self::optical()
+    }
+}
+
+impl WaterExtentConfig {
+    /// Optical water indices (MNDWI/NDWI/AWEI): high = water, fallback at 0.
+    pub fn optical() -> Self {
+        Self {
+            polarity: WaterPolarity::HighValueIsWater,
+            fixed_threshold: FIXED_WATER_THRESHOLD,
+            min_mode_separation: DEFAULT_OPTICAL_MODE_SEPARATION,
+        }
+    }
+
+    /// SAR backscatter (dB): low = water, fallback at -15 dB.
+    pub fn sar_backscatter() -> Self {
+        Self {
+            polarity: WaterPolarity::LowValueIsWater,
+            fixed_threshold: FIXED_SAR_WATER_THRESHOLD,
+            min_mode_separation: DEFAULT_SAR_MODE_SEPARATION,
+        }
+    }
+}
 
 /// How the threshold was chosen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,6 +143,7 @@ pub struct WaterExtentEvidence {
     pub otsu_threshold: Option<f32>,
     pub histogram_bins: usize,
     pub min_class_fraction: f64,
+    pub polarity: WaterPolarity,
     pub spatial_ref: RasterSpatialRef,
     pub input_hash: String,
 }
@@ -125,33 +180,35 @@ pub enum WaterExtentError {
     Evidence(#[from] AnalysisEvidenceError),
 }
 
-/// Histogram bin index for a value (clamped into the index domain).
-fn bin_of(value: f32) -> usize {
-    let clamped = value.clamp(WATER_INDEX_MIN, WATER_INDEX_MAX);
-    let t = f64::from((clamped - WATER_INDEX_MIN) / (WATER_INDEX_MAX - WATER_INDEX_MIN));
-    ((t * (HISTOGRAM_BINS - 1) as f64).round()) as usize
-}
-
-/// Center value of a bin.
-fn bin_center(bin: usize) -> f32 {
-    let t = bin as f64 / (HISTOGRAM_BINS - 1) as f64;
-    (f64::from(WATER_INDEX_MIN) + t * f64::from(WATER_INDEX_MAX - WATER_INDEX_MIN)) as f32
+/// Value at a fractional bin position within `[value_min, value_max]`.
+/// Otsu cuts *between* bins, so the threshold is taken at `best_bin + 0.5`
+/// — strictly above the low mode and below the high mode even when the two
+/// modes sit on the histogram's extreme bins.
+fn bin_boundary(bin_position: f64, value_min: f32, value_max: f32) -> f32 {
+    let t = bin_position / (HISTOGRAM_BINS - 1) as f64;
+    (f64::from(value_min) + t * f64::from(value_max - value_min)) as f32
 }
 
 /// Otsu outcome: the chosen cut plus the quality signals the caller uses
 /// to decide whether to trust it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct OtsuOutcome {
+    /// Threshold in the raster's value units.
     pub threshold: f32,
-    /// Weight fraction of the foreground (water) class.
-    pub water_weight: f64,
-    /// Distance between the class means, in index units.
+    /// Weight fraction above the cut.
+    pub high_weight: f64,
+    /// Distance between the class means, in value units.
     pub mode_separation: f32,
 }
 
-/// Otsu's threshold over a histogram: the bin cut maximizing between-class
-/// variance (first maximum wins ties, deterministically).
-pub fn otsu_threshold(histogram: &[u64; HISTOGRAM_BINS]) -> Option<OtsuOutcome> {
+/// Otsu's threshold over a histogram binned across `[value_min, value_max]`:
+/// the bin cut maximizing between-class variance (first maximum wins ties,
+/// deterministically). Thresholds are returned in value units.
+pub fn otsu_threshold(
+    histogram: &[u64; HISTOGRAM_BINS],
+    value_min: f32,
+    value_max: f32,
+) -> Option<OtsuOutcome> {
     let total: u64 = histogram.iter().sum();
     if total == 0 {
         return None;
@@ -198,18 +255,20 @@ pub fn otsu_threshold(histogram: &[u64; HISTOGRAM_BINS]) -> Option<OtsuOutcome> 
         .sum();
     let mean_background_bin = background_sum / background as f64;
     let mean_foreground_bin = (weighted_sum - background_sum) / foreground as f64;
-    let bin_width = f64::from(WATER_INDEX_MAX - WATER_INDEX_MIN) / (HISTOGRAM_BINS - 1) as f64;
+    let bin_width = f64::from(value_max - value_min) / (HISTOGRAM_BINS - 1) as f64;
     Some(OtsuOutcome {
-        threshold: bin_center(best_bin),
-        water_weight: foreground as f64 / total_f,
+        threshold: bin_boundary(best_bin as f64 + 0.5, value_min, value_max),
+        high_weight: foreground as f64 / total_f,
         mode_separation: ((mean_foreground_bin - mean_background_bin) * bin_width) as f32,
     })
 }
 
-/// Extract a water mask from a water-index raster: Otsu threshold with a
+/// Extract a water mask from a water-index / backscatter raster: Otsu
+/// threshold over the data's own value range, with a polarity-aware
 /// reason-coded fixed fallback on degenerate (unimodal) histograms.
 pub fn extract_water_extent(
     raster: &WaterIndexRaster,
+    config: &WaterExtentConfig,
 ) -> Result<WaterExtentResult, WaterExtentError> {
     assert_raster_spatial_ref(Some(&raster.spatial_ref), raster.width, raster.height)
         .map_err(|reason| WaterExtentError::SpatialRef { reason })?;
@@ -227,12 +286,16 @@ pub fn extract_water_extent(
         });
     }
 
-    let mut histogram = [0u64; HISTOGRAM_BINS];
+    // Data-driven histogram range over the valid values (works for bounded
+    // optical ratios and unbounded SAR dB alike).
+    let mut value_min = f32::MAX;
+    let mut value_max = f32::MIN;
     let mut valid = 0u32;
     for pixel in 0..pixel_count {
         let value = raster.values[pixel];
         if raster.valid_mask[pixel] && value.is_finite() {
-            histogram[bin_of(value)] += 1;
+            value_min = value_min.min(value);
+            value_max = value_max.max(value);
             valid += 1;
         }
     }
@@ -240,18 +303,40 @@ pub fn extract_water_extent(
         return Err(WaterExtentError::NoValidPixels);
     }
 
-    let otsu = otsu_threshold(&histogram);
-    let (method, threshold) = match otsu {
-        Some(outcome)
-            if outcome.water_weight >= MIN_CLASS_FRACTION
-                && outcome.water_weight <= 1.0 - MIN_CLASS_FRACTION
-                && outcome.mode_separation >= MIN_MODE_SEPARATION =>
-        {
-            (ThresholdMethod::Otsu, outcome.threshold)
+    let (otsu, threshold, method) = if value_max <= value_min {
+        // Single value: no cut possible, fall back.
+        (None, config.fixed_threshold, ThresholdMethod::FixedFallback)
+    } else {
+        let bin_of = |value: f32| {
+            let t = f64::from(
+                (value.clamp(value_min, value_max) - value_min) / (value_max - value_min),
+            );
+            ((t * (HISTOGRAM_BINS - 1) as f64).round()) as usize
+        };
+        let mut histogram = [0u64; HISTOGRAM_BINS];
+        for pixel in 0..pixel_count {
+            let value = raster.values[pixel];
+            if raster.valid_mask[pixel] && value.is_finite() {
+                histogram[bin_of(value)] += 1;
+            }
         }
-        _ => (ThresholdMethod::FixedFallback, FIXED_WATER_THRESHOLD),
+        let otsu = otsu_threshold(&histogram, value_min, value_max);
+        match otsu {
+            Some(outcome)
+                if outcome.high_weight >= MIN_CLASS_FRACTION
+                    && outcome.high_weight <= 1.0 - MIN_CLASS_FRACTION
+                    && outcome.mode_separation.abs() >= config.min_mode_separation =>
+            {
+                (otsu, outcome.threshold, ThresholdMethod::Otsu)
+            }
+            _ => (otsu, config.fixed_threshold, ThresholdMethod::FixedFallback),
+        }
     };
 
+    let is_water = |value: f32| match config.polarity {
+        WaterPolarity::HighValueIsWater => value > threshold,
+        WaterPolarity::LowValueIsWater => value < threshold,
+    };
     let mut classes = vec![WaterClass::Invalid; pixel_count];
     let mut water_pixels = 0u32;
     let mut land_pixels = 0u32;
@@ -260,7 +345,7 @@ pub fn extract_water_extent(
         if !raster.valid_mask[pixel] || !value.is_finite() {
             continue;
         }
-        if value > threshold {
+        if is_water(value) {
             *class = WaterClass::Water;
             water_pixels += 1;
         } else {
@@ -270,12 +355,13 @@ pub fn extract_water_extent(
     }
 
     let input_hash = deterministic_fingerprint(&(
-        "water_extent_v1",
+        "water_extent_v2",
         &raster.product_id,
         &raster.index_kind,
         &raster.values,
         &raster.valid_mask,
         &raster.spatial_ref,
+        config,
     ))?;
 
     Ok(WaterExtentResult {
@@ -299,6 +385,7 @@ pub fn extract_water_extent(
             otsu_threshold: otsu.map(|outcome| outcome.threshold),
             histogram_bins: HISTOGRAM_BINS,
             min_class_fraction: MIN_CLASS_FRACTION,
+            polarity: config.polarity,
             spatial_ref: raster.spatial_ref.clone(),
             input_hash,
         },
@@ -338,6 +425,7 @@ pub fn water_extent_l3_draft(
         parameters: serde_json::json!({
             "index_kind": result.evidence.index_kind,
             "method": result.evidence.method,
+            "polarity": result.evidence.polarity,
             "threshold": result.evidence.threshold,
             "otsu_threshold": result.evidence.otsu_threshold,
             "water_pixels": result.water_pixels,
@@ -395,7 +483,8 @@ mod tests {
         }
         let mut mask = vec![true; 16];
         mask[15] = false;
-        let result = extract_water_extent(&raster(values, mask)).unwrap();
+        let result =
+            extract_water_extent(&raster(values, mask), &WaterExtentConfig::optical()).unwrap();
 
         assert_eq!(result.evidence.method, ThresholdMethod::Otsu);
         let threshold = result.evidence.threshold;
@@ -419,7 +508,11 @@ mod tests {
         // All-land scene with tiny noise: Otsu would split the noise; the
         // class-fraction guard must reason-code it and use index > 0.
         let values: Vec<f32> = (0..16).map(|i| -0.4 + 0.001 * i as f32).collect();
-        let result = extract_water_extent(&raster(values, vec![true; 16])).unwrap();
+        let result = extract_water_extent(
+            &raster(values, vec![true; 16]),
+            &WaterExtentConfig::optical(),
+        )
+        .unwrap();
         assert_eq!(result.evidence.method, ThresholdMethod::FixedFallback);
         assert_eq!(result.evidence.threshold, FIXED_WATER_THRESHOLD);
         assert_eq!(result.water_pixels, 0);
@@ -430,7 +523,11 @@ mod tests {
 
     #[test]
     fn all_water_scene_also_falls_back() {
-        let result = extract_water_extent(&raster(vec![0.6; 16], vec![true; 16])).unwrap();
+        let result = extract_water_extent(
+            &raster(vec![0.6; 16], vec![true; 16]),
+            &WaterExtentConfig::optical(),
+        )
+        .unwrap();
         assert_eq!(result.evidence.method, ThresholdMethod::FixedFallback);
         assert_eq!(result.water_pixels, 16);
         assert_eq!(result.water_fraction, 1.0);
@@ -439,7 +536,10 @@ mod tests {
     #[test]
     fn no_valid_pixels_is_an_error() {
         assert!(matches!(
-            extract_water_extent(&raster(vec![0.5; 16], vec![false; 16])),
+            extract_water_extent(
+                &raster(vec![0.5; 16], vec![false; 16]),
+                &WaterExtentConfig::optical()
+            ),
             Err(WaterExtentError::NoValidPixels)
         ));
     }
@@ -450,7 +550,11 @@ mod tests {
         for pixel in 0..8 {
             values[pixel] = 0.5;
         }
-        let result = extract_water_extent(&raster(values, vec![true; 16])).unwrap();
+        let result = extract_water_extent(
+            &raster(values, vec![true; 16]),
+            &WaterExtentConfig::optical(),
+        )
+        .unwrap();
         let draft = water_extent_l3_draft(
             &result,
             &WaterExtentL3Scope {
@@ -470,5 +574,45 @@ mod tests {
             draft.evidence_digests,
             vec![result.evidence.input_hash.clone()]
         );
+    }
+
+    #[test]
+    fn sar_low_backscatter_is_classified_as_water() {
+        // SAR VV sigma0 (dB): smooth water is dark (-20), land is bright
+        // (-6). 8 water + 7 land + 1 nodata; low-value polarity classifies
+        // the dark pixels as water, and the fallback/threshold live in dB.
+        let mut values = vec![-6.0f32; 16];
+        for pixel in 0..8 {
+            values[pixel] = -20.0;
+        }
+        let mut mask = vec![true; 16];
+        mask[15] = false;
+        let mut sar = raster(values, mask);
+        sar.index_kind = "sar_vv".to_string();
+        let result = extract_water_extent(&sar, &WaterExtentConfig::sar_backscatter()).unwrap();
+
+        assert_eq!(result.evidence.method, ThresholdMethod::Otsu);
+        assert_eq!(result.evidence.polarity, WaterPolarity::LowValueIsWater);
+        let threshold = result.evidence.threshold;
+        assert!(
+            threshold > -20.0 && threshold < -6.0,
+            "dB threshold {threshold}"
+        );
+        // The DARK pixels (0..8) are water under low-value polarity.
+        assert_eq!(result.water_pixels, 8);
+        assert_eq!(result.classes[0], WaterClass::Water);
+        assert_eq!(result.classes[8], WaterClass::Land);
+
+        // Uniform-bright SAR noise (~1 dB spread, << 3 dB SAR separation)
+        // must fall back to the physical -15 dB threshold, not split speckle.
+        let noise: Vec<f32> = (0..16).map(|i| -6.0 + 0.05 * i as f32).collect();
+        let mut sar_noise = raster(noise, vec![true; 16]);
+        sar_noise.index_kind = "sar_vv".to_string();
+        let result =
+            extract_water_extent(&sar_noise, &WaterExtentConfig::sar_backscatter()).unwrap();
+        assert_eq!(result.evidence.method, ThresholdMethod::FixedFallback);
+        assert_eq!(result.evidence.threshold, FIXED_SAR_WATER_THRESHOLD);
+        // All bright (~-6 dB) -> all land under the -15 dB fallback.
+        assert_eq!(result.water_pixels, 0);
     }
 }
