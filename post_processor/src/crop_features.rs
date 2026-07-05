@@ -123,6 +123,8 @@ pub struct TrainingSamples {
 pub enum CropFeatureError {
     #[error("feature matrix has {features} pixels, reference has {reference}")]
     LengthMismatch { features: usize, reference: usize },
+    #[error("bootstrap mask has {mask} pixels, expected {expected}")]
+    MaskLengthMismatch { mask: usize, expected: usize },
     #[error("no labeled training samples could be built (all {excluded} pixels excluded)")]
     NoSamples { excluded: u32 },
     #[error("model was fit on features {fit:?} but inference features are {given:?}")]
@@ -142,18 +144,57 @@ pub fn build_training_samples(
     reference_nodata: u8,
     class_map: &ReferenceClassMap,
 ) -> Result<TrainingSamples, CropFeatureError> {
+    build_training_samples_masked(
+        features,
+        reference_codes,
+        reference_nodata,
+        class_map,
+        None,
+        None,
+    )
+}
+
+/// [`build_training_samples`] with bootstrap controls (batch 27):
+/// - `region_mask`: harvest only inside the mask (homogeneous reference
+///   interiors — see `landcover_agreement::homogeneous_reference_mask`);
+///   pixels outside are excluded as `outside_bootstrap_mask`.
+/// - `max_per_class`: deterministic class balancing — classes over the cap
+///   are decimated by even row-major stride (keeps spatial spread without
+///   randomness); dropped samples are excluded as `class_cap`.
+pub fn build_training_samples_masked(
+    features: &FeatureMatrix,
+    reference_codes: &[u8],
+    reference_nodata: u8,
+    class_map: &ReferenceClassMap,
+    region_mask: Option<&[bool]>,
+    max_per_class: Option<usize>,
+) -> Result<TrainingSamples, CropFeatureError> {
     if features.rows.len() != reference_codes.len() {
         return Err(CropFeatureError::LengthMismatch {
             features: features.rows.len(),
             reference: reference_codes.len(),
         });
     }
+    if let Some(mask) = region_mask {
+        if mask.len() != features.rows.len() {
+            return Err(CropFeatureError::MaskLengthMismatch {
+                mask: mask.len(),
+                expected: features.rows.len(),
+            });
+        }
+    }
     let mut samples = Vec::new();
     let mut excluded: std::collections::BTreeMap<String, u32> = std::collections::BTreeMap::new();
     let exclude = |reason: &str, map: &mut std::collections::BTreeMap<String, u32>| {
         *map.entry(reason.to_string()).or_insert(0) += 1;
     };
-    for (row, code) in features.rows.iter().zip(reference_codes) {
+    for (pixel, (row, code)) in features.rows.iter().zip(reference_codes).enumerate() {
+        if let Some(mask) = region_mask {
+            if !mask[pixel] {
+                exclude("outside_bootstrap_mask", &mut excluded);
+                continue;
+            }
+        }
         let Some(vector) = row else {
             exclude("no_features", &mut excluded);
             continue;
@@ -170,12 +211,52 @@ pub fn build_training_samples(
             None => exclude("reference_unmapped", &mut excluded),
         }
     }
+    if let Some(cap) = max_per_class {
+        samples = decimate_per_class(samples, cap.max(1), &mut excluded);
+    }
     if samples.is_empty() {
         return Err(CropFeatureError::NoSamples {
             excluded: excluded.values().sum(),
         });
     }
     Ok(TrainingSamples { samples, excluded })
+}
+
+/// Even row-major decimation per class: a class with `count > cap` keeps the
+/// samples at positions `(j * count) / cap` for `j in 0..cap` (distinct
+/// because `count >= cap`), spreading kept samples across the raster
+/// deterministically. Order of surviving samples is preserved.
+fn decimate_per_class(
+    samples: Vec<LabeledSample>,
+    cap: usize,
+    excluded: &mut std::collections::BTreeMap<String, u32>,
+) -> Vec<LabeledSample> {
+    let mut per_class: std::collections::BTreeMap<u8, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for (index, sample) in samples.iter().enumerate() {
+        per_class
+            .entry(sample.label.class_code().unwrap_or(u8::MAX))
+            .or_default()
+            .push(index);
+    }
+    let mut keep = vec![false; samples.len()];
+    for indices in per_class.values() {
+        if indices.len() <= cap {
+            for index in indices {
+                keep[*index] = true;
+            }
+        } else {
+            for j in 0..cap {
+                keep[indices[(j * indices.len()) / cap]] = true;
+            }
+            *excluded.entry("class_cap".to_string()).or_insert(0) += (indices.len() - cap) as u32;
+        }
+    }
+    samples
+        .into_iter()
+        .zip(keep)
+        .filter_map(|(sample, kept)| kept.then_some(sample))
+        .collect()
 }
 
 /// Per-feature standardization (z-score) parameters.
@@ -426,6 +507,59 @@ mod tests {
         assert_eq!(training.samples[1].label, LandCoverClass::Water);
         assert_eq!(training.excluded.get("reference_nodata"), Some(&1));
         assert_eq!(training.excluded.get("no_features"), Some(&1));
+    }
+
+    #[test]
+    fn bootstrap_mask_and_class_cap_gate_training_samples() {
+        let features = extract_features(&phenology_2x2());
+        // All three feature-valid pixels are cropland (40); pixel 3 has no
+        // features. Pixel 1 sits outside the bootstrap mask.
+        let reference = [40u8, 40, 40, 0];
+        let mask = [true, false, true, true];
+        let training = build_training_samples_masked(
+            &features,
+            &reference,
+            0,
+            &ReferenceClassMap::default(),
+            Some(&mask),
+            None,
+        )
+        .unwrap();
+        assert_eq!(training.samples.len(), 2);
+        assert_eq!(training.excluded.get("outside_bootstrap_mask"), Some(&1));
+        assert_eq!(training.excluded.get("no_features"), Some(&1));
+
+        // Class cap 1 over 3 unmasked crop samples: even stride keeps the
+        // sample at position (0*3)/1 = 0, excluding 2 as class_cap.
+        let capped = build_training_samples_masked(
+            &features,
+            &reference,
+            0,
+            &ReferenceClassMap::default(),
+            None,
+            Some(1),
+        )
+        .unwrap();
+        assert_eq!(capped.samples.len(), 1);
+        assert_eq!(capped.excluded.get("class_cap"), Some(&2));
+        assert_eq!(capped.samples[0].label, LandCoverClass::AnnualCrop);
+
+        // A short mask is a typed error, and the unmasked delegate is
+        // unchanged behavior.
+        assert!(matches!(
+            build_training_samples_masked(
+                &features,
+                &reference,
+                0,
+                &ReferenceClassMap::default(),
+                Some(&[true; 2]),
+                None,
+            ),
+            Err(CropFeatureError::MaskLengthMismatch {
+                mask: 2,
+                expected: 4
+            })
+        ));
     }
 
     #[test]

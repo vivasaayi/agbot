@@ -114,6 +114,14 @@ pub struct AgreementResult {
 pub enum AgreementError {
     #[error("class rasters differ in length: ours {ours}, reference {reference}")]
     LengthMismatch { ours: usize, reference: usize },
+    #[error("bootstrap mask has {mask} pixels, expected {expected}")]
+    MaskLengthMismatch { mask: usize, expected: usize },
+    #[error("reference grid {width}x{height} does not hold {pixels} pixels")]
+    BadGrid {
+        width: u32,
+        height: u32,
+        pixels: usize,
+    },
     #[error("no comparable pixels (all {excluded} excluded)")]
     NoComparablePixels { excluded: u32 },
     #[error("evidence metadata failed: {0}")]
@@ -129,6 +137,50 @@ const COMPARABLE: [LandCoverClass; 5] = [
     LandCoverClass::Grassland,
 ];
 
+/// Bootstrap mask over a reference raster (batch 27): `true` only where the
+/// pixel and every in-bounds 3x3 neighbor share one non-nodata code. Global
+/// reference maps (WorldCover, WorldCereal) are least reliable on class
+/// boundaries at 10 m; restricting training/validation to homogeneous
+/// interiors keeps boundary label noise out of both.
+pub fn homogeneous_reference_mask(
+    codes: &[u8],
+    width: u32,
+    height: u32,
+    nodata: u8,
+) -> Result<Vec<bool>, AgreementError> {
+    let pixel_count = width as usize * height as usize;
+    if codes.len() != pixel_count {
+        return Err(AgreementError::BadGrid {
+            width,
+            height,
+            pixels: codes.len(),
+        });
+    }
+    let (width, height) = (width as i64, height as i64);
+    let mut mask = vec![false; pixel_count];
+    for row in 0..height {
+        'pixels: for col in 0..width {
+            let code = codes[(row * width + col) as usize];
+            if code == nodata {
+                continue;
+            }
+            for dr in -1..=1i64 {
+                for dc in -1..=1i64 {
+                    let (nr, nc) = (row + dr, col + dc);
+                    if nr < 0 || nc < 0 || nr >= height || nc >= width {
+                        continue;
+                    }
+                    if codes[(nr * width + nc) as usize] != code {
+                        continue 'pixels;
+                    }
+                }
+            }
+            mask[(row * width + col) as usize] = true;
+        }
+    }
+    Ok(mask)
+}
+
 /// Compare a tier-1 classification against reference codes on the same
 /// grid. `reference_nodata` marks reference fill (WorldCover uses 0).
 pub fn compare_landcover(
@@ -137,11 +189,32 @@ pub fn compare_landcover(
     reference_nodata: u8,
     class_map: &ReferenceClassMap,
 ) -> Result<AgreementResult, AgreementError> {
+    compare_landcover_within(ours, reference_codes, reference_nodata, class_map, None)
+}
+
+/// [`compare_landcover`] restricted to a bootstrap region mask (batch 27):
+/// pixels outside the mask are excluded as `outside_bootstrap_mask`, so
+/// agreement/kappa are computed only where the reference is trusted.
+pub fn compare_landcover_within(
+    ours: &[LandCoverClass],
+    reference_codes: &[u8],
+    reference_nodata: u8,
+    class_map: &ReferenceClassMap,
+    region_mask: Option<&[bool]>,
+) -> Result<AgreementResult, AgreementError> {
     if ours.len() != reference_codes.len() {
         return Err(AgreementError::LengthMismatch {
             ours: ours.len(),
             reference: reference_codes.len(),
         });
+    }
+    if let Some(mask) = region_mask {
+        if mask.len() != ours.len() {
+            return Err(AgreementError::MaskLengthMismatch {
+                mask: mask.len(),
+                expected: ours.len(),
+            });
+        }
     }
 
     let mut excluded: BTreeMap<String, u32> = BTreeMap::new();
@@ -152,7 +225,13 @@ pub fn compare_landcover(
     let mut compared = 0u32;
     let index_of = |class: LandCoverClass| COMPARABLE.iter().position(|c| *c == class);
 
-    for (mine, code) in ours.iter().zip(reference_codes) {
+    for (pixel, (mine, code)) in ours.iter().zip(reference_codes).enumerate() {
+        if let Some(mask) = region_mask {
+            if !mask[pixel] {
+                exclude("outside_bootstrap_mask", &mut excluded);
+                continue;
+            }
+        }
         let our_index = match mine {
             LandCoverClass::Invalid => {
                 exclude("ours_invalid", &mut excluded);
@@ -231,11 +310,12 @@ pub fn compare_landcover(
         .map(|((our, reference), count)| ((COMPARABLE[*our], COMPARABLE[*reference]), *count))
         .collect();
     let input_hash = deterministic_fingerprint(&(
-        "landcover_agreement_v1",
+        "landcover_agreement_v2",
         ours,
         reference_codes,
         reference_nodata,
         &class_map.entries,
+        region_mask,
     ))?;
 
     Ok(AgreementResult {
@@ -343,6 +423,82 @@ mod tests {
         assert!(matches!(
             compare_landcover(&ours, &reference, 0, &ReferenceClassMap::default()),
             Err(AgreementError::NoComparablePixels { excluded: 2 })
+        ));
+    }
+
+    #[test]
+    fn homogeneous_mask_keeps_interiors_drops_boundaries_and_nodata() {
+        // 3x4 reference (rows top-down): tree block (10) in columns 0-1,
+        // cropland (40) in columns 2-3, one nodata (0) at (1,3).
+        //   10 10 40 40
+        //   10 10 40  0
+        //   10 10 40 40
+        // Only column 0 is fully interior: column 1 touches the class
+        // boundary, column 2 touches it from the other side, and column 3
+        // touches the nodata hole (adjacent-to-fill is untrusted too).
+        #[rustfmt::skip]
+        let codes = [
+            10u8, 10, 40, 40,
+            10,   10, 40,  0,
+            10,   10, 40, 40,
+        ];
+        let mask = homogeneous_reference_mask(&codes, 4, 3, 0).unwrap();
+        #[rustfmt::skip]
+        let expected = [
+            true, false, false, false,
+            true, false, false, false,
+            true, false, false, false,
+        ];
+        assert_eq!(mask, expected);
+
+        assert!(matches!(
+            homogeneous_reference_mask(&codes, 4, 4, 0),
+            Err(AgreementError::BadGrid { .. })
+        ));
+    }
+
+    #[test]
+    fn masked_compare_excludes_pixels_outside_the_bootstrap_mask() {
+        // Same 4-pixel scene as the hand-computed kappa test, but only the
+        // first two pixels are inside the mask: both agree (crop/crop,
+        // water/water), po = 1, pe = 0.5 -> kappa = 1.
+        let ours = [
+            LandCoverClass::AnnualCrop,
+            LandCoverClass::Water,
+            LandCoverClass::TreeOrPerennial,
+            LandCoverClass::Grassland,
+        ];
+        let reference = [40u8, 80, 30, 30];
+        let mask = [true, true, false, false];
+        let result = compare_landcover_within(
+            &ours,
+            &reference,
+            0,
+            &ReferenceClassMap::default(),
+            Some(&mask),
+        )
+        .unwrap();
+        assert_eq!(result.compared_pixels, 2);
+        assert_eq!(result.excluded.get("outside_bootstrap_mask"), Some(&2));
+        assert!((result.overall_agreement - 1.0).abs() < 1e-12);
+        assert!((result.kappa - 1.0).abs() < 1e-12, "{}", result.kappa);
+        // The mask is identity-bearing in the evidence hash.
+        let unmasked =
+            compare_landcover(&ours, &reference, 0, &ReferenceClassMap::default()).unwrap();
+        assert_ne!(result.input_hash, unmasked.input_hash);
+
+        assert!(matches!(
+            compare_landcover_within(
+                &ours,
+                &reference,
+                0,
+                &ReferenceClassMap::default(),
+                Some(&[true; 3]),
+            ),
+            Err(AgreementError::MaskLengthMismatch {
+                mask: 3,
+                expected: 4
+            })
         ));
     }
 }

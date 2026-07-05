@@ -15,11 +15,11 @@
 use std::path::{Path, PathBuf};
 
 use post_processor::crop_features::{
-    build_training_samples, classify_raster, extract_features, CropFeatureError,
+    build_training_samples_masked, classify_raster, extract_features, CropFeatureError,
     NearestCentroidModel,
 };
 use post_processor::landcover_agreement::{
-    compare_landcover, AgreementError, AgreementResult, ReferenceClassMap,
+    compare_landcover_within, AgreementError, AgreementResult, ReferenceClassMap,
 };
 use post_processor::phenology::PhenologyResult;
 use post_processor::phenology::{
@@ -605,6 +605,11 @@ pub struct LandCoverValidateRequest {
     pub landcover_product_id: String,
     /// Catalog id of the `landcover_reference` product on the same grid.
     pub reference_product_id: String,
+    /// Restrict agreement/kappa to homogeneous reference interiors
+    /// (batch 27): boundary pixels, where 10 m reference labels are noisy,
+    /// are excluded as `outside_bootstrap_mask`.
+    #[serde(default)]
+    pub bootstrap_mask: bool,
 }
 
 /// Outcome of one validation.
@@ -707,7 +712,25 @@ pub async fn validate_landcover(
         })
         .collect();
     let class_map = ReferenceClassMap::default();
-    let result = compare_landcover(&ours, &reference_codes, WORLDCOVER_NODATA, &class_map)?;
+    let mask = if request.bootstrap_mask {
+        Some(
+            post_processor::landcover_agreement::homogeneous_reference_mask(
+                &reference_codes,
+                reference_raster.width,
+                reference_raster.height,
+                WORLDCOVER_NODATA,
+            )?,
+        )
+    } else {
+        None
+    };
+    let result = compare_landcover_within(
+        &ours,
+        &reference_codes,
+        WORLDCOVER_NODATA,
+        &class_map,
+        mask.as_deref(),
+    )?;
 
     // --- Agreement L3 (JSON artifact) with lineage to both inputs.
     let draft = ProductRecordDraft {
@@ -723,6 +746,7 @@ pub async fn validate_landcover(
             "overall_agreement": result.overall_agreement,
             "kappa": result.kappa,
             "excluded": result.excluded,
+            "bootstrap_mask": request.bootstrap_mask,
         }),
         inputs: vec![
             ProductInputRef {
@@ -807,6 +831,15 @@ pub struct LandCoverMlRequest {
     pub reference_product_id: String,
     pub field_id: String,
     pub season_id: String,
+    /// Bootstrap training labels (batch 27): harvest samples only from
+    /// homogeneous reference interiors, keeping boundary label noise out
+    /// of the centroids.
+    #[serde(default)]
+    pub bootstrap: bool,
+    /// Deterministic per-class training cap (even row-major stride);
+    /// `None` keeps every sample.
+    #[serde(default)]
+    pub max_samples_per_class: Option<usize>,
 }
 
 /// Outcome of one learned classification.
@@ -889,11 +922,25 @@ pub async fn classify_landcover_ml(
             }
         })
         .collect();
-    let training = build_training_samples(
+    let bootstrap_mask = if request.bootstrap {
+        Some(
+            post_processor::landcover_agreement::homogeneous_reference_mask(
+                &reference_codes,
+                reference_raster.width,
+                reference_raster.height,
+                WORLDCOVER_NODATA,
+            )?,
+        )
+    } else {
+        None
+    };
+    let training = build_training_samples_masked(
         &features,
         &reference_codes,
         WORLDCOVER_NODATA,
         &ReferenceClassMap::default(),
+        bootstrap_mask.as_deref(),
+        request.max_samples_per_class,
     )?;
     let model = NearestCentroidModel::fit(&training.samples)?;
     let classes = classify_raster(&features, &model)?;
@@ -942,6 +989,8 @@ pub async fn classify_landcover_ml(
             "reference_product_id": reference_product.product_id,
             "training_sample_count": model.training_sample_count,
             "training_hash": model.training_hash,
+            "bootstrap": request.bootstrap,
+            "max_samples_per_class": request.max_samples_per_class,
             "feature_names": model.feature_names,
             "model": model_json,
             "excluded": training.excluded,

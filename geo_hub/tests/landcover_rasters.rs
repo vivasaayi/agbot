@@ -681,3 +681,201 @@ async fn ml_classify_learns_from_reference_and_registers_a_raster() -> Result<()
     );
     Ok(())
 }
+
+/// Batch 27: WorldCover bootstrap masks gate both tiers. On the 2x2
+/// checkerboard reference every pixel touches a class boundary, so the
+/// homogeneous-interior mask is empty and a bootstrap validation is refused
+/// (nothing trustworthy to compare). Against a uniform reference the mask
+/// covers the scene: bootstrap validation succeeds as a DISTINCT agreement
+/// product, and bootstrap training with a per-class cap decimates the
+/// samples deterministically.
+#[tokio::test]
+async fn worldcover_bootstrap_masks_gate_training_and_validation() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = ctx(&tmp).await?;
+
+    for (stamp, pixels) in SERIES {
+        register_l2(&ctx, &tmp, "ndvi", stamp, pixels.to_vec(), TRANSFORM).await?;
+    }
+    for stamp in ["2026-05-01", "2026-09-01"] {
+        register_l2(
+            &ctx,
+            &tmp,
+            "mndwi",
+            stamp,
+            vec![-0.3, -0.3, -0.2, 0.4],
+            TRANSFORM,
+        )
+        .await?;
+    }
+    let (status, bytes) = send(
+        &ctx.app,
+        "POST",
+        "/api/landcover/derive",
+        Some(derive_body()),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    let derived: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let landcover_id = derived["landcover_product_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let phenology_id = derived["phenology_product_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Two WorldCover tiles on the grid: a 4-class checkerboard (every 2x2
+    // pixel touches a boundary) and a uniform cropland tile.
+    let reference_dir = tmp.path().join("worldcover");
+    std::fs::create_dir_all(&reference_dir)?;
+    for (name, values) in [
+        (
+            "ESA_WorldCover_10m_2021_v200_N09E075_Map.tif",
+            [40.0f32, 10.0, 30.0, 80.0],
+        ),
+        (
+            "ESA_WorldCover_10m_2021_v200_N09E078_Map.tif",
+            [40.0, 40.0, 40.0, 40.0],
+        ),
+    ] {
+        write_geotiff_f32(
+            reference_dir.join(name),
+            2,
+            2,
+            &values,
+            &GeoTiffTags {
+                epsg: Some(EPSG),
+                geo_transform: Some(TRANSFORM),
+                nodata: Some(0.0),
+            },
+        )?;
+    }
+    let (status, bytes) = send(
+        &ctx.app,
+        "POST",
+        "/api/landcover/reference/register",
+        Some(json!({ "dir": reference_dir.to_string_lossy() })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    let registered: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let tiles = registered["registered"].as_array().unwrap();
+    assert_eq!(tiles.len(), 2);
+    let checker_id = tiles[0][1].as_str().unwrap().to_string();
+    let uniform_id = tiles[1][1].as_str().unwrap().to_string();
+
+    // Checkerboard + bootstrap mask: nothing is interior -> refused with a
+    // reason, not a bogus kappa over boundary noise.
+    let (status, bytes) = send(
+        &ctx.app,
+        "POST",
+        "/api/landcover/validate",
+        Some(json!({
+            "landcover_product_id": landcover_id,
+            "reference_product_id": checker_id,
+            "bootstrap_mask": true,
+        })),
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    assert!(String::from_utf8_lossy(&bytes).contains("no comparable pixels"));
+
+    // Uniform reference: the interior mask covers the whole 2x2, so the
+    // bootstrap validation compares all classifiable pixels and registers a
+    // DISTINCT product from the unmasked validation of the same pair.
+    let validate = |bootstrap: bool| {
+        json!({
+            "landcover_product_id": landcover_id,
+            "reference_product_id": uniform_id,
+            "bootstrap_mask": bootstrap,
+        })
+    };
+    let (status, bytes) = send(
+        &ctx.app,
+        "POST",
+        "/api/landcover/validate",
+        Some(validate(true)),
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let masked: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let (status, bytes) = send(
+        &ctx.app,
+        "POST",
+        "/api/landcover/validate",
+        Some(validate(false)),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    let unmasked: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_ne!(
+        masked["agreement_product_id"],
+        unmasked["agreement_product_id"]
+    );
+    let masked_product =
+        catalog::get_product(&ctx.pool, masked["agreement_product_id"].as_str().unwrap())
+            .await?
+            .unwrap();
+    assert_eq!(masked_product.parameters["bootstrap_mask"], true);
+
+    // Bootstrap training with a per-class cap: 3 feature-valid pixels all
+    // labeled cropland decimate to 1 sample; the run is a distinct product
+    // with the bootstrap recorded in identity-bearing parameters.
+    let classify = |body: serde_json::Value| async {
+        send(&ctx.app, "POST", "/api/landcover/ml/classify", Some(body)).await
+    };
+    let (status, bytes) = classify(json!({
+        "phenology_product_id": phenology_id,
+        "reference_product_id": uniform_id,
+        "field_id": "field-1",
+        "season_id": "season-2026",
+        "bootstrap": true,
+        "max_samples_per_class": 1,
+    }))
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let bootstrapped: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(bootstrapped["training_sample_count"], 1);
+    let (status, bytes) = classify(json!({
+        "phenology_product_id": phenology_id,
+        "reference_product_id": uniform_id,
+        "field_id": "field-1",
+        "season_id": "season-2026",
+    }))
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    let plain: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(plain["training_sample_count"], 3);
+    assert_ne!(
+        bootstrapped["landcover_ml_product_id"],
+        plain["landcover_ml_product_id"]
+    );
+    let ml_product = catalog::get_product(
+        &ctx.pool,
+        bootstrapped["landcover_ml_product_id"].as_str().unwrap(),
+    )
+    .await?
+    .unwrap();
+    assert_eq!(ml_product.parameters["bootstrap"], true);
+    assert_eq!(ml_product.parameters["max_samples_per_class"], 1);
+    assert_eq!(ml_product.parameters["excluded"]["class_cap"], 2);
+
+    Ok(())
+}
