@@ -13,6 +13,14 @@
 //! (EPSG code + per-resolution ULX/ULY/XDIM/YDIM) — Sentinel-2 JP2s do not
 //! carry a GeoTIFF-style grid, and the decoder is deliberately a pure pixel
 //! reader.
+//!
+//! **SCL cloud masking (batch 28):** when the scene's registered
+//! `band_scl_20m` product (Sen2Cor's own Scene Classification Layer) is
+//! present, cloud/shadow/defective pixels are masked before the index —
+//! the Sen2Cor parallel of the HLS Fmask path. SCL is 20 m against the
+//! 10 m bands, so codes are block-replicated 2x by deterministic
+//! nearest-neighbor before masking; `scl_applied` is recorded in the
+//! product parameters and the SCL product joins the lineage.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -37,6 +45,16 @@ use crate::sen2cor::SEN2COR_SOURCE_ID;
 /// may sit (`IMG_DATA/R10m/band.jp2` -> granule dir is 2..3 levels up).
 const METADATA_SEARCH_DEPTH: usize = 4;
 
+/// Sen2Cor SCL codes kept as clear-sky ground for index math: vegetation
+/// (4), not-vegetated (5), water (6), unclassified (7 — not positively
+/// cloudy), and snow/ice (11 — valid ground, matching the HLS Fmask
+/// decision). Rejected: no-data (0), saturated/defective (1), cast/dark
+/// shadows (2), cloud shadows (3), cloud medium/high probability (8/9),
+/// thin cirrus (10), and any out-of-range code.
+pub fn scl_clear(code: u16) -> bool {
+    matches!(code, 4 | 5 | 6 | 7 | 11)
+}
+
 #[derive(Debug, Error)]
 pub enum Sen2CorDeriveError {
     #[error("scene {scene_id} has no registered {kind} product (run `geo_hub sen2cor run` first)")]
@@ -49,6 +67,13 @@ pub enum Sen2CorDeriveError {
     GridMismatch {
         red_dims: (u32, u32),
         nir_dims: (u32, u32),
+    },
+    #[error(
+        "SCL band {scl_dims:?} is not the 20 m half-resolution grid of the {band_dims:?} bands"
+    )]
+    SclGridMismatch {
+        scl_dims: (u32, u32),
+        band_dims: (u32, u32),
     },
     #[error("no MTD_TL.xml found within {depth} levels above {band_path}")]
     MetadataNotFound { band_path: PathBuf, depth: usize },
@@ -82,6 +107,7 @@ impl Sen2CorDeriveError {
             Sen2CorDeriveError::BandNotFound { .. }
                 | Sen2CorDeriveError::NoArtifact { .. }
                 | Sen2CorDeriveError::GridMismatch { .. }
+                | Sen2CorDeriveError::SclGridMismatch { .. }
                 | Sen2CorDeriveError::MetadataNotFound { .. }
                 | Sen2CorDeriveError::BadGeocoding { .. }
         )
@@ -116,6 +142,8 @@ pub struct Sen2CorNdviOutcome {
     pub valid_pixels: usize,
     pub invalid_pixels: usize,
     pub sensor_profile: String,
+    /// Whether Sen2Cor's SCL band masked clouds before the index.
+    pub scl_applied: bool,
     pub ndvi_artifact: PathBuf,
     pub stac_item_href: String,
     pub tiles_href: String,
@@ -208,6 +236,20 @@ async fn band_product(
         })
 }
 
+/// Like [`band_product`] but absence is not an error (quality bands are
+/// optional).
+async fn optional_band_product(
+    pool: &DbPool,
+    scene_id: &str,
+    kind: &str,
+) -> Result<Option<RegisteredProduct>, Sen2CorDeriveError> {
+    match band_product(pool, scene_id, kind).await {
+        Ok(product) => Ok(Some(product)),
+        Err(Sen2CorDeriveError::BandNotFound { .. }) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 fn decode_band(product: &RegisteredProduct) -> Result<(Jp2Gray, PathBuf), Sen2CorDeriveError> {
     let path = product
         .path
@@ -266,7 +308,37 @@ pub async fn derive_sen2cor_ndvi(
         (IndexBandRole::Red, scaled_red.pixels),
         (IndexBandRole::Nir, scaled_nir.pixels),
     ]);
-    let clear = vec![true; red.values.len()];
+
+    // Clear-sky mask from Sen2Cor's own SCL band when the scene has one
+    // (20 m codes block-replicated to the 10 m grid); otherwise keep all.
+    let scl_product = optional_band_product(pool, &request.scene_id, "band_scl_20m").await?;
+    let (clear, scl_applied, scl_input) = match &scl_product {
+        Some(product) => {
+            let (scl, _) = decode_band(product)?;
+            if (scl.width * 2, scl.height * 2) != (red.width, red.height) {
+                return Err(Sen2CorDeriveError::SclGridMismatch {
+                    scl_dims: (scl.width, scl.height),
+                    band_dims: (red.width, red.height),
+                });
+            }
+            let codes = crate::satellite_derivation::resample_nearest(
+                &scl.values,
+                scl.width,
+                scl.height,
+                red.width,
+                red.height,
+            );
+            (
+                codes.iter().map(|code| scl_clear(*code)).collect(),
+                true,
+                Some(ProductInputRef {
+                    product_id: product.product_id.clone(),
+                    role: "scl_mask".to_string(),
+                }),
+            )
+        }
+        None => (vec![true; red.values.len()], false, None),
+    };
     let index = compute_masked_index(IndexKind::Ndvi, &bands, &clear)
         .map_err(|err| Sen2CorDeriveError::Index(err.to_string()))?;
 
@@ -299,6 +371,7 @@ pub async fn derive_sen2cor_ndvi(
             "red_band": "B04_10m",
             "nir_band": "B08_10m",
             "sensor_profile": profile_label,
+            "scl_applied": scl_applied,
         }),
         inputs: vec![
             ProductInputRef {
@@ -309,7 +382,10 @@ pub async fn derive_sen2cor_ndvi(
                 product_id: nir_product.product_id.clone(),
                 role: "nir".to_string(),
             },
-        ],
+        ]
+        .into_iter()
+        .chain(scl_input)
+        .collect(),
         scope: ProductScope {
             farm_id: None,
             field_id: request.field_id.clone(),
@@ -383,6 +459,7 @@ pub async fn derive_sen2cor_ndvi(
         valid_pixels: index.valid_pixels,
         invalid_pixels: index.invalid_pixels,
         sensor_profile: profile_label.to_string(),
+        scl_applied,
         ndvi_artifact: ndvi_path,
     })
 }
@@ -440,6 +517,19 @@ mod tests {
             parse_tile_geocoding(&no_ulx, 10),
             Err(Sen2CorDeriveError::BadGeocoding { what: "ULX", .. })
         ));
+    }
+
+    #[test]
+    fn scl_clear_codes_are_pinned() {
+        // 0 nodata, 1 saturated, 2 cast shadow, 3 cloud shadow, 8/9 cloud,
+        // 10 cirrus -> rejected; 4 vegetation, 5 bare, 6 water,
+        // 7 unclassified, 11 snow -> kept; out-of-range rejected.
+        for rejected in [0u16, 1, 2, 3, 8, 9, 10, 12, 255] {
+            assert!(!scl_clear(rejected), "{rejected}");
+        }
+        for kept in [4u16, 5, 6, 7, 11] {
+            assert!(scl_clear(kept), "{kept}");
+        }
     }
 
     #[test]

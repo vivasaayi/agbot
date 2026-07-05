@@ -262,3 +262,89 @@ async fn sen2cor_jp2_bands_derive_local_ndvi_with_lineage() -> Result<()> {
 
     Ok(())
 }
+
+/// Batch 28: Sen2Cor's own SCL band masks clouds before the index — the
+/// sen2cor parallel of HLS Fmask. The SCL is 20 m (4x4 against the 8x8
+/// bands); its top-left cell is cloud (code 9), so after 2x nearest
+/// block-replication the four top-left 10 m pixels are nodata. The SCL
+/// product joins the lineage as `scl_mask`, `scl_applied` is recorded,
+/// and the product id differs from an unmasked derivation.
+#[tokio::test]
+async fn scl_band_masks_clouds_before_the_index() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = ctx(&tmp).await?;
+
+    // Fabricate the SAFE with an SCL band this time: 4x4 codes, cell 0 is
+    // cloud-high (9), the rest vegetation (4).
+    let input = tmp.path().join(L1C_NAME);
+    std::fs::create_dir_all(&input)?;
+    std::fs::write(input.join("MTD_MSIL1C.xml"), b"<l1c/>")?;
+    let output_dir = tmp.path().join("l2a_out");
+    fabricate_l2a(&output_dir)?;
+    let granule = output_dir
+        .join(L2A_NAME)
+        .join("GRANULE")
+        .join("L2A_T43PFN_A046739_20240601T051651");
+    let scl_dir = granule.join("IMG_DATA").join("R20m");
+    std::fs::create_dir_all(&scl_dir)?;
+    let mut scl = vec![4u16; 16];
+    scl[0] = 9;
+    write_jp2_gray(
+        &scl_dir.join("T43PFN_20240601T051651_SCL_20m.jp2"),
+        4,
+        4,
+        &scl,
+    );
+    let config = Sen2CorConfig {
+        command: vec![
+            "noop".to_string(),
+            "{input}".to_string(),
+            "{output_dir}".to_string(),
+        ],
+    };
+    run_sen2cor(&ctx.pool, &NoopRunner, &config, &input, &output_dir).await?;
+
+    let (status, outcome) = send(
+        &ctx.app,
+        "POST",
+        "/api/ingest/sen2cor/ndvi/derive",
+        Some(json!({ "scene_id": SCENE_ID })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{outcome}");
+    assert_eq!(outcome["scl_applied"], true);
+    // 8x8 grid: SCL cell (0,0) covers 10 m pixels (0,0),(0,1),(1,0),(1,1);
+    // the band fill pixel 0 overlaps one of them. 64 - 4 cloud = 60 valid.
+    assert_eq!(outcome["valid_pixels"], 60);
+    assert_eq!(outcome["invalid_pixels"], 4);
+    let ndvi_id = outcome["ndvi_product_id"].as_str().unwrap().to_string();
+
+    let product = catalog::get_product(&ctx.pool, &ndvi_id).await?.unwrap();
+    assert_eq!(product.parameters["scl_applied"], true);
+    let values = {
+        let mut reader = GeoTiffReader::open(product.path.as_deref().unwrap())?;
+        reader.read_band()?.to_f32()
+    };
+    // Cloud-masked corner: pixels (0,0),(0,1),(1,0),(1,1) row-major.
+    for masked in [0usize, 1, 8, 9] {
+        assert_eq!(values[masked], NODATA, "pixel {masked} must be masked");
+    }
+    for (pixel, value) in values.iter().enumerate() {
+        if ![0usize, 1, 8, 9].contains(&pixel) {
+            assert!((value - 0.5).abs() < 1e-6, "pixel {pixel}: {value}");
+        }
+    }
+
+    // The SCL product is in the lineage under its role.
+    let edges = catalog::trace_inputs(&ctx.pool, &ndvi_id).await?;
+    let scl_edge = edges
+        .iter()
+        .find(|edge| edge.role == "scl_mask")
+        .expect("scl lineage edge");
+    let scl_product = catalog::get_product(&ctx.pool, &scl_edge.input_product_id)
+        .await?
+        .unwrap();
+    assert_eq!(scl_product.kind, "band_scl_20m");
+
+    Ok(())
+}
