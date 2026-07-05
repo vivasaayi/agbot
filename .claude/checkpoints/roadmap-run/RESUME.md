@@ -1,5 +1,14 @@
 # Resume — field-intel-run-1
 
+## CURRENT: satellite intelligence pipeline (2026-07)
+Active plan + per-batch ledger: `docs/design/satellite-intelligence-pipeline.md`
+(the ledger there is authoritative; batches 1-7 committed). Last: batch 7
+(2bf6464 + ledger f49974c) — global Web Mercator tiler
+(`geo_hub/src/product_tiler.rs`, `/api/catalog/products/:id/tiles/:z/:x/:y.png`,
+STAC `tiles_web` asset, /browse raster source). NEXT: batch 8 = climatology/
+drought wiring (see ledger "Next" line). Everything below is the earlier
+(completed) Track A/B refactor history.
+
 Refactor: AGBot → layered field-intelligence pipeline.
 Plan: /Users/rajanpanneerselvam/Docs/AGBOT/refactor.md (reviewed + expanded 2026-07-03).
 
