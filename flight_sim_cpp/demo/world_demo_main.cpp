@@ -1,0 +1,665 @@
+// agbot_world_demo: builds the realistic-world demo scene for Lower Manhattan.
+//
+// Pipeline: worldgen::compile_world (terrain_engine DEM + detail fusion + NYC
+// footprint extrusion + OSM basemap draping) emits an .agbworld manifest with
+// per-tile provenance and deterministic hashes plus the base .agbscn scene.
+// This driver then overlays a Cessna flythrough and a delivery-robot street
+// route as demonstration markers and writes the final artifacts.
+//
+// Usage:
+//   agbot_world_demo            build scene, write out/world/manhattan.{agbscn,agbworld}
+//   agbot_world_demo --check    build scene, assert invariants, exit 0/1
+
+#include "agbot_config/Params.hpp"
+#include "agbot_flight_sim/WeatherPreset.hpp"
+#include "agbot_nav/AerialPlanner.hpp"
+#include "agbot_nav/CityEvidence.hpp"
+#include "agbot_nav/RoadGraphPlanner.hpp"
+#include "agbot_render/Atmosphere.hpp"
+#include "agbot_render/OffscreenRenderer.hpp"
+#include "agbot_render/SceneFile.hpp"
+#include "agbot_vehicles/FixedWingAutopilot.hpp"
+#include "agbot_vehicles/FixedWingModel.hpp"
+#include "agbot_worldgen/RoadNetwork.hpp"
+#include "agbot_worldgen/WorldCompiler.hpp"
+
+#include <array>
+#include <cmath>
+#include <filesystem>
+#include <iostream>
+#include <memory>
+#include <string>
+
+namespace {
+
+namespace cfg = agbot::config;
+namespace fs = agbot::flight_sim;
+
+// Terrain config with the authoritative bare-earth DEM (layer 0, the Gate 2
+// reference) plus subordinate synthetic detail. When the 3DEP GeoTIFF is
+// present it is the ground-truth base (NAVD88 metres); otherwise the compiler
+// falls back to Terrarium tiles so a data-less checkout still builds.
+std::string terrain_config_toml(const std::string& dem_geotiff_path) {
+    std::string base_layer;
+    if (!dem_geotiff_path.empty()) {
+        base_layer =
+            "[[layer]]\n"
+            "algorithm = \"dem_fusion\"\n"
+            "weight = 1.0\n"
+            "  [layer.params]\n"
+            "  source = \"geotiff\"\n"
+            "  path = \"" + dem_geotiff_path + "\"\n"
+            "  resample = \"bilinear\"\n"
+            "  clamp_min_m = -30.0\n";
+    } else {
+        base_layer =
+            "[[layer]]\n"
+            "algorithm = \"dem_fusion\"\n"
+            "weight = 1.0\n"
+            "  [layer.params]\n"
+            "  source = \"terrarium\"\n"
+            "  zoom = 13\n"
+            "  resample = \"bilinear\"\n"
+            "  void_fill = \"idw\"\n"
+            "  clamp_min_m = -2.0\n";
+    }
+    return
+        "[pipeline]\n"
+        "target_gsd_m = 30.0\n"
+        "resolution = 128\n"
+        "aoi = { min_lat = 40.700, min_lon = -74.020, max_lat = 40.740, max_lon = -73.980 }\n\n" +
+        base_layer +
+        "\n[[layer]]\n"
+        "algorithm = \"synthetic_detail\"\n"
+        "weight = 1.0\n"
+        "  [layer.params]\n"
+        "  amplitude_m = 0.6\n"
+        "  octaves = 4\n"
+        "  frequency = 8.0\n"
+        "  seed = 1337\n"
+        "  confidence = 0.3\n\n"
+        "[fusion]\n"
+        "method = \"detail_injection\"\n"
+        "lambda = 0.3\n"
+        "cutoff_cells = 2\n\n"
+        "[validation]\n"
+        "enabled = true\n"
+        "reference_layer = 0\n"
+        "output_json = \"out/world/terrain_validation.json\"\n";
+}
+
+struct FlythroughResult {
+    bool completed = false;
+    double max_altitude_error_m = 0.0;
+    double elapsed_s = 0.0;
+    std::vector<agbot::render::RenderScene::Marker> trail;
+};
+
+// Fly a Dubins-planned rectangular circuit above the city and trace the actual
+// 6-DOF flight path into the scene as markers.
+FlythroughResult fly_circuit(double cruise_alt_m, double airspeed_mps) {
+    FlythroughResult flight;
+    agbot::vehicles::FixedWingModel cessna;
+    agbot::vehicles::FixedWingAutopilot autopilot;
+
+    cfg::ParamTable planner_params;
+    planner_params["turn_radius_m"] = cfg::ParamValue(450.0);
+    planner_params["sample_spacing_m"] = cfg::ParamValue(40.0);
+    const agbot::nav::DubinsAirplanePlanner planner(planner_params);
+
+    const std::array<agbot::nav::AirPose, 4> corners = {{
+        {-1200.0, -1200.0, 0.0, cruise_alt_m},
+        {1200.0, -1200.0, 1.5707963, cruise_alt_m},
+        {1200.0, 1200.0, 3.1415926, cruise_alt_m},
+        {-1200.0, 1200.0, -1.5707963, cruise_alt_m},
+    }};
+    std::vector<fs::Vec3> route;
+    for (std::size_t leg = 0; leg < corners.size(); ++leg) {
+        const auto plan = planner.plan(corners[leg], corners[(leg + 1) % corners.size()]);
+        if (!plan.ok) {
+            return flight;
+        }
+        route.insert(route.end(), plan.path.points.begin(), plan.path.points.end());
+    }
+
+    agbot::vehicles::EntityState state = cessna.set_initial_trim(
+        cruise_alt_m, airspeed_mps, corners[0].heading_rad, corners[0].x, corners[0].z);
+    autopilot.reset(cessna.trim_controls());
+
+    constexpr double kDt = 0.02;
+    constexpr double kLookaheadM = 250.0;
+    std::size_t target_index = 0;
+    double marker_accum_s = 0.0;
+    const double time_budget_s = 1.35 * (8.0 * 2400.0) / airspeed_mps;
+    while (flight.elapsed_s < time_budget_s) {
+        while (target_index + 1 < route.size()) {
+            const double dx = route[target_index].x - state.position.x;
+            const double dz = route[target_index].z - state.position.z;
+            if (std::sqrt(dx * dx + dz * dz) > kLookaheadM) {
+                break;
+            }
+            ++target_index;
+        }
+        if (target_index + 1 >= route.size()) {
+            flight.completed = true;
+            break;
+        }
+        const fs::Vec3& target = route[target_index];
+        agbot::vehicles::AutopilotCommand command;
+        command.heading_rad =
+            std::atan2(target.z - state.position.z, target.x - state.position.x);
+        command.altitude_m = cruise_alt_m;
+        command.airspeed_mps = airspeed_mps;
+        cessna.set_controls(autopilot.update(state, cessna.body_rates(), command, kDt));
+        state = cessna.step(state, {}, kDt);
+        flight.elapsed_s += kDt;
+        flight.max_altitude_error_m = std::max(
+            flight.max_altitude_error_m, std::abs(state.position.y - cruise_alt_m));
+        marker_accum_s += kDt;
+        if (marker_accum_s >= 4.0) {
+            marker_accum_s = 0.0;
+            flight.trail.push_back({static_cast<float>(state.position.x),
+                                    static_cast<float>(state.position.y),
+                                    static_cast<float>(state.position.z),
+                                    1.0f, 0.85f, 0.1f, 8.0f});
+        }
+    }
+    return flight;
+}
+
+struct StreetRouteResult {
+    bool attempted = false;
+    bool ok = false;
+    double length_m = 0.0;
+    double euclidean_m = 0.0;
+    std::vector<agbot::render::RenderScene::Marker> trail;
+};
+
+// Plan a delivery-robot route along the compiled OSM road graph and trace it
+// into the scene. Soft-skips when the compile found no road data.
+StreetRouteResult plan_street_route(const std::vector<agbot::worldgen::ExtractedFeature>& roads,
+                                    const fs::GeoCoordinate& origin) {
+    StreetRouteResult street;
+    if (roads.empty()) {
+        return street;
+    }
+    street.attempted = true;
+    auto network = std::make_shared<agbot::worldgen::RoadNetwork>(
+        agbot::worldgen::RoadNetwork::build(
+            roads, origin, agbot::worldgen::road_network_params_from({})));
+    agbot::nav::RoadGraphPlanner planner;
+    planner.set_network(network);
+    const fs::Vec3 start{-1200.0, 0.0, -800.0};
+    const fs::Vec3 goal{1200.0, 0.0, 800.0};
+    const agbot::nav::PlanResult route = planner.plan(agbot::nav::Costmap{}, start, goal);
+    street.ok = route.ok;
+    if (route.ok && route.path.points.size() > 1) {
+        street.euclidean_m = std::sqrt((goal.x - start.x) * (goal.x - start.x) +
+                                       (goal.z - start.z) * (goal.z - start.z));
+        for (std::size_t i = 1; i < route.path.points.size(); ++i) {
+            const fs::Vec3& a = route.path.points[i - 1];
+            const fs::Vec3& b = route.path.points[i];
+            street.length_m +=
+                std::sqrt((b.x - a.x) * (b.x - a.x) + (b.z - a.z) * (b.z - a.z));
+        }
+        for (std::size_t i = 0; i < route.path.points.size(); i += 6) {
+            const fs::Vec3& p = route.path.points[i];
+            street.trail.push_back({static_cast<float>(p.x), 8.0f, static_cast<float>(p.z),
+                                    0.15f, 0.9f, 0.3f, 6.0f});
+        }
+    }
+    return street;
+}
+
+// --- Weather-preset-driven scene lighting + night lamps --------------------
+
+double highway_importance(const agbot::worldgen::ExtractedFeature& road) {
+    const auto it = road.attributes.find("highway");
+    const std::string h = it != road.attributes.end() ? it->second : "";
+    if (h == "motorway" || h == "trunk" || h == "primary") {
+        return 1.0;
+    }
+    if (h == "secondary") {
+        return 0.75;
+    }
+    if (h == "tertiary") {
+        return 0.5;
+    }
+    return 0.3; // residential / service / unclassified
+}
+
+struct LightingSummary {
+    double sun_elevation_deg = 0.0;
+    bool lights_on = false;
+    std::size_t light_count = 0;
+    float sun_alignment = 0.0f; // dot(scene light dir, toward-sun) — should be ~ -1
+};
+
+// Set the scene sun direction from a recorded weather preset and generate street
+// lamps along the compiled roads (by highway hierarchy). When the preset is at
+// night/dusk the lamps are added to the scene as warm emissive markers.
+LightingSummary apply_scene_lighting(agbot::worldgen::WorldCompileResult& world,
+                                     const agbot::flight_sim::WeatherPreset& preset) {
+    const agbot::render::LightingState lighting = agbot::render::lighting_from_preset(preset);
+    // Scene sun_dir is the light travel direction (from the sun toward the
+    // ground): the negative of the toward-sun vector.
+    world.scene.sun_dir[0] = -lighting.sun_dir.x;
+    world.scene.sun_dir[1] = -lighting.sun_dir.y;
+    world.scene.sun_dir[2] = -lighting.sun_dir.z;
+
+    std::vector<std::vector<agbot::render::Vec3f>> polylines;
+    std::vector<double> importance;
+    for (const auto& road : world.roads) {
+        std::vector<agbot::render::Vec3f> pl;
+        pl.reserve(road.exterior.size());
+        for (const auto& c : road.exterior) {
+            const fs::Vec3 p = fs::local_from_geo(c, world.origin);
+            pl.push_back({static_cast<float>(p.x), 0.0f, static_cast<float>(p.z)});
+        }
+        if (pl.size() < 2) {
+            continue;
+        }
+        polylines.push_back(std::move(pl));
+        importance.push_back(highway_importance(road));
+    }
+    const auto lamps = agbot::render::night_lights_from_roads(polylines, importance);
+
+    if (lighting.artificial_lights_on) {
+        for (const auto& lamp : lamps) {
+            world.scene.markers.push_back({lamp.position.x, lamp.position.y, lamp.position.z,
+                                           lamp.color.r, lamp.color.g, lamp.color.b, 3.0f});
+        }
+    }
+
+    const auto sun = agbot::flight_sim::solar_position(preset);
+    LightingSummary s;
+    s.sun_elevation_deg = sun.elevation_rad * 180.0 / 3.14159265358979323846;
+    s.lights_on = lighting.artificial_lights_on;
+    s.light_count = lamps.size();
+    s.sun_alignment = world.scene.sun_dir[0] * lighting.sun_dir.x +
+        world.scene.sun_dir[1] * lighting.sun_dir.y + world.scene.sun_dir[2] * lighting.sun_dir.z;
+    return s;
+}
+
+} // namespace
+
+int main(int argc, char** argv) {
+    const bool check_mode = argc > 1 && std::string(argv[1]) == "--check";
+    bool night_mode = false;
+    for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--night") {
+            night_mode = true;
+        }
+    }
+    const std::filesystem::path source_dir = AGBOT_FLIGHT_SIM_SOURCE_DIR;
+
+    // --- Compile the world artifact ----------------------------------------
+    const std::filesystem::path dem_path = source_dir / "data/terrain/manhattan_3dep_dem.tif";
+    const std::string dem_geotiff = std::filesystem::exists(dem_path) ? dem_path.string() : "";
+
+    agbot::worldgen::WorldCompileSpec spec;
+    spec.seed = 1337;
+    spec.terrain_config_toml = terrain_config_toml(dem_geotiff);
+    if (!dem_geotiff.empty()) {
+        spec.terrain_license = "USGS 3DEP (public domain)";
+        spec.terrain_uri =
+            "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer";
+        spec.terrain_version = "3DEP exportImage 512px";
+        spec.terrain_vertical_datum = "NAVD88";
+        spec.terrain_authoritative = true;
+        spec.water_mask = true;
+    } else {
+        spec.terrain_license = "AWS Terrarium (mixed source licenses)";
+        spec.terrain_uri = "s3://elevation-tiles-prod/terrarium";
+    }
+
+    spec.buildings_path = (source_dir / "data/worldgen/manhattan_buildings.geojson").string();
+    spec.buildings_license = "NYC Open Data (public domain)";
+    spec.buildings_uri = "https://data.cityofnewyork.us/Housing-Development/Building-Footprints";
+    // NYC building ground_elevation is referenced to NAVD88, matching 3DEP.
+    spec.buildings_vertical_datum = dem_geotiff.empty() ? "" : "NAVD88";
+    spec.building_params["height_attr"] = cfg::ParamValue(std::string("height_roof"));
+    spec.building_params["height_units"] = cfg::ParamValue(std::string("feet"));
+    spec.building_params["base_elev_attr"] = cfg::ParamValue(std::string("ground_elevation"));
+    spec.building_params["base_units"] = cfg::ParamValue(std::string("feet"));
+    spec.building_params["id_attr"] = cfg::ParamValue(std::string("bin"));
+    spec.building_params["min_area_m2"] = cfg::ParamValue(10.0);
+
+    // Optional surface-detail sources (M3 batch 3). Activate the ranked LoD1
+    // measured tier + land-cover semantic mask when the reprojected rasters are
+    // present; the compile falls back cleanly otherwise. Fetch with
+    // terrain_engine/tools/fetch_nyc_dsm.sh / fetch_nyc_landcover.sh.
+    const std::filesystem::path dsm_path = source_dir / "data/terrain/manhattan_nyc_dsm.tif";
+    if (!dem_geotiff.empty() && std::filesystem::exists(dsm_path)) {
+        spec.dsm_path = dsm_path.string();
+        spec.dsm_license = "NYC Open Data (public domain)";
+        spec.dsm_uri = "https://data.cityofnewyork.us/";
+        spec.dsm_version = "NYC 2017 highest-hit DSM";
+        spec.dsm_vertical_datum = "NAVD88";
+    }
+    const std::filesystem::path landcover_path =
+        source_dir / "data/terrain/manhattan_nyc_landcover.tif";
+    if (std::filesystem::exists(landcover_path)) {
+        spec.landcover_path = landcover_path.string();
+        spec.landcover_license = "NYC Open Data (public domain)";
+        spec.landcover_uri = "https://data.cityofnewyork.us/";
+        spec.landcover_version = "NYC 2017 6-inch Land Cover";
+    }
+
+    spec.roads_path = (source_dir / "data/worldgen/manhattan_roads.json").string();
+    spec.roads_license = "OpenStreetMap (ODbL)";
+    spec.roads_uri = "https://overpass-api.de/api/interpreter";
+
+    spec.basemap_source_dir = source_dir;
+    spec.basemap_license = "OpenStreetMap (ODbL)";
+
+    agbot::worldgen::WorldCompileResult world = agbot::worldgen::compile_world(spec);
+    if (!world.ok) {
+        if (world.error_code == "buildings_file_missing") {
+            std::cerr << "SKIP: building data missing; run "
+                         "worldgen/tools/fetch_nyc_buildings.sh first ("
+                      << world.error_detail << ")\n";
+            return 77; // ctest SKIP_RETURN_CODE
+        }
+        std::cerr << "world compile failed: " << world.error_code << " — "
+                  << world.error_detail << "\n";
+        return 1;
+    }
+
+    // --- Demonstration overlays --------------------------------------------
+    const FlythroughResult flight = fly_circuit(400.0, 55.0);
+    const StreetRouteResult street = plan_street_route(world.roads, world.origin);
+
+    // M6: delivery-robot evidence loop over the same compiled building geometry
+    // the sensor path observes (Gate 5).
+    const agbot::nav::EvidencePlanResult evidence =
+        agbot::nav::run_evidence_loop(world.buildings, world.origin);
+
+    // M6 batch 2: sensor-derived occupancy vs the footprint occupancy. Render a
+    // near-nadir sensor frame, back-project depth+semantic into an occupancy
+    // grid, and check the robot's *perceived* obstacles agree with the compiled
+    // building footprints (semantic/occupancy consistency).
+    agbot::nav::CityOccupancyParams occ_params;
+    occ_params.half_extent_m = 1350.0;
+    occ_params.resolution_m = 3.0;
+    occ_params.inflation_cells = 1;
+    const agbot::nav::OccupancyGrid footprint_occ =
+        agbot::nav::build_city_occupancy(world.buildings, world.origin, occ_params);
+
+    agbot::render::OffscreenCamera nadir_cam;
+    nadir_cam.eye = {0.0f, 3000.0f, 0.5f};
+    nadir_cam.target = {0.0f, 0.0f, 0.0f};
+    nadir_cam.up = {0.0f, 0.0f, -1.0f};
+    nadir_cam.far_m = 9000.0f;
+    const auto nadir_frame = agbot::render::render_offscreen(world.scene, nadir_cam, 240, 240);
+    agbot::nav::SensorOccupancyParams sensor_occ_params;
+    sensor_occ_params.grid = occ_params;
+    // Above the terrain ceiling (~14 m NAVD88), so only building roofs/facades
+    // register as obstacles, not high ground.
+    sensor_occ_params.min_obstacle_height_m = 25.0f;
+    const agbot::nav::OccupancyGrid sensor_occ =
+        agbot::nav::occupancy_from_sensor_frame(nadir_frame, nadir_cam, sensor_occ_params);
+    const agbot::nav::OccupancyConsistency consistency =
+        agbot::nav::occupancy_consistency(sensor_occ, footprint_occ, 2);
+
+    world.scene.markers.push_back({0.0f, 320.0f, 0.0f, 1.0f, 0.25f, 0.2f, 12.0f});
+    world.scene.markers.insert(world.scene.markers.end(), flight.trail.begin(),
+                               flight.trail.end());
+    world.scene.markers.insert(world.scene.markers.end(), street.trail.begin(),
+                               street.trail.end());
+
+    // --- Weather-preset lighting (M7 b2/b3): drive the scene sun from a
+    // recorded preset and generate street lamps by road hierarchy. --night uses
+    // a dusk preset (lamps lit); otherwise a clear-noon daytime scene.
+    const agbot::flight_sim::WeatherPreset lighting_preset =
+        night_mode ? agbot::flight_sim::preset_overcast_dusk()
+                   : agbot::flight_sim::preset_clear_noon();
+    const LightingSummary lighting = apply_scene_lighting(world, lighting_preset);
+
+    // --- Persist .agbscn + .agbworld ---------------------------------------
+    const std::filesystem::path out_dir = source_dir / "out/world";
+    const agbot::worldgen::WorldWriteResult written =
+        agbot::worldgen::write_world_artifacts(world, out_dir, "manhattan");
+    if (!written.ok) {
+        std::cerr << "world write failed: " << written.error_code << " — "
+                  << written.error_detail << "\n";
+        return 1;
+    }
+
+    // --- Stats + evidence ---------------------------------------------------
+    const agbot::worldgen::WorldQuality& q = world.manifest.quality;
+    std::cout << "manhattan world scene: " << written.scene_path.string() << "\n"
+              << "  manifest: " << written.manifest_path.string() << " (world_hash "
+              << world.manifest.world_hash << ")\n"
+              << "  terrain grid " << world.terrain.elevation.width << "x"
+              << world.terrain.elevation.height << ", elevation " << q.terrain_min_m << ".."
+              << q.terrain_max_m << " m (source: " << world.terrain.source_algorithm << ")\n"
+              << "  terrain datum: " << world.manifest.crs_policy.vertical_datum
+              << ", Gate 2 RMSE vs authoritative DEM: " << q.terrain_rmse_m << " m (MAE "
+              << q.terrain_mae_m << ", bias " << q.terrain_bias_m << ")\n"
+              << "  terrain cells: " << q.terrain_cell_count << " ("
+              << q.terrain_authoritative_cells << " authoritative, " << q.terrain_water_cells
+              << " water, " << q.terrain_nodata_cells << " nodata), state "
+              << to_string(world.manifest.tiles.front().elevation_state) << "\n"
+              << "  buildings " << q.building_count << ", max height "
+              << q.max_building_height_m << " m, median " << q.median_building_height_m
+              << " m, footprint area " << q.building_footprint_area_m2 << " m2, courtyards "
+              << q.building_with_courtyard_count << "\n"
+              << "  height source: measured " << q.height_from_measured << ", attr "
+              << q.height_from_attribute << ", levels " << q.height_from_levels << ", default "
+              << q.height_from_default << "\n"
+              << "  city mesh " << q.city_vertex_count << " verts, " << q.city_triangle_count
+              << " tris, " << q.city_batch_count << " batches\n"
+              << "  terrain basemap: "
+              << (world.terrain_textured ? "OSM tiles draped" : "height-colored fallback") << "\n"
+              << "  street route: "
+              << (street.attempted
+                      ? (street.ok ? std::to_string(street.length_m) + " m over roads (" +
+                                         std::to_string(street.euclidean_m) + " m euclidean)"
+                                   : std::string("FAILED"))
+                      : std::string("skipped (no road data)"))
+              << "\n"
+              << "  cessna circuit: " << (flight.completed ? "completed" : "incomplete") << " in "
+              << flight.elapsed_s << " s, max altitude error " << flight.max_altitude_error_m
+              << " m, trail markers " << flight.trail.size() << "\n"
+              << "  robot evidence loop: "
+              << (evidence.ok ? "reached goal" : std::string("FAILED (") +
+                                                     agbot::nav::to_string(evidence.failure) + ")")
+              << ", path " << evidence.length_m << " m (" << evidence.euclidean_m
+              << " m euclidean), min clearance " << evidence.min_clearance_m << " m, replans "
+              << evidence.replan_count << ", recoveries " << evidence.recovery_count
+              << ", lethal cells " << evidence.lethal_cells << "\n"
+              << "    planner effort: time-to-first-plan " << evidence.time_to_first_plan
+              << " expansions, time-in-recovery " << evidence.time_in_recovery << "\n"
+              << "  sensor/occupancy consistency: precision " << consistency.precision << " ("
+              << consistency.agree_lethal << "/" << consistency.sensor_lethal
+              << " perceived obstacles are real), recall " << consistency.recall << " ("
+              << consistency.footprint_lethal << " footprint cells)\n"
+              << "  executed trajectory: "
+              << (evidence.executed.reached ? "reached goal" : "did not reach") << " in "
+              << evidence.executed.duration_s << " s, length " << evidence.executed.length_m
+              << " m, mean crosstrack " << evidence.executed.mean_crosstrack_m << " m (max "
+              << evidence.executed.max_crosstrack_m << "), steering "
+              << evidence.executed.steering_smoothness_radps << " rad/s, collisions "
+              << evidence.executed.collisions << "\n"
+              << "  scene lighting: preset '" << lighting_preset.name << "', sun elevation "
+              << lighting.sun_elevation_deg << " deg, lamps "
+              << (lighting.lights_on ? "ON" : "off") << " (" << lighting.light_count
+              << " generated" << (lighting.lights_on ? ", added to scene" : "") << ")\n";
+
+    if (check_mode) {
+        int failures = 0;
+        auto expect = [&failures](bool condition, const char* label) {
+            std::cout << (condition ? "PASS " : "FAIL ") << label << "\n";
+            failures += condition ? 0 : 1;
+        };
+        // Authoritative-DEM runs are identified by the recorded NAVD88 datum
+        // (set only when the 3DEP GeoTIFF was consumed).
+        const bool authoritative = world.manifest.crs_policy.vertical_datum == "NAVD88";
+        bool terrain_source_is_3dep = false;
+        for (const auto& source : world.manifest.sources) {
+            if (source.source_id == "terrain") {
+                terrain_source_is_3dep =
+                    source.license.find("3DEP") != std::string::npos &&
+                    source.vertical_datum == "NAVD88";
+            }
+        }
+        expect(world.terrain.elevation.width >= 64 && world.terrain.elevation.height >= 64,
+               "terrain grid resolved");
+        // Bare-earth 3DEP reaches ~-16 m at native resolution (harbor/excavation);
+        // both sources stay well under Lower Manhattan's high ground.
+        expect(q.terrain_min_m > -30.0f && q.terrain_max_m < 150.0f &&
+                   q.terrain_max_m > q.terrain_min_m,
+               "manhattan elevation range plausible");
+        expect(!authoritative || terrain_source_is_3dep,
+               "authoritative run records a 3DEP/NAVD88 terrain source");
+        // Gate 2: the compiled terrain must track its authoritative reference DEM.
+        // Authoritative 3DEP is held to a tighter bound than the Terrarium fallback.
+        expect(q.terrain_rmse_m < (authoritative ? 2.0 : 5.0),
+               "Gate 2: fused terrain stays anchored to the reference DEM");
+        expect(dem_geotiff.empty() || authoritative,
+               "3DEP DEM, when present, is compiled as the authoritative terrain");
+        // No-silent-zero: the tile carries an explicit elevation state.
+        const auto& tile0 = world.manifest.tiles.front();
+        const bool state_consistent =
+            authoritative
+                ? (tile0.elevation_state == agbot::worldgen::ElevationState::Authoritative)
+                : (tile0.elevation_state == agbot::worldgen::ElevationState::Fallback);
+        expect(state_consistent, "tile elevation_state matches the terrain source class");
+        expect(q.terrain_cell_count > 0 &&
+                   q.terrain_authoritative_cells + q.terrain_nodata_cells <= q.terrain_cell_count,
+               "terrain cell accounting is consistent");
+        expect(!authoritative || (q.terrain_nodata_cells == 0 &&
+                                  q.terrain_authoritative_cells == q.terrain_cell_count),
+               "authoritative AOI has full DEM coverage (no silent-zero gaps)");
+        // Gate 3 (buildings): geometry + height sanity vs the authoritative NYC source.
+        expect(q.building_count > 1000, "more than 1000 buildings imported");
+        expect(q.max_building_height_m > 150.0 && q.max_building_height_m < 400.0,
+               "tallest building 150-400 m");
+        expect(q.median_building_height_m > 5.0 && q.median_building_height_m < 120.0,
+               "Gate 3: median building height plausible");
+        expect(q.building_footprint_area_m2 > 100000.0,
+               "Gate 3: total footprint area is substantial");
+        expect(q.height_from_attribute > q.building_count / 2,
+               "Gate 3: most heights come from the authoritative height attribute");
+        expect(q.height_from_measured + q.height_from_attribute + q.height_from_levels +
+                       q.height_from_default ==
+                   q.building_count,
+               "Gate 3: every building has a ranked height provenance");
+        expect(q.city_triangle_count > 50000, "city mesh has >50k triangles");
+        expect(q.city_batch_count > 10, "spatial batching active");
+        expect(world.manifest.world_hash != 0, "world manifest carries a content hash");
+        expect(!world.manifest.tiles.empty() &&
+                   world.manifest.tiles.front().provenance.size() >= 2,
+               "tile records terrain + building provenance");
+        expect(!street.attempted || street.ok, "street route plans over the OSM road graph");
+        expect(!street.ok || (street.length_m > street.euclidean_m &&
+                              street.length_m < 2.5 * street.euclidean_m),
+               "street route length plausible (1..2.5x euclidean)");
+        expect(!street.ok || street.trail.size() > 10, "street route traced into the scene");
+        expect(flight.completed, "cessna completes the Dubins circuit over the city");
+        expect(flight.max_altitude_error_m < 30.0, "cessna altitude held within 30 m");
+        expect(flight.trail.size() > 30, "flight trail traced into the scene");
+
+        // Gate 5 (navigation): the delivery robot routes across an occupancy
+        // costmap built from the same footprints the sensor observes, stays
+        // collision-free, keeps clearance, and recovers when the plan is blocked.
+        expect(evidence.ok, "Gate 5: robot reaches the goal over the city occupancy grid");
+        expect(evidence.failure == agbot::nav::EvidenceFailure::None,
+               "Gate 5: no navigation failure class on success");
+        expect(evidence.collision_free, "Gate 5: robot path is collision-free");
+        expect(evidence.lethal_cells > 0,
+               "Gate 5: building footprints rasterize into lethal occupancy cells");
+        expect(evidence.length_m >= evidence.euclidean_m &&
+                   evidence.length_m < 3.0 * evidence.euclidean_m,
+               "Gate 5: robot path length plausible (1..3x euclidean)");
+        expect(evidence.recovery_count == 1 && evidence.replan_count == 1,
+               "Gate 5: robot replans once when the plan is blocked (recovery)");
+        expect(evidence.min_clearance_m >= 0.0, "Gate 5: path clearance is defined");
+        expect(evidence.time_to_first_plan > 0 && evidence.time_in_recovery > 0,
+               "Gate 5: planner effort (expansions) reported for first plan + recovery");
+        // Sensor/occupancy consistency: the robot's perceived obstacles (from the
+        // offscreen depth+semantic frame) must agree with the compiled footprints.
+        expect(consistency.sensor_lethal > 0,
+               "Gate 5: sensor frame back-projects to perceived obstacle cells");
+        expect(consistency.precision > 0.7,
+               "Gate 5: most perceived obstacles are real building footprints");
+        // Closed-loop execution: a controller-tracked robot follows the plan.
+        expect(evidence.executed.steps > 0 && evidence.executed.length_m > 100.0,
+               "Gate 5: robot executes the plan closed-loop over the costmap");
+        expect(evidence.executed.mean_crosstrack_m < 6.0,
+               "Gate 5: executed trajectory tracks the plan (mean crosstrack < 6 m)");
+
+        // Weather-preset lighting integration (M7 b2/b3 driving the scene).
+        expect(lighting.sun_alignment < -0.9,
+               "scene sun_dir opposes the preset's toward-sun vector");
+        expect(lighting.light_count > 100,
+               "street lamps generated along the compiled road network");
+        if (night_mode) {
+            expect(lighting.lights_on, "night preset lights the scene");
+        } else {
+            expect(!lighting.lights_on && lighting.sun_elevation_deg > 10.0,
+                   "clear-noon preset keeps lamps off with the sun well up");
+        }
+        expect(agbot::render::lighting_from_preset(agbot::flight_sim::preset_overcast_dusk())
+                   .artificial_lights_on,
+               "a dusk preset turns artificial lighting on");
+        const auto readback = agbot::render::read_scene_file(written.scene_path);
+        expect(readback.ok() &&
+                   readback.scene.static_meshes.size() + readback.scene.textured_meshes.size() == 2,
+               "scene file round-trips with 2 meshes");
+        expect(!world.terrain_textured || readback.scene.textured_meshes.size() == 1,
+               "draped basemap terrain survives scene round-trip");
+
+        // Gate 4 (render): the offscreen sensor path reads the same scene graph
+        // as the viewer and produces non-blank, deterministic, co-registered
+        // RGB / linear-depth / semantic frames.
+        agbot::render::OffscreenCamera sensor_cam;
+        sensor_cam.eye = {0.0f, 900.0f, 3000.0f};
+        sensor_cam.target = {0.0f, 60.0f, 0.0f};
+        sensor_cam.up = {0.0f, 1.0f, 0.0f};
+        sensor_cam.far_m = 8000.0f;
+        const auto frame = agbot::render::render_offscreen(world.scene, sensor_cam, 160, 120);
+        const auto frame_again = agbot::render::render_offscreen(world.scene, sensor_cam, 160, 120);
+        std::cout << "  Gate 4 sensor frame: coverage " << frame.coverage_ratio()
+                  << ", hash " << agbot::render::frame_hash(frame) << "\n";
+        expect(frame.coverage_ratio() > 0.25, "Gate 4: offscreen sensor frame is non-blank");
+        expect(agbot::render::frame_hash(frame) == agbot::render::frame_hash(frame_again),
+               "Gate 4: sensor frame hash is deterministic across renders");
+        bool coregistered = true;
+        for (std::size_t i = 0; i < frame.semantic.size(); ++i) {
+            if ((frame.semantic[i] != 0) != (frame.depth[i] > 0.0f)) {
+                coregistered = false;
+                break;
+            }
+        }
+        expect(coregistered, "Gate 4: depth and semantic layers are co-registered");
+
+        // Atmosphere (M7 b3) on the sensor render: preset-driven Preetham sky +
+        // aerial haze on RGB only. Depth/semantic (hence coverage) are untouched.
+        agbot::render::SkyParams sky;
+        sky.enabled = true;
+        const agbot::render::LightingState sky_light =
+            agbot::render::lighting_from_preset(lighting_preset);
+        sky.sun_dir = sky_light.sun_dir;
+        sky.turbidity = sky_light.turbidity;
+        sky.visibility_m = lighting_preset.visibility_m;
+        const auto sky_frame =
+            agbot::render::render_offscreen(world.scene, sensor_cam, 160, 120, {}, sky);
+        const auto sky_again =
+            agbot::render::render_offscreen(world.scene, sensor_cam, 160, 120, {}, sky);
+        expect(agbot::render::frame_hash(sky_frame) != agbot::render::frame_hash(frame),
+               "Gate 4: atmosphere changes the rendered RGB (sky + haze)");
+        expect(agbot::render::frame_hash(sky_frame) == agbot::render::frame_hash(sky_again),
+               "Gate 4: atmosphere-applied frame is deterministic");
+        expect(sky_frame.coverage_ratio() == frame.coverage_ratio(),
+               "Gate 4: atmosphere leaves depth/semantic coverage unchanged");
+
+        if (failures != 0) {
+            std::cout << failures << " failing checks\n";
+            return 1;
+        }
+        std::cout << "world demo check passed\n";
+    }
+    return 0;
+}

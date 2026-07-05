@@ -16,3 +16,5 @@ processed/
 mission_planner/frontend/node_modules
 simulator/assets
 .codex
+flight_sim_cpp/.cache
+out

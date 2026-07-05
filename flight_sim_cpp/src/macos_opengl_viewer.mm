@@ -546,6 +546,8 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     double record_sample_accumulator_;
     double replay_time_s_;
     double real_world_area_km2_;
+    int map_tile_zoom_;
+    std::string map_tile_key_;
     double globe_view_zoom_;
     int globe_map_zoom_;
     std::string globe_map_key_;
@@ -620,6 +622,8 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
         record_sample_accumulator_ = 0.0;
         replay_time_s_ = 0.0;
         real_world_area_km2_ = 20.0;
+        map_tile_zoom_ = 0;
+        map_tile_key_.clear();
         globe_view_zoom_ = 1.0;
         globe_map_zoom_ = 0;
         globe_center_latitude_ = 20.0;
@@ -835,6 +839,8 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
         }
     }
     map_tiles_.clear();
+    map_tile_zoom_ = 0;
+    map_tile_key_.clear();
     map_status_ = "Map off";
 }
 
@@ -914,9 +920,6 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
         return;
     }
 
-    [[self openGLContext] makeCurrentContext];
-    [self clearMapTiles];
-
     const auto& mission = simulation_->mission();
     const GeoCoordinate origin = *mission.home_geo;
     const ViewBounds view_bounds = [self viewBoundsForRect:[self sceneRect]];
@@ -963,6 +966,18 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
         }
     }
 
+    std::ostringstream key_builder;
+    key_builder << selected_zoom << ":"
+                << min_tile_x << ":" << max_tile_x << ":"
+                << min_tile_y << ":" << max_tile_y;
+    const std::string requested_key = key_builder.str();
+    if (!map_tiles_.empty() && map_tile_zoom_ == selected_zoom && map_tile_key_ == requested_key) {
+        return;
+    }
+
+    [[self openGLContext] makeCurrentContext];
+    [self clearMapTiles];
+
     int loaded_count = 0;
     for (int tile_y = min_tile_y; tile_y <= max_tile_y; ++tile_y) {
         for (int tile_x = min_tile_x; tile_x <= max_tile_x; ++tile_x) {
@@ -990,9 +1005,12 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     }
 
     if (loaded_count > 0) {
-        map_status_ = "OSM z" + std::to_string(selected_zoom);
+        map_tile_zoom_ = selected_zoom;
+        map_tile_key_ = requested_key;
+        map_status_ = "OSM z" + std::to_string(selected_zoom) + " " + std::to_string(loaded_count) + " tiles";
         [self setStatusMessage:"Map tiles loaded"];
     } else {
+        map_tile_key_.clear();
         map_status_ = "Grid only";
         [self setStatusMessage:"Map unavailable"];
     }
@@ -2140,20 +2158,39 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
         return;
     }
 
+    constexpr int kSubdivisions = 12;
+    constexpr double kDrapeOffsetM = 0.35;
+
     glEnable(GL_TEXTURE_2D);
-    set_color(1.0, 1.0, 1.0, 0.78);
+    set_color(1.0, 1.0, 1.0, 0.84);
     for (const MapTile& tile : map_tiles_) {
         glBindTexture(GL_TEXTURE_2D, tile.texture_id);
-        glBegin(GL_QUADS);
-        glTexCoord2d(0.0, 1.0);
-        glVertex3d(tile.min_x, -0.3, tile.min_z);
-        glTexCoord2d(1.0, 1.0);
-        glVertex3d(tile.max_x, -0.3, tile.min_z);
-        glTexCoord2d(1.0, 0.0);
-        glVertex3d(tile.max_x, -0.3, tile.max_z);
-        glTexCoord2d(0.0, 0.0);
-        glVertex3d(tile.min_x, -0.3, tile.max_z);
-        glEnd();
+        for (int row = 0; row < kSubdivisions; ++row) {
+            const double z0_fraction = static_cast<double>(row) / static_cast<double>(kSubdivisions);
+            const double z1_fraction = static_cast<double>(row + 1) / static_cast<double>(kSubdivisions);
+            const double z0 = tile.min_z + (tile.max_z - tile.min_z) * z0_fraction;
+            const double z1 = tile.min_z + (tile.max_z - tile.min_z) * z1_fraction;
+            const double v0 = 1.0 - z0_fraction;
+            const double v1 = 1.0 - z1_fraction;
+
+            for (int column = 0; column < kSubdivisions; ++column) {
+                const double x0_fraction = static_cast<double>(column) / static_cast<double>(kSubdivisions);
+                const double x1_fraction = static_cast<double>(column + 1) / static_cast<double>(kSubdivisions);
+                const double x0 = tile.min_x + (tile.max_x - tile.min_x) * x0_fraction;
+                const double x1 = tile.min_x + (tile.max_x - tile.min_x) * x1_fraction;
+
+                glBegin(GL_QUADS);
+                glTexCoord2d(x0_fraction, v0);
+                glVertex3d(x0, [self terrainHeightAtX:x0 z:z0] + kDrapeOffsetM, z0);
+                glTexCoord2d(x1_fraction, v0);
+                glVertex3d(x1, [self terrainHeightAtX:x1 z:z0] + kDrapeOffsetM, z0);
+                glTexCoord2d(x1_fraction, v1);
+                glVertex3d(x1, [self terrainHeightAtX:x1 z:z1] + kDrapeOffsetM, z1);
+                glTexCoord2d(x0_fraction, v1);
+                glVertex3d(x0, [self terrainHeightAtX:x0 z:z1] + kDrapeOffsetM, z1);
+                glEnd();
+            }
+        }
     }
     glBindTexture(GL_TEXTURE_2D, 0);
     glDisable(GL_TEXTURE_2D);
@@ -2614,10 +2651,10 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
         glDisable(GL_LIGHTING);
         glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
         [self apply3DCameraForScene:scene];
+        [self drawTerrain3D];
         glDepthMask(GL_FALSE);
         [self drawMapTiles3D];
         glDepthMask(GL_TRUE);
-        [self drawTerrain3D];
         [self drawGroundGrid3D];
         [self drawMissionPath3D];
         [self drawTrail3D];
@@ -2740,6 +2777,7 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
                 return;
             }
             zoom_m_ = std::min(1000.0, zoom_m_ * 1.15);
+            [self loadMapTilesForMission];
             return;
         }
         if (key == '=' || key == '+') {
@@ -2752,19 +2790,23 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
                 return;
             }
             zoom_m_ = std::max(30.0, zoom_m_ / 1.15);
+            [self loadMapTilesForMission];
             return;
         }
     }
 
     constexpr double pan_step = 20.0;
+    bool panned_map = false;
     switch ([event keyCode]) {
         case 123:
             chase_camera_ = false;
             pan_x_ -= pan_step;
+            panned_map = true;
             break;
         case 124:
             chase_camera_ = false;
             pan_x_ += pan_step;
+            panned_map = true;
             break;
         case 125:
             if (manual_mode_) {
@@ -2772,6 +2814,7 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
             } else {
                 chase_camera_ = false;
                 pan_z_ -= pan_step;
+                panned_map = true;
             }
             break;
         case 126:
@@ -2780,11 +2823,15 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
             } else {
                 chase_camera_ = false;
                 pan_z_ += pan_step;
+                panned_map = true;
             }
             break;
         default:
             [super keyDown:event];
             break;
+    }
+    if (panned_map && !globe_mode_) {
+        [self loadMapTilesForMission];
     }
 }
 
@@ -2923,7 +2970,8 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     if (globe_mode_ && dragging_globe_) {
         const NSPoint location = [self convertPoint:[event locationInWindow] fromView:nil];
         const NSRect scene = [self sceneRect];
-        const double degrees_per_pixel = 180.0 / std::max(1.0, static_cast<double>(std::min(scene.size.width, scene.size.height)));
+        const NSRect globe_frame = [self globeFrameForScene:scene];
+        const double degrees_per_pixel = 180.0 / std::max(1.0, static_cast<double>(globe_frame.size.width));
         globe_center_longitude_ = globe_drag_start_longitude_ - (location.x - globe_drag_start_.x) * degrees_per_pixel;
         globe_center_latitude_ = std::clamp(
             globe_drag_start_latitude_ - (location.y - globe_drag_start_.y) * degrees_per_pixel,
@@ -3009,8 +3057,10 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
 
     if ([event scrollingDeltaY] > 0.0) {
         zoom_m_ = std::max(30.0, zoom_m_ / 1.08);
+        [self loadMapTilesForMission];
     } else if ([event scrollingDeltaY] < 0.0) {
         zoom_m_ = std::min(1000.0, zoom_m_ * 1.08);
+        [self loadMapTilesForMission];
     }
 }
 

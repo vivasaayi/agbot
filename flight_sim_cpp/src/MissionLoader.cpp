@@ -15,6 +15,11 @@ namespace {
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kEarthMetersPerDegreeLat = 111'320.0;
 
+double meters_per_degree_lon_at(double latitude_degrees) {
+    return kEarthMetersPerDegreeLat *
+        std::max(0.01, std::abs(std::cos(latitude_degrees * kPi / 180.0)));
+}
+
 std::string read_all(const std::filesystem::path& path) {
     std::ifstream file(path);
     if (!file) {
@@ -319,8 +324,7 @@ std::optional<FieldBoundary> field_boundary_from_object(const std::string& objec
 } // namespace
 
 Vec3 local_from_geo(const GeoCoordinate& coordinate, const GeoCoordinate& origin) {
-    const double meters_per_degree_lon =
-        kEarthMetersPerDegreeLat * std::cos(origin.latitude * kPi / 180.0);
+    const double meters_per_degree_lon = meters_per_degree_lon_at(origin.latitude);
     return {
         (coordinate.longitude - origin.longitude) * meters_per_degree_lon,
         coordinate.altitude_m,
@@ -329,8 +333,7 @@ Vec3 local_from_geo(const GeoCoordinate& coordinate, const GeoCoordinate& origin
 }
 
 GeoCoordinate geo_from_local(const Vec3& local_position, const GeoCoordinate& origin) {
-    const double meters_per_degree_lon =
-        kEarthMetersPerDegreeLat * std::cos(origin.latitude * kPi / 180.0);
+    const double meters_per_degree_lon = meters_per_degree_lon_at(origin.latitude);
     return {
         origin.latitude + (local_position.z / kEarthMetersPerDegreeLat),
         origin.longitude + (local_position.x / meters_per_degree_lon),

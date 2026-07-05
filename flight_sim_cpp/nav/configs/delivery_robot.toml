@@ -1,0 +1,184 @@
+# Delivery robot navigation pipeline: every stage is a named strategy with its
+# parameters; swap `algorithm` values to hot-swap implementations.
+
+[pipeline]
+sensor_period_s = 0.1
+map_period_s = 0.1
+plan_period_s = 1.0
+local_period_s = 0.05
+goal_tolerance_m = 1.0
+
+[vehicle]
+algorithm = "kinematic_bicycle"
+max_speed_mps = 3.0
+max_reverse_speed_mps = 1.0
+max_accel_mps2 = 2.5
+max_brake_mps2 = 4.0
+max_steer_rad = 0.6
+max_steer_rate_radps = 2.5
+wheelbase_m = 0.8
+
+[sensing]
+algorithm = "depth_camera"
+width = 32
+height = 24
+horizontal_fov_deg = 90.0
+vertical_fov_deg = 60.0
+max_range_m = 30.0
+mount_yaw_rad = 0.0
+mount_pitch_rad = 0.0
+mount_height_m = 0.5
+range_noise_a = 0.0
+dropout_pct = 0.0
+seed = 7
+
+[perception]
+algorithm = "height_threshold"
+ground_height_m = 0.0
+max_step_m = 0.15
+
+[mapping]
+algorithm = "occupancy_grid"
+origin_x = -10.0
+origin_z = -10.0
+width = 400
+height = 80
+resolution_m = 0.25
+hit_increment = 128
+decay = 0
+carve_free = false
+inflation_radius_m = 1.0
+cost_scaling = 3.0
+lethal_threshold = 200
+
+[global]
+algorithm = "astar"
+lethal_threshold = 200
+heuristic_weight = 1.0
+cost_weight = 4.0
+unknown_cost = 0
+smooth = true
+
+# Alternate: kinodynamic Hybrid-A* (bicycle motion primitives + Dubins
+# analytic expansion). Set algorithm = "hybrid_astar" and uncomment:
+# min_turn_radius_m = 1.5          # bicycle minimum turn radius
+# arc_length_m = 1.0               # length of one motion primitive
+# n_headings = 24                  # heading discretization bins
+# allow_reverse = false            # enable backing-up primitives
+# reverse_penalty = 2.0            # cost multiplier on reverse arcs
+# steer_change_penalty = 0.5      # cost per unit steer-fraction change
+# heuristic_weight = 1.0           # euclidean heuristic inflation
+# cost_weight = 2.0                # costmap traversal cost weight
+# analytic_expansion_period = 8    # Dubins goal shot every N expansions
+# goal_xy_tolerance_m = 1.0
+# goal_yaw_tolerance_rad = 0.35
+
+# Alternate: road-graph strategic routing on real OSM streets. This is the
+# two-level pattern: "road_graph" picks WHICH streets to ride (snapping
+# start/goal onto the network and searching the directed road graph), while
+# a geometric planner (hybrid_astar/astar) plus the local planner handle the
+# last-meter geometry and obstacle avoidance along that route. Fetch the
+# street data with worldgen/tools/fetch_osm_roads.sh. Set
+# algorithm = "road_graph" and uncomment:
+# cost_mode = "time"               # "time" (speed-aware) | "distance"
+# max_snap_m = 50.0                # reason-coded failure beyond this snap
+# heuristic_weight = 1.0           # euclidean heuristic inflation
+# use_costmap = false              # streets are the map; true skips lethal edges
+# roads_path = "data/worldgen/manhattan_roads.json"
+# aoi_min_lat = 40.700             # AOI for the self-loaded road network
+# aoi_min_lon = -74.020            # (origin = AOI center, matching worldgen)
+# aoi_max_lat = 40.740
+# aoi_max_lon = -73.980
+# weld_tol_m = 1.5                 # intersection weld tolerance
+# default_speed_mps = 8.0          # speed for unmapped highway classes
+
+[local]
+algorithm = "pure_pursuit"
+lookahead_m = 2.5
+cruise_speed_mps = 2.5
+curvature_gain = 1.5
+obstacle_slow_start = 80.0
+goal_slow_gain = 0.8
+min_speed_mps = 0.4
+horizon_s = 1.5
+rollout_dt_s = 0.1
+
+# Alternate: sampling MPC (MPPI). Set algorithm = "mppi" and uncomment:
+# time_steps = 30                  # horizon length (steps)
+# dt = 0.05                        # rollout step (s)
+# num_samples = 1024               # control sequences per solve
+# lambda = 0.4                     # softmax temperature
+# sigma_accel = 1.0                # accel noise sigma (m/s^2)
+# sigma_steer_rate = 1.2           # steer-rate noise sigma (rad/s)
+# lethal_threshold = 200
+# w_obstacle = 3.0                 # obstacle critic weight
+# w_path = 1.2                     # path alignment critic weight
+# w_goal = 0.6                     # goal progress critic weight
+# w_speed = 0.4                    # cruise-speed critic weight
+# w_smooth = 0.05                  # control-effort critic weight
+# seed = 1                         # counter-RNG seed (bit-deterministic)
+
+# Predictive dynamic-obstacle costing (mppi + dwa; requires the [tracking]
+# stage to feed tracked objects). Each tracked object is extrapolated along
+# its constant-velocity estimate to the rollout step time; rollouts inside
+# the hard margin (robot_radius_m + object radius + dynamic_margin_m) are
+# rejected/penalized as lethal, surviving ones pay
+# w_dynamic * exp(-d^2 / (2 * dynamic_sigma_m^2)). Defaults shown:
+# w_dynamic = 3.0                  # predicted-proximity critic weight
+# dynamic_margin_m = 0.3           # extra hard margin around the object
+# dynamic_sigma_m = 1.2            # gaussian proximity falloff (m)
+# max_prediction_s = 3.0           # constant-velocity extrapolation cap (s)
+# robot_radius_m = 0.5             # robot body radius for the hard margin
+# pure_pursuit instead uses a simple yield guard: it samples its
+# straight-ahead motion against each tracked object's prediction and scales
+# speed to a stop when the predicted surface separation drops below
+# stop_distance_m (params: robot_radius_m, stop_distance_m = 2.0,
+# max_prediction_s).
+
+# Optional localization stage. Default (section absent or "ground_truth")
+# passes the true pose through, leaving legacy behavior bit-identical.
+# [localization]
+# algorithm = "ekf_2d"             # or "ground_truth"
+# sigma_odom_v = 0.05              # EKF process noise, speed (m/s)
+# sigma_odom_yaw_rate = 0.01       # EKF process noise, yaw rate (rad/s)
+# init_pos_sigma_m = 0.5           # initial position sigma
+# init_yaw_sigma_rad = 0.05        # initial heading sigma
+# gps_sigma_m = 0.6                # simulated GPS sigma (nominal quality)
+# gps_period_s = 0.2               # GPS fix period
+# compass_sigma_rad = 0.03         # simulated compass sigma
+# compass_period_s = 0.1           # compass period
+# odom_v_sigma = 0.05              # simulated odometry slip noise
+# odom_yaw_rate_sigma = 0.01       # simulated yaw-rate noise
+# noise_seed = 11                  # deterministic sensor noise seed
+# NavigationPipeline::set_gps_quality(q) drives urban-canyon degradation:
+# q in [0, 1] scales both the simulated GPS noise and the EKF measurement
+# covariance R.
+
+# Multi-object tracking stage between perception and local planning. The
+# default ("none", or section absent) keeps legacy behavior bit-identical:
+# no tracker runs and dynamic sensor returns fall into the static map. With
+# a tracker enabled, pedestrian/vehicle depth returns are clustered into
+# detections, tracked with per-track constant-velocity Kalman filters, kept
+# out of the static occupancy grid, and handed to the local planner for
+# predictive avoidance.
+[tracking]
+algorithm = "none"                 # "none" | "greedy_nn"
+# use_object_ids = true            # cluster by sensor object id (GT path);
+#                                  # false = distance-based clustering
+# cluster_distance_m = 1.0         # fallback clustering join distance
+# gate_m = 2.5                     # nearest-neighbor association gate
+# min_hits = 2                     # hits before a track is reported (birth)
+# max_missed = 5                   # consecutive misses before track death
+# q_pos = 0.3                      # KF position process noise (m^2/s)
+# q_vel = 2.0                      # KF velocity process noise ((m/s)^2/s)
+# r_pos = 0.2                      # measurement sigma (m)
+# init_vel_sigma = 3.0             # initial velocity sigma of new tracks
+
+[control]
+algorithm = "pid_stanley"
+kp = 1.5
+ki = 0.3
+kd = 0.0
+integral_limit = 2.0
+k_e = 1.2
+k_soft = 1.0

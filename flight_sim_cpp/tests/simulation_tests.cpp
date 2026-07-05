@@ -187,6 +187,25 @@ void test_loads_geodetic_mission() {
     assert(std::abs(reloaded.waypoints[0].geo->latitude - 37.7750) < 1e-6);
 }
 
+void test_geodetic_conversion_stays_finite_near_mercator_limit() {
+    const GeoCoordinate origin {85.0, 179.5, 4.0};
+    const GeoCoordinate waypoint {85.0002, 179.5004, 42.0};
+
+    const auto local = agbot::flight_sim::local_from_geo(waypoint, origin);
+    assert(std::isfinite(local.x));
+    assert(std::isfinite(local.y));
+    assert(std::isfinite(local.z));
+    assert(std::abs(local.x) > 1.0);
+    assert(std::abs(local.z) > 1.0);
+
+    const GeoCoordinate round_tripped = agbot::flight_sim::geo_from_local(local, origin);
+    assert(std::isfinite(round_tripped.latitude));
+    assert(std::isfinite(round_tripped.longitude));
+    assert(std::abs(round_tripped.latitude - waypoint.latitude) < 1e-9);
+    assert(std::abs(round_tripped.longitude - waypoint.longitude) < 1e-9);
+    assert(std::abs(round_tripped.altitude_m - waypoint.altitude_m) < 1e-9);
+}
+
 void test_mission_preview_overlay_aligns_field_boundary_and_coverage() {
     const auto mission = MissionLoader::load_from_text(kFieldPreviewMissionJson);
     const auto overlay = agbot::flight_sim::build_mission_preview_overlay(mission);
@@ -2082,6 +2101,7 @@ void test_fault_injection_rejects_fault_without_seed() {
 int main() {
     test_loads_mission();
     test_loads_geodetic_mission();
+    test_geodetic_conversion_stays_finite_near_mercator_limit();
     test_mission_preview_overlay_aligns_field_boundary_and_coverage();
     test_mission_preview_overlay_reports_missing_boundary();
     test_mission_validation_report_is_deterministic_and_reports_metrics();

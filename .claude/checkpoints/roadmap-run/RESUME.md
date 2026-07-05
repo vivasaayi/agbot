@@ -1,23 +1,17 @@
-# Roadmap Run — Resume
+# Resume — world-sim-run-1
 
-- **Run ID**: run-02-sim
-- **Roadmap hash**: f7f689d5947be4fbf236914925c1af7693d98188
-- **Last implementation commit**: d76d8c00682b7601627206b26f0436d798ea36c4 (`batch-02-05`)
-- **Latest checkpoint commit**: fe5b37513e3ee82411928f82b74ffe042e60ca2f (`batch-02-05` checkpoint)
-- **Current batch**: none — ready to start `batch-02-06`
-- **Completed batches**: 5 committed
-- **Blocker**: none
-
-## Latest verification
-
-- `cmake --build flight_sim_cpp/build --target agbot_flight_sim_tests agbot_sim agbot_flight_sim_headless` — pass
-- `./flight_sim_cpp/build/agbot_flight_sim_tests` — pass
-- `just flight-sim-test` — pass
-- `agbot_flight_sim_headless --fault gps_drift:9001:0:-:2.0:gps` — pass; manifest records fault hashes/events and a fault-specific `run_id`
-- `agbot_flight_sim_headless --fault bad_tile:777:0:-:0.0:terrain/tile/z12/x655/y1583` — pass; manifest records `flat_fallback`
-- `agbot_flight_sim_headless --fault gps_drift:-:0:-:1.0:gps` — expected fail on missing fault seed
-- `agbot-sim diff` baseline vs GPS-fault trace — expected divergence at `position.x`
-
-## Next action
-
-Start `batch-02-06`: claim and implement STORY `02-09` real DEM terrain with CRS/extent assertions as the next foundational P0 terrain dependency before LiDAR/camera/preview stories.
+- Branch: simulator-enhancements; last commit d424941 (M5 roads+renderer); prior ce87ab9.
+- ALL plan milestones M0-M4 complete and committed:
+  M0 config core | M1 terrain_engine + worldgen(NYC) + GL4.1 renderer + Manhattan demo |
+  M2 vehicles + nav pipeline | M3 Cessna 6-DOF + Dubins + flythrough |
+  M4 ONNX mono-depth (RMSE 2.38 m vs DEM) + hybrid-A* + MPPI + EKF + ONNX/classical segmentation.
+- Validation: 14/14 ctest suites green, ONNX active, zero warnings.
+- Fresh-clone prerequisites (gitignored): fetch_nyc_buildings.sh, fetch_depth_model.sh,
+  fetch_seg_model.sh, Terrarium tiles z13 x2411-2412 y3079-3080.
+- User's dirty files untouched: src/MissionLoader.cpp, src/macos_opengl_viewer.mm, tests/simulation_tests.cpp.
+- M5 DONE: OSM road import + welded street graph + road_graph planner (real route 5090 m);
+  AGBSCN02 textured meshes, basemap draped over terrain, 4x MSAA, sky gradient.
+- Fresh-clone also needs: fetch_osm_roads.sh; OSM basemap tiles z15 x9646-9650 y12316-12321.
+- M6 DONE (e858ae6): dynamic agents + KF tracker + predictive MPPI/DWA avoidance;
+  corridor + street-delivery scenarios collision-free, deterministic. 17/17 suites.
+- Next: CDLOD streaming terrain, VIO/LIO SLAM, viewer entity animation, ROS2 bridge.

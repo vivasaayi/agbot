@@ -1,0 +1,14 @@
+{
+  "dataset": "USGS 3DEP bare-earth DEM",
+  "service": "3DEPElevation/ImageServer/exportImage",
+  "request_url": "https://elevation.nationalmap.gov/arcgis/rest/services/3DEPElevation/ImageServer/exportImage?bbox=-74.015,40.705,-74.005,40.715&bboxSR=4326&imageSR=4326&size=128,128&format=tiff&pixelType=F32&interpolation=RSP_BilinearInterpolation&f=image",
+  "aoi": {"min_lat": 40.705, "min_lon": -74.015, "max_lat": 40.715, "max_lon": -74.005},
+  "size_px": 128,
+  "horizontal_crs": "EPSG:4326",
+  "vertical_datum": "NAVD88",
+  "units": "metres",
+  "license": "USGS 3DEP (public domain)",
+  "fetched_utc": "2026-07-03T02:03:34Z",
+  "sha256": "7b655d202857ee09cf98e34bbbb30e1351e0aa0a59adfaec7ede957f64290246",
+  "bytes": 66342
+}

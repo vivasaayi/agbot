@@ -33,6 +33,7 @@ add_library(agbot_flight_sim_core
     src/TraceDiff.cpp
     src/TwinBackend.cpp
     src/TwinContractV1.cpp
+    src/WeatherPreset.cpp
 )
 
 target_include_directories(agbot_flight_sim_core
@@ -78,6 +79,10 @@ target_link_libraries(agbot_flight_sim_tests PRIVATE agbot_flight_sim_core)
 add_test(NAME agbot_flight_sim_tests COMMAND agbot_flight_sim_tests)
 add_test(NAME agbot_flight_sim_golden_regression COMMAND agbot_sim regress)
 
+add_executable(agbot_weather_tests tests/weather_tests.cpp)
+target_link_libraries(agbot_weather_tests PRIVATE agbot_flight_sim_core agbot_vehicles)
+add_test(NAME agbot_weather_tests COMMAND agbot_weather_tests)
+
 if(APPLE)
     enable_language(OBJCXX)
 
@@ -97,3 +102,29 @@ if(APPLE)
         -Wno-deprecated-declarations
     )
 endif()
+
+# --- World-simulator modules (config, terrain, city, vehicles, navigation, render) ---
+
+add_library(agbot_third_party INTERFACE)
+target_include_directories(agbot_third_party INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/third_party)
+
+add_subdirectory(config)
+add_subdirectory(terrain_engine)
+add_subdirectory(worldgen)
+add_subdirectory(vehicles)
+add_subdirectory(nav)
+add_subdirectory(render)
+
+add_executable(agbot_world_demo demo/world_demo_main.cpp)
+# agbot_worldgen PUBLIC-links agbot_terrain + agbot_render (the world compiler
+# exposes their types), so the demo only names worldgen + nav directly.
+target_link_libraries(agbot_world_demo
+    PRIVATE
+        agbot_worldgen
+        agbot_nav
+)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(agbot_world_demo PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+add_test(NAME agbot_world_demo_check COMMAND agbot_world_demo --check)
+set_tests_properties(agbot_world_demo_check PROPERTIES SKIP_RETURN_CODE 77)
