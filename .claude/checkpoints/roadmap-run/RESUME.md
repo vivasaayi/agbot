@@ -2,14 +2,14 @@
 
 ## CURRENT: satellite intelligence pipeline (2026-07)
 Active plan + per-batch ledger: `docs/design/satellite-intelligence-pipeline.md`
-(the ledger there is authoritative; batches 1-11 committed). Last: batch 11
-(a292632) — SPI-N accumulation windows (window_months on spi/derive; identity,
-lineage, incomplete-window reason codes). Batch 10 (ab688b0): phenology +
-tier-1 land-cover + categorical tiler colormap. Batch 9 (b131e4e): CHIRPS +
-SPI + tiler EPSG:4326. Batch 8 (dde2610): climatology + VCI. Batch 7
-(2bf6464): Web Mercator tiler + STAC tiles_web. NEXT: batch 12 = CHIRPS dekad
-registration + injectable HTTPS fetcher, or Sen2Cor path (see ledger "Next"
-line). Everything below is the earlier (completed) Track A/B refactor
+(the ledger there is authoritative; batches 1-12 committed). Last: batch 12
+(51e842b) — CHIRPS dekads + injectable HTTPS fetcher (POST /api/drought-
+management/chirps/fetch, ChirpsFetcher seam, gzip inflate, resume, per-file
+failures). Batch 11 (a292632): SPI-N accumulation windows. Batch 10
+(ab688b0): phenology + tier-1 land-cover. Batch 9 (b131e4e): CHIRPS + SPI.
+Batch 8 (dde2610): climatology + VCI. Batch 7 (2bf6464): Web Mercator tiler.
+NEXT: batch 13 = Sen2Cor containerized L1C->L2A path, or Phase 4 (see ledger
+"Next" line). Everything below is the earlier (completed) Track A/B refactor
 history.
 
 Refactor: AGBot → layered field-intelligence pipeline.
