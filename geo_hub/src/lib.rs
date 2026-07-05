@@ -12,6 +12,7 @@ pub mod ingest;
 pub mod ingest_contract;
 pub mod landsat;
 pub mod product_catalog;
+pub mod product_tiler;
 pub mod proposal_adapters;
 pub mod proposal_dispatch;
 pub mod proposal_mission;

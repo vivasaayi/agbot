@@ -20,21 +20,25 @@
 //                 "links": [ { "rel": "derived_from", "href", "title" }, ... ],
 //                 "assets": { "data": { "href": "/api/scenes/<id>/products/<kind>" },
 //                             "tiles": { "href":
-//                       "/api/scenes/<id>/products/<kind>/tiles/{z}/{x}/{y}.png" } } }
+//                       "/api/scenes/<id>/products/<kind>/tiles/{z}/{x}/{y}.png" },
+//                             "tiles_web"?: { "href":  // GeoTIFF products only
+//                       "/api/catalog/products/<id>/tiles/{z}/{x}/{y}.png" } } }
 //
 //   GET /api/fields/export/geojson
 //     -> standard GeoJSON FeatureCollection of Polygon features with
 //        properties { field_id, name, farm_id?, crop?, area_ha?, ... }
 //
-// TILE GRID SEMANTICS (important): geo_hub product tiles are SCENE-LOCAL, not
-// Web Mercator. `generate_tile_bytes` in geo_hub splits the product image
-// itself into 2^z x 2^z equal pixel-space tiles and resizes each to 256px;
-// z=0/0/0 is the whole image. A MapLibre `raster` (XYZ) source would therefore
-// place them wrongly. Instead we stitch all tiles at a fixed detail zoom into
-// an offscreen canvas and add it as a MapLibre `image` source positioned by
-// the STAC item's WGS84 bbox (assuming a north-up raster: tile row y=0 is the
-// max-latitude edge). A true global-TMS (Web Mercator) tiler is future work;
-// when it lands, switch to a `raster` source with the tile URL template.
+// TILE GRID SEMANTICS (important): there are two tile assets.
+// - `tiles_web` (GeoTIFF products): TRUE Web Mercator XYZ tiles from
+//   /api/catalog/products/<id>/tiles/... — used directly as a MapLibre
+//   `raster` source. Preferred whenever present.
+// - `tiles` (legacy PNG products): SCENE-LOCAL tiles. `generate_tile_bytes`
+//   splits the product image itself into 2^z x 2^z equal pixel-space tiles
+//   and resizes each to 256px; z=0/0/0 is the whole image. A `raster` source
+//   would place them wrongly, so we stitch all tiles at a fixed detail zoom
+//   into an offscreen canvas and add it as a MapLibre `image` source
+//   positioned by the STAC item's WGS84 bbox (assuming a north-up raster:
+//   tile row y=0 is the max-latitude edge).
 
 const STITCH_ZOOM = 2; // 2^2 x 2^2 tiles of 256px -> 1024x1024 stitched image
 const TILE_PX = 256;
@@ -314,9 +318,10 @@ function renderMetadata(item) {
   return details;
 }
 
-/** An item is displayable when it has a WGS84 bbox to position the image and a
- *  scene-tile asset to render. Projected-CRS items have no bbox by design
- *  (geo_hub does not reproject yet) and cannot be placed. */
+/** An item is displayable when it has a WGS84 bbox to position it and either a
+ *  Web Mercator tile template (`tiles_web`, GeoTIFF products — preferred) or a
+ *  scene-local tile asset to stitch. Projected-CRS items have no bbox by
+ *  design (geo_hub does not reproject yet) and cannot be placed. */
 function canDisplay(item) {
   if (!item.bbox) {
     return {
@@ -325,7 +330,7 @@ function canDisplay(item) {
         (item.properties || {})["agbot:geometry_omitted_reason"] || "no WGS84 bbox",
     };
   }
-  if (!item.assets || !item.assets.tiles) {
+  if (!item.assets || (!item.assets.tiles_web && !item.assets.tiles)) {
     return { ok: false, reason: "no tile asset (artifact-only product)" };
   }
   return { ok: true };
@@ -383,23 +388,36 @@ async function addItemLayer(item) {
   if (activeLayers.has(item.id)) return;
   setStatus(`Loading ${item.id}…`);
 
-  const dataUrl = await stitchTiles(item.assets.tiles.href);
   const [minLon, minLat, maxLon, maxLat] = item.bbox;
   const sourceId = `agbot-src-${item.id}`;
   const layerId = `agbot-lyr-${item.id}`;
 
-  // Image source corners are [TL, TR, BR, BL]. Tile row y=0 is the top of the
-  // product raster, which for a north-up raster is the max-latitude edge.
-  map.addSource(sourceId, {
-    type: "image",
-    url: dataUrl,
-    coordinates: [
-      [minLon, maxLat],
-      [maxLon, maxLat],
-      [maxLon, minLat],
-      [minLon, minLat],
-    ],
-  });
+  if (item.assets.tiles_web) {
+    // True Web Mercator XYZ template (GeoTIFF products): a plain raster
+    // source, no stitching. `bounds` stops MapLibre requesting tiles outside
+    // the product footprint.
+    map.addSource(sourceId, {
+      type: "raster",
+      tiles: [item.assets.tiles_web.href],
+      tileSize: 256,
+      bounds: [minLon, minLat, maxLon, maxLat],
+    });
+  } else {
+    // Scene-local tiles: stitch into one image and place it by bbox. Image
+    // source corners are [TL, TR, BR, BL]; tile row y=0 is the top of the
+    // product raster, which for a north-up raster is the max-latitude edge.
+    const dataUrl = await stitchTiles(item.assets.tiles.href);
+    map.addSource(sourceId, {
+      type: "image",
+      url: dataUrl,
+      coordinates: [
+        [minLon, maxLat],
+        [maxLon, maxLat],
+        [maxLon, minLat],
+        [minLon, minLat],
+      ],
+    });
+  }
   map.addLayer({
     id: layerId,
     type: "raster",

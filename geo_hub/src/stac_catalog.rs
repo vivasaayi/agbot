@@ -591,6 +591,31 @@ pub fn product_to_item(
         }
         (None, None) => {}
     }
+    // GeoTIFF artifacts additionally get a true Web Mercator XYZ template
+    // (the scene-local `tiles` asset splits the product image in its own
+    // pixel space and cannot back a slippy-map raster source).
+    let is_geotiff_artifact = product
+        .path
+        .as_deref()
+        .map(|path| {
+            let lower = path.to_ascii_lowercase();
+            lower.ends_with(".tif") || lower.ends_with(".tiff")
+        })
+        .unwrap_or(false);
+    if is_geotiff_artifact {
+        assets.insert(
+            "tiles_web".to_string(),
+            StacAsset {
+                href: format!(
+                    "/api/catalog/products/{}/tiles/{{z}}/{{x}}/{{y}}.png",
+                    product.product_id
+                ),
+                media_type: Some("image/png".to_string()),
+                title: Some("Web Mercator XYZ tile template".to_string()),
+                roles: vec!["visual".to_string()],
+            },
+        );
+    }
 
     Ok(StacItem {
         type_: "Feature".to_string(),
@@ -1108,6 +1133,29 @@ mod tests {
         let item = product_to_item(&record, &[]).unwrap();
         assert_eq!(item.assets["data"].href, "/data/prod-1.tif");
         assert!(!item.assets.contains_key("tiles"));
+    }
+
+    #[test]
+    fn geotiff_artifacts_get_a_web_mercator_tile_asset() {
+        // Scene-backed and artifact-only GeoTIFFs both get the global
+        // template; non-GeoTIFF artifacts do not.
+        let item = product_to_item(&product(ProductLevel::L2, "ndvi"), &[]).unwrap();
+        assert_eq!(
+            item.assets["tiles_web"].href,
+            "/api/catalog/products/prod-1/tiles/{z}/{x}/{y}.png"
+        );
+        assert_eq!(item.assets["tiles_web"].roles, vec!["visual".to_string()]);
+
+        let mut artifact_only = product(ProductLevel::L3, "temporal_composite");
+        artifact_only.scene_id = None;
+        let item = product_to_item(&artifact_only, &[]).unwrap();
+        assert!(item.assets.contains_key("tiles_web"));
+
+        let mut png_product = product(ProductLevel::L2, "ndvi");
+        png_product.path = Some("/data/prod-1.png".to_string());
+        png_product.format = Some("png".to_string());
+        let item = product_to_item(&png_product, &[]).unwrap();
+        assert!(!item.assets.contains_key("tiles_web"));
     }
 
     #[test]
