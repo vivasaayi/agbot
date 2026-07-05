@@ -22,6 +22,7 @@ pub mod proposal_queue;
 pub mod provenance_store;
 pub mod routes;
 pub mod satellite_derivation;
+pub mod sen2cor;
 pub mod server;
 pub mod shapefile;
 pub mod spi_rasters;

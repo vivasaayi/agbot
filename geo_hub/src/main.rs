@@ -49,6 +49,31 @@ async fn main() -> anyhow::Result<()> {
                 bail!("{} sidecar(s) failed to register", report.failed.len())
             }
         }
-        _ => bail!("usage: geo_hub [catalog register <dir>]"),
+        [cmd, sub, input, rest @ ..] if cmd == "sen2cor" && sub == "run" && rest.len() <= 1 => {
+            let output_dir = match rest {
+                [dir] => std::path::PathBuf::from(dir),
+                _ => config.data_root.join("sen2cor"),
+            };
+            let outcome = geo_hub::sen2cor::run_sen2cor(
+                &pool,
+                &geo_hub::sen2cor::SystemProcessRunner,
+                &geo_hub::sen2cor::Sen2CorConfig::from_env(),
+                std::path::Path::new(input),
+                &output_dir,
+            )
+            .await
+            .context("sen2cor run failed")?;
+            println!(
+                "scene {}: L2A at {} — {} band product(s) registered (L0 {})",
+                outcome.scene_id,
+                outcome.l2a_safe.display(),
+                outcome.band_products.len(),
+                outcome.l0_product_id,
+            );
+            Ok(())
+        }
+        _ => {
+            bail!("usage: geo_hub [catalog register <dir> | sen2cor run <input.SAFE> [output_dir]]")
+        }
     }
 }
