@@ -6,6 +6,7 @@ pub mod catalog;
 pub mod config;
 pub mod crop_health_run;
 pub mod db;
+pub mod dnbr_rasters;
 pub mod drought_rasters;
 pub mod earth_search;
 pub mod error;

@@ -140,6 +140,15 @@ const RAMP_DIVERGING_DRY_WET: &[[u8; 3]] = &[[178, 24, 43], [247, 247, 247], [33
 const RAMP_PRECIP: &[[u8; 3]] = &[[247, 251, 255], [8, 69, 148]];
 /// Black -> white fallback for unknown kinds.
 const RAMP_GRAY: &[[u8; 3]] = &[[0, 0, 0], [255, 255, 255]];
+/// Green -> white -> yellow -> red -> purple: dNBR burn severity
+/// (regrowth negative, burn positive; Key & Benson class range).
+const RAMP_DNBR: &[[u8; 3]] = &[
+    [26, 152, 80],
+    [247, 247, 247],
+    [254, 224, 139],
+    [215, 48, 39],
+    [122, 1, 119],
+];
 /// Categorical land-cover class colors, codes 1..=6: water blue, bare tan,
 /// annual crop yellow, tree/perennial dark green, grassland light green,
 /// unknown gray.
@@ -187,6 +196,13 @@ pub fn colormap_for_kind(kind: &str) -> Colormap {
         "precipitation" => Colormap {
             domain: (0.0, 500.0),
             stops: RAMP_PRECIP,
+            categorical: false,
+        },
+        // dNBR: diverging over the Key & Benson class range (-0.5 regrowth
+        // .. 1.0 high severity); white sits at unburned ~0 (domain quarter).
+        "dnbr" => Colormap {
+            domain: (-0.5, 1.0),
+            stops: RAMP_DNBR,
             categorical: false,
         },
         // Tier-1 land-cover classes (codes 1..=6: water, bare, annual crop,
@@ -698,6 +714,16 @@ mod tests {
         let (fx, fy) = tile_containing(48.0, 2.0, 8);
         let far = render_web_tile(&source, &colormap_for_kind("spi"), 8, fx, fy).unwrap();
         assert_eq!(far.opaque_pixels, 0);
+    }
+
+    #[test]
+    fn dnbr_colormap_is_pinned_diverging() {
+        let dnbr = colormap_for_kind("dnbr");
+        assert_eq!(dnbr.domain, (-0.5, 1.0));
+        assert_eq!(dnbr.rgb(-0.5), [26, 152, 80]); // strong regrowth
+                                                   // Stops sit every 0.375 across the domain: -0.125 is exact white.
+        assert_eq!(dnbr.rgb(-0.125), [247, 247, 247]);
+        assert_eq!(dnbr.rgb(1.0), [122, 1, 119]); // high severity
     }
 
     #[test]

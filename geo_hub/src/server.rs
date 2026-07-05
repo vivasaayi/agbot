@@ -393,6 +393,11 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::derive_spi_raster_route),
         )
         .route(
+            "/api/change-detection/dnbr/derive",
+            post(routes::derive_dnbr_route),
+        )
+        .route("/api/change-detection/dnbr", get(routes::list_dnbr_route))
+        .route(
             "/api/landcover/derive",
             post(routes::derive_landcover_route),
         )
