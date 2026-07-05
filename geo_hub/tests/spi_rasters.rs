@@ -57,13 +57,9 @@ async fn ctx(tmp: &TempDir) -> Result<Ctx> {
     })
 }
 
-fn write_chirps(dir: &Path, year: i32, value: f32) -> Result<()> {
-    let mut values = vec![value; 4];
-    if year == 2025 {
-        values[3] = NODATA; // one nodata pixel in the current month
-    }
+fn write_chirps_month(dir: &Path, year: i32, month: u32, values: Vec<f32>) -> Result<()> {
     write_geotiff_f32(
-        &dir.join(format!("chirps-v2.0.{year}.06.tif")),
+        &dir.join(format!("chirps-v2.0.{year}.{month:02}.tif")),
         2,
         2,
         &values,
@@ -74,6 +70,14 @@ fn write_chirps(dir: &Path, year: i32, value: f32) -> Result<()> {
         },
     )?;
     Ok(())
+}
+
+fn write_chirps(dir: &Path, year: i32, value: f32) -> Result<()> {
+    let mut values = vec![value; 4];
+    if year == 2025 {
+        values[3] = NODATA; // one nodata pixel in the current month
+    }
+    write_chirps_month(dir, year, 6, values)
 }
 
 async fn send(
@@ -272,5 +276,147 @@ async fn spi_error_paths_are_reason_coded() -> Result<()> {
     )
     .await?;
     assert_ne!(status, StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test]
+async fn spi3_accumulates_windows_and_gets_a_distinct_identity() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = ctx(&tmp).await?;
+    let chirps_dir = tmp.path().join("chirps");
+    std::fs::create_dir_all(&chirps_dir)?;
+    // Apr+May+Jun per year; window sums (current included):
+    // {0, 0, 30, 60, 90, 0} -> three zeros of six, q = 0.5; a zero current
+    // window gives SPI = probit(0.5) = 0 exactly (same mixture argument as
+    // the SPI-1 test, now over accumulated windows).
+    for (year, monthly) in [
+        (2020, 0.0f32),
+        (2021, 0.0),
+        (2022, 10.0),
+        (2023, 20.0),
+        (2024, 30.0),
+        (2025, 0.0),
+    ] {
+        for month in [4u32, 5, 6] {
+            write_chirps_month(&chirps_dir, year, month, vec![monthly; 4])?;
+        }
+    }
+    // 2019 has May+Jun but no April: its SPI-3 window is incomplete and the
+    // year must be skipped with a reason, not silently folded in.
+    for month in [5u32, 6] {
+        write_chirps_month(&chirps_dir, 2019, month, vec![5.0; 4])?;
+    }
+
+    let (status, bytes) = send(
+        &ctx.app,
+        "POST",
+        "/api/drought-management/chirps/register",
+        Some(json!({ "dir": chirps_dir.to_string_lossy() })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    let registered: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let product_id_of = |name: &str| -> String {
+        registered["registered"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry[0] == name)
+            .unwrap_or_else(|| panic!("{name} not registered"))[1]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let current = product_id_of("chirps-v2.0.2025.06.tif");
+
+    let derive = |window: u32| {
+        json!({
+            "current_product_id": current,
+            "field_id": "field-1",
+            "season_id": "season-2025",
+            "min_years": 5,
+            "window_months": window,
+        })
+    };
+
+    let (status, bytes) = send(
+        &ctx.app,
+        "POST",
+        "/api/drought-management/spi/derive",
+        Some(derive(3)),
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let spi3: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(spi3["window_months"], 3);
+    assert_eq!(spi3["month"], 6);
+    assert_eq!(
+        spi3["record_years"],
+        json!([2020, 2021, 2022, 2023, 2024, 2025])
+    );
+    assert_eq!(
+        spi3["observations_skipped"],
+        json!([{ "product_id": "window:2019-06", "reason": "incomplete_window" }])
+    );
+    // SPI exactly 0 everywhere (all pixels valid in this fixture).
+    assert_eq!(spi3["valid_fraction"], 1.0);
+    let spi_path = spi3["spi_artifact"].as_str().unwrap();
+    let mut reader = GeoTiffReader::open(spi_path)?;
+    let values = reader.read_band()?.to_f32();
+    for value in &values {
+        assert!(value.abs() < 1e-6, "SPI-3 must be 0, got {value}");
+    }
+
+    // Lineage reaches every window member month: 6 complete years x 3
+    // months = 18 monthly products (the current product IS the 2025 June
+    // ending product, so it dedups into the same set).
+    let spi3_id = spi3["spi_product_id"].as_str().unwrap();
+    let edges = geo_hub::catalog::trace_inputs(&ctx.pool, spi3_id).await?;
+    assert_eq!(edges.len(), 18, "all window members: {edges:?}");
+
+    // SPI-1 for the same end month is a distinct product identity.
+    let (status, bytes) = send(
+        &ctx.app,
+        "POST",
+        "/api/drought-management/spi/derive",
+        Some(derive(1)),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    let spi1: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_ne!(spi1["spi_product_id"], spi3["spi_product_id"]);
+
+    // Window validation is reason-coded.
+    let (status, bytes) = send(
+        &ctx.app,
+        "POST",
+        "/api/drought-management/spi/derive",
+        Some(derive(13)),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(String::from_utf8_lossy(&bytes).contains("1..=12"));
+
+    // A window reaching before the record start is a client error naming
+    // the missing month (December 2024 for a 7-month window... actually
+    // window 12 needs Jul 2024: absent).
+    let (status, bytes) = send(
+        &ctx.app,
+        "POST",
+        "/api/drought-management/spi/derive",
+        Some(derive(12)),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        String::from_utf8_lossy(&bytes).contains("incomplete"),
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
     Ok(())
 }

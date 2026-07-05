@@ -51,6 +51,14 @@ pub enum SpiRasterError {
     NotPrecipitation { product_id: String, kind: String },
     #[error("no usable record observations share the current product's month and grid (all {skipped} candidates skipped)")]
     NoUsableRecord { skipped: usize },
+    #[error("window_months must be in 1..=12, got {0}")]
+    InvalidWindowMonths(u32),
+    #[error("the current {window_months}-month window is incomplete: no monthly precipitation product for {year}-{month:02}")]
+    MissingWindowMonth {
+        window_months: u32,
+        year: i32,
+        month: u32,
+    },
     #[error("SPI computation failed: {0}")]
     Spi(#[from] SpiError),
     #[error(transparent)]
@@ -72,7 +80,9 @@ impl SpiRasterError {
         match self {
             SpiRasterError::CurrentNotFound(_)
             | SpiRasterError::NotPrecipitation { .. }
-            | SpiRasterError::NoUsableRecord { .. } => true,
+            | SpiRasterError::NoUsableRecord { .. }
+            | SpiRasterError::InvalidWindowMonths(_)
+            | SpiRasterError::MissingWindowMonth { .. } => true,
             SpiRasterError::Shared(shared) => shared.is_client_error(),
             _ => false,
         }
@@ -211,27 +221,63 @@ pub async fn register_chirps_dir(
 // SPI derivation
 // ---------------------------------------------------------------------------
 
+/// The (year, month) that is `back` calendar months before (year, month).
+fn months_back(year: i32, month: u32, back: u32) -> (i32, u32) {
+    let total = year as i64 * 12 + i64::from(month) - 1 - i64::from(back);
+    (
+        (total.div_euclid(12)) as i32,
+        (total.rem_euclid(12) + 1) as u32,
+    )
+}
+
+/// (year, month) of a product covering exactly one full calendar month
+/// (temporal_start on day 1, temporal_end on that month's last day) — the
+/// contract CHIRPS monthly registration writes. Anything else (dekads,
+/// arbitrary spans) is not usable for monthly accumulation windows.
+fn monthly_span(product: &RegisteredProduct) -> Option<(i32, u32)> {
+    let start = observed_on(product)?;
+    if start.day() != 1 {
+        return None;
+    }
+    let end_text = product.temporal_end.as_deref()?;
+    let end = chrono::NaiveDate::parse_from_str(end_text.get(..10)?, "%Y-%m-%d").ok()?;
+    let (year, month) = (start.year(), start.month());
+    if end.year() != year || end.month() != month || end.day() != last_day_of_month(year, month) {
+        return None;
+    }
+    Some((year, month))
+}
+
 /// An SPI raster derivation request.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SpiDeriveRequest {
-    /// Catalog id of the current-month precipitation product to score.
+    /// Catalog id of the precipitation product for the window's END month.
     pub current_product_id: String,
     pub field_id: String,
     pub season_id: String,
     #[serde(default = "default_min_years")]
     pub min_years: u32,
+    /// Accumulation window in calendar months ending at the current
+    /// product's month: 1 = classic monthly SPI, 3/6/12 = SPI-3/6/12.
+    #[serde(default = "default_window_months")]
+    pub window_months: u32,
 }
 
 fn default_min_years() -> u32 {
     DEFAULT_SPI_MIN_YEARS
 }
 
+fn default_window_months() -> u32 {
+    1
+}
+
 /// Outcome of one SPI derivation.
 #[derive(Debug, Clone, Serialize)]
 pub struct SpiDeriveOutcome {
     pub spi_product_id: String,
-    /// Calendar month scored (1..=12).
+    /// Calendar month the window ends in (1..=12).
     pub month: u32,
+    pub window_months: u32,
     pub record_years: Vec<i32>,
     pub valid_fraction: f32,
     pub class_counts: SpiClassCounts,
@@ -275,7 +321,15 @@ pub async fn derive_spi_raster(
         .map(|(valid, value)| *valid && *value >= 0.0)
         .collect();
 
-    let candidates = catalog::list_products(
+    let window = request.window_months;
+    if !(1..=12).contains(&window) {
+        return Err(SpiRasterError::InvalidWindowMonths(window));
+    }
+
+    // Index every same-grid full-calendar-month precipitation raster by
+    // (year, month). Deterministic: candidates sorted by product id; a
+    // duplicate month keeps the first and reports the rest.
+    let mut candidates = catalog::list_products(
         pool,
         &ProductFilter {
             kind: Some(PRECIPITATION_KIND.to_string()),
@@ -285,9 +339,8 @@ pub async fn derive_spi_raster(
         },
     )
     .await?;
+    candidates.sort_by(|a, b| a.product_id.cmp(&b.product_id));
 
-    let mut observations = Vec::new();
-    let mut used_ids = Vec::new();
     let mut skipped = Vec::new();
     let skip = |product_id: &str, reason: &str, list: &mut Vec<SkippedObservation>| {
         list.push(SkippedObservation {
@@ -295,19 +348,29 @@ pub async fn derive_spi_raster(
             reason: reason.to_string(),
         });
     };
+    struct MonthRaster {
+        product_id: String,
+        values: Vec<f32>,
+        valid_mask: Vec<bool>,
+    }
+    let mut months: std::collections::BTreeMap<(i32, u32), MonthRaster> =
+        std::collections::BTreeMap::new();
     for candidate in &candidates {
-        let is_current = candidate.product_id == current.product_id;
-        let Some(date) = observed_on(candidate) else {
-            skip(&candidate.product_id, "bad_temporal", &mut skipped);
+        let Some(key) = monthly_span(candidate) else {
+            skip(
+                &candidate.product_id,
+                "not_a_full_calendar_month",
+                &mut skipped,
+            );
             continue;
         };
-        if date.month() != current_date.month() {
-            // Different calendar month: not part of this SPI record, and
-            // not worth reporting as skipped noise.
+        if months.contains_key(&key) {
+            skip(&candidate.product_id, "duplicate_month", &mut skipped);
             continue;
         }
-        let raster = if is_current {
-            None
+        let is_current = candidate.product_id == current.product_id;
+        let (values, valid_mask) = if is_current {
+            (current_raster.values.clone(), current_mask.clone())
         } else {
             let Ok(path) = geotiff_artifact_path(candidate) else {
                 skip(&candidate.product_id, "no_artifact", &mut skipped);
@@ -323,7 +386,13 @@ pub async fn derive_spi_raster(
                         skip(&candidate.product_id, "grid_mismatch", &mut skipped);
                         continue;
                     }
-                    Some(raster)
+                    let mask: Vec<bool> = raster
+                        .valid_mask
+                        .iter()
+                        .zip(&raster.values)
+                        .map(|(valid, value)| *valid && *value >= 0.0)
+                        .collect();
+                    (raster.values, mask)
                 }
                 Err(_) => {
                     skip(&candidate.product_id, "unreadable", &mut skipped);
@@ -331,18 +400,89 @@ pub async fn derive_spi_raster(
                 }
             }
         };
-        let (values, mask) = match &raster {
-            Some(raster) => (raster.values.clone(), raster.valid_mask.clone()),
-            None => (current_raster.values.clone(), current_mask.clone()),
-        };
-        observations.push(SpiObservation {
-            product_id: candidate.product_id.clone(),
-            observed_on: date,
-            values,
-            valid_mask: mask,
-            spatial_ref: current_raster.spatial_ref.clone(),
-        });
-        used_ids.push(candidate.product_id.clone());
+        months.insert(
+            key,
+            MonthRaster {
+                product_id: candidate.product_id.clone(),
+                values,
+                valid_mask,
+            },
+        );
+    }
+
+    let pixel_count = current_raster.values.len();
+    let end_month = current_date.month();
+    // Accumulate one window ending at (year, end_month): per-pixel sum with
+    // an all-months-valid mask; None when any member month is missing.
+    let window_of = |year: i32,
+                     months: &std::collections::BTreeMap<(i32, u32), MonthRaster>|
+     -> Option<(Vec<f32>, Vec<bool>, Vec<String>)> {
+        let mut sum = vec![0.0f32; pixel_count];
+        let mut mask = vec![true; pixel_count];
+        let mut member_ids = Vec::with_capacity(window as usize);
+        for back in 0..window {
+            let member = months.get(&months_back(year, end_month, back))?;
+            for pixel in 0..pixel_count {
+                sum[pixel] += member.values[pixel];
+                mask[pixel] &= member.valid_mask[pixel];
+            }
+            member_ids.push(member.product_id.clone());
+        }
+        Some((sum, mask, member_ids))
+    };
+
+    // The current window must be complete.
+    let current_year = current_date.year();
+    for back in 0..window {
+        let (year, month) = months_back(current_year, end_month, back);
+        if !months.contains_key(&(year, month)) {
+            return Err(SpiRasterError::MissingWindowMonth {
+                window_months: window,
+                year,
+                month,
+            });
+        }
+    }
+    let (current_values, current_window_mask, current_member_ids) =
+        window_of(current_year, &months).expect("checked complete above");
+
+    // Record: one accumulated observation per year whose window is complete
+    // (current year included — the fit uses the full record).
+    let mut observations = Vec::new();
+    let mut used_ids = Vec::new();
+    let mut member_lineage: Vec<String> = current_member_ids.clone();
+    let record_year_candidates: std::collections::BTreeSet<i32> = months
+        .keys()
+        .filter(|(_, month)| *month == end_month)
+        .map(|(year, _)| *year)
+        .collect();
+    for year in record_year_candidates {
+        match window_of(year, &months) {
+            Some((values, mask, member_ids)) => {
+                let ending = months
+                    .get(&(year, end_month))
+                    .expect("window complete implies ending month");
+                observations.push(SpiObservation {
+                    product_id: ending.product_id.clone(),
+                    observed_on: chrono::NaiveDate::from_ymd_opt(year, end_month, 1)
+                        .expect("valid month start"),
+                    values,
+                    valid_mask: mask,
+                    spatial_ref: current_raster.spatial_ref.clone(),
+                });
+                used_ids.push(ending.product_id.clone());
+                for member in member_ids {
+                    if !member_lineage.contains(&member) {
+                        member_lineage.push(member);
+                    }
+                }
+            }
+            None => skip(
+                &format!("window:{year}-{end_month:02}"),
+                "incomplete_window",
+                &mut skipped,
+            ),
+        }
     }
     if observations.is_empty() {
         return Err(SpiRasterError::NoUsableRecord {
@@ -356,24 +496,24 @@ pub async fn derive_spi_raster(
             width: current_raster.width,
             height: current_raster.height,
             spatial_ref: current_raster.spatial_ref.clone(),
-            values: current_raster.values.clone(),
-            valid_mask: current_mask,
+            values: current_values,
+            valid_mask: current_window_mask,
         },
         observations,
         min_years: request.min_years,
     })?;
 
-    // --- SPI GeoTIFF + L3 registration.
+    // --- SPI GeoTIFF + L3 registration. The scope spans the whole
+    // accumulation window; the window length is stamped into the parameters
+    // so SPI-1 and SPI-3 for the same end month get distinct identities.
+    let (start_year, start_month) = months_back(current_year, end_month, window - 1);
     let mut draft = spi_l3_draft(
         &result,
         &SpiL3Scope {
             field_id: request.field_id.clone(),
             season_id: request.season_id.clone(),
             scene_id: None,
-            temporal_start: current
-                .temporal_start
-                .clone()
-                .unwrap_or_else(|| format!("{current_date}T00:00:00Z")),
+            temporal_start: format!("{start_year}-{start_month:02}-01T00:00:00Z"),
             temporal_end: current
                 .temporal_end
                 .clone()
@@ -381,6 +521,24 @@ pub async fn derive_spi_raster(
             source_id: current.source_id.clone(),
         },
     );
+    draft
+        .parameters
+        .as_object_mut()
+        .expect("spi parameters are an object")
+        .insert(
+            "accumulation".to_string(),
+            serde_json::json!({ "window_months": window, "cadence": "monthly" }),
+        );
+    // Lineage: spi_l3_draft covers the window-ending products; add every
+    // other window member so the trace reaches all consumed months.
+    for member in &member_lineage {
+        if !draft.inputs.iter().any(|edge| &edge.product_id == member) {
+            draft.inputs.push(shared::product_graph::ProductInputRef {
+                product_id: member.clone(),
+                role: "accumulation_member".to_string(),
+            });
+        }
+    }
     let spi_dir = data_root.join("derived").join("spi");
     std::fs::create_dir_all(&spi_dir).map_err(|source| SpiRasterError::Store {
         what: "spi directory",
@@ -425,7 +583,8 @@ pub async fn derive_spi_raster(
             "/api/catalog/products/{spi_product_id}/tiles/{{z}}/{{x}}/{{y}}.png"
         ),
         spi_product_id,
-        month: current_date.month(),
+        month: end_month,
+        window_months: window,
         record_years: result.evidence.record_years.clone(),
         valid_fraction: result.valid_fraction,
         class_counts: result.class_counts.clone(),
