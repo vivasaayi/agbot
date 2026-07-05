@@ -1,0 +1,258 @@
+/* AGBot browse UI — plain CSS, no build step. Left panel + full-bleed map. */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 14px;
+  color: #1c2430;
+}
+
+body {
+  display: flex;
+}
+
+#panel {
+  width: 340px;
+  min-width: 340px;
+  height: 100%;
+  overflow-y: auto;
+  background: #f7f8fa;
+  border-right: 1px solid #d5dae1;
+  display: flex;
+  flex-direction: column;
+}
+
+#panel header {
+  padding: 14px 16px 8px;
+  border-bottom: 1px solid #e2e6eb;
+}
+
+#panel h1 {
+  margin: 0;
+  font-size: 17px;
+}
+
+#panel .subtitle {
+  margin: 4px 0 0;
+  color: #667085;
+  font-size: 12px;
+}
+
+#panel section {
+  padding: 10px 16px;
+  border-bottom: 1px solid #e2e6eb;
+}
+
+#panel h2 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #667085;
+}
+
+#filters label {
+  display: block;
+  margin-bottom: 6px;
+  color: #344054;
+}
+
+#filters input[type="datetime-local"] {
+  width: 100%;
+  margin-top: 2px;
+  padding: 4px 6px;
+  border: 1px solid #cfd6de;
+  border-radius: 4px;
+}
+
+.filter-actions {
+  display: flex;
+  gap: 8px;
+}
+
+button {
+  padding: 4px 10px;
+  border: 1px solid #cfd6de;
+  border-radius: 4px;
+  background: #fff;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #eef1f5;
+}
+
+.toggle-row {
+  display: block;
+  padding: 2px 0;
+}
+
+.hint {
+  color: #98a2b3;
+  font-size: 11px;
+}
+
+.error {
+  color: #b42318;
+  font-size: 12px;
+}
+
+/* Collections list */
+
+.collection {
+  margin-bottom: 6px;
+}
+
+.collection > summary {
+  cursor: pointer;
+  font-weight: 600;
+  padding: 4px 0;
+}
+
+.collection .count {
+  font-weight: 400;
+  color: #667085;
+}
+
+.items {
+  margin: 4px 0 4px 12px;
+  padding: 0;
+  list-style: none;
+}
+
+.item {
+  border: 1px solid #e2e6eb;
+  border-radius: 4px;
+  background: #fff;
+  padding: 6px 8px;
+  margin-bottom: 6px;
+}
+
+.item .item-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.item .item-title {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 12px;
+}
+
+.item .item-date {
+  display: block;
+  color: #667085;
+  font-size: 11px;
+  margin-top: 2px;
+}
+
+.item .undisplayable {
+  color: #b42318;
+  font-size: 11px;
+}
+
+.item .opacity-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  font-size: 11px;
+  color: #667085;
+}
+
+.item .opacity-row input[type="range"] {
+  flex: 1;
+}
+
+/* Metadata popover (native <details>) */
+
+.item details.meta > summary {
+  cursor: pointer;
+  font-size: 11px;
+  color: #4062bb;
+  margin-top: 4px;
+}
+
+.item .meta-body {
+  margin: 4px 0 0;
+  font-size: 11px;
+}
+
+.item .meta-body dt {
+  font-weight: 600;
+  color: #344054;
+}
+
+.item .meta-body dd {
+  margin: 0 0 4px;
+  word-break: break-all;
+}
+
+#status {
+  margin-top: auto;
+  padding: 8px 16px;
+  font-size: 12px;
+  color: #667085;
+  min-height: 32px;
+}
+
+#status.error {
+  color: #b42318;
+}
+
+#map {
+  flex: 1;
+  height: 100%;
+}
+
+/* Derive affordances (batch 26) */
+details.derive {
+  margin-top: 4px;
+  font-size: 12px;
+}
+
+details.derive > summary {
+  cursor: pointer;
+  color: #175cd3;
+}
+
+.derive-form {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 6px 0;
+  padding: 6px;
+  border: 1px solid #e4e7ec;
+  border-radius: 6px;
+}
+
+.derive-field {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+  color: #667085;
+}
+
+.derive-field input {
+  flex: 1;
+  max-width: 60%;
+  font-size: 12px;
+  padding: 2px 4px;
+}
+
+.derive-form button {
+  align-self: flex-end;
+  padding: 2px 12px;
+  cursor: pointer;
+}

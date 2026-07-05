@@ -71,6 +71,10 @@ pub struct IndicesArgs {
     /// Sensor preset for band mapping (overrides can still be applied)
     #[arg(long, value_enum)]
     pub sensor: Option<SensorPreset>,
+    /// Radiometric sensor profile applied to u16 GeoTIFF band DNs before
+    /// index math (requires GeoTIFF band inputs)
+    #[arg(long, value_enum, default_value_t = SensorProfileArg::None)]
+    pub sensor_profile: SensorProfileArg,
     /// Optional mask image path (non-zero = valid). Applied before stats.
     #[arg(long)]
     pub mask: Option<PathBuf>,
@@ -163,9 +167,19 @@ pub struct MasksArgs {
     /// Output directory for mask results
     #[arg(long)]
     pub output_dir: PathBuf,
-    /// QA band name (e.g., QA_PIXEL for Landsat)
-    #[arg(long, default_value = "QA_PIXEL")]
-    pub qa_band: String,
+    /// QA band name. Defaults to QA_PIXEL for the qa-pixel scheme and SCL for the scl scheme.
+    #[arg(long)]
+    pub qa_band: Option<String>,
+    /// QA scheme: Landsat Collection 2 QA_PIXEL bit flags or Sentinel-2 SCL classes
+    #[arg(long, value_enum, default_value_t = QaScheme::QaPixel)]
+    pub qa_scheme: QaScheme,
+    /// SCL classes kept as clear (scl scheme only). Defaults to 4,5,6; pass 4,5,6,7
+    /// for a permissive keep-set that also keeps unclassified pixels.
+    #[arg(long, value_delimiter = ',')]
+    pub scl_keep_classes: Vec<u8>,
+    /// Dilation radius in pixels applied to the SCL cloud/shadow reject mask
+    #[arg(long, default_value_t = 1)]
+    pub scl_dilate_radius: u32,
     /// Mask kinds to generate; if omitted, all are generated
     #[arg(long, value_enum)]
     pub kinds: Vec<MaskKind>,
@@ -198,6 +212,9 @@ pub enum IndexKind {
     Nbr,
     Ndmi,
     Evi2,
+    Osavi,
+    AweiNsh,
+    AweiSh,
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Debug, Serialize, Deserialize)]
@@ -367,14 +384,19 @@ impl IndexKind {
             IndexKind::Nbr,
             IndexKind::Ndmi,
             IndexKind::Evi2,
+            IndexKind::Osavi,
+            IndexKind::AweiNsh,
+            IndexKind::AweiSh,
         ]
     }
 
     pub fn required_bands(self) -> &'static [IndexBandRole] {
         match self {
-            IndexKind::Ndvi | IndexKind::Savi | IndexKind::Msavi | IndexKind::Evi2 => {
-                &[IndexBandRole::Red, IndexBandRole::Nir]
-            }
+            IndexKind::Ndvi
+            | IndexKind::Savi
+            | IndexKind::Msavi
+            | IndexKind::Evi2
+            | IndexKind::Osavi => &[IndexBandRole::Red, IndexBandRole::Nir],
             IndexKind::Ndre => &[IndexBandRole::RedEdge, IndexBandRole::Nir],
             IndexKind::Evi => &[IndexBandRole::Blue, IndexBandRole::Red, IndexBandRole::Nir],
             IndexKind::Vari => &[
@@ -386,11 +408,33 @@ impl IndexKind {
             IndexKind::Mndwi => &[IndexBandRole::Green, IndexBandRole::Swir1],
             IndexKind::Nbr => &[IndexBandRole::Nir, IndexBandRole::Swir2],
             IndexKind::Ndmi => &[IndexBandRole::Nir, IndexBandRole::Swir1],
+            IndexKind::AweiNsh => &[
+                IndexBandRole::Green,
+                IndexBandRole::Nir,
+                IndexBandRole::Swir1,
+                IndexBandRole::Swir2,
+            ],
+            IndexKind::AweiSh => &[
+                IndexBandRole::Blue,
+                IndexBandRole::Green,
+                IndexBandRole::Nir,
+                IndexBandRole::Swir1,
+                IndexBandRole::Swir2,
+            ],
         }
     }
 
+    /// Display/scaling range for the index. Normalized-difference indices span
+    /// [-1, 1]; the AWEI variants are unbounded reflectance combinations, so
+    /// their range is derived from the reflectance domain [0, 1] per band.
     pub fn expected_value_range(self) -> (f32, f32) {
-        (-1.0, 1.0)
+        match self {
+            // AWEInsh = 4(G-SWIR1) - (0.25 NIR + 2.75 SWIR2) over reflectance [0,1].
+            IndexKind::AweiNsh => (-7.0, 4.0),
+            // AWEIsh = B + 2.5G - 1.5(NIR+SWIR1) - 0.25 SWIR2 over reflectance [0,1].
+            IndexKind::AweiSh => (-3.25, 3.5),
+            _ => (-1.0, 1.0),
+        }
     }
 
     pub fn compute_value(
@@ -466,6 +510,26 @@ impl IndexKind {
                 let red = values.required(self, IndexBandRole::Red)?;
                 ratio_or_invalid(2.5 * (nir - red), nir + 2.4 * red + 1.0)
             }
+            IndexKind::Osavi => {
+                let nir = values.required(self, IndexBandRole::Nir)?;
+                let red = values.required(self, IndexBandRole::Red)?;
+                ratio_or_invalid(nir - red, nir + red + 0.16)
+            }
+            IndexKind::AweiNsh => {
+                let green = values.required(self, IndexBandRole::Green)?;
+                let nir = values.required(self, IndexBandRole::Nir)?;
+                let swir1 = values.required(self, IndexBandRole::Swir1)?;
+                let swir2 = values.required(self, IndexBandRole::Swir2)?;
+                IndexPixelValue::Valid(4.0 * (green - swir1) - (0.25 * nir + 2.75 * swir2))
+            }
+            IndexKind::AweiSh => {
+                let blue = values.required(self, IndexBandRole::Blue)?;
+                let green = values.required(self, IndexBandRole::Green)?;
+                let nir = values.required(self, IndexBandRole::Nir)?;
+                let swir1 = values.required(self, IndexBandRole::Swir1)?;
+                let swir2 = values.required(self, IndexBandRole::Swir2)?;
+                IndexPixelValue::Valid(blue + 2.5 * green - 1.5 * (nir + swir1) - 0.25 * swir2)
+            }
         };
 
         Ok(pixel_value)
@@ -506,12 +570,63 @@ pub enum ThermalProduct {
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, ValueEnum, Debug)]
+pub enum QaScheme {
+    /// Landsat Collection 2 QA_PIXEL bit flags
+    QaPixel,
+    /// Sentinel-2 L2A scene classification layer (SCL) classes
+    Scl,
+}
+
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, ValueEnum, Debug)]
 pub enum MaskKind {
     Cloud,
     CloudShadow,
     Snow,
     Water,
     Clear,
+}
+
+/// CLI selector for the batch-1 radiometric `SensorProfile` scaling applied
+/// to u16 GeoTIFF DNs before index math.
+#[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, ValueEnum, Debug, Default)]
+pub enum SensorProfileArg {
+    /// Landsat Collection 2 Level-2 surface reflectance (DN * 0.0000275 - 0.2)
+    #[value(name = "landsat-c2-l2-sr")]
+    LandsatC2L2Sr,
+    /// Sentinel-2 L2A processing baseline >= 04.00 ((DN - 1000) / 10000)
+    #[value(name = "sentinel2-l2a-baseline-0400")]
+    Sentinel2L2ABaseline0400,
+    /// Sentinel-2 L2A pre-04.00 baseline (DN / 10000)
+    #[value(name = "sentinel2-l2a-legacy")]
+    Sentinel2L2ALegacy,
+    /// No radiometric scaling; DNs are used as-is
+    #[default]
+    #[value(name = "none")]
+    None,
+}
+
+impl SensorProfileArg {
+    pub fn profile(self) -> Option<crate::pipeline::calibration::SensorProfile> {
+        use crate::pipeline::calibration::SensorProfile;
+        match self {
+            SensorProfileArg::LandsatC2L2Sr => Some(SensorProfile::LandsatC2L2Sr),
+            SensorProfileArg::Sentinel2L2ABaseline0400 => {
+                Some(SensorProfile::Sentinel2L2ABaseline0400)
+            }
+            SensorProfileArg::Sentinel2L2ALegacy => Some(SensorProfile::Sentinel2L2ALegacy),
+            SensorProfileArg::None => None,
+        }
+    }
+
+    /// CLI spelling for evidence records; `None` when no profile is applied.
+    pub fn cli_name(self) -> Option<&'static str> {
+        match self {
+            SensorProfileArg::LandsatC2L2Sr => Some("landsat-c2-l2-sr"),
+            SensorProfileArg::Sentinel2L2ABaseline0400 => Some("sentinel2-l2a-baseline-0400"),
+            SensorProfileArg::Sentinel2L2ALegacy => Some("sentinel2-l2a-legacy"),
+            SensorProfileArg::None => None,
+        }
+    }
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Ord, PartialOrd, ValueEnum, Debug)]
@@ -599,6 +714,7 @@ impl Processor {
 }
 
 pub mod pipeline {
+    pub mod calibration;
     pub mod classify;
     pub mod export;
     pub mod indices;
@@ -607,6 +723,7 @@ pub mod pipeline {
 }
 
 pub mod io;
+pub mod product_sidecar;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum IndexStatisticsOutcome {
@@ -674,7 +791,7 @@ mod index_catalog_tests {
 
     #[test]
     fn full_index_catalog_declares_required_bands() {
-        assert_eq!(IndexKind::catalog().len(), 12);
+        assert_eq!(IndexKind::catalog().len(), 15);
         assert_eq!(
             IndexKind::Ndvi.required_bands(),
             &[IndexBandRole::Red, IndexBandRole::Nir]
@@ -690,6 +807,29 @@ mod index_catalog_tests {
         assert_eq!(
             IndexKind::Nbr.required_bands(),
             &[IndexBandRole::Nir, IndexBandRole::Swir2]
+        );
+        assert_eq!(
+            IndexKind::Osavi.required_bands(),
+            &[IndexBandRole::Red, IndexBandRole::Nir]
+        );
+        assert_eq!(
+            IndexKind::AweiNsh.required_bands(),
+            &[
+                IndexBandRole::Green,
+                IndexBandRole::Nir,
+                IndexBandRole::Swir1,
+                IndexBandRole::Swir2
+            ]
+        );
+        assert_eq!(
+            IndexKind::AweiSh.required_bands(),
+            &[
+                IndexBandRole::Blue,
+                IndexBandRole::Green,
+                IndexBandRole::Nir,
+                IndexBandRole::Swir1,
+                IndexBandRole::Swir2
+            ]
         );
     }
 
@@ -709,6 +849,12 @@ mod index_catalog_tests {
             (IndexKind::Nbr, 0.6),
             (IndexKind::Ndmi, 0.4117647),
             (IndexKind::Evi2, 0.48076925),
+            // OSAVI = (0.6 - 0.2) / (0.6 + 0.2 + 0.16) = 0.4 / 0.96
+            (IndexKind::Osavi, 0.41666666),
+            // AWEInsh = 4*(0.4 - 0.25) - (0.25*0.6 + 2.75*0.15) = 0.6 - 0.5625
+            (IndexKind::AweiNsh, 0.0375),
+            // AWEIsh = 0.1 + 2.5*0.4 - 1.5*(0.6 + 0.25) - 0.25*0.15 = -0.2125
+            (IndexKind::AweiSh, -0.2125),
         ];
 
         for (index, expected) in cases {
@@ -736,6 +882,91 @@ mod index_catalog_tests {
                 index: IndexKind::Evi,
                 band: IndexBandRole::Blue
             }
+        );
+    }
+
+    #[test]
+    fn awei_missing_swir_bands_are_reported() {
+        let values = IndexBandValues::default()
+            .with_band(IndexBandRole::Blue, 0.1)
+            .with_band(IndexBandRole::Green, 0.4)
+            .with_band(IndexBandRole::Nir, 0.6);
+
+        assert_eq!(
+            IndexKind::AweiNsh.compute_value(&values).unwrap_err(),
+            IndexCatalogError::MissingRequiredBand {
+                index: IndexKind::AweiNsh,
+                band: IndexBandRole::Swir1
+            }
+        );
+        assert_eq!(
+            IndexKind::AweiSh.compute_value(&values).unwrap_err(),
+            IndexCatalogError::MissingRequiredBand {
+                index: IndexKind::AweiSh,
+                band: IndexBandRole::Swir1
+            }
+        );
+        assert_eq!(
+            IndexKind::Osavi.compute_value(&values).unwrap_err(),
+            IndexCatalogError::MissingRequiredBand {
+                index: IndexKind::Osavi,
+                band: IndexBandRole::Red
+            }
+        );
+    }
+
+    #[test]
+    fn awei_variants_are_not_clamped_to_normalized_difference_range() {
+        // Strong open-water reflectance signature: bright green, dark SWIR/NIR.
+        let water = IndexBandValues::default()
+            .with_band(IndexBandRole::Blue, 0.9)
+            .with_band(IndexBandRole::Green, 0.9)
+            .with_band(IndexBandRole::Nir, 0.01)
+            .with_band(IndexBandRole::Swir1, 0.01)
+            .with_band(IndexBandRole::Swir2, 0.01);
+
+        // AWEInsh = 4*(0.9 - 0.01) - (0.25*0.01 + 2.75*0.01) = 3.56 - 0.03 = 3.53
+        let nsh = IndexKind::AweiNsh
+            .compute_value(&water)
+            .unwrap()
+            .value()
+            .unwrap();
+        assert_close(nsh, 3.53);
+        assert!(nsh > 1.0, "AWEI must not be clamped to [-1, 1]");
+        assert!(nsh > 0.0, "water pixels must score positive");
+        let (min, max) = IndexKind::AweiNsh.expected_value_range();
+        assert!((min, max) == (-7.0, 4.0) && nsh >= min && nsh <= max);
+
+        // AWEIsh = 0.9 + 2.5*0.9 - 1.5*(0.01 + 0.01) - 0.25*0.01 = 3.1175
+        let sh = IndexKind::AweiSh
+            .compute_value(&water)
+            .unwrap()
+            .value()
+            .unwrap();
+        assert_close(sh, 3.1175);
+        let (min, max) = IndexKind::AweiSh.expected_value_range();
+        assert!((min, max) == (-3.25, 3.5) && sh >= min && sh <= max);
+    }
+
+    #[test]
+    fn new_index_band_roles_resolve_for_landsat_and_sentinel2_presets() {
+        for preset in [SensorPreset::Landsat8, SensorPreset::Sentinel2] {
+            for index in [IndexKind::Osavi, IndexKind::AweiNsh, IndexKind::AweiSh] {
+                for role in index.required_bands() {
+                    assert!(
+                        preset.default_band_for_role(*role).is_some(),
+                        "{preset:?} must map a default band for {role:?} required by {index:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            SensorPreset::Sentinel2.default_band_for_role(IndexBandRole::Swir1),
+            Some("B11")
+        );
+        assert_eq!(
+            SensorPreset::Landsat8.default_band_for_role(IndexBandRole::Swir2),
+            Some("B7")
         );
     }
 }

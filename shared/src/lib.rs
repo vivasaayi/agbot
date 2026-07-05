@@ -6,11 +6,13 @@ use serde::{Deserialize, Serialize};
 
 pub mod config;
 pub mod control_plane;
+pub mod drone_ingest;
 pub mod error;
 pub mod fleet_alerts;
 pub mod logging;
 pub mod observability;
 pub mod plugin_extensions;
+pub mod product_graph;
 pub mod resource_budget;
 pub mod schemas;
 pub mod secrets;

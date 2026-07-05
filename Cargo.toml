@@ -20,6 +20,7 @@ members = [
     "plugin_sdk",
     "interop",
     "lidar_mapper",
+    "raster_io",
     "imagery_processor",
     "geo_hub",
     "geo_viewer",

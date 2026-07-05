@@ -17,6 +17,8 @@ pub enum ArtifactKind {
     Recommendation,
     Report,
     Action,
+    Alert,
+    Proposal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1134,6 +1136,35 @@ pub fn emit_product_lineage(
     })
 }
 
+/// Build a [`LineageRecord`] for a product draft from the shared product
+/// catalog contract. The record uses the draft's deterministic
+/// [`shared::product_graph::ProductRecordDraft::product_id`] as the artifact
+/// id, the algorithm id as the method, and the draft's input product ids
+/// (deduplicated, order preserved) as lineage inputs. The record is not yet
+/// recorded; pass it to [`LineageLedger::record_lineage`].
+pub fn lineage_record_for_product_draft(
+    draft: &shared::product_graph::ProductRecordDraft,
+    actor: ActorIdentity,
+    created_at: &str,
+) -> LineageRecord {
+    let mut inputs: Vec<String> = Vec::with_capacity(draft.inputs.len());
+    for input in &draft.inputs {
+        if !inputs.contains(&input.product_id) {
+            inputs.push(input.product_id.clone());
+        }
+    }
+    LineageRecord {
+        artifact_id: draft.product_id(),
+        kind: ArtifactKind::Product,
+        inputs,
+        method: draft.algorithm_id.clone(),
+        parameters: ProvenanceParameters::from_json(draft.parameters.clone()),
+        operator: actor.actor_id.clone(),
+        actor,
+        created_at: created_at.to_string(),
+    }
+}
+
 pub fn output_hash_for_bytes(bytes: &[u8]) -> String {
     digest_for_bytes(EVIDENCE_DIGEST_ALGORITHM, bytes)
 }
@@ -1480,6 +1511,10 @@ fn entry_artifact_kind(entry: &AuditEntry) -> Option<ArtifactKind> {
         Some(ArtifactKind::Report)
     } else if artifact_ref.starts_with("action:") || artifact_ref.starts_with("mission:") {
         Some(ArtifactKind::Action)
+    } else if artifact_ref.starts_with("alert:") {
+        Some(ArtifactKind::Alert)
+    } else if artifact_ref.starts_with("proposal:") {
+        Some(ArtifactKind::Proposal)
     } else {
         None
     }
@@ -1803,15 +1838,78 @@ fn normalize_optional_text_owned(value: String) -> Option<String> {
 mod tests {
     use super::{
         build_evidence_pack, build_reproducibility_manifest, emit_product_lineage,
-        output_hash_for_bytes, verify_audit_chain, verify_audit_slice_export,
-        verify_evidence_pack_schema, verify_reproducible_output, ActionContext, ActorIdentity,
-        ActorKind, ArtifactKind, AuditAction, AuditChainBreachReason, AuditLedger,
-        AuditLedgerExportRequest, AuditOutcome, AuditRefusalReason, AuditRetentionPolicy,
-        EvidenceObject, EvidencePackRequest, EvidenceStore, LineageLedger, LineageRecord,
-        ProductLineageEmissionRequest, ProvenanceError, ProvenanceParameters,
+        lineage_record_for_product_draft, output_hash_for_bytes, verify_audit_chain,
+        verify_audit_slice_export, verify_evidence_pack_schema, verify_reproducible_output,
+        ActionContext, ActorIdentity, ActorKind, ArtifactKind, AuditAction, AuditChainBreachReason,
+        AuditLedger, AuditLedgerExportRequest, AuditOutcome, AuditRefusalReason,
+        AuditRetentionPolicy, EvidenceObject, EvidencePackRequest, EvidenceStore, LineageLedger,
+        LineageRecord, ProductLineageEmissionRequest, ProvenanceError, ProvenanceParameters,
         ReproducibilityInputBytes, ReproducibilityManifestStore, ReproducibilityMismatchReason,
         RetentionDecision,
     };
+
+    #[test]
+    fn lineage_record_for_product_draft_maps_identity_inputs_and_method() {
+        use shared::product_graph::{
+            ProductInputRef, ProductLevel, ProductRecordDraft, ProductScope,
+        };
+
+        let draft = ProductRecordDraft {
+            level: ProductLevel::L2,
+            kind: "ndvi".to_string(),
+            algorithm_id: "ndvi.standard".to_string(),
+            algorithm_version: "1.2.0".to_string(),
+            parameters: serde_json::json!({"epsilon": 1e-6}),
+            inputs: vec![
+                ProductInputRef {
+                    product_id: "scene-42:reflectance:aaaaaaaaaaaa".to_string(),
+                    role: "band:nir".to_string(),
+                },
+                ProductInputRef {
+                    product_id: "scene-42:reflectance:bbbbbbbbbbbb".to_string(),
+                    role: "band:red".to_string(),
+                },
+            ],
+            scope: ProductScope {
+                farm_id: Some("farm-1".to_string()),
+                field_id: Some("field-7".to_string()),
+                season_id: None,
+                scene_id: Some("scene-42".to_string()),
+                temporal_start: "2026-07-01T00:00:00Z".to_string(),
+                temporal_end: "2026-07-01T01:00:00Z".to_string(),
+            },
+            spatial_ref: None,
+            gsd_m_per_px: None,
+            artifact: None,
+            quality_mask: None,
+            confidence: None,
+            confidence_method: None,
+            quality_summary: None,
+            evidence_digests: Vec::new(),
+            source_id: None,
+        };
+
+        let record =
+            lineage_record_for_product_draft(&draft, sample_actor(), "2026-07-01T02:00:00Z");
+
+        assert_eq!(record.kind, ArtifactKind::Product);
+        assert_eq!(record.artifact_id, draft.product_id());
+        assert_eq!(
+            record.inputs,
+            vec![
+                "scene-42:reflectance:aaaaaaaaaaaa".to_string(),
+                "scene-42:reflectance:bbbbbbbbbbbb".to_string(),
+            ]
+        );
+        assert_eq!(record.method, "ndvi.standard");
+        assert_eq!(
+            record.parameters,
+            ProvenanceParameters::from_json(serde_json::json!({"epsilon": 1e-6}))
+        );
+        assert_eq!(record.operator, sample_actor().actor_id);
+        assert_eq!(record.actor, sample_actor());
+        assert_eq!(record.created_at, "2026-07-01T02:00:00Z");
+    }
 
     #[test]
     fn records_finding_lineage_from_product() {

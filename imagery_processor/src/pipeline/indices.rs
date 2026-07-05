@@ -337,12 +337,46 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
         .await
         .map_err(|err| processing_error(err.to_string()))?;
     let resolved_bands = resolved_index_band_names(args);
-    let evidence = crate::io::resolve_band_ingest_evidence_for_resolved_bands(
-        &image,
-        args.sensor,
-        resolved_bands,
-    )
-    .map_err(|err| processing_error(err.to_string()))?;
+    let profile = args.sensor_profile.profile();
+
+    let resolved_paths = resolved_bands
+        .values()
+        .filter_map(|band_name| image.file_paths.get(band_name))
+        .collect::<Vec<_>>();
+    let geotiff_count = resolved_paths
+        .iter()
+        .filter(|path| crate::io::geotiff_ingest::is_geotiff_path(path))
+        .count();
+    let geotiff_input = !resolved_paths.is_empty() && geotiff_count == resolved_paths.len();
+    if geotiff_count > 0 && !geotiff_input {
+        return Err(processing_error(
+            "mixed band inputs: all bands must be GeoTIFF or none",
+        ));
+    }
+    if profile.is_some() && !geotiff_input {
+        return Err(processing_error(
+            "--sensor-profile requires GeoTIFF (.tif/.tiff) band inputs",
+        ));
+    }
+
+    let (evidence, geotiff_bands) = if geotiff_input {
+        let ingest = crate::io::geotiff_ingest::ingest_geotiff_index_bands(
+            &image,
+            args.sensor,
+            resolved_bands,
+            profile,
+        )
+        .map_err(|err| processing_error(err.to_string()))?;
+        (ingest.evidence, Some(ingest.bands))
+    } else {
+        let evidence = crate::io::resolve_band_ingest_evidence_for_resolved_bands(
+            &image,
+            args.sensor,
+            resolved_bands,
+        )
+        .map_err(|err| processing_error(err.to_string()))?;
+        (evidence, None)
+    };
     crate::io::write_band_ingest_evidence(&args.output_dir, &evidence)
         .await
         .map_err(|err| processing_error(err.to_string()))?;
@@ -361,13 +395,27 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
                 ))
             })?
             .clone();
-        let band = load_index_band(
-            &image,
-            &band_name,
-            *role,
-            (width, height),
-            &evidence.radiometric_calibration,
-        )?;
+        let band = if let Some(bands) = geotiff_bands.as_ref() {
+            let loaded = bands.get(&band_name).ok_or_else(|| {
+                processing_error(format!(
+                    "{:?} required {} band '{band_name}' was not ingested from GeoTIFF",
+                    args.index,
+                    role.label()
+                ))
+            })?;
+            LoadedIndexBand {
+                values: loaded.values.clone(),
+                valid: loaded.valid.clone(),
+            }
+        } else {
+            load_index_band(
+                &image,
+                &band_name,
+                *role,
+                (width, height),
+                &evidence.radiometric_calibration,
+            )?
+        };
         loaded_bands.insert(*role, band);
     }
 
@@ -553,6 +601,7 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
             "index": format!("{:?}", args.index).to_lowercase(),
             "out_format": format!("{:?}", args.out_format).to_lowercase(),
             "sensor": args.sensor.map(|sensor| format!("{:?}", sensor).to_lowercase()),
+            "sensor_profile": args.sensor_profile.cli_name(),
             "resolved_bands": evidence.resolved_bands.clone(),
             "band_overrides": band_overrides,
         }),
@@ -574,6 +623,29 @@ async fn process_one(metadata_file: &PathBuf, args: &IndicesArgs) -> AgroResult<
         }),
         output_hashes,
     );
+
+    // Emit the L2 product-record sidecar next to the index output (Track A phase
+    // 7b). A later `geo_hub catalog register` pass walks these into the catalog.
+    let scene_id = image.image_id.to_string();
+    let index_kind = format!("{:?}", args.index).to_lowercase();
+    let index_timestamp = image.metadata.timestamp.to_rfc3339();
+    let sidecar_mask_ref = args
+        .mask
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string());
+    let sidecar_ctx = crate::product_sidecar::l2_index_sidecar_context(
+        &scene_id,
+        &index_kind,
+        env!("CARGO_PKG_VERSION"),
+        &evidence.resolved_bands,
+        evidence.spatial_ref.clone(),
+        &index_timestamp,
+        sidecar_mask_ref.as_deref(),
+        None,
+    );
+    let sidecar_draft =
+        crate::product_sidecar::draft_from_evidence(&reproducibility, &sidecar_ctx, &out_path);
+    crate::product_sidecar::write_product_sidecar(&out_path, &sidecar_draft).await?;
 
     let meta = IndexResultMeta {
         timestamp: chrono::Utc::now(),

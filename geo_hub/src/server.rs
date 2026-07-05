@@ -6,6 +6,7 @@ use axum::{
 };
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
+use tower_http::services::ServeDir;
 use tracing::{info, warn};
 
 async fn health_handler() -> &'static str {
@@ -18,8 +19,15 @@ async fn ready_handler() -> &'static str {
 
 pub fn build_router(state: AppState) -> Router {
     Router::new()
+        .nest_service(
+            "/workspace",
+            ServeDir::new(state.config.workspace_web_dir()),
+        )
         .route("/", get(routes::mobile_app))
         .route("/app", get(routes::mobile_app))
+        .route("/browse", get(routes::browse_app))
+        .route("/browse/app.js", get(routes::browse_app_js))
+        .route("/browse/style.css", get(routes::browse_style_css))
         .route(
             "/api/mobile/scenes/search",
             post(routes::mobile_search_scenes),
@@ -28,6 +36,106 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health_handler))
         .route("/ready", get(ready_handler))
         .route("/api/ingest/health", get(routes::get_ingest_health))
+        .route(
+            "/api/ingest/drone-session",
+            post(routes::ingest_drone_session),
+        )
+        .route("/api/ingest/hls/register", post(routes::register_hls))
+        .route(
+            "/api/ingest/sen2cor/ndvi/derive",
+            post(routes::derive_sen2cor_ndvi_route),
+        )
+        .route(
+            "/api/catalog/products",
+            get(routes::list_catalog_products).post(routes::register_catalog_product),
+        )
+        .route(
+            "/api/catalog/products/:product_id",
+            get(routes::get_catalog_product),
+        )
+        .route(
+            "/api/catalog/products/:product_id/tiles/:z/:x/:y.png",
+            get(routes::catalog_product_web_tile),
+        )
+        .route("/api/satellite/derive", post(routes::satellite_derive))
+        .route("/api/stac", get(routes::stac_landing_page))
+        .route("/api/stac/conformance", get(routes::stac_conformance))
+        .route("/api/stac/collections", get(routes::stac_list_collections))
+        .route(
+            "/api/stac/collections/:collection_id",
+            get(routes::stac_get_collection),
+        )
+        .route(
+            "/api/stac/collections/:collection_id/items",
+            get(routes::stac_list_collection_items),
+        )
+        .route(
+            "/api/stac/collections/:collection_id/items/:item_id",
+            get(routes::stac_get_collection_item),
+        )
+        .route(
+            "/api/stac/search",
+            get(routes::stac_search_get).post(routes::stac_search_post),
+        )
+        .route(
+            "/api/applications/:app_id/runs",
+            post(routes::create_application_run),
+        )
+        .route(
+            "/api/application-runs/:run_id",
+            get(routes::get_application_run),
+        )
+        .route(
+            "/api/fields/:field_id/findings",
+            get(routes::list_field_findings),
+        )
+        .route(
+            "/api/applications/crop-health/runs",
+            post(routes::run_crop_health_app),
+        )
+        .route(
+            "/api/applications/water-priority/runs",
+            post(routes::run_water_priority_app),
+        )
+        .route(
+            "/api/applications/anomaly/runs",
+            post(routes::run_anomaly_app),
+        )
+        .route(
+            "/api/fields/:field_id/alert-evaluation",
+            post(routes::evaluate_field_alerts),
+        )
+        .route(
+            "/api/fields/:field_id/alerts",
+            get(routes::list_field_alerts),
+        )
+        .route(
+            "/api/alerts/:alert_id/severity",
+            get(routes::get_alert_severity_classification),
+        )
+        .route(
+            "/api/alerts/:alert_id/lifecycle",
+            get(routes::get_alert_lifecycle),
+        )
+        .route(
+            "/api/alerts/:alert_id/acknowledge",
+            post(routes::acknowledge_alert),
+        )
+        .route("/api/alerts/:alert_id/resolve", post(routes::resolve_alert))
+        .route("/api/proposals", post(routes::create_proposal))
+        .route(
+            "/api/fields/:field_id/proposals",
+            get(routes::list_field_proposals),
+        )
+        .route("/api/proposals/:proposal_id", get(routes::get_proposal))
+        .route(
+            "/api/proposals/:proposal_id/accept",
+            post(routes::accept_proposal),
+        )
+        .route(
+            "/api/proposals/:proposal_id/reject",
+            post(routes::reject_proposal),
+        )
         .route(
             "/api/farms",
             get(routes::list_farms).post(routes::create_farm),
@@ -268,6 +376,69 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/drought-management/indices/compute",
             post(routes::compute_drought_index_route),
+        )
+        .route(
+            "/api/drought-management/rasters",
+            get(routes::list_drought_rasters_route),
+        )
+        .route(
+            "/api/drought-management/rasters/derive",
+            post(routes::derive_drought_raster_route),
+        )
+        .route(
+            "/api/drought-management/chirps/register",
+            post(routes::register_chirps_route),
+        )
+        .route(
+            "/api/drought-management/chirps/fetch",
+            post(routes::fetch_chirps_route),
+        )
+        .route(
+            "/api/drought-management/spi/derive",
+            post(routes::derive_spi_raster_route),
+        )
+        .route(
+            "/api/drought-management/vhi/derive",
+            post(routes::derive_vhi_raster_route),
+        )
+        .route("/api/thermal/lst/derive", post(routes::derive_lst_route))
+        .route(
+            "/api/change-detection/dnbr/derive",
+            post(routes::derive_dnbr_route),
+        )
+        .route("/api/change-detection/dnbr", get(routes::list_dnbr_route))
+        .route(
+            "/api/water-management/jrc/register",
+            post(routes::register_jrc_route),
+        )
+        .route(
+            "/api/water-management/sentinel1/register",
+            post(routes::register_sentinel1_route),
+        )
+        .route(
+            "/api/water-management/extent/derive",
+            post(routes::derive_water_extent_route),
+        )
+        .route(
+            "/api/water-management/extent",
+            get(routes::list_water_extent_route),
+        )
+        .route(
+            "/api/landcover/derive",
+            post(routes::derive_landcover_route),
+        )
+        .route("/api/landcover/rasters", get(routes::list_landcover_route))
+        .route(
+            "/api/landcover/reference/register",
+            post(routes::register_landcover_reference_route),
+        )
+        .route(
+            "/api/landcover/validate",
+            post(routes::validate_landcover_route),
+        )
+        .route(
+            "/api/landcover/ml/classify",
+            post(routes::classify_landcover_ml_route),
         )
         .route(
             "/api/marketplace/accounts",
@@ -634,6 +805,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/provenance/lineage/:artifact_id",
             get(routes::get_provenance_lineage_record),
+        )
+        .route(
+            "/api/provenance/trace/:artifact_id",
+            get(routes::get_provenance_trace),
         )
         .route(
             "/api/provenance/audit",

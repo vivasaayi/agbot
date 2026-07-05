@@ -824,12 +824,26 @@ pub enum CropClosedLoopAction {
 #[serde(rename_all = "snake_case")]
 pub enum CropClosedLoopApprovalStatus {
     Pending,
+    Approved,
+    Rejected,
 }
 
 impl CropClosedLoopApprovalStatus {
     pub fn as_str(self) -> &'static str {
         match self {
             CropClosedLoopApprovalStatus::Pending => "pending",
+            CropClosedLoopApprovalStatus::Approved => "approved",
+            CropClosedLoopApprovalStatus::Rejected => "rejected",
+        }
+    }
+
+    /// Parse a persisted approval-status string.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(CropClosedLoopApprovalStatus::Pending),
+            "approved" => Some(CropClosedLoopApprovalStatus::Approved),
+            "rejected" => Some(CropClosedLoopApprovalStatus::Rejected),
+            _ => None,
         }
     }
 }

@@ -47,3 +47,36 @@ Nothing is built for this domain. The following adjacent surfaces are real or in
 - A per-field/region deterministic risk score runs and is inspectable before any AI drought prediction; the AI forecast, when shown, cites its evidence layer and flags uncertainty.
 - Early warnings fire on threshold crossings and route to the portal (`13`) and operator surfaces (`11`).
 - Mitigation strategy recommendations tie to real field actions, primarily irrigation (`16`) and advisor guidance (`09`), with reporting and a full audit trail.
+
+## Update (2026-07): satellite drought pipeline shipped
+
+The "greenfield" maturity above is superseded. The satellite intelligence
+pipeline (`docs/design/satellite-intelligence-pipeline.md`, batches 1-27,
+branch `field-intelligence-pipeline`) implemented the deterministic drought
+core this module planned:
+
+- **VCI** (Vegetation Condition Index): multi-year cataloged NDVI L2
+  archives build a per-pixel min/max climatology
+  (`post_processor/src/index_climatology.rs`) and the current period scores
+  into a VCI L3 raster (`post_processor/src/drought_indices.rs`,
+  `geo_hub/src/drought_rasters.rs`,
+  `POST /api/drought-management/rasters/derive`).
+- **TCI** (Temperature Condition Index): the same route over `lst` L2
+  products; LST derives from thermal DN via the pure engine in
+  `post_processor/src/lst.rs` (`POST /api/thermal/lst/derive`).
+- **VHI** (Vegetation Health Index): `α·VCI + (1−α)·TCI` blend of two
+  registered same-grid drought L3s
+  (`POST /api/drought-management/vhi/derive`).
+- **SPI** (Standardized Precipitation Index): CHIRPS monthly/dekad
+  registration + fetcher, Thom-1958 gamma fit, SPI-1/3/6/12 windows
+  (`post_processor/src/spi.rs`, `geo_hub/src/spi_rasters.rs`,
+  `POST /api/drought-management/spi/derive`).
+- Severity classes follow the Kogan 10/20/30/40 convention; every product
+  is a content-addressed catalog L3 with lineage to its observations and
+  climatology, web-tiled via `/api/catalog/products/<id>/tiles/...`, listed
+  in `/api/stac`, and derivable from the `/browse` UI.
+
+Still open for this domain: weather-model fusion (`15`), SPEI-style
+water-balance indices, early-warning threshold routing to `13`/`11`, and
+mitigation recommendations tied to `16` — the alerting/advisor rails from
+Tracks C/D exist and can consume drought findings.

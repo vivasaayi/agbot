@@ -3005,6 +3005,318 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // --- Product catalog (field-intelligence pipeline, Track A) ---------------
+    //
+    // The `products` table above is a per-scene serving projection with a
+    // `UNIQUE(scene_id, kind)` constraint that structurally cannot hold L3
+    // (multi-scene, field/season-scoped) or re-parameterized products. The
+    // catalog tables below are the authoritative cross-source product graph:
+    // `catalog_products` are the nodes, `catalog_product_inputs` the edges.
+    // Identity is `UNIQUE(kind, parameters_hash)` (deterministic over the
+    // algorithm + parameters + sorted inputs); scope is descriptive metadata,
+    // not identity.
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS catalog_sources (
+            source_id TEXT PRIMARY KEY,
+            source_kind TEXT NOT NULL CHECK(
+                source_kind IN ('satellite','drone','field_survey','iot','weather','equipment')
+            ),
+            platform TEXT,
+            sensor TEXT,
+            config_json TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            registered_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS catalog_products (
+            product_id TEXT PRIMARY KEY,
+            level TEXT NOT NULL CHECK(level IN ('l0','l1','l2','l3')),
+            kind TEXT NOT NULL,
+            algorithm_id TEXT NOT NULL,
+            algorithm_version TEXT NOT NULL,
+            parameters_json TEXT NOT NULL,
+            parameters_hash TEXT NOT NULL,
+            path TEXT,
+            format TEXT,
+            checksum_sha256 TEXT,
+            spatial_ref_json TEXT,
+            crs TEXT,
+            bbox_min_x REAL,
+            bbox_min_y REAL,
+            bbox_max_x REAL,
+            bbox_max_y REAL,
+            gsd_m_per_px REAL,
+            temporal_start TEXT,
+            temporal_end TEXT,
+            farm_id TEXT,
+            field_id TEXT,
+            season_id TEXT,
+            scene_id TEXT,
+            source_id TEXT,
+            quality_mask_product_id TEXT,
+            confidence REAL,
+            confidence_method TEXT,
+            quality_summary_json TEXT,
+            status TEXT NOT NULL DEFAULT 'registered' CHECK(
+                status IN ('registered','published','superseded','failed_qa')
+            ),
+            superseded_by TEXT,
+            provenance_id TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(kind, parameters_hash)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS catalog_product_inputs (
+            product_id TEXT NOT NULL,
+            input_product_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            PRIMARY KEY(product_id, input_product_id, role),
+            FOREIGN KEY(product_id) REFERENCES catalog_products(product_id) ON DELETE CASCADE,
+            FOREIGN KEY(input_product_id) REFERENCES catalog_products(product_id)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS provenance_evidence (
+            digest TEXT PRIMARY KEY,
+            algorithm TEXT NOT NULL,
+            evidence_kind TEXT NOT NULL,
+            payload_json TEXT NOT NULL,
+            byte_len INTEGER,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_catalog_products_scope
+        ON catalog_products(field_id, season_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_catalog_products_scene
+        ON catalog_products(scene_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_catalog_products_level_kind
+        ON catalog_products(level, kind);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_catalog_products_bbox
+        ON catalog_products(bbox_min_x, bbox_min_y, bbox_max_x, bbox_max_y);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_catalog_product_inputs_input
+        ON catalog_product_inputs(input_product_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Application runs + findings (Track B phase B1): governed analysis runs that
+    // consume cataloged L2/L3 products and emit findings with provenance.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS application_runs (
+            run_id TEXT PRIMARY KEY,
+            app_id TEXT NOT NULL,
+            org_id TEXT,
+            field_id TEXT,
+            input_product_ids_json TEXT NOT NULL,
+            params_json TEXT,
+            params_digest TEXT NOT NULL,
+            status TEXT NOT NULL,
+            output_finding_ids_json TEXT,
+            output_recommendation_ids_json TEXT,
+            provenance_id TEXT,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS application_findings (
+            finding_id TEXT PRIMARY KEY,
+            run_id TEXT NOT NULL,
+            app_id TEXT NOT NULL,
+            field_id TEXT,
+            kind TEXT NOT NULL,
+            severity TEXT,
+            confidence REAL,
+            zone_geometry_json TEXT,
+            metrics_json TEXT,
+            evidence_refs_json TEXT,
+            created_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_application_findings_field
+        ON application_findings(field_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_application_runs_app
+        ON application_runs(app_id, field_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Fired alerts (Track C phase C1): findings screened into alerts by a rule
+    // set. Each alert carries lineage back to the finding that produced it.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS fired_alerts (
+            alert_id TEXT PRIMARY KEY,
+            matched_rule_id TEXT NOT NULL,
+            source_finding_id TEXT NOT NULL,
+            field_id TEXT,
+            event_type TEXT NOT NULL,
+            subject_ref TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            channels_json TEXT,
+            evidence_refs_json TEXT,
+            explanation TEXT,
+            fired_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_fired_alerts_field
+        ON fired_alerts(field_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Alert severity classification (Track C phase C3): evidence-based severity
+    // derived from the source finding's metrics, overriding the static rule
+    // severity for downstream decisions. Retains the rule severity for audit.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS alert_severity_classification (
+            alert_id TEXT PRIMARY KEY,
+            rule_severity TEXT NOT NULL,
+            classified_severity TEXT NOT NULL,
+            hard_override_downstream INTEGER NOT NULL,
+            metric TEXT NOT NULL,
+            observed_value REAL NOT NULL,
+            threshold_value REAL,
+            method_version TEXT NOT NULL,
+            explanation TEXT NOT NULL,
+            classified_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Alert lifecycle (Track C phase C2): the governed fired->acknowledged->
+    // resolved state machine per fired alert, with an append-only transition log.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS alert_lifecycle (
+            alert_id TEXT PRIMARY KEY,
+            source_event_ref TEXT NOT NULL,
+            state TEXT NOT NULL,
+            fired_at TEXT NOT NULL,
+            transitions_json TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Proposal queue (Track D phase D1): the unified accept/reject queue over
+    // signals (alerts / findings / recommendations). Each proposal carries
+    // lineage back to its source artifact.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS proposals (
+            proposal_id TEXT PRIMARY KEY,
+            source_kind TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            field_id TEXT,
+            title TEXT NOT NULL,
+            action_category TEXT NOT NULL,
+            priority TEXT NOT NULL,
+            status TEXT NOT NULL,
+            rationale TEXT,
+            created_at TEXT NOT NULL,
+            reviewed_by TEXT,
+            reviewed_at TEXT
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_proposals_field
+        ON proposals(field_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     info!("database ready");
     Ok(())
 }

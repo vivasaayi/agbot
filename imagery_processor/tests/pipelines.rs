@@ -12,7 +12,8 @@ use imagery_processor::{
         thermal::run_thermal,
     },
     BandOverrideSpec, ClassifyArgs, ExportArgs, IndexBandRole, IndexKind, IndicesArgs, MasksArgs,
-    OutputFormat, SensorPreset, TemperatureUnit, ThermalArgs, ThermalProduct,
+    OutputFormat, QaScheme, SensorPreset, SensorProfileArg, TemperatureUnit, ThermalArgs,
+    ThermalProduct,
 };
 use serde_json::Value;
 use shared::schemas::{assert_raster_spatial_ref, RasterSpatialRef};
@@ -153,6 +154,7 @@ fn base_indices_args(input_dir: PathBuf, output_dir: PathBuf) -> IndicesArgs {
         band_overrides: Vec::new(),
         out_format: OutputFormat::Png,
         sensor: None,
+        sensor_profile: SensorProfileArg::None,
         mask: None,
     }
 }
@@ -161,7 +163,10 @@ fn base_masks_args(input_dir: PathBuf, output_dir: PathBuf) -> MasksArgs {
     MasksArgs {
         input_dir,
         output_dir,
-        qa_band: "QA_PIXEL".to_string(),
+        qa_band: None,
+        qa_scheme: QaScheme::QaPixel,
+        scl_keep_classes: Vec::new(),
+        scl_dilate_radius: 1,
         kinds: Vec::new(),
         out_format: OutputFormat::Png,
     }
@@ -1317,6 +1322,126 @@ async fn masks_persist_class_count_evidence() {
 }
 
 #[tokio::test]
+async fn scl_masks_share_output_contract_and_persist_evidence() {
+    let root = temp_test_dir("scl_mask_evidence");
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    // 6x1 SCL strip: vegetation, bare, water, cloud-high, snow, nodata.
+    let scl_path = input_dir.join("scl.png");
+    write_gray16_image(&scl_path, 6, 1, &[4, 5, 6, 9, 11, 0]);
+    write_metadata(&input_dir, 6, 1, &[("SCL", scl_path.as_path())]);
+
+    let mut args = base_masks_args(input_dir, output_dir.clone());
+    args.qa_scheme = QaScheme::Scl;
+    args.scl_dilate_radius = 0;
+
+    run_masks(&args).await.unwrap();
+
+    let evidence = read_mask_evidence(&output_dir);
+    assert_eq!(evidence["qa_band"].as_str().unwrap(), "SCL");
+    assert_eq!(evidence["qa_scheme"].as_str().unwrap(), "scl");
+    assert_eq!(evidence["class_counts"]["vegetation"].as_u64().unwrap(), 1);
+    assert_eq!(
+        evidence["class_counts"]["not_vegetated"].as_u64().unwrap(),
+        1
+    );
+    assert_eq!(evidence["class_counts"]["water"].as_u64().unwrap(), 1);
+    assert_eq!(
+        evidence["class_counts"]["cloud_high_probability"]
+            .as_u64()
+            .unwrap(),
+        1
+    );
+    assert_eq!(evidence["class_counts"]["snow_ice"].as_u64().unwrap(), 1);
+    assert_eq!(evidence["class_counts"]["no_data"].as_u64().unwrap(), 1);
+    assert_eq!(evidence["class_counts"]["clear"].as_u64().unwrap(), 3);
+    // Same output kinds as the QA_PIXEL path so downstream consumes either uniformly.
+    for kind in ["cloud", "cloud_shadow", "snow", "water", "clear"] {
+        assert!(
+            evidence["outputs"][kind]
+                .as_str()
+                .unwrap()
+                .ends_with(".png"),
+            "SCL run must emit the shared '{kind}' mask output"
+        );
+    }
+    let params = &evidence["reproducibility"]["parameters"];
+    assert_eq!(params["qa_scheme"].as_str().unwrap(), "scl");
+    assert_eq!(params["scl_keep_classes"], serde_json::json!([4, 5, 6]));
+    assert_eq!(params["scl_dilate_radius"].as_u64().unwrap(), 0);
+
+    // The clear mask keeps {4,5,6} and rejects cloud/snow/nodata pixels.
+    let clear_path = evidence["outputs"]["clear"].as_str().unwrap();
+    let clear = image::open(clear_path).unwrap().to_luma8();
+    let clear_values: Vec<u8> = clear.pixels().map(|pixel| pixel[0]).collect();
+    assert_eq!(clear_values, [255, 255, 255, 0, 0, 0]);
+}
+
+#[tokio::test]
+async fn scl_dilation_grows_reject_region_in_clear_output() {
+    let root = temp_test_dir("scl_mask_dilation");
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    // 5x5 vegetation with a single cloud pixel at the center.
+    let mut scl_values = vec![4u16; 25];
+    scl_values[12] = 9;
+    let scl_path = input_dir.join("scl.png");
+    write_gray16_image(&scl_path, 5, 5, &scl_values);
+    write_metadata(&input_dir, 5, 5, &[("SCL", scl_path.as_path())]);
+
+    let mut args = base_masks_args(input_dir, output_dir.clone());
+    args.qa_scheme = QaScheme::Scl;
+    args.scl_dilate_radius = 1;
+
+    run_masks(&args).await.unwrap();
+
+    let evidence = read_mask_evidence(&output_dir);
+    assert_eq!(
+        evidence["class_counts"]["clear"].as_u64().unwrap(),
+        16,
+        "radius-1 dilation must reject the 3x3 block around the cloud"
+    );
+    let clear_path = evidence["outputs"]["clear"].as_str().unwrap();
+    let clear = image::open(clear_path).unwrap().to_luma8();
+    for y in 1..4u32 {
+        for x in 1..4u32 {
+            assert_eq!(clear.get_pixel(x, y)[0], 0, "({x},{y}) inside dilated hole");
+        }
+    }
+    assert_eq!(clear.get_pixel(0, 0)[0], 255);
+}
+
+#[tokio::test]
+async fn scl_permissive_keep_set_keeps_unclassified_pixels() {
+    let root = temp_test_dir("scl_mask_permissive");
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    let scl_path = input_dir.join("scl.png");
+    write_gray16_image(&scl_path, 4, 1, &[4, 7, 8, 6]);
+    write_metadata(&input_dir, 4, 1, &[("SCL", scl_path.as_path())]);
+
+    let mut args = base_masks_args(input_dir, output_dir.clone());
+    args.qa_scheme = QaScheme::Scl;
+    args.scl_keep_classes = vec![4, 5, 6, 7];
+    args.scl_dilate_radius = 0;
+
+    run_masks(&args).await.unwrap();
+
+    let evidence = read_mask_evidence(&output_dir);
+    assert_eq!(evidence["class_counts"]["clear"].as_u64().unwrap(), 3);
+    assert_eq!(
+        evidence["reproducibility"]["parameters"]["scl_keep_classes"],
+        serde_json::json!([4, 5, 6, 7])
+    );
+}
+
+#[tokio::test]
 async fn masks_error_when_qa_band_is_missing() {
     let root = temp_test_dir("qa_mask_missing_band");
     let input_dir = root.join("input");
@@ -1421,6 +1546,115 @@ async fn mndwi_uses_only_declared_green_and_swir1_bands() {
     assert_eq!(meta["index"].as_str().unwrap(), "mndwi");
     assert_eq!(meta["valid_pixel_count"].as_u64().unwrap(), 1);
     assert!((meta["mean"].as_f64().unwrap() - (15.0 / 65.0)).abs() < 1e-6);
+}
+
+#[tokio::test]
+async fn osavi_matches_hand_computed_fixture_with_sentinel2_band_names() {
+    let root = temp_test_dir("osavi_sentinel2");
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    // Sentinel-2 preset calibrates DN/255 -> reflectance: red 51/255 = 0.2, nir 153/255 = 0.6.
+    let red_path = input_dir.join("b04.png");
+    let nir_path = input_dir.join("b08.png");
+    write_gray_image(&red_path, 1, 1, &[51]);
+    write_gray_image(&nir_path, 1, 1, &[153]);
+    write_metadata(
+        &input_dir,
+        1,
+        1,
+        &[("B04", red_path.as_path()), ("B08", nir_path.as_path())],
+    );
+
+    let mut args = base_indices_args(input_dir, output_dir.clone());
+    args.index = IndexKind::Osavi;
+    args.sensor = Some(SensorPreset::Sentinel2);
+
+    run_indices(&args).await.unwrap();
+
+    let meta = read_result_meta(&output_dir);
+    assert_eq!(meta["index"].as_str().unwrap(), "osavi");
+    assert_eq!(meta["valid_pixel_count"].as_u64().unwrap(), 1);
+    // OSAVI = (0.6 - 0.2) / (0.6 + 0.2 + 0.16) = 0.4 / 0.96
+    assert!((meta["mean"].as_f64().unwrap() - (0.4 / 0.96)).abs() < 1e-6);
+}
+
+#[tokio::test]
+async fn awei_nsh_matches_hand_computed_fixture_with_landsat_band_names() {
+    let root = temp_test_dir("awei_nsh_landsat");
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    // Landsat-8 preset calibrates DN/255 -> reflectance:
+    // green B3 102/255 = 0.4, nir B5 153/255 = 0.6, swir1 B6 51/255 = 0.2, swir2 B7 51/255 = 0.2.
+    let green_path = input_dir.join("b3.png");
+    let nir_path = input_dir.join("b5.png");
+    let swir1_path = input_dir.join("b6.png");
+    let swir2_path = input_dir.join("b7.png");
+    write_gray_image(&green_path, 1, 1, &[102]);
+    write_gray_image(&nir_path, 1, 1, &[153]);
+    write_gray_image(&swir1_path, 1, 1, &[51]);
+    write_gray_image(&swir2_path, 1, 1, &[51]);
+    write_metadata(
+        &input_dir,
+        1,
+        1,
+        &[
+            ("B3", green_path.as_path()),
+            ("B5", nir_path.as_path()),
+            ("B6", swir1_path.as_path()),
+            ("B7", swir2_path.as_path()),
+        ],
+    );
+
+    let mut args = base_indices_args(input_dir, output_dir.clone());
+    args.index = IndexKind::AweiNsh;
+    args.sensor = Some(SensorPreset::Landsat8);
+
+    run_indices(&args).await.unwrap();
+
+    let meta = read_result_meta(&output_dir);
+    assert_eq!(meta["index"].as_str().unwrap(), "aweinsh");
+    assert_eq!(meta["valid_pixel_count"].as_u64().unwrap(), 1);
+    // AWEInsh = 4*(0.4 - 0.2) - (0.25*0.6 + 2.75*0.2) = 0.8 - 0.7 = 0.1
+    assert!((meta["mean"].as_f64().unwrap() - 0.1).abs() < 1e-6);
+}
+
+#[tokio::test]
+async fn awei_sh_error_when_swir2_band_is_missing() {
+    let root = temp_test_dir("awei_sh_missing_swir2");
+    let input_dir = root.join("input");
+    let output_dir = root.join("output");
+    fs::create_dir_all(&input_dir).unwrap();
+
+    let blue_path = input_dir.join("b02.png");
+    let green_path = input_dir.join("b03.png");
+    let nir_path = input_dir.join("b08.png");
+    let swir1_path = input_dir.join("b11.png");
+    write_gray_image(&blue_path, 1, 1, &[26]);
+    write_gray_image(&green_path, 1, 1, &[102]);
+    write_gray_image(&nir_path, 1, 1, &[153]);
+    write_gray_image(&swir1_path, 1, 1, &[51]);
+    write_metadata(
+        &input_dir,
+        1,
+        1,
+        &[
+            ("B02", blue_path.as_path()),
+            ("B03", green_path.as_path()),
+            ("B08", nir_path.as_path()),
+            ("B11", swir1_path.as_path()),
+        ],
+    );
+
+    let mut args = base_indices_args(input_dir, output_dir);
+    args.index = IndexKind::AweiSh;
+    args.sensor = Some(SensorPreset::Sentinel2);
+
+    let error = run_indices(&args).await.unwrap_err().to_string();
+    assert!(error.contains("required band 'B12'"));
 }
 
 #[tokio::test]

@@ -1,5 +1,7 @@
+use crate::catalog;
 use crate::db::DbPool;
 use anyhow::{Context, Result};
+use shared::product_graph::{ProductArtifact, ProductLevel, ProductRecordDraft, ProductScope};
 use shared::schemas::{MultispectralImage, RasterSpatialRef};
 use sqlx::Row;
 use std::path::Path;
@@ -97,9 +99,15 @@ pub async fn publish_product(
     .execute(pool)
     .await?;
 
+    // Dual-write into the catalog (Track A batch 4); legacy row above is the
+    // serving projection, this mirrors it into the product graph.
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    register_legacy_publication(pool, &context, product_path, &now).await?;
+
     Ok(context)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn publish_georeferenced_product(
     pool: &DbPool,
     scene_id: &str,
@@ -224,7 +232,7 @@ pub async fn publish_georeferenced_product(
     .execute(pool)
     .await?;
 
-    Ok(ProductPublication {
+    let publication = ProductPublication {
         product_id,
         scene_id,
         field_id,
@@ -236,7 +244,13 @@ pub async fn publish_georeferenced_product(
         width_px: Some(width_px),
         height_px: Some(height_px),
         gsd_m_per_px: Some(gsd_m_per_px),
-    })
+    };
+
+    // Dual-write into the catalog (Track A batch 4).
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    register_legacy_publication(pool, &publication, product_path, &now).await?;
+
+    Ok(publication)
 }
 
 async fn load_publication_context(
@@ -324,4 +338,131 @@ fn normalize_required(
 fn normalize_optional(value: &str) -> Option<String> {
     let trimmed = value.trim().to_string();
     (!trimmed.is_empty()).then_some(trimmed)
+}
+
+// --- Legacy `products` -> `catalog_products` bridge (Track A batch 4) -------
+//
+// The `products` table (scene-scoped, UNIQUE(scene_id, kind)) predates the
+// catalog and remains the serving projection for legacy tile/export routes.
+// This bridge additively mirrors legacy products into `catalog_products` so the
+// product graph is complete, without changing the legacy routes.
+
+fn artifact_format(path: &str) -> String {
+    Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Map a legacy scene product into a catalog draft. Legacy rows carry no input
+/// graph, so `scene_id` is folded into `parameters` to preserve per-scene
+/// identity under `UNIQUE(kind, parameters_hash)` — otherwise two scenes'
+/// same-kind products would collapse into one catalog row.
+fn legacy_product_draft(
+    scene_id: &str,
+    field_id: Option<String>,
+    season_id: Option<String>,
+    kind: &str,
+    path: &str,
+    spatial_ref: Option<RasterSpatialRef>,
+    gsd_m_per_px: Option<f64>,
+    created_at: &str,
+) -> ProductRecordDraft {
+    ProductRecordDraft {
+        level: ProductLevel::L2,
+        kind: kind.to_string(),
+        algorithm_id: format!("legacy.{kind}"),
+        algorithm_version: "legacy-bridge".to_string(),
+        parameters: serde_json::json!({ "scene_id": scene_id }),
+        inputs: Vec::new(),
+        scope: ProductScope {
+            farm_id: None,
+            field_id,
+            season_id,
+            scene_id: Some(scene_id.to_string()),
+            temporal_start: created_at.to_string(),
+            temporal_end: created_at.to_string(),
+        },
+        spatial_ref,
+        gsd_m_per_px,
+        artifact: normalize_optional(path).map(|path| ProductArtifact {
+            format: artifact_format(&path),
+            path,
+            checksum_sha256: None,
+        }),
+        quality_mask: None,
+        confidence: None,
+        confidence_method: None,
+        quality_summary: None,
+        evidence_digests: Vec::new(),
+        source_id: None,
+    }
+}
+
+/// Dual-write a just-published legacy product into the catalog. Idempotent
+/// (catalog registration dedupes on identity); returns the catalog product id.
+pub async fn register_legacy_publication(
+    pool: &DbPool,
+    publication: &ProductPublication,
+    path: &Path,
+    created_at: &str,
+) -> Result<String> {
+    let draft = legacy_product_draft(
+        &publication.scene_id,
+        normalize_optional(&publication.field_id),
+        normalize_optional(&publication.season_id),
+        &publication.product_kind,
+        &path.to_string_lossy(),
+        Some(publication.spatial_ref.clone()),
+        publication.gsd_m_per_px,
+        created_at,
+    );
+    catalog::register_product(pool, &draft, created_at)
+        .await
+        .context("failed to dual-write product into catalog")
+}
+
+/// Backfill every legacy `products` row into `catalog_products`. Idempotent;
+/// returns the number of rows processed. Leaves the `products` table untouched.
+pub async fn backfill_products_to_catalog(pool: &DbPool) -> Result<usize> {
+    let rows = sqlx::query(
+        r#"
+        SELECT scene_id, field_id, season_id, kind, path, spatial_ref_json,
+               gsd_m_per_px, created_at
+        FROM products
+        "#,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut migrated = 0usize;
+    for row in &rows {
+        let scene_id: String = row.get("scene_id");
+        let field_id: Option<String> = row.get("field_id");
+        let season_id: Option<String> = row.get("season_id");
+        let kind: String = row.get("kind");
+        let path: String = row.get("path");
+        let spatial_ref_json: Option<String> = row.get("spatial_ref_json");
+        let gsd_m_per_px: Option<f64> = row.get("gsd_m_per_px");
+        let created_at: String = row.get("created_at");
+
+        let spatial_ref =
+            spatial_ref_json.and_then(|json| serde_json::from_str::<RasterSpatialRef>(&json).ok());
+        let draft = legacy_product_draft(
+            &scene_id,
+            field_id.and_then(|value| normalize_optional(&value)),
+            season_id.and_then(|value| normalize_optional(&value)),
+            &kind,
+            &path,
+            spatial_ref,
+            gsd_m_per_px,
+            &created_at,
+        );
+        catalog::register_product(pool, &draft, &created_at)
+            .await
+            .context("failed to backfill product into catalog")?;
+        migrated += 1;
+    }
+    Ok(migrated)
 }

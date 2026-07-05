@@ -20,6 +20,8 @@ use std::{
 use tracing::{error, info};
 use uuid::Uuid;
 
+pub mod product_sidecar;
+
 #[derive(Parser, Debug)]
 #[command(name = "lidar_mapper")]
 #[command(about = "LiDAR Mapper for point cloud processing")]
@@ -620,6 +622,33 @@ impl LidarMapper {
 
         // Save grid as image
         self.save_grid_image(&grid.cells, output_dir).await?;
+
+        // Emit the L2 product-record sidecar next to the occupancy grid (Track A
+        // phase 10b). Its inputs are the identity-bearing source scan refs; a
+        // later `geo_hub catalog register` pass walks it into the catalog.
+        let occupancy_product_path = output_dir.join("occupancy_grid.png");
+        let sidecar_timestamp = all_scans
+            .iter()
+            .map(|scan| scan.timestamp)
+            .min()
+            .map(|timestamp| timestamp.to_rfc3339())
+            .unwrap_or_default();
+        let sidecar_ctx = crate::product_sidecar::LidarSidecarContext {
+            scene_id: None,
+            timestamp: sidecar_timestamp,
+            algorithm_version: env!("CARGO_PKG_VERSION").to_string(),
+            source_id: None,
+        };
+        let sidecar_draft = crate::product_sidecar::draft_from_lidar_evidence(
+            &product_evidence,
+            &sidecar_ctx,
+            &occupancy_product_path,
+        );
+        crate::product_sidecar::write_lidar_product_sidecar(
+            &occupancy_product_path,
+            &sidecar_draft,
+        )
+        .await?;
 
         // Save point cloud
         self.save_point_cloud(&all_scans, output_dir).await?;
