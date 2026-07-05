@@ -8,6 +8,11 @@ shared = { path = "../shared" }
 thiserror = { workspace = true }
 tiff = "0.10"
 
+# JPEG 2000 band decode (Sentinel-2 L2A / Sen2Cor output). Pure-Rust
+# `openjp2` backend (source port of the reference OpenJPEG) — no C
+# toolchain or GDAL required.
+jpeg2k = { version = "0.10", default-features = false, features = ["openjp2"] }
+
 # Remote COG backend (feature `remote`): async range-read of tiled
 # Cloud-Optimized GeoTIFFs from HTTP/S3 object storage without downloading
 # whole files. Kept behind a feature so the default sync local-file path
@@ -18,14 +23,19 @@ async-trait = { version = "0.1", optional = true }
 bytes = { version = "1", optional = true }
 url = { version = "2", optional = true }
 
-# Tiled-GeoTIFF fixture builder (feature `test-util`): deterministic in-memory
-# COGs for network-free tests here and in downstream crates (geo_hub).
+# Test-fixture builders (feature `test-util`): deterministic in-memory tiled
+# COGs and reference-encoded JP2 bands for network-free tests here and in
+# downstream crates (geo_hub). `openjp2` is the same pure-Rust OpenJPEG port
+# `jpeg2k` decodes with; test-util exposes its ENCODER so fixtures are
+# conformant codestreams.
 flate2 = { version = "1", optional = true }
+openjp2 = { version = "0.6", features = ["file-io"], optional = true }
 
 [features]
 default = []
 remote = ["dep:async-tiff", "dep:object_store", "dep:async-trait", "dep:bytes", "dep:url"]
-test-util = ["dep:flate2"]
+test-util = ["dep:flate2", "dep:openjp2"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tempfile = "3"

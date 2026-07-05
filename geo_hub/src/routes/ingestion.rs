@@ -70,3 +70,26 @@ pub async fn register_hls(
         crate::hls::register_hls_dir(&state.pool, std::path::Path::new(&request.dir)).await?;
     Ok(Json(outcome))
 }
+
+impl From<crate::sen2cor_derive::Sen2CorDeriveError> for AppError {
+    fn from(err: crate::sen2cor_derive::Sen2CorDeriveError) -> Self {
+        match &err {
+            crate::sen2cor_derive::Sen2CorDeriveError::BandNotFound { .. } => AppError::NotFound,
+            _ if err.is_client_error() => AppError::BadRequest(err.to_string()),
+            _ => AppError::Anyhow(err.into()),
+        }
+    }
+}
+
+/// Derive NDVI locally from a registered Sen2Cor scene's 10 m JP2 bands
+/// (batch 24): decode red/NIR via `raster_io`'s JP2 reader, calibrate to
+/// reflectance, register an `ndvi` L2 with lineage to both band products.
+pub async fn derive_sen2cor_ndvi_route(
+    State(state): State<AppState>,
+    Json(request): Json<crate::sen2cor_derive::Sen2CorNdviRequest>,
+) -> AppResult<Json<crate::sen2cor_derive::Sen2CorNdviOutcome>> {
+    let outcome =
+        crate::sen2cor_derive::derive_sen2cor_ndvi(&state.pool, &state.config.data_root, &request)
+            .await?;
+    Ok(Json(outcome))
+}

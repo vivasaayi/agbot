@@ -35,6 +35,7 @@
 
 mod error;
 mod geotiff;
+mod jp2;
 #[cfg(feature = "remote")]
 mod remote;
 #[cfg(feature = "test-util")]
@@ -43,6 +44,7 @@ mod write;
 
 pub use error::RasterIoError;
 pub use geotiff::{GeoTiffInfo, GeoTiffReader, RasterBand, RasterDtype, RasterWindow};
+pub use jp2::{read_jp2_gray, Jp2Gray};
 #[cfg(feature = "remote")]
 pub use remote::{CogTileLayout, RemoteCogReader, RemoteFetchMetrics};
 pub use write::{

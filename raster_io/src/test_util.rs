@@ -310,3 +310,76 @@ pub fn build_tiled_geotiff(spec: &FixtureSpec) -> Vec<u8> {
     assert_eq!(out.len(), running as usize, "builder offset bookkeeping");
     out
 }
+
+// ---------------------------------------------------------------------------
+// JP2 fixture encoder (satellite pipeline batch 24)
+// ---------------------------------------------------------------------------
+
+/// Write a single-component unsigned 16-bit lossless J2K codestream, encoded
+/// by the reference OpenJPEG encoder (the same pure-Rust `openjp2` port the
+/// production decode path uses), so fixtures are conformant codestreams —
+/// exactly what Sentinel-2 band files contain.
+///
+/// Panics on encoder failure: this is a test fixture builder, not an API.
+pub fn write_jp2_gray(path: &std::path::Path, width: u32, height: u32, values: &[u16]) {
+    use openjp2::image::{opj_image_cmptparm_t, opj_image_create, opj_image_destroy};
+    use openjp2::openjpeg::*;
+    use std::ffi::CString;
+
+    assert_eq!(
+        values.len(),
+        width as usize * height as usize,
+        "values must be width*height"
+    );
+    assert!(
+        width.min(height) >= 4,
+        "encoder fixture needs at least 4x4 for 2 decomposition levels"
+    );
+
+    unsafe {
+        let mut params: opj_cparameters_t = std::mem::zeroed();
+        opj_set_default_encoder_parameters(&mut params);
+        params.numresolution = 3;
+        params.tcp_numlayers = 1;
+        params.tcp_rates[0] = 0.0; // lossless
+        params.cp_disto_alloc = 1;
+        assert_eq!(params.irreversible, 0, "default must be reversible 5/3");
+
+        let mut cmpt: opj_image_cmptparm_t = std::mem::zeroed();
+        cmpt.dx = 1;
+        cmpt.dy = 1;
+        cmpt.w = width;
+        cmpt.h = height;
+        cmpt.prec = 16;
+        cmpt.bpp = 16;
+        cmpt.sgnd = 0;
+        let image = opj_image_create(1, &mut cmpt, OPJ_CLRSPC_GRAY);
+        assert!(!image.is_null(), "opj_image_create");
+        (*image).x0 = 0;
+        (*image).y0 = 0;
+        (*image).x1 = width;
+        (*image).y1 = height;
+        let comps = (*image).comps_mut().expect("image components");
+        let data = comps[0].data_mut().expect("component buffer");
+        for (dst, src) in data.iter_mut().zip(values) {
+            *dst = i32::from(*src);
+        }
+
+        let codec = opj_create_compress(OPJ_CODEC_J2K);
+        assert!(!codec.is_null(), "opj_create_compress");
+        assert_eq!(opj_setup_encoder(codec, &mut params, image), 1, "setup");
+        let fname = CString::new(path.to_str().expect("utf-8 fixture path")).expect("no NUL");
+        let stream = opj_stream_create_default_file_stream(fname.as_ptr(), 0);
+        assert!(!stream.is_null(), "output stream");
+        assert_eq!(
+            opj_start_compress(codec, image, stream),
+            1,
+            "start_compress"
+        );
+        assert_eq!(opj_encode(codec, stream), 1, "encode");
+        assert_eq!(opj_end_compress(codec, stream), 1, "end_compress");
+        opj_stream_destroy(stream);
+        opj_destroy_codec(codec);
+        opj_image_destroy(image);
+    }
+}
