@@ -20,8 +20,20 @@
 //!
 //! Output is a binary water mask with per-pixel classes, the water fraction
 //! and area (when the GSD is known), and evidence recording the polarity and
-//! which method chose the threshold. JRC global-surface-water priors are
-//! future work (they would gate Otsu flips against a long-term reference).
+//! which method chose the threshold.
+//!
+//! **Prior gating (batch 25):** Otsu maximizes between-class variance
+//! blindly, so on confounded scenes (terrain/cloud shadow, dark soils,
+//! wind-roughened water) the class it labels "water" can be the wrong side
+//! of the cut — a polarity flip. When a long-term water-occurrence prior
+//! (JRC Global Surface Water) on the same grid is supplied, the Otsu
+//! classification is checked against the pixels the record is confident
+//! about (occurrence >= [`PRIOR_WATER_OCCURRENCE_MIN`] = usually water,
+//! <= [`PRIOR_LAND_OCCURRENCE_MAX`] = almost never water). If the Otsu
+//! labels agree with fewer than half of those pixels, the cut is inverted
+//! relative to decades of observations: the result is reason-coded
+//! ([`PriorGate::RejectedOtsuFlip`]) and classification falls back to the
+//! physical threshold instead of publishing a flipped mask.
 
 use crate::evidence::{deterministic_fingerprint, AnalysisEvidenceError};
 use crate::l3_product::{to_l3_draft, L3DraftContext};
@@ -47,6 +59,19 @@ pub const DEFAULT_SAR_MODE_SEPARATION: f32 = 3.0;
 /// Physical SAR water fallback (VV sigma0, dB): smooth water is specular
 /// and dark, so backscatter BELOW this reads as water.
 pub const FIXED_SAR_WATER_THRESHOLD: f32 = -15.0;
+
+/// JRC occurrence (percent of observations water) at or above this marks a
+/// pixel the long-term record calls water.
+pub const PRIOR_WATER_OCCURRENCE_MIN: f32 = 75.0;
+/// JRC occurrence at or below this marks a pixel almost never water.
+pub const PRIOR_LAND_OCCURRENCE_MAX: f32 = 5.0;
+/// The gate needs at least this many prior-water AND prior-land pixels to
+/// judge a flip; below it the prior is uninformative for the scene.
+pub const MIN_PRIOR_CLASS_PIXELS: u32 = 5;
+/// Otsu labels agreeing with fewer than this fraction of the
+/// prior-informative pixels mean the cut is flipped (the inverse labeling
+/// agrees better).
+pub const PRIOR_FLIP_AGREEMENT: f32 = 0.5;
 
 /// Which side of the threshold is water: high values (optical water indices,
 /// where water > land) or low values (SAR backscatter, where smooth water
@@ -131,6 +156,49 @@ pub struct WaterIndexRaster {
     pub gsd_m_per_px: Option<f64>,
 }
 
+/// A long-term water-occurrence prior (JRC Global Surface Water
+/// `occurrence` band, percent 0-100) on the same grid as the index raster.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WaterOccurrencePrior {
+    /// Catalog product id of the occurrence raster (becomes L3 lineage).
+    pub product_id: String,
+    /// Occurrence percent per pixel, row-major.
+    pub occurrence: Vec<f32>,
+    /// `true` = usable prior pixel.
+    pub valid_mask: Vec<bool>,
+}
+
+/// Outcome of checking the Otsu classification against the prior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PriorGate {
+    /// Otsu labels agree with the long-term record.
+    Passed,
+    /// Otsu labels contradict the record (inverse labeling agrees better);
+    /// classification fell back to the physical threshold.
+    RejectedOtsuFlip,
+    /// Too few confidently-water / confidently-land prior pixels to judge.
+    InsufficientPrior,
+    /// The threshold did not come from Otsu (fixed fallback already), so
+    /// there was no Otsu cut to gate.
+    OtsuNotUsed,
+}
+
+/// Prior evidence recorded when a prior was supplied.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WaterPriorEvidence {
+    pub prior_product_id: String,
+    pub water_occurrence_min: f32,
+    pub land_occurrence_max: f32,
+    /// Prior-informative pixel counts (valid in raster AND prior).
+    pub prior_water_pixels: u32,
+    pub prior_land_pixels: u32,
+    /// Fraction of prior-informative pixels the OTSU labels agreed with
+    /// (`None` when Otsu was not used or the prior was uninformative).
+    pub otsu_agreement: Option<f32>,
+    pub gate: PriorGate,
+}
+
 /// Evidence object for one extraction.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WaterExtentEvidence {
@@ -145,6 +213,8 @@ pub struct WaterExtentEvidence {
     pub min_class_fraction: f64,
     pub polarity: WaterPolarity,
     pub spatial_ref: RasterSpatialRef,
+    /// Prior-gate audit, present when an occurrence prior was supplied.
+    pub prior: Option<WaterPriorEvidence>,
     pub input_hash: String,
 }
 
@@ -174,6 +244,10 @@ pub enum WaterExtentError {
     MaskMismatch { expected: usize, actual: usize },
     #[error("raster has no valid pixels to threshold")]
     NoValidPixels,
+    #[error("occurrence prior has {actual} pixels, expected {expected}")]
+    PriorLengthMismatch { expected: usize, actual: usize },
+    #[error("occurrence prior pixel {pixel} is {value}, outside the [0, 100] percent domain (not a JRC occurrence raster?)")]
+    PriorOccurrenceOutOfRange { pixel: usize, value: f32 },
     #[error("grid spatial metadata is invalid: {reason}")]
     SpatialRef { reason: RasterSpatialRefError },
     #[error("evidence metadata failed: {0}")]
@@ -270,6 +344,17 @@ pub fn extract_water_extent(
     raster: &WaterIndexRaster,
     config: &WaterExtentConfig,
 ) -> Result<WaterExtentResult, WaterExtentError> {
+    extract_water_extent_with_prior(raster, config, None)
+}
+
+/// [`extract_water_extent`] with an optional long-term water-occurrence
+/// prior (JRC Global Surface Water) gating Otsu polarity flips — see the
+/// module docs for the gate semantics.
+pub fn extract_water_extent_with_prior(
+    raster: &WaterIndexRaster,
+    config: &WaterExtentConfig,
+    prior: Option<&WaterOccurrencePrior>,
+) -> Result<WaterExtentResult, WaterExtentError> {
     assert_raster_spatial_ref(Some(&raster.spatial_ref), raster.width, raster.height)
         .map_err(|reason| WaterExtentError::SpatialRef { reason })?;
     let pixel_count = raster.width as usize * raster.height as usize;
@@ -284,6 +369,26 @@ pub fn extract_water_extent(
             expected: pixel_count,
             actual: raster.valid_mask.len(),
         });
+    }
+    if let Some(prior) = prior {
+        if prior.occurrence.len() != pixel_count || prior.valid_mask.len() != pixel_count {
+            return Err(WaterExtentError::PriorLengthMismatch {
+                expected: pixel_count,
+                actual: if prior.occurrence.len() != pixel_count {
+                    prior.occurrence.len()
+                } else {
+                    prior.valid_mask.len()
+                },
+            });
+        }
+        for (pixel, (value, valid)) in prior.occurrence.iter().zip(&prior.valid_mask).enumerate() {
+            if *valid && !(0.0..=100.0).contains(value) {
+                return Err(WaterExtentError::PriorOccurrenceOutOfRange {
+                    pixel,
+                    value: *value,
+                });
+            }
+        }
     }
 
     // Data-driven histogram range over the valid values (works for bounded
@@ -333,10 +438,77 @@ pub fn extract_water_extent(
         }
     };
 
-    let is_water = |value: f32| match config.polarity {
+    let classify = |value: f32, threshold: f32| match config.polarity {
         WaterPolarity::HighValueIsWater => value > threshold,
         WaterPolarity::LowValueIsWater => value < threshold,
     };
+
+    // --- Prior gate: check the Otsu labels against the long-term record
+    // before publishing them (a flipped cut agrees with < half of the
+    // prior-informative pixels; the fallback threshold is the honest
+    // recovery, not silently inverting classes).
+    let (threshold, method, prior_evidence) = match prior {
+        None => (threshold, method, None),
+        Some(prior) => {
+            let mut prior_water = 0u32;
+            let mut prior_land = 0u32;
+            let mut agreeing = 0u32;
+            for pixel in 0..pixel_count {
+                let value = raster.values[pixel];
+                if !raster.valid_mask[pixel]
+                    || !value.is_finite()
+                    || !prior.valid_mask[pixel]
+                    || !prior.occurrence[pixel].is_finite()
+                {
+                    continue;
+                }
+                let occurrence = prior.occurrence[pixel];
+                let record_says_water = if occurrence >= PRIOR_WATER_OCCURRENCE_MIN {
+                    prior_water += 1;
+                    true
+                } else if occurrence <= PRIOR_LAND_OCCURRENCE_MAX {
+                    prior_land += 1;
+                    false
+                } else {
+                    continue; // intermittent water: uninformative
+                };
+                if classify(value, threshold) == record_says_water {
+                    agreeing += 1;
+                }
+            }
+            let mut evidence = WaterPriorEvidence {
+                prior_product_id: prior.product_id.clone(),
+                water_occurrence_min: PRIOR_WATER_OCCURRENCE_MIN,
+                land_occurrence_max: PRIOR_LAND_OCCURRENCE_MAX,
+                prior_water_pixels: prior_water,
+                prior_land_pixels: prior_land,
+                otsu_agreement: None,
+                gate: PriorGate::OtsuNotUsed,
+            };
+            if method != ThresholdMethod::Otsu {
+                (threshold, method, Some(evidence))
+            } else if prior_water < MIN_PRIOR_CLASS_PIXELS || prior_land < MIN_PRIOR_CLASS_PIXELS {
+                evidence.gate = PriorGate::InsufficientPrior;
+                (threshold, method, Some(evidence))
+            } else {
+                let agreement = agreeing as f32 / (prior_water + prior_land) as f32;
+                evidence.otsu_agreement = Some(agreement);
+                if agreement < PRIOR_FLIP_AGREEMENT {
+                    evidence.gate = PriorGate::RejectedOtsuFlip;
+                    (
+                        config.fixed_threshold,
+                        ThresholdMethod::FixedFallback,
+                        Some(evidence),
+                    )
+                } else {
+                    evidence.gate = PriorGate::Passed;
+                    (threshold, method, Some(evidence))
+                }
+            }
+        }
+    };
+
+    let is_water = |value: f32| classify(value, threshold);
     let mut classes = vec![WaterClass::Invalid; pixel_count];
     let mut water_pixels = 0u32;
     let mut land_pixels = 0u32;
@@ -355,13 +527,14 @@ pub fn extract_water_extent(
     }
 
     let input_hash = deterministic_fingerprint(&(
-        "water_extent_v2",
+        "water_extent_v3",
         &raster.product_id,
         &raster.index_kind,
         &raster.values,
         &raster.valid_mask,
         &raster.spatial_ref,
         config,
+        prior.map(|prior| (&prior.product_id, &prior.occurrence, &prior.valid_mask)),
     ))?;
 
     Ok(WaterExtentResult {
@@ -387,6 +560,7 @@ pub fn extract_water_extent(
             min_class_fraction: MIN_CLASS_FRACTION,
             polarity: config.polarity,
             spatial_ref: raster.spatial_ref.clone(),
+            prior: prior_evidence,
             input_hash,
         },
     })
@@ -408,10 +582,17 @@ pub struct WaterExtentL3Scope {
 }
 
 /// Map a water-extent result to an L3 catalog draft (kind `water_extent`).
+/// When a prior gated the extraction, the prior product joins the lineage
+/// and the gate outcome is identity-bearing (a gated mask is a different
+/// product from an ungated one).
 pub fn water_extent_l3_draft(
     result: &WaterExtentResult,
     scope: &WaterExtentL3Scope,
 ) -> ProductRecordDraft {
+    let mut input_product_ids = vec![result.evidence.input_product_id.clone()];
+    if let Some(prior) = &result.evidence.prior {
+        input_product_ids.push(prior.prior_product_id.clone());
+    }
     to_l3_draft(&L3DraftContext {
         kind: "water_extent".to_string(),
         algorithm_id: "water.extent_otsu".to_string(),
@@ -421,7 +602,7 @@ pub fn water_extent_l3_draft(
         scene_id: scope.scene_id.clone(),
         temporal_start: scope.temporal_start.clone(),
         temporal_end: scope.temporal_end.clone(),
-        input_product_ids: vec![result.evidence.input_product_id.clone()],
+        input_product_ids,
         parameters: serde_json::json!({
             "index_kind": result.evidence.index_kind,
             "method": result.evidence.method,
@@ -432,6 +613,7 @@ pub fn water_extent_l3_draft(
             "water_fraction": result.water_fraction,
             "water_area_m2": result.water_area_m2,
             "mask_codes": { "land": 0, "water": 1 },
+            "prior": result.evidence.prior,
         }),
         confidence: Some(f64::from(result.valid_fraction)),
         confidence_method: Some("valid_coverage_fraction".to_string()),
@@ -574,6 +756,165 @@ mod tests {
             draft.evidence_digests,
             vec![result.evidence.input_hash.clone()]
         );
+    }
+
+    /// Bimodal optical scene: 8 high (+0.5) and 8 low (-0.5) pixels. Otsu
+    /// labels the HIGH pixels water under optical polarity.
+    fn bimodal_values() -> Vec<f32> {
+        let mut values = vec![-0.5f32; 16];
+        for pixel in 0..8 {
+            values[pixel] = 0.5;
+        }
+        values
+    }
+
+    fn prior(occurrence: Vec<f32>) -> WaterOccurrencePrior {
+        WaterOccurrencePrior {
+            product_id: "jrc-occurrence-1".to_string(),
+            valid_mask: vec![true; occurrence.len()],
+            occurrence,
+        }
+    }
+
+    #[test]
+    fn prior_confirms_a_correct_otsu_cut() {
+        // Record agrees: the high pixels are long-term water (90%), the low
+        // pixels never water (0%). Gate passes, Otsu stands, agreement 1.0.
+        let mut occurrence = vec![0.0f32; 16];
+        for pixel in 0..8 {
+            occurrence[pixel] = 90.0;
+        }
+        let result = extract_water_extent_with_prior(
+            &raster(bimodal_values(), vec![true; 16]),
+            &WaterExtentConfig::optical(),
+            Some(&prior(occurrence)),
+        )
+        .unwrap();
+        assert_eq!(result.evidence.method, ThresholdMethod::Otsu);
+        let audit = result.evidence.prior.as_ref().unwrap();
+        assert_eq!(audit.gate, PriorGate::Passed);
+        assert_eq!(audit.prior_water_pixels, 8);
+        assert_eq!(audit.prior_land_pixels, 8);
+        assert_eq!(audit.otsu_agreement, Some(1.0));
+        assert_eq!(result.water_pixels, 8);
+    }
+
+    #[test]
+    fn prior_rejects_a_flipped_otsu_cut() {
+        // Confounded scene: the HIGH-value pixels (e.g. shadow artifacts)
+        // are pixels the record says are NEVER water, and the true water
+        // pixels read low. Otsu's water label contradicts every informative
+        // pixel (agreement 0 < 0.5) -> reason-coded flip, classification
+        // falls back to the physical threshold instead of publishing it as
+        // a trusted Otsu cut.
+        let mut occurrence = vec![90.0f32; 16];
+        for pixel in 0..8 {
+            occurrence[pixel] = 0.0; // high-value pixels: never water
+        }
+        let result = extract_water_extent_with_prior(
+            &raster(bimodal_values(), vec![true; 16]),
+            &WaterExtentConfig::optical(),
+            Some(&prior(occurrence)),
+        )
+        .unwrap();
+        assert_eq!(result.evidence.method, ThresholdMethod::FixedFallback);
+        assert_eq!(result.evidence.threshold, FIXED_WATER_THRESHOLD);
+        let audit = result.evidence.prior.as_ref().unwrap();
+        assert_eq!(audit.gate, PriorGate::RejectedOtsuFlip);
+        assert_eq!(audit.otsu_agreement, Some(0.0));
+        // Otsu's would-be threshold stays in the audit trail.
+        assert!(result.evidence.otsu_threshold.is_some());
+    }
+
+    #[test]
+    fn uninformative_prior_leaves_otsu_standing() {
+        // All intermittent water (30%): neither confidently water nor land.
+        let result = extract_water_extent_with_prior(
+            &raster(bimodal_values(), vec![true; 16]),
+            &WaterExtentConfig::optical(),
+            Some(&prior(vec![30.0; 16])),
+        )
+        .unwrap();
+        assert_eq!(result.evidence.method, ThresholdMethod::Otsu);
+        let audit = result.evidence.prior.as_ref().unwrap();
+        assert_eq!(audit.gate, PriorGate::InsufficientPrior);
+        assert_eq!(audit.otsu_agreement, None);
+        assert_eq!(audit.prior_water_pixels, 0);
+        assert_eq!(audit.prior_land_pixels, 0);
+    }
+
+    #[test]
+    fn prior_on_a_fallback_scene_records_otsu_not_used() {
+        // Unimodal all-land scene already falls back; nothing to gate.
+        let values: Vec<f32> = (0..16).map(|i| -0.4 + 0.001 * i as f32).collect();
+        let result = extract_water_extent_with_prior(
+            &raster(values, vec![true; 16]),
+            &WaterExtentConfig::optical(),
+            Some(&prior(vec![0.0; 16])),
+        )
+        .unwrap();
+        assert_eq!(result.evidence.method, ThresholdMethod::FixedFallback);
+        assert_eq!(
+            result.evidence.prior.as_ref().unwrap().gate,
+            PriorGate::OtsuNotUsed
+        );
+    }
+
+    #[test]
+    fn bad_priors_are_typed_errors_and_lineage_carries_the_prior() {
+        let raster16 = raster(bimodal_values(), vec![true; 16]);
+        assert!(matches!(
+            extract_water_extent_with_prior(
+                &raster16,
+                &WaterExtentConfig::optical(),
+                Some(&prior(vec![0.0; 4])),
+            ),
+            Err(WaterExtentError::PriorLengthMismatch { .. })
+        ));
+        assert!(matches!(
+            extract_water_extent_with_prior(
+                &raster16,
+                &WaterExtentConfig::optical(),
+                Some(&prior(
+                    std::iter::once(300.0)
+                        .chain(std::iter::repeat(0.0).take(15))
+                        .collect()
+                )),
+            ),
+            Err(WaterExtentError::PriorOccurrenceOutOfRange {
+                pixel: 0,
+                value
+            }) if value == 300.0
+        ));
+
+        // A gated result's L3 draft carries the prior in lineage + params.
+        let mut occurrence = vec![0.0f32; 16];
+        for pixel in 0..8 {
+            occurrence[pixel] = 90.0;
+        }
+        let result = extract_water_extent_with_prior(
+            &raster16,
+            &WaterExtentConfig::optical(),
+            Some(&prior(occurrence)),
+        )
+        .unwrap();
+        let draft = water_extent_l3_draft(
+            &result,
+            &WaterExtentL3Scope {
+                field_id: "field-1".to_string(),
+                season_id: "season-2026".to_string(),
+                scene_id: None,
+                temporal_start: "2026-06-01T00:00:00Z".to_string(),
+                temporal_end: "2026-06-01T23:59:59Z".to_string(),
+                source_id: None,
+            },
+        );
+        assert_eq!(draft.inputs.len(), 2);
+        assert!(draft
+            .inputs
+            .iter()
+            .any(|input| input.product_id == "jrc-occurrence-1"));
+        assert_eq!(draft.parameters["prior"]["gate"], "passed");
     }
 
     #[test]

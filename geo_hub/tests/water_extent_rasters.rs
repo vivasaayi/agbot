@@ -358,3 +358,145 @@ async fn sentinel1_backscatter_registers_and_extracts_water_low_polarity() -> Re
     assert_eq!(edges[0].input_product_id, sar_id);
     Ok(())
 }
+
+/// Batch 25: a registered JRC occurrence prior gates Otsu polarity flips.
+/// The confounded MNDWI scene reads HIGH exactly where the JRC record says
+/// water NEVER occurs (and low where water is permanent), so the Otsu cut
+/// is flipped: the derive must reason-code `rejected_otsu_flip`, fall back
+/// to the physical threshold, and lineage must include the prior. A second
+/// derive over an agreeing prior passes the gate and keeps Otsu.
+#[tokio::test]
+async fn jrc_prior_gates_otsu_polarity_flips() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = ctx(&tmp).await?;
+
+    // Register the JRC occurrence tile: pixels 0..8 never water (0%),
+    // pixels 8.. permanent water (90%).
+    let jrc_dir = tmp.path().join("jrc");
+    std::fs::create_dir_all(&jrc_dir)?;
+    let mut occurrence = vec![90.0f32; 16];
+    for pixel in 0..8 {
+        occurrence[pixel] = 0.0;
+    }
+    write_geotiff_f32(
+        &jrc_dir.join("occurrence_70E_20Nv1_4_2021.tif"),
+        4,
+        4,
+        &occurrence,
+        &GeoTiffTags {
+            epsg: Some(EPSG),
+            geo_transform: Some(TRANSFORM),
+            nodata: Some(f64::from(NODATA)),
+        },
+    )?;
+    std::fs::write(jrc_dir.join("readme.txt"), b"not jrc")?;
+    let (status, bytes) = send(
+        &ctx.app,
+        "POST",
+        "/api/water-management/jrc/register",
+        Some(json!({ "dir": jrc_dir.to_string_lossy() })),
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let outcome: serde_json::Value = serde_json::from_slice(&bytes)?;
+    let registered = outcome["registered"].as_array().unwrap();
+    assert_eq!(registered.len(), 1);
+    assert_eq!(outcome["skipped"], json!(["readme.txt"]));
+    let prior_id = registered[0][1].as_str().unwrap().to_string();
+    let prior = catalog::get_product(&ctx.pool, &prior_id).await?.unwrap();
+    assert_eq!(prior.kind, "water_occurrence");
+    assert_eq!(prior.source_id.as_deref(), Some("jrc-gsw"));
+
+    // Confounded scene: HIGH (+0.5) on the never-water pixels, low (-0.5)
+    // on the permanent-water pixels -> Otsu's water label is flipped.
+    let mut values = vec![-0.5f32; 16];
+    for pixel in 0..8 {
+        values[pixel] = 0.5;
+    }
+    let mndwi_id = register_index(&ctx, &tmp, "mndwi", values).await?;
+    let (status, bytes) = send(
+        &ctx.app,
+        "POST",
+        "/api/water-management/extent/derive",
+        Some(json!({
+            "product_id": mndwi_id,
+            "field_id": "field-1",
+            "season_id": "season-2026",
+            "prior_product_id": prior_id,
+        })),
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let outcome: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(outcome["prior_gate"], "rejected_otsu_flip");
+    assert_eq!(outcome["method"], "fixed_fallback");
+    assert_eq!(outcome["threshold"], 0.0);
+    let extent_id = outcome["water_extent_product_id"].as_str().unwrap();
+
+    // The L3 carries the gate audit as identity-bearing parameters and the
+    // prior in its lineage.
+    let extent = catalog::get_product(&ctx.pool, extent_id).await?.unwrap();
+    assert_eq!(extent.parameters["prior"]["gate"], "rejected_otsu_flip");
+    assert_eq!(extent.parameters["prior"]["otsu_agreement"], 0.0);
+    let edges = catalog::trace_inputs(&ctx.pool, extent_id).await?;
+    let inputs: Vec<&str> = edges.iter().map(|e| e.input_product_id.as_str()).collect();
+    assert!(inputs.contains(&mndwi_id.as_str()));
+    assert!(inputs.contains(&prior_id.as_str()));
+
+    // Agreeing scene on a second index product: gate passes, Otsu stands,
+    // and the product id differs from the gated one (identity-bearing).
+    let mut agreeing = vec![0.5f32; 16];
+    for pixel in 0..8 {
+        agreeing[pixel] = -0.5; // never-water pixels read low: consistent
+    }
+    let mndwi2_id = register_index(&ctx, &tmp, "ndwi", agreeing).await?;
+    let (status, bytes) = send(
+        &ctx.app,
+        "POST",
+        "/api/water-management/extent/derive",
+        Some(json!({
+            "product_id": mndwi2_id,
+            "field_id": "field-1",
+            "season_id": "season-2026",
+            "prior_product_id": prior_id,
+        })),
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let outcome: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(outcome["prior_gate"], "passed");
+    assert_eq!(outcome["method"], "otsu");
+    assert_ne!(outcome["water_extent_product_id"], extent_id);
+
+    // A non-prior product id is refused as a caller error.
+    let (status, _) = send(
+        &ctx.app,
+        "POST",
+        "/api/water-management/extent/derive",
+        Some(json!({
+            "product_id": mndwi2_id,
+            "field_id": "field-1",
+            "season_id": "season-2026",
+            "prior_product_id": mndwi_id,
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    Ok(())
+}

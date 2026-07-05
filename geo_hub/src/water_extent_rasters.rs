@@ -12,8 +12,9 @@
 use std::path::{Path, PathBuf};
 
 use post_processor::water_extent::{
-    extract_water_extent, water_extent_l3_draft, ThresholdMethod, WaterClass, WaterExtentConfig,
-    WaterExtentError, WaterExtentL3Scope, WaterIndexRaster,
+    extract_water_extent_with_prior, water_extent_l3_draft, PriorGate, ThresholdMethod, WaterClass,
+    WaterExtentConfig, WaterExtentError, WaterExtentL3Scope, WaterIndexRaster,
+    WaterOccurrencePrior,
 };
 use raster_io::{write_geotiff_f32, GeoTiffTags};
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,10 @@ pub const OPTICAL_WATER_INDEX_KINDS: &[&str] = &["mndwi", "ndwi", "aweinsh", "aw
 pub const SAR_WATER_KINDS: &[&str] = &["sar_vv", "sar_vh", "sar_backscatter"];
 /// Source id stamped on Sentinel-1 backscatter registrations.
 pub const SENTINEL1_SOURCE_ID: &str = "sentinel-1-grd";
+/// Source id stamped on JRC Global Surface Water registrations.
+pub const JRC_GSW_SOURCE_ID: &str = "jrc-gsw";
+/// Catalog kind of a registered occurrence prior raster.
+pub const WATER_OCCURRENCE_KIND: &str = "water_occurrence";
 
 /// Pick the extraction config for a product kind, or `None` if the kind is
 /// not a supported water source.
@@ -61,6 +66,10 @@ pub enum WaterExtentRasterError {
     Raster(#[from] raster_io::RasterIoError),
     #[error("catalog registration failed: {0}")]
     Catalog(#[from] CatalogError),
+    #[error("prior product {product_id} kind {kind:?} is not a {WATER_OCCURRENCE_KIND} raster")]
+    NotAPrior { product_id: String, kind: String },
+    #[error("prior product {product_id} is not on the water-index raster's grid")]
+    PriorGridMismatch { product_id: String },
     #[error("failed to store {what}: {source}")]
     Store {
         what: &'static str,
@@ -74,6 +83,8 @@ impl WaterExtentRasterError {
         match self {
             WaterExtentRasterError::NotFound(_)
             | WaterExtentRasterError::NotWaterIndex { .. }
+            | WaterExtentRasterError::NotAPrior { .. }
+            | WaterExtentRasterError::PriorGridMismatch { .. }
             | WaterExtentRasterError::Extent(_) => true,
             WaterExtentRasterError::Shared(shared) => shared.is_client_error(),
             _ => false,
@@ -88,6 +99,10 @@ pub struct WaterExtentDeriveRequest {
     pub product_id: String,
     pub field_id: String,
     pub season_id: String,
+    /// Catalog id of a registered `water_occurrence` prior (JRC Global
+    /// Surface Water) on the same grid, gating Otsu polarity flips.
+    #[serde(default)]
+    pub prior_product_id: Option<String>,
 }
 
 /// Outcome of one derivation.
@@ -101,6 +116,8 @@ pub struct WaterExtentDeriveOutcome {
     pub water_fraction: f32,
     pub water_area_m2: Option<f64>,
     pub valid_fraction: f32,
+    /// Prior-gate outcome when a prior was supplied.
+    pub prior_gate: Option<PriorGate>,
     pub water_extent_artifact: PathBuf,
     pub water_extent_stac_item_href: String,
     pub water_extent_tiles_href: String,
@@ -123,7 +140,37 @@ pub async fn derive_water_extent(
         })?;
     let raster = load_raster(Path::new(geotiff_artifact_path(&product)?))?;
 
-    let result = extract_water_extent(
+    // Optional JRC occurrence prior on the exact same grid.
+    let prior = match &request.prior_product_id {
+        None => None,
+        Some(prior_id) => {
+            let prior_product = catalog::get_product(pool, prior_id)
+                .await?
+                .ok_or_else(|| WaterExtentRasterError::NotFound(prior_id.clone()))?;
+            if prior_product.kind != WATER_OCCURRENCE_KIND {
+                return Err(WaterExtentRasterError::NotAPrior {
+                    product_id: prior_id.clone(),
+                    kind: prior_product.kind.clone(),
+                });
+            }
+            let prior_raster = load_raster(Path::new(geotiff_artifact_path(&prior_product)?))?;
+            if prior_raster.epsg != raster.epsg
+                || prior_raster.geo_transform != raster.geo_transform
+                || (prior_raster.width, prior_raster.height) != (raster.width, raster.height)
+            {
+                return Err(WaterExtentRasterError::PriorGridMismatch {
+                    product_id: prior_id.clone(),
+                });
+            }
+            Some(WaterOccurrencePrior {
+                product_id: prior_product.product_id.clone(),
+                occurrence: prior_raster.values,
+                valid_mask: prior_raster.valid_mask,
+            })
+        }
+    };
+
+    let result = extract_water_extent_with_prior(
         &WaterIndexRaster {
             product_id: product.product_id.clone(),
             index_kind: product.kind.clone(),
@@ -135,6 +182,7 @@ pub async fn derive_water_extent(
             gsd_m_per_px: product.gsd_m_per_px,
         },
         &config,
+        prior.as_ref(),
     )?;
 
     // --- Mask GeoTIFF + L3 registration.
@@ -207,6 +255,7 @@ pub async fn derive_water_extent(
         ),
         water_extent_product_id,
         input_product_id: product.product_id,
+        prior_gate: result.evidence.prior.as_ref().map(|prior| prior.gate),
         method: result.evidence.method,
         threshold: result.evidence.threshold,
         water_pixels: result.water_pixels,
@@ -369,4 +418,149 @@ pub async fn register_sentinel1_dir(
         }
     }
     Ok(outcome)
+}
+
+// ---------------------------------------------------------------------------
+// JRC Global Surface Water registration (batch 25)
+// ---------------------------------------------------------------------------
+//
+// The JRC GSW `occurrence` band (Pekel et al., percent of valid observations
+// water over 1984-2021) is the long-term reference that gates Otsu polarity
+// flips. Download is out-of-band (tiles from the JRC data portal, or
+// clipped/reprojected onto the working grid with GDAL); this registers those
+// occurrence GeoTIFFs as `water_occurrence` catalog products the derive
+// route accepts as `prior_product_id`.
+
+/// (tile token, dataset version) parsed from a JRC GSW occurrence filename,
+/// e.g. `occurrence_70E_20Nv1_4_2021.tif` -> (`70E_20N`, `1_4_2021`).
+pub fn parse_jrc_filename(name: &str) -> Option<(String, String)> {
+    let stem = name
+        .strip_suffix(".tif")
+        .or_else(|| name.strip_suffix(".tiff"))?;
+    let rest = stem.strip_prefix("occurrence_")?;
+    // Tile token ends at the `v` introducing the version.
+    let v_at = rest.rfind('v')?;
+    let (tile, version) = (rest.get(..v_at)?, rest.get(v_at + 1..)?);
+    if tile.is_empty() || version.is_empty() {
+        return None;
+    }
+    Some((tile.to_string(), version.to_string()))
+}
+
+/// Build the draft for one JRC occurrence GeoTIFF. The record period is the
+/// dataset's own (1984-2021 for v1.4); occurrence is percent 0-100.
+pub fn jrc_occurrence_draft(path: &Path, tile: &str, version: &str) -> ProductRecordDraft {
+    ProductRecordDraft {
+        level: ProductLevel::L2,
+        kind: WATER_OCCURRENCE_KIND.to_string(),
+        algorithm_id: "jrc.gsw.occurrence.ingest".to_string(),
+        algorithm_version: "1.0.0".to_string(),
+        parameters: serde_json::json!({
+            "dataset": "JRC Global Surface Water",
+            "provider": "EC Joint Research Centre",
+            "band": "occurrence",
+            "units": "percent_of_observations_water",
+            "tile": tile,
+            "version": version,
+        }),
+        inputs: Vec::new(),
+        scope: ProductScope {
+            farm_id: None,
+            field_id: None,
+            season_id: None,
+            scene_id: Some(format!("jrc-gsw-occurrence-{tile}-v{version}")),
+            // The GSW v1.x record period (Landsat archive coverage).
+            temporal_start: "1984-03-16T00:00:00Z".to_string(),
+            temporal_end: "2021-12-31T23:59:59Z".to_string(),
+        },
+        spatial_ref: None,
+        gsd_m_per_px: None,
+        artifact: Some(ProductArtifact {
+            format: "tif".to_string(),
+            path: path.to_string_lossy().to_string(),
+            checksum_sha256: None,
+        }),
+        quality_mask: None,
+        confidence: None,
+        confidence_method: None,
+        quality_summary: None,
+        evidence_digests: Vec::new(),
+        source_id: Some(JRC_GSW_SOURCE_ID.to_string()),
+    }
+}
+
+/// Outcome of a JRC directory registration.
+#[derive(Debug, Clone, Serialize)]
+pub struct JrcRegisterOutcome {
+    pub registered: Vec<(String, String)>,
+    pub skipped: Vec<String>,
+}
+
+/// Register every JRC occurrence GeoTIFF in a local directory (idempotent;
+/// non-matching names skipped).
+pub async fn register_jrc_dir(
+    pool: &DbPool,
+    dir: &Path,
+) -> Result<JrcRegisterOutcome, WaterExtentRasterError> {
+    let mut names: Vec<(String, PathBuf)> = std::fs::read_dir(dir)
+        .map_err(|source| WaterExtentRasterError::Store {
+            what: "jrc directory listing",
+            source,
+        })?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            Some((
+                entry.file_name().to_string_lossy().to_string(),
+                entry.path(),
+            ))
+        })
+        .collect();
+    names.sort();
+    let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let mut outcome = JrcRegisterOutcome {
+        registered: Vec::new(),
+        skipped: Vec::new(),
+    };
+    for (name, path) in names {
+        match parse_jrc_filename(&name) {
+            Some((tile, version)) => {
+                let draft = jrc_occurrence_draft(&path, &tile, &version);
+                let product_id = catalog::register_product_with_actor(
+                    pool,
+                    &draft,
+                    &provenance::ActorIdentity::system("geo_hub:jrc_ingest"),
+                    &created_at,
+                )
+                .await?;
+                outcome.registered.push((name, product_id));
+            }
+            None => outcome.skipped.push(name),
+        }
+    }
+    Ok(outcome)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jrc_filename_parsing_is_pinned() {
+        assert_eq!(
+            parse_jrc_filename("occurrence_70E_20Nv1_4_2021.tif"),
+            Some(("70E_20N".to_string(), "1_4_2021".to_string()))
+        );
+        assert_eq!(
+            parse_jrc_filename("occurrence_80W_10Sv1_4_2021.tiff"),
+            Some(("80W_10S".to_string(), "1_4_2021".to_string()))
+        );
+        for bad in [
+            "seasonality_70E_20Nv1_4_2021.tif", // other GSW band
+            "occurrence_70E_20N.tif",           // no version
+            "occurrencev1_4_2021.tif",          // no tile
+            "readme.txt",
+        ] {
+            assert_eq!(parse_jrc_filename(bad), None, "{bad}");
+        }
+    }
 }

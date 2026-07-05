@@ -8,8 +8,9 @@ use serde::Deserialize;
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 use crate::water_extent_rasters::{
-    derive_water_extent, list_water_extent_products, register_sentinel1_dir, SarRegisterOutcome,
-    WaterExtentDeriveOutcome, WaterExtentDeriveRequest, WaterExtentRasterError,
+    derive_water_extent, list_water_extent_products, register_jrc_dir, register_sentinel1_dir,
+    JrcRegisterOutcome, SarRegisterOutcome, WaterExtentDeriveOutcome, WaterExtentDeriveRequest,
+    WaterExtentRasterError,
 };
 
 impl From<WaterExtentRasterError> for AppError {
@@ -33,6 +34,22 @@ pub async fn register_sentinel1_route(
     Json(request): Json<SarRegisterRequest>,
 ) -> AppResult<Json<SarRegisterOutcome>> {
     let outcome = register_sentinel1_dir(&state.pool, std::path::Path::new(&request.dir)).await?;
+    Ok(Json(outcome))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct JrcRegisterRequest {
+    /// Server-local directory of JRC GSW occurrence GeoTIFFs.
+    pub dir: String,
+}
+
+/// Register JRC Global Surface Water occurrence rasters (batch 25) — the
+/// long-term priors the extent derive accepts as `prior_product_id`.
+pub async fn register_jrc_route(
+    State(state): State<AppState>,
+    Json(request): Json<JrcRegisterRequest>,
+) -> AppResult<Json<JrcRegisterOutcome>> {
+    let outcome = register_jrc_dir(&state.pool, std::path::Path::new(&request.dir)).await?;
     Ok(Json(outcome))
 }
 
