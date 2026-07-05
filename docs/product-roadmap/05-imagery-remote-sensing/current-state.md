@@ -45,3 +45,35 @@ early-to-strong partial: the CLI surface, index catalog, sensor presets, and ove
 - Thermal LST computed through the full radiance → BT → emissivity chain, with NDVI-derived emissivity when available.
 - Every product linked to scene/field/season and published as an overlay the viewer (`08`) trusts and the advisor (`09`) cites.
 - Fixture-first: the pipeline runs on captured `04` fixtures before real-hardware inputs, with unit tests on the index/thermal math.
+
+## Update (2026-07): satellite ingestion and derivation shipped
+
+The gaps list above predates the satellite intelligence pipeline
+(`docs/design/satellite-intelligence-pipeline.md`, batches 1-27). This
+domain is no longer drone-only:
+
+- **Satellite ingestion**: Earth Search STAC scene search + AOI-windowed
+  remote-COG band reads (`geo_hub/src/satellite_derivation.rs`,
+  `raster_io` remote backend); USGS Landsat live ingest through the
+  normalized `commit_ingest` contract (`geo_hub/src/landsat.rs`); Sen2Cor
+  L1C→L2A orchestration with JP2 band decode — pure-Rust OpenJPEG port, no
+  GDAL (`geo_hub/src/sen2cor.rs`, `sen2cor_derive.rs`, `raster_io/src/jp2.rs`);
+  HLS v2.0 harmonized Landsat+Sentinel Int16 ingestion with Fmask cloud
+  masking (`geo_hub/src/hls.rs`); Sentinel-1 SAR backscatter and CHIRPS
+  precipitation registration.
+- **Radiometric calibration is real**: per-sensor DN→reflectance profiles
+  incl. the Sentinel-2 baseline-04.00 BOA offset
+  (`imagery_processor/src/pipeline/calibration.rs`), applied before index
+  math; QA/Fmask masking applied before statistics.
+- **Thermal LST chain is complete**: DN→radiance→brightness temperature→
+  emissivity-corrected LST as a pure engine (`post_processor/src/lst.rs`)
+  registered as catalog `lst` L2 products feeding TCI/VHI.
+- **Provenance handoff exists**: every live pipeline (`indices`, `masks`,
+  `thermal`, `classify`) writes `*.product_record.json` sidecars
+  (`imagery_processor/src/product_sidecar.rs`) that register into the
+  catalog with L0→L3 lineage; products carry scene/field/season scope and
+  web-tile through `geo_hub`.
+
+Remaining from the original gaps: broader fixture coverage for the drone
+(`04`) capture path and the `gdal-io` GeoTIFF hardening for the CLI PNG
+path (the catalog path uses `raster_io` GeoTIFFs and does not need GDAL).

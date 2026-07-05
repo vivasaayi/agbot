@@ -243,19 +243,17 @@ routing (route_alert_to_recipients/evaluate_alert_preference), escalation
 - TA-09b (8f84fa6): post_processor AnalysisResult::to_product_draft +
   ResultType::product_kind — analysis result self-describes as an L3 draft
   (delegates to l3_draft_from_request; identity invariant preserved). 2 tests.
-- REMAINING (next batch, a coherent live-route wiring set):
-  - TA-07b: the imagery sidecar API (product_sidecar::draft_from_evidence +
-    write_product_sidecar) is DANGLING (no callers). Wire it into the live
-    pipelines (indices.rs process_one ~line 549-596 builds reproducibility +
-    out_path; call draft_from_evidence+write_product_sidecar before meta move).
-    Design decision: how to derive L1 input refs + ProductScope in the CLI path
-    (no catalog product ids there — derive from evidence.resolved_bands + image_id
-    scene). Also masks/thermal/classify.
-  - TA-05b: route live landsat/Sentinel ingest through commit_ingest.
-  - TA-10b: Finding/Recommendation/Report lineage from live geo_hub create routes
-    + lidar_mapper sidecars.
-  Then full-workspace `cargo check` (use CARGO_INCREMENTAL=0; disk tight) +
-  `just gis-test`.
+- ALL WIRING FOLLOW-ONS VERIFIED DONE (2026-07-05 audit):
+  - TA-07b DONE: write_product_sidecar called from all four live pipelines
+    (indices.rs:648, masks.rs:465, thermal.rs:626, classify.rs:363).
+  - TA-05b DONE: live landsat ingest -> commit_ingest (landsat.rs:1582,
+    "Track A phase 5b"); satellite_derivation.rs:849 and sen2cor.rs:487 too.
+  - TA-10b DONE: Finding (applications.rs:182), Recommendation
+    (routes/workspace.rs:268, routes.rs:11883), Report (routes.rs:11918)
+    lineage from live routes; lidar_mapper/src/product_sidecar.rs exists.
+  - GIS gates green 2026-07-05: shared 60, geo_hub 36 suites, geo_viewer 60,
+    acceptance_ 5. Roadmap-doc debts paid: 05-imagery + 17-drought
+    current-state.md gained "Update (2026-07)" shipped-state sections.
 
 ## Disk note
 Build ran target/ to 100% (No space left on device). Recovered by removing
