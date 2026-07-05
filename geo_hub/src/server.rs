@@ -389,6 +389,11 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::derive_spi_raster_route),
         )
         .route(
+            "/api/landcover/derive",
+            post(routes::derive_landcover_route),
+        )
+        .route("/api/landcover/rasters", get(routes::list_landcover_route))
+        .route(
             "/api/marketplace/accounts",
             get(routes::list_marketplace_accounts).post(routes::create_marketplace_account),
         )

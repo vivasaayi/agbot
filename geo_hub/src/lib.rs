@@ -11,6 +11,7 @@ pub mod earth_search;
 pub mod error;
 pub mod ingest;
 pub mod ingest_contract;
+pub mod landcover_rasters;
 pub mod landsat;
 pub mod product_catalog;
 pub mod product_tiler;

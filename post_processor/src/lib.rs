@@ -21,6 +21,7 @@ pub mod l3_product;
 pub mod lidar_analysis;
 pub mod lidar_change;
 pub mod ndvi_analysis;
+pub mod phenology;
 pub mod product_anomalies;
 pub mod report_generator;
 pub mod spi;

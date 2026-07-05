@@ -119,8 +119,12 @@ pub struct Colormap {
     /// Inclusive value domain mapped onto the ramp; values clamp to it.
     pub domain: (f32, f32),
     /// RGB stops at evenly spaced fractions of the domain (first = domain.0,
-    /// last = domain.1).
+    /// last = domain.1). For categorical maps, one color per integer class
+    /// code from `domain.0` upward.
     pub stops: &'static [[u8; 3]],
+    /// Categorical: values round to integer class codes and pick a stop
+    /// directly (no interpolation).
+    pub categorical: bool,
 }
 
 /// Brown -> pale yellow -> green: vegetation indices.
@@ -136,6 +140,17 @@ const RAMP_DIVERGING_DRY_WET: &[[u8; 3]] = &[[178, 24, 43], [247, 247, 247], [33
 const RAMP_PRECIP: &[[u8; 3]] = &[[247, 251, 255], [8, 69, 148]];
 /// Black -> white fallback for unknown kinds.
 const RAMP_GRAY: &[[u8; 3]] = &[[0, 0, 0], [255, 255, 255]];
+/// Categorical land-cover class colors, codes 1..=6: water blue, bare tan,
+/// annual crop yellow, tree/perennial dark green, grassland light green,
+/// unknown gray.
+const RAMP_LANDCOVER: &[[u8; 3]] = &[
+    [24, 100, 190],
+    [210, 180, 140],
+    [228, 180, 60],
+    [0, 100, 0],
+    [154, 205, 50],
+    [128, 128, 128],
+];
 
 /// Colormap for a catalog product kind. Vegetation indices use the full
 /// theoretical [-1, 1] domain; water and moisture indices likewise; drought
@@ -148,15 +163,18 @@ pub fn colormap_for_kind(kind: &str) -> Colormap {
         | "nbr" => Colormap {
             domain: (-1.0, 1.0),
             stops: RAMP_VEGETATION,
+            categorical: false,
         },
         "ndwi" | "mndwi" | "ndmi" | "aweinsh" | "aweish" => Colormap {
             domain: (-1.0, 1.0),
             stops: RAMP_WATER,
+            categorical: false,
         },
         "drought_index" | "drought.vci" | "drought.tci" | "drought.vhi" | "vci" | "tci" | "vhi" => {
             Colormap {
                 domain: (0.0, 100.0),
                 stops: RAMP_CONDITION,
+                categorical: false,
             }
         }
         // SPI is a standard-normal quantile; McKee classes end at ±2, the
@@ -164,14 +182,24 @@ pub fn colormap_for_kind(kind: &str) -> Colormap {
         "spi" => Colormap {
             domain: (-3.0, 3.0),
             stops: RAMP_DIVERGING_DRY_WET,
+            categorical: false,
         },
         "precipitation" => Colormap {
             domain: (0.0, 500.0),
             stops: RAMP_PRECIP,
+            categorical: false,
+        },
+        // Tier-1 land-cover classes (codes 1..=6: water, bare, annual crop,
+        // tree/perennial, grassland, unknown).
+        "landcover_rule" => Colormap {
+            domain: (1.0, 6.0),
+            stops: RAMP_LANDCOVER,
+            categorical: true,
         },
         _ => Colormap {
             domain: (-1.0, 1.0),
             stops: RAMP_GRAY,
+            categorical: false,
         },
     }
 }
@@ -181,6 +209,10 @@ impl Colormap {
     /// between adjacent stops.
     pub fn rgb(&self, value: f32) -> [u8; 3] {
         let (lo, hi) = self.domain;
+        if self.categorical {
+            let index = (f64::from(value).round() - f64::from(lo)).max(0.0) as usize;
+            return self.stops[index.min(self.stops.len() - 1)];
+        }
         let t = f64::from((value.clamp(lo, hi) - lo) / (hi - lo));
         let segments = self.stops.len() - 1;
         let scaled = t * segments as f64;
@@ -666,6 +698,19 @@ mod tests {
         let (fx, fy) = tile_containing(48.0, 2.0, 8);
         let far = render_web_tile(&source, &colormap_for_kind("spi"), 8, fx, fy).unwrap();
         assert_eq!(far.opaque_pixels, 0);
+    }
+
+    #[test]
+    fn landcover_colormap_is_categorical_with_exact_class_colors() {
+        let landcover = colormap_for_kind("landcover_rule");
+        assert!(landcover.categorical);
+        assert_eq!(landcover.rgb(1.0), [24, 100, 190]); // water
+        assert_eq!(landcover.rgb(3.0), [228, 180, 60]); // annual crop
+        assert_eq!(landcover.rgb(3.4), [228, 180, 60]); // rounds to code 3
+        assert_eq!(landcover.rgb(6.0), [128, 128, 128]); // unknown
+                                                         // Out-of-range codes clamp instead of panicking.
+        assert_eq!(landcover.rgb(0.0), [24, 100, 190]);
+        assert_eq!(landcover.rgb(9.0), [128, 128, 128]);
     }
 
     #[test]
