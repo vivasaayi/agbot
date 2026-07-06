@@ -531,3 +531,119 @@ async fn mndwi_and_ndmi_derive_across_resolutions() -> Result<()> {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     Ok(())
 }
+
+/// Batch 31: the full local burn-severity chain composes — two Sen2Cor
+/// scenes (pre/post fire) each derive an `nbr` L2 via the batch-30 spec,
+/// and the batch-14 dNBR route consumes them directly. Pre-fire NBR = 0.5
+/// (B8A 0.6 / B12 0.2), post-fire NBR = 0 (0.2 / 0.2), so dNBR = 0.5
+/// everywhere: Key & Benson moderate-high severity (0.44..0.66).
+#[tokio::test]
+async fn local_nbr_pair_composes_into_dnbr_burn_severity() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = ctx(&tmp).await?;
+
+    /// Minimal L2A SAFE with just the 20 m NBR bands + tile metadata.
+    fn fabricate_nbr_safe(
+        output_dir: &Path,
+        l2a_name: &str,
+        b8a_dn: u16,
+        b12_dn: u16,
+    ) -> Result<()> {
+        let granule = output_dir
+            .join(l2a_name)
+            .join("GRANULE")
+            .join("L2A_T43PFN_A046739");
+        let img20 = granule.join("IMG_DATA").join("R20m");
+        std::fs::create_dir_all(&img20)?;
+        write_jp2_gray(&img20.join("T43PFN_B8A_20m.jp2"), 4, 4, &[b8a_dn; 16]);
+        write_jp2_gray(&img20.join("T43PFN_B12_20m.jp2"), 4, 4, &[b12_dn; 16]);
+        std::fs::write(granule.join("MTD_TL.xml"), TILE_XML)?;
+        std::fs::write(output_dir.join(l2a_name).join("MTD_MSIL2A.xml"), b"<l2a/>")?;
+        Ok(())
+    }
+
+    // Register a pre-fire (June) and a post-fire (August) scene.
+    let mut nbr_ids = Vec::new();
+    for (stamp, b8a_dn, b12_dn) in [
+        ("20240601T051651", 7000u16, 3000u16),
+        ("20240801T051651", 3000, 3000),
+    ] {
+        let l1c_name = format!("S2A_MSIL1C_{stamp}_N0510_R062_T43PFN_{stamp}.SAFE");
+        let l2a_name = format!("S2A_MSIL2A_{stamp}_N0510_R062_T43PFN_{stamp}.SAFE");
+        let scene_id = l1c_name.trim_end_matches(".SAFE").to_string();
+        let input = tmp.path().join(&l1c_name);
+        std::fs::create_dir_all(&input)?;
+        std::fs::write(input.join("MTD_MSIL1C.xml"), b"<l1c/>")?;
+        let output_dir = tmp.path().join(format!("l2a_out_{stamp}"));
+        std::fs::create_dir_all(&output_dir)?;
+        fabricate_nbr_safe(&output_dir, &l2a_name, b8a_dn, b12_dn)?;
+        let config = Sen2CorConfig {
+            command: vec![
+                "noop".to_string(),
+                "{input}".to_string(),
+                "{output_dir}".to_string(),
+            ],
+        };
+        run_sen2cor(&ctx.pool, &NoopRunner, &config, &input, &output_dir).await?;
+
+        let (status, outcome) = send(
+            &ctx.app,
+            "POST",
+            "/api/ingest/sen2cor/index/derive",
+            Some(json!({ "scene_id": scene_id, "index": "nbr" })),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{outcome}");
+        nbr_ids.push(outcome["index_product_id"].as_str().unwrap().to_string());
+    }
+
+    // The batch-14 dNBR route consumes the two local NBR products directly.
+    let (status, outcome) = send(
+        &ctx.app,
+        "POST",
+        "/api/change-detection/dnbr/derive",
+        Some(json!({
+            "pre_product_id": nbr_ids[0],
+            "post_product_id": nbr_ids[1],
+            "field_id": "field-1",
+            "season_id": "2024-fire",
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{outcome}");
+    // dNBR = 0.5 - 0 = 0.5 on every pixel: moderate-high severity.
+    assert_eq!(outcome["class_counts"]["moderate_high_severity"], 16);
+    assert_eq!(outcome["disturbed_fraction"], 1.0);
+    let values = {
+        let mut reader = GeoTiffReader::open(outcome["dnbr_artifact"].as_str().unwrap())?;
+        reader.read_band()?.to_f32()
+    };
+    assert_eq!(values.len(), 16);
+    for value in &values {
+        assert!((value - 0.5).abs() < 1e-6, "dNBR must be 0.5, got {value}");
+    }
+
+    // Lineage closes over both locally-derived NBR products.
+    let dnbr_id = outcome["dnbr_product_id"].as_str().unwrap();
+    let edges = catalog::trace_inputs(&ctx.pool, dnbr_id).await?;
+    let inputs: Vec<&str> = edges.iter().map(|e| e.input_product_id.as_str()).collect();
+    assert!(inputs.contains(&nbr_ids[0].as_str()), "pre NBR in lineage");
+    assert!(inputs.contains(&nbr_ids[1].as_str()), "post NBR in lineage");
+
+    // Swapped chronology (post before pre) is refused.
+    let (status, _) = send(
+        &ctx.app,
+        "POST",
+        "/api/change-detection/dnbr/derive",
+        Some(json!({
+            "pre_product_id": nbr_ids[1],
+            "post_product_id": nbr_ids[0],
+            "field_id": "field-1",
+            "season_id": "2024-fire",
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    Ok(())
+}
