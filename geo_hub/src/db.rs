@@ -3372,6 +3372,21 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // Portal report inbox (batch F-B3): per-account read receipts for the
+    // report inbox. A row means the account has opened/acknowledged the report.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS portal_report_reads (
+            account_id TEXT NOT NULL,
+            report_id TEXT NOT NULL,
+            read_at TEXT NOT NULL,
+            PRIMARY KEY (account_id, report_id)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     // Satellite pipeline (batch S-6): per-field dataset subscriptions and the
     // durable job queue that drives discover -> derive -> L3 -> app runs.
     sqlx::query(

@@ -18044,6 +18044,7 @@ fn is_valid_work_order_status_transition(from: WorkOrderStatus, to: WorkOrderSta
 #[serde(rename_all = "snake_case")]
 pub enum ReportFormat {
     Html,
+    Pdf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -18051,6 +18052,9 @@ pub enum ReportFormat {
 pub enum ReportVisibility {
     Org,
     Shared,
+    /// Grower-facing report generated from the farmer portal; listed in the
+    /// portal inbox and the org workspace, but never publicly shareable.
+    Grower,
 }
 
 impl Default for ReportVisibility {

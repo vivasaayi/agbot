@@ -13,14 +13,20 @@ use crate::portal_auth::{
     parse_stored_timestamp, session_expires_at, session_is_valid, AccessCodeStatus, SessionStatus,
 };
 use crate::portal_overview::{
-    build_field_card, build_field_overview, FieldCard, FieldInput, FieldOverview, FindingInput,
-    RecommendationInput, SceneInput,
+    boundary_to_svg, build_field_card, build_field_overview, FieldCard, FieldInput, FieldOverview,
+    FindingInput, RecommendationInput, SceneInput,
 };
 use crate::state::AppState;
 use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
 use axum::Json;
 use chrono::Utc;
+use post_processor::findings_export::FindingExportRecord;
+use post_processor::grower_report::{
+    render_grower_ready_pdf, FieldReportMetadata, GrowerReportRequest, SceneReportMetadata,
+};
+use post_processor::product_anomalies::ProductAnomalyReasonCode;
+use post_processor::zone_delineation::{AnomalyZone, AnomalyZonePolygon};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
@@ -675,4 +681,463 @@ pub async fn portal_field_overview(
         &alert_fired_ats,
         Utc::now(),
     )))
+}
+
+// ---------------------------------------------------------------------------
+// Portal report inbox + grower PDF generation (batch F-B3). Reports reach the
+// inbox through their field: `reports.field_id -> fields.field_id` with
+// `fields.owner = org`, so cross-org report IDs stay indistinguishable from
+// missing ones (404). Read receipts are per account in `portal_report_reads`.
+// ---------------------------------------------------------------------------
+
+/// Stored `reports.visibility` for grower-facing PDFs generated via the portal.
+const GROWER_REPORT_VISIBILITY: &str = "grower";
+/// Stored `reports.format` for grower PDFs.
+const GROWER_REPORT_FORMAT: &str = "pdf";
+/// Season bucket used when the field row has no season.
+const UNSPECIFIED_SEASON: &str = "season-unspecified";
+
+/// One inbox entry: a report row joined to its owning field, plus the
+/// caller-account read flag.
+#[derive(Debug, Serialize)]
+pub struct PortalReport {
+    pub report_id: String,
+    pub scene_id: String,
+    pub field_id: String,
+    pub field_name: String,
+    pub title: String,
+    pub format: String,
+    pub visibility: String,
+    pub annotation_count: i64,
+    pub recommendation_count: i64,
+    pub created_at: String,
+    pub read: bool,
+}
+
+fn portal_report_from_row(row: &sqlx::sqlite::SqliteRow) -> PortalReport {
+    PortalReport {
+        report_id: row.get("report_id"),
+        scene_id: row.get("scene_id"),
+        field_id: row.get("field_id"),
+        field_name: row.get("field_name"),
+        title: row.get("title"),
+        format: row.get("format"),
+        visibility: row.get("visibility"),
+        annotation_count: row.get("annotation_count"),
+        recommendation_count: row.get("recommendation_count"),
+        created_at: row.get("created_at"),
+        read: row.get::<i64, _>("is_read") != 0,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PortalReportListQuery {
+    pub unread_only: Option<bool>,
+}
+
+/// GET /api/portal/reports?unread_only= — the caller's report inbox: reports
+/// for fields owned by the org, newest first, with per-account read flags.
+pub async fn portal_list_reports(
+    identity: PortalIdentity,
+    Query(query): Query<PortalReportListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<PortalReport>>> {
+    let unread_only = i64::from(query.unread_only.unwrap_or(false));
+    let rows = sqlx::query(
+        r#"
+        SELECT r.report_id, r.scene_id, r.field_id, r.title, r.format, r.visibility,
+               r.annotation_count, r.recommendation_count, r.created_at,
+               f.name AS field_name,
+               CASE WHEN rr.report_id IS NULL THEN 0 ELSE 1 END AS is_read
+        FROM reports r
+        JOIN fields f ON f.field_id = r.field_id
+        LEFT JOIN portal_report_reads rr
+          ON rr.report_id = r.report_id AND rr.account_id = ?2
+        WHERE f.owner = ?1 AND (?3 = 0 OR rr.report_id IS NULL)
+        ORDER BY r.created_at DESC, r.report_id ASC
+        "#,
+    )
+    .bind(&identity.org_id)
+    .bind(&identity.account_id)
+    .bind(unread_only)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(Json(rows.iter().map(portal_report_from_row).collect()))
+}
+
+/// Load a report (plus its artifact path) only if its field belongs to the
+/// caller's org; cross-org and missing reports are both 404.
+async fn owned_portal_report(
+    state: &AppState,
+    identity: &PortalIdentity,
+    report_id: &str,
+) -> AppResult<(PortalReport, String)> {
+    let row = sqlx::query(
+        r#"
+        SELECT r.report_id, r.scene_id, r.field_id, r.title, r.format, r.visibility,
+               r.annotation_count, r.recommendation_count, r.created_at, r.path,
+               f.name AS field_name,
+               CASE WHEN rr.report_id IS NULL THEN 0 ELSE 1 END AS is_read
+        FROM reports r
+        JOIN fields f ON f.field_id = r.field_id
+        LEFT JOIN portal_report_reads rr
+          ON rr.report_id = r.report_id AND rr.account_id = ?3
+        WHERE r.report_id = ?1 AND f.owner = ?2
+        "#,
+    )
+    .bind(report_id)
+    .bind(&identity.org_id)
+    .bind(&identity.account_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?
+    .ok_or(AppError::NotFound)?;
+
+    Ok((portal_report_from_row(&row), row.get("path")))
+}
+
+#[derive(Debug, Serialize)]
+pub struct PortalReportReadResponse {
+    pub report_id: String,
+    pub read: bool,
+}
+
+/// POST /api/portal/reports/:report_id/read — idempotently record that the
+/// caller's account has read an owned report.
+pub async fn portal_mark_report_read(
+    identity: PortalIdentity,
+    Path(report_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<PortalReportReadResponse>> {
+    owned_portal_report(&state, &identity, &report_id).await?;
+
+    sqlx::query(
+        "INSERT OR IGNORE INTO portal_report_reads (account_id, report_id, read_at) \
+         VALUES (?1, ?2, ?3)",
+    )
+    .bind(&identity.account_id)
+    .bind(&report_id)
+    .bind(current_record_timestamp())
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(Json(PortalReportReadResponse {
+        report_id,
+        read: true,
+    }))
+}
+
+fn portal_report_content_type(format: &str) -> &'static str {
+    match format {
+        "pdf" => "application/pdf",
+        "html" => "text/html; charset=utf-8",
+        "csv" => "text/csv; charset=utf-8",
+        _ => "application/octet-stream",
+    }
+}
+
+/// GET /api/portal/reports/:report_id/download — stream an owned report's
+/// artifact with a content type derived from the stored format (mirrors
+/// `report_file_response` for the org-side download).
+pub async fn portal_download_report(
+    identity: PortalIdentity,
+    Path(report_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Response> {
+    let (report, path) = owned_portal_report(&state, &identity, &report_id).await?;
+
+    let report_path = PathBuf::from(&path);
+    let file = File::open(&report_path)
+        .await
+        .map_err(|error| match error.kind() {
+            ErrorKind::NotFound => AppError::NotFound,
+            _ => AppError::Anyhow(error.into()),
+        })?;
+    let body = Body::from_stream(ReaderStream::new(file));
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static(portal_report_content_type(&report.format)),
+    );
+    if let Some(filename) = report_path.file_name().and_then(|name| name.to_str()) {
+        if let Ok(value) = HeaderValue::from_str(&format!("inline; filename=\"{filename}\"")) {
+            headers.insert(header::CONTENT_DISPOSITION, value);
+        }
+    }
+
+    Ok((headers, body).into_response())
+}
+
+/// Derived layer kinds for a scene, as `layer:<kind>` refs. Prefers the
+/// satellite product catalog (`catalog_products`) and falls back to the
+/// legacy `products` table for scenes processed before the catalog existed.
+async fn scene_layer_refs(state: &AppState, scene_id: &str) -> AppResult<Vec<String>> {
+    let mut kinds: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT kind FROM catalog_products WHERE scene_id = ?1 ORDER BY kind ASC",
+    )
+    .bind(scene_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    if kinds.is_empty() {
+        kinds = sqlx::query_as(
+            "SELECT DISTINCT kind FROM products WHERE scene_id = ?1 ORDER BY kind ASC",
+        )
+        .bind(scene_id)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(Error::from)?;
+    }
+    Ok(kinds
+        .into_iter()
+        .map(|(kind,)| format!("layer:{kind}"))
+        .collect())
+}
+
+/// Map a stored severity label onto the report priority scale.
+fn grower_priority_from_severity(severity: Option<&str>) -> RecommendationPriority {
+    match severity
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("critical") => RecommendationPriority::Critical,
+        Some("high") => RecommendationPriority::High,
+        Some("medium") => RecommendationPriority::Medium,
+        _ => RecommendationPriority::Low,
+    }
+}
+
+/// Recover the anomaly reason code from a finding's metrics when the
+/// producing application recorded one; otherwise bucket it as a statistical
+/// anomaly, the generic satellite-finding reason.
+fn grower_reason_code(metrics: &serde_json::Value) -> ProductAnomalyReasonCode {
+    match metrics.get("reason").and_then(|value| value.as_str()) {
+        Some("below_absolute_threshold") => ProductAnomalyReasonCode::BelowAbsoluteThreshold,
+        Some("above_absolute_threshold") => ProductAnomalyReasonCode::AboveAbsoluteThreshold,
+        Some("above_statistical_band") => ProductAnomalyReasonCode::AboveStatisticalBand,
+        _ => ProductAnomalyReasonCode::BelowStatisticalBand,
+    }
+}
+
+/// Map one `application_findings` row into the grower-report export shape.
+/// Application findings often carry no zone geometry; when
+/// `zone_geometry_json` does not decode as an [`AnomalyZone`], a minimal
+/// placeholder zone (empty polygon, zero area, unspecified CRS) keeps the
+/// finding visible in the PDF instead of dropping it.
+fn grower_finding_from_row(row: &sqlx::sqlite::SqliteRow) -> FindingExportRecord {
+    let finding_id: String = row.get("finding_id");
+    let kind: String = row.get("kind");
+    let severity: Option<String> = row.get("severity");
+    let metrics: serde_json::Value = row
+        .get::<Option<String>, _>("metrics_json")
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok())
+        .unwrap_or(serde_json::Value::Null);
+
+    let zone = row
+        .get::<Option<String>, _>("zone_geometry_json")
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<AnomalyZone>(raw).ok())
+        .unwrap_or_else(|| AnomalyZone {
+            zone_id: metrics
+                .get("zone_id")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("zone-{kind}")),
+            cell_indices: Vec::new(),
+            polygon: AnomalyZonePolygon {
+                coordinates: Vec::new(),
+            },
+            area_m2: metrics
+                .get("area_m2")
+                .and_then(|value| value.as_f64())
+                .unwrap_or(0.0) as f32,
+            centroid: (0.0, 0.0),
+            crs: "unspecified".to_string(),
+            evidence: Vec::new(),
+        });
+
+    let evidence_refs = row
+        .get::<Option<String>, _>("evidence_refs_json")
+        .as_deref()
+        .and_then(|raw| serde_json::from_str::<Vec<String>>(raw).ok())
+        .filter(|refs| !refs.is_empty())
+        .unwrap_or_else(|| vec![format!("finding:{finding_id}")]);
+
+    FindingExportRecord {
+        finding_id,
+        zone,
+        reason: grower_reason_code(&metrics),
+        priority: grower_priority_from_severity(severity.as_deref()),
+        evidence_refs,
+    }
+}
+
+async fn grower_findings(state: &AppState, field_id: &str) -> AppResult<Vec<FindingExportRecord>> {
+    let rows = sqlx::query(
+        "SELECT finding_id, kind, severity, zone_geometry_json, metrics_json, evidence_refs_json \
+         FROM application_findings WHERE field_id = ?1 \
+         ORDER BY created_at DESC, finding_id ASC",
+    )
+    .bind(field_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    Ok(rows.iter().map(grower_finding_from_row).collect())
+}
+
+async fn grower_open_recommendations(
+    state: &AppState,
+    field_id: &str,
+) -> AppResult<Vec<RecommendationRecord>> {
+    let rows = sqlx::query(
+        "SELECT recommendation_id, scene_id, field_id, title, note, category, priority, status, \
+                evidence_refs_json, created_at, updated_at \
+         FROM recommendations WHERE field_id = ?1 AND status = 'open' \
+         ORDER BY created_at ASC, recommendation_id ASC",
+    )
+    .bind(field_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let mut records = Vec::with_capacity(rows.len());
+    for row in &rows {
+        records.push(decode_recommendation_record(state, row).await?);
+    }
+    Ok(records)
+}
+
+/// Fallback map view for fields whose boundary is missing or not a polygon:
+/// the grower report requires a non-empty map view, and a labelled placeholder
+/// is more honest than refusing the report outright.
+fn placeholder_map_svg(field_name: &str) -> String {
+    format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 200 40\">\
+         <text x=\"10\" y=\"25\">Field {} (no boundary map available)</text></svg>",
+        field_name.replace(['<', '>'], "")
+    )
+}
+
+/// POST /api/portal/fields/:field_id/grower-report — assemble a
+/// [`GrowerReportRequest`] from the field's stored rows, render the grower
+/// PDF, persist it under the same `reports/<scene_id>/` convention as scene
+/// reports, and register it in the inbox (unread, visibility `grower`).
+pub async fn portal_generate_grower_report(
+    identity: PortalIdentity,
+    Path(field_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<PortalReport>> {
+    let field = owned_field(&state, &identity.org_id, &field_id).await?;
+
+    let scene = field_latest_scene(&state, &field.field_id)
+        .await?
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "field {field_id} has no linked scene; a grower report needs at least one \
+                 processed satellite scene"
+            ))
+        })?;
+
+    let layer_refs = scene_layer_refs(&state, &scene.scene_id).await?;
+    if layer_refs.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "scene {} has no derived layers; run the pipeline before generating a grower report",
+            scene.scene_id
+        )));
+    }
+
+    let findings = grower_findings(&state, &field.field_id).await?;
+    let recommendations = grower_open_recommendations(&state, &field.field_id).await?;
+
+    let (boundary_json,): (String,) =
+        sqlx::query_as("SELECT boundary_json FROM fields WHERE field_id = ?1")
+            .bind(&field.field_id)
+            .fetch_one(&state.pool)
+            .await
+            .map_err(Error::from)?;
+    let map_view_svg =
+        boundary_to_svg(&boundary_json).unwrap_or_else(|| placeholder_map_svg(&field.name));
+
+    let generated_at = current_record_timestamp();
+    let generated_date = generated_at.get(..10).unwrap_or(&generated_at);
+    let title = format!("Grower report — {} {}", field.name, generated_date);
+    let report_id = Uuid::new_v4().to_string();
+
+    let request = GrowerReportRequest {
+        report_id: report_id.clone(),
+        title: title.clone(),
+        field: FieldReportMetadata {
+            field_id: field.field_id.clone(),
+            field_name: field.name.clone(),
+            org_id: identity.org_id.clone(),
+            season_id: field
+                .season
+                .clone()
+                .unwrap_or_else(|| UNSPECIFIED_SEASON.to_string()),
+        },
+        scene: SceneReportMetadata {
+            scene_id: scene.scene_id.clone(),
+            captured_at: scene.acquired_at.clone(),
+            layer_refs,
+        },
+        map_view_svg,
+        findings,
+        recommendations,
+        generated_at: generated_at.clone(),
+    };
+
+    let pdf =
+        render_grower_ready_pdf(&request).map_err(|err| AppError::BadRequest(err.to_string()))?;
+
+    let report_dir = state.config.data_root.join("reports").join(&scene.scene_id);
+    fs::create_dir_all(&report_dir)
+        .await
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    let artifact_path = report_dir.join(format!("{report_id}.pdf"));
+    fs::write(&artifact_path, &pdf)
+        .await
+        .map_err(|err| AppError::Anyhow(err.into()))?;
+    let artifact_uri = artifact_path.to_string_lossy().to_string();
+
+    let recommendation_count = request.recommendations.len() as i64;
+    sqlx::query(
+        r#"
+        INSERT INTO reports (
+            report_id, scene_id, field_id, title, format, path, visibility,
+            annotation_count, recommendation_count, created_at
+        )
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9)
+        "#,
+    )
+    .bind(&report_id)
+    .bind(&scene.scene_id)
+    .bind(&field.field_id)
+    .bind(&title)
+    .bind(GROWER_REPORT_FORMAT)
+    .bind(&artifact_uri)
+    .bind(GROWER_REPORT_VISIBILITY)
+    .bind(recommendation_count)
+    .bind(&generated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(Json(PortalReport {
+        report_id,
+        scene_id: scene.scene_id,
+        field_id: field.field_id,
+        field_name: field.name,
+        title,
+        format: GROWER_REPORT_FORMAT.to_string(),
+        visibility: GROWER_REPORT_VISIBILITY.to_string(),
+        annotation_count: 0,
+        recommendation_count,
+        created_at: generated_at,
+        read: false,
+    }))
 }

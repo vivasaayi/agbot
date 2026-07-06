@@ -511,6 +511,19 @@ pub fn build_router(state: AppState) -> Router {
             "/api/portal/fields/:field_id/overview",
             get(routes::portal_field_overview),
         )
+        .route("/api/portal/reports", get(routes::portal_list_reports))
+        .route(
+            "/api/portal/reports/:report_id/read",
+            post(routes::portal_mark_report_read),
+        )
+        .route(
+            "/api/portal/reports/:report_id/download",
+            get(routes::portal_download_report),
+        )
+        .route(
+            "/api/portal/fields/:field_id/grower-report",
+            post(routes::portal_generate_grower_report),
+        )
         .route(
             "/api/admin/portal/access-codes",
             get(routes::list_portal_access_codes).post(routes::issue_portal_access_code),

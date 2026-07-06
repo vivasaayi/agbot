@@ -229,6 +229,82 @@ pub fn build_field_overview(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Boundary map view (batch F-B3).
+// ---------------------------------------------------------------------------
+
+/// Side length (px) of the square canvas `boundary_to_svg` draws into.
+const BOUNDARY_SVG_SIZE: f64 = 200.0;
+/// Padding (px) kept around the boundary outline.
+const BOUNDARY_SVG_PADDING: f64 = 10.0;
+
+/// Render a stored field boundary as a small standalone SVG outline for the
+/// grower report map view. Accepts either a GeoJSON `Polygon` (exterior ring
+/// of `[lon, lat]` pairs) or the legacy `FieldBoundary` shape
+/// (`{"coordinates": [{"longitude": .., "latitude": ..}, ..]}`). Returns
+/// `None` when the JSON is not a polygon with at least three distinct points.
+pub fn boundary_to_svg(boundary_json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(boundary_json).ok()?;
+    let points = boundary_ring_points(&value)?;
+    if points.len() < 3 {
+        return None;
+    }
+
+    let (min_x, max_x) = min_max(points.iter().map(|point| point.0))?;
+    let (min_y, max_y) = min_max(points.iter().map(|point| point.1))?;
+    let span = (max_x - min_x).max(max_y - min_y);
+    if !(span.is_finite() && span > 0.0) {
+        return None;
+    }
+
+    let scale = (BOUNDARY_SVG_SIZE - 2.0 * BOUNDARY_SVG_PADDING) / span;
+    let outline = points
+        .iter()
+        .map(|(x, y)| {
+            // Latitude grows upward; SVG y grows downward, so flip y.
+            let sx = BOUNDARY_SVG_PADDING + (x - min_x) * scale;
+            let sy = BOUNDARY_SVG_PADDING + (max_y - y) * scale;
+            format!("{sx:.1},{sy:.1}")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    Some(format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {size:.0} {size:.0}\">\
+         <polygon points=\"{outline}\" fill=\"none\" stroke=\"#2f6f3e\" stroke-width=\"2\"/>\
+         </svg>",
+        size = BOUNDARY_SVG_SIZE,
+    ))
+}
+
+/// Extract the boundary ring as `(x, y)` pairs from either supported format.
+fn boundary_ring_points(value: &serde_json::Value) -> Option<Vec<(f64, f64)>> {
+    if value.get("type").and_then(|t| t.as_str()) == Some("Polygon") {
+        let ring = value.get("coordinates")?.as_array()?.first()?.as_array()?;
+        return ring
+            .iter()
+            .map(|pair| Some((pair.get(0)?.as_f64()?, pair.get(1)?.as_f64()?)))
+            .collect();
+    }
+    let coordinates = value.get("coordinates")?.as_array()?;
+    coordinates
+        .iter()
+        .map(|point| {
+            Some((
+                point.get("longitude")?.as_f64()?,
+                point.get("latitude")?.as_f64()?,
+            ))
+        })
+        .collect()
+}
+
+fn min_max(values: impl Iterator<Item = f64>) -> Option<(f64, f64)> {
+    values.fold(None, |acc, value| match acc {
+        None => Some((value, value)),
+        Some((min, max)) => Some((min.min(value), max.max(value))),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,5 +470,49 @@ mod tests {
             .map(|rec| rec.recommendation_id.as_str())
             .collect();
         assert_eq!(ids, vec!["r-crit", "r-high", "r-med", "r-low-1", "r-low-2"]);
+    }
+
+    #[test]
+    fn boundary_to_svg_scales_a_geojson_square_into_the_canvas() {
+        let boundary = r#"{"type":"Polygon","coordinates":[[[0,0],[10,0],[10,10],[0,10],[0,0]]]}"#;
+
+        let svg = boundary_to_svg(boundary).expect("square renders");
+
+        assert!(svg.starts_with("<svg"));
+        assert!(svg.contains("<polygon"));
+        // Corners land on the padded canvas: (0,0) is bottom-left after the
+        // y-flip, (10,10) is top-right.
+        assert!(svg.contains("10.0,190.0"), "bottom-left corner: {svg}");
+        assert!(svg.contains("190.0,10.0"), "top-right corner: {svg}");
+        assert!(svg.contains("viewBox=\"0 0 200 200\""));
+    }
+
+    #[test]
+    fn boundary_to_svg_accepts_legacy_field_boundary_points() {
+        let boundary = r#"{"coordinates":[
+            {"longitude":0.0,"latitude":0.0},
+            {"longitude":4.0,"latitude":0.0},
+            {"longitude":4.0,"latitude":4.0},
+            {"longitude":0.0,"latitude":4.0}
+        ]}"#;
+
+        let svg = boundary_to_svg(boundary).expect("legacy square renders");
+        assert!(svg.contains("<polygon"));
+    }
+
+    #[test]
+    fn boundary_to_svg_rejects_empty_and_degenerate_boundaries() {
+        assert_eq!(boundary_to_svg("{}"), None);
+        assert_eq!(boundary_to_svg("not json"), None);
+        // Two points cannot form a polygon.
+        assert_eq!(
+            boundary_to_svg(r#"{"type":"Polygon","coordinates":[[[0,0],[1,1]]]}"#),
+            None
+        );
+        // Zero-extent square collapses to a point.
+        assert_eq!(
+            boundary_to_svg(r#"{"type":"Polygon","coordinates":[[[2,2],[2,2],[2,2],[2,2]]]}"#),
+            None
+        );
     }
 }

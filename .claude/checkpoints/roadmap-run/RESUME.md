@@ -1,3 +1,27 @@
+# Resume — sat-farmer-run-1 (CURRENT, 2026-07-06)
+
+- Plan: `/Users/rajanpanneerselvam/.claude/plans/you-re-right-the-project-starry-boole.md`
+  (hash e1b595dd4972a5a0eda85068fc9712c749c32542f1f9afe09cb0c047292d014d).
+  21 features: S-01..S-14 (satellite engine) + F-B1..F-B7 (farmer portal).
+- Branch: `satellite-farmer-expansion` (from landsat-parity @ 04d748f).
+- Committed: wave 1 — S-01 timeseries prune (7551ca2), S-02 naming+field scope
+  (3ef9964), F-B1 portal auth (3dd5f00).
+- Current: wave 2 agents running — S-03 field_timeseries extraction (lane1),
+  S-06 pipeline job queue + WAL (lane2), F-B2 portal scoped reads (lane3).
+  lib.rs module lines pre-seeded by coordinator with stub files.
+- WORKTREE CAUTION: another session has uncommitted water-balance work here
+  (water_balance_rasters.rs, post_processor water_balance, fmt-only diffs in
+  many routes files; one foreign hunk each in geo_hub/src/lib.rs, server.rs,
+  post_processor/src/lib.rs). Stage surgically; partial-stage mixed files via
+  `git diff -U0` filtered patches + `git apply --cached`. NEVER run bare
+  `cargo fmt -p geo_hub` — use `rustfmt --edition 2021 <files>`.
+- Next action: on wave-2 completion verify + partial-stage + commit serially,
+  update checkpoint, then wave 3 = S-4 (timeseries route) + S-7 (pipeline
+  worker) + F-B3 (report inbox/grower PDF). Then S-5/S-8/F-B4, S-9/F-B5,
+  S-10, S-11/F-B6, S-12/S-13/F-B7, S-14 last.
+
+---
+
 # Resume — field-intel-run-1
 
 ## ACTIVE BRANCHES (2026-07-06)

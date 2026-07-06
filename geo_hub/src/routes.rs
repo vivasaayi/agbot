@@ -12327,12 +12327,14 @@ fn parse_recommendation_status(value: String) -> AppResult<RecommendationStatus>
 fn report_format_str(format: ReportFormat) -> &'static str {
     match format {
         ReportFormat::Html => "html",
+        ReportFormat::Pdf => "pdf",
     }
 }
 
 fn parse_report_format(value: String) -> AppResult<ReportFormat> {
     match value.as_str() {
         "html" => Ok(ReportFormat::Html),
+        "pdf" => Ok(ReportFormat::Pdf),
         _ => Err(AppError::Anyhow(anyhow::anyhow!(
             "invalid report format {}",
             value
@@ -12344,6 +12346,7 @@ fn report_visibility_str(visibility: ReportVisibility) -> &'static str {
     match visibility {
         ReportVisibility::Org => "org",
         ReportVisibility::Shared => "shared",
+        ReportVisibility::Grower => "grower",
     }
 }
 
@@ -12351,6 +12354,7 @@ fn parse_report_visibility(value: String) -> AppResult<ReportVisibility> {
     match value.as_str() {
         "org" => Ok(ReportVisibility::Org),
         "shared" => Ok(ReportVisibility::Shared),
+        "grower" => Ok(ReportVisibility::Grower),
         _ => Err(AppError::BadRequest(format!(
             "invalid report visibility {}",
             value
