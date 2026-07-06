@@ -7,12 +7,13 @@ continues on enhance-satellite-image-pipeline. Batch 30 (4dc8d1a): index surface
 affordance on band_b* items. Batch 29 (da46205): spec-driven multi-index
 (ndvi/mndwi/ndmi), cross-resolution B11 replication, SCL native/replicated.
 Batch 28 (7b6e26e): SCL cloud masking.
-Batch 32 (f26b796): temporal compositing catalog-wired — composite_rasters
-+ POST /api/composites/derive (median/medoid over same-kind same-grid L2
-window, temporal_composite L3, gap_fraction confidence). Batch 31
-(263805e): local dNBR composition proof.
-NEXT: batch 33 candidates = /browse composite affordance; Landsat C2 local
-band derivation parity; composite-fed phenology.
+Batch 33 (114b917): composite-fed phenology (series=l2|composites on
+/api/landcover/derive, identity-bearing) + /browse composite window form.
+Batch 32 (f26b796): temporal compositing catalog-wired. Batch 31 (263805e):
+local dNBR composition proof.
+NEXT: batch 34 candidates = Landsat C2 local band derivation parity
+(sen2cor-style spec over USGS band products); composite-fed drought
+climatology baselines.
 
 ## MERGED HISTORY: satellite intelligence pipeline (2026-07)
 Active plan + per-batch ledger: `docs/design/satellite-intelligence-pipeline.md`
