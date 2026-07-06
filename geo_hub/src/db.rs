@@ -1,12 +1,21 @@
 use crate::config::HubConfig;
 use anyhow::Result;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{Pool, Row, Sqlite, SqlitePool};
+use std::str::FromStr;
+use std::time::Duration;
 use tracing::info;
 
 pub type DbPool = SqlitePool;
 
 pub async fn connect_pool(config: &HubConfig) -> Result<DbPool> {
-    let pool = SqlitePool::connect(&config.database_url).await?;
+    // WAL + a generous busy timeout so concurrent readers (API handlers) and
+    // the single pipeline writer do not fail fast on transient lock contention.
+    // Connect options apply to every connection the pool opens.
+    let options = SqliteConnectOptions::from_str(&config.database_url)?
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_millis(5000));
+    let pool = SqlitePool::connect_with(options).await?;
     apply_migrations(&pool).await?;
     Ok(pool)
 }
@@ -3358,6 +3367,75 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
         r#"
         CREATE INDEX IF NOT EXISTS idx_portal_sessions_account
         ON portal_sessions(account_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Satellite pipeline (batch S-6): per-field dataset subscriptions and the
+    // durable job queue that drives discover -> derive -> L3 -> app runs.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS satellite_subscriptions (
+            subscription_id TEXT PRIMARY KEY,
+            field_id TEXT NOT NULL,
+            dataset TEXT NOT NULL,
+            indices_json TEXT NOT NULL,
+            cadence_hours INTEGER NOT NULL DEFAULT 24,
+            max_cloud_cover REAL NOT NULL DEFAULT 60.0,
+            lookback_days INTEGER NOT NULL DEFAULT 14,
+            status TEXT NOT NULL DEFAULT 'active',
+            last_checked_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(field_id, dataset)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS pipeline_jobs (
+            job_id TEXT PRIMARY KEY,
+            job_key TEXT NOT NULL UNIQUE,
+            kind TEXT NOT NULL,
+            field_id TEXT,
+            dataset TEXT,
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'queued',
+            priority INTEGER NOT NULL DEFAULT 0,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            max_attempts INTEGER NOT NULL DEFAULT 3,
+            run_after TEXT NOT NULL,
+            backfill_id TEXT,
+            parent_job_id TEXT,
+            claimed_at TEXT,
+            started_at TEXT,
+            finished_at TEXT,
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_pipeline_jobs_ready
+        ON pipeline_jobs(status, run_after, priority);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_pipeline_jobs_backfill
+        ON pipeline_jobs(backfill_id, status);
         "#,
     )
     .execute(pool)

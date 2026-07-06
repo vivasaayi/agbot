@@ -61,6 +61,27 @@ impl Default for LandsatConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PipelineConfig {
+    /// Master switch for the background satellite pipeline worker.
+    pub enabled: bool,
+    /// How often the worker polls the job queue for ready work.
+    pub poll_interval_ms: u64,
+    /// Minimum delay between successive upstream provider requests.
+    pub provider_min_delay_ms: u64,
+}
+
+impl Default for PipelineConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            poll_interval_ms: 1000,
+            provider_min_delay_ms: 250,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct HubConfig {
@@ -75,6 +96,7 @@ pub struct HubConfig {
     /// `GEO_HUB__WORKSPACE_WEB_ROOT`.
     pub workspace_web_root: PathBuf,
     pub landsat: LandsatConfig,
+    pub pipeline: PipelineConfig,
 }
 
 impl Default for HubConfig {
@@ -86,6 +108,7 @@ impl Default for HubConfig {
             data_root: PathBuf::from("data/geo_hub"),
             workspace_web_root: PathBuf::from("geo_hub/web"),
             landsat: LandsatConfig::default(),
+            pipeline: PipelineConfig::default(),
         }
     }
 }
@@ -240,6 +263,36 @@ source = "landsat"
         };
 
         assert_eq!(config.workspace_web_dir(), tmp.path());
+    }
+
+    #[test]
+    fn hub_config_pipeline_defaults_off_and_loads_from_file() {
+        let default_config = HubConfig::default();
+        assert!(!default_config.pipeline.enabled);
+        assert_eq!(default_config.pipeline.poll_interval_ms, 1000);
+        assert_eq!(default_config.pipeline.provider_min_delay_ms, 250);
+
+        let (_tmp, path) = write_config(
+            r#"
+runtime_mode = "simulation"
+bind_address = "127.0.0.1:8787"
+database_url = "sqlite://geo_hub_test.db"
+data_root = "tmp/geo_hub"
+
+[landsat]
+source = "sample"
+
+[pipeline]
+enabled = true
+poll_interval_ms = 2500
+provider_min_delay_ms = 500
+"#,
+        );
+
+        let config = HubConfig::load_with_path(Some(&path)).unwrap();
+        assert!(config.pipeline.enabled);
+        assert_eq!(config.pipeline.poll_interval_ms, 2500);
+        assert_eq!(config.pipeline.provider_min_delay_ms, 500);
     }
 
     #[test]

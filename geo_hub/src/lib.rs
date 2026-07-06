@@ -48,3 +48,4 @@ pub use ingest::{
 };
 pub use server::serve;
 pub mod portal_auth;
+pub mod pipeline;
