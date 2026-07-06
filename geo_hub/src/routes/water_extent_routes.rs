@@ -73,6 +73,32 @@ pub async fn derive_water_seasonality_route(
     Ok(Json(outcome))
 }
 
+impl From<crate::water_balance_rasters::WaterBalanceRasterError> for AppError {
+    fn from(err: crate::water_balance_rasters::WaterBalanceRasterError) -> Self {
+        if err.is_client_error() {
+            AppError::BadRequest(err.to_string())
+        } else {
+            AppError::Anyhow(err.into())
+        }
+    }
+}
+
+/// Summarize a field's water balance over a window (batch 41): supply
+/// (extent areas + seasonality anchor + precipitation) vs demand (mean
+/// ET fraction), reason-coded status, JSON-artifact L3.
+pub async fn derive_water_balance_route(
+    State(state): State<AppState>,
+    Json(request): Json<crate::water_balance_rasters::WaterBalanceDeriveRequest>,
+) -> AppResult<Json<crate::water_balance_rasters::WaterBalanceDeriveOutcome>> {
+    let outcome = crate::water_balance_rasters::derive_water_balance(
+        &state.pool,
+        &state.config.data_root,
+        &request,
+    )
+    .await?;
+    Ok(Json(outcome))
+}
+
 #[derive(Debug, Deserialize)]
 pub struct WaterExtentListQuery {
     pub field_id: Option<String>,

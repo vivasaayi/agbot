@@ -37,6 +37,7 @@ pub mod spi_rasters;
 pub mod stac_catalog;
 pub mod state;
 pub mod utm;
+pub mod water_balance_rasters;
 pub mod water_extent_rasters;
 pub mod water_priority_run;
 
