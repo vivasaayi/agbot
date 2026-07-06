@@ -1,5 +1,15 @@
 # Resume — field-intel-run-1
 
+## ACTIVE BRANCHES (2026-07-06)
+- landsat-parity (CURRENT): batch 38 (5ecded5) DONE — spec-driven Landsat
+  derive (8 kinds), TM/ETM+ instrument tables (1982+ archive), ST_QA lst
+  confidence. NEXT candidates: ET research+engine (LST+NDVI SSEBop-style,
+  water-availability demand side); reprojection core (continental blocker).
+- crop-type-classification: foundation done (b898192) — CropType /
+  WorldCerealSeason / EwocCode+legend / ClassLabel trait. Next: generalize
+  NearestCentroidModel over ClassLabel.
+- enhance-satellite-image-pipeline: batches 28-37 pushed, awaiting PR.
+
 ## CURRENT: satellite pipeline ENHANCEMENTS (2026-07, branch enhance-satellite-image-pipeline)
 field-intelligence-pipeline was merged to main via PR #5 (26b084a); work
 continues on enhance-satellite-image-pipeline. Batch 30 (4dc8d1a): index surface complete — nbr (B8A+B12, 20 m) + ndwi
