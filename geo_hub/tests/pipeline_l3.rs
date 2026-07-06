@@ -397,8 +397,15 @@ async fn composite_recompute_supersedes_previous() -> Result<()> {
     )
     .await?;
     enqueue_l3(&ctx, "field-1", "2026-06").await?;
-    let outcome = run_one_tick(&ctx).await?;
-    assert_eq!(outcome.result, Some(JobRunResult::Succeeded), "{outcome:?}");
+    // The first composite tick fanned out climatology/drought sibling jobs
+    // (S-12), so a single tick may claim one of those instead of the composite
+    // recompute. Drain the queue the way the real worker loop does so the
+    // recompute actually runs before asserting supersede.
+    for _ in 0..64 {
+        if !run_one_tick(&ctx).await?.claimed {
+            break;
+        }
+    }
 
     let registered =
         composite_rasters::list_composite_products(&ctx.pool, Some("field-1".to_string())).await?;
