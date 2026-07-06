@@ -32,6 +32,13 @@ export const endpoints = {
   fieldActivities: "/api/portal/fields/:field_id/activities",
   fieldActivitySummary: "/api/portal/fields/:field_id/activities/summary",
   activity: "/api/portal/activities/:activity_id",
+  // Open (non-portal) read routes, called with the same fetch wrapper: the
+  // Bearer token is harmless there. Field record carries the boundary
+  // polygon the overview response omits.
+  fieldRecord: "/api/fields/:field_id",
+  fieldTimeseries: "/api/fields/:field_id/timeseries",
+  sceneProduct: "/api/scenes/:scene_id/products/:kind",
+  sceneProductTile: "/api/scenes/:scene_id/products/:kind/tiles/:z/:x/:y.png",
 };
 
 /** Fill `:param` placeholders with URI-encoded values. */
@@ -185,8 +192,20 @@ export function notificationsSummary() {
 
 // --- Field activities (used by F-B7 field detail) ---------------------------
 
-export function fieldActivities(fieldId) {
-  return request("GET", buildPath(endpoints.fieldActivities, { field_id: fieldId }), {});
+export function fieldActivities(fieldId, { from, to, activityType, page, pageSize } = {}) {
+  const params = new URLSearchParams();
+  if (from) params.set("from", from);
+  if (to) params.set("to", to);
+  if (activityType) params.set("activity_type", activityType);
+  if (page) params.set("page", String(page));
+  if (pageSize) params.set("page_size", String(pageSize));
+  const query = params.toString();
+  return request(
+    "GET",
+    buildPath(endpoints.fieldActivities, { field_id: fieldId }) +
+      (query ? `?${query}` : ""),
+    {},
+  );
 }
 
 export function createFieldActivity(fieldId, draft) {
@@ -211,4 +230,58 @@ export function updateActivity(activityId, patch) {
 
 export function deleteActivity(activityId) {
   return request("DELETE", buildPath(endpoints.activity, { activity_id: activityId }), {});
+}
+
+// --- Open read APIs used by the field detail view (F-B7) --------------------
+
+/** Full field record (includes the boundary polygon) from the open API. */
+export function fieldRecord(fieldId) {
+  return request("GET", buildPath(endpoints.fieldRecord, { field_id: fieldId }), {});
+}
+
+/**
+ * Multi-source field time-series ({per_source, merged, harmonization}).
+ * `metric` is required by the server (e.g. "sat.ndvi.mean").
+ */
+export function fieldTimeseries(fieldId, { metric, start, end, source } = {}) {
+  const params = new URLSearchParams({ metric: metric || "sat.ndvi.mean" });
+  if (start) params.set("start", start);
+  if (end) params.set("end", end);
+  if (source) params.set("source", source);
+  return request(
+    "GET",
+    buildPath(endpoints.fieldTimeseries, { field_id: fieldId }) + `?${params}`,
+    {},
+  );
+}
+
+/**
+ * Leaflet tile URL template for a scene product raster
+ * (…/tiles/{z}/{x}/{y}.png). Kept here so every backend URL, including tile
+ * templates, lives in api.js.
+ */
+export function sceneProductTileUrlTemplate(sceneId, kind) {
+  return (
+    BASE_URL +
+    endpoints.sceneProductTile
+      .replace(":scene_id", encodeURIComponent(sceneId))
+      .replace(":kind", encodeURIComponent(kind))
+      .replace(":z", "{z}")
+      .replace(":x", "{x}")
+      .replace(":y.png", "{y}.png")
+  );
+}
+
+/**
+ * True when the scene product exists and is servable (HEAD on the product
+ * route). Used to disable the raster toggle instead of surfacing tile 404s.
+ */
+export async function sceneProductAvailable(sceneId, kind) {
+  const path = buildPath(endpoints.sceneProduct, { scene_id: sceneId, kind });
+  try {
+    const response = await fetch(BASE_URL + path, { method: "HEAD" });
+    return response.ok;
+  } catch {
+    return false;
+  }
 }

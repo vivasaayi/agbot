@@ -6,7 +6,7 @@ import { clearSession, isLoggedIn } from "./auth.js";
 import { renderLogin } from "./views/login.js";
 import { renderHome } from "./views/home.js";
 import { renderReports } from "./views/reports.js";
-import { renderFieldStub } from "./views/field.js";
+import { renderField } from "./views/field.js";
 
 const view = document.getElementById("view");
 const tabBar = document.getElementById("tab-bar");
@@ -49,8 +49,7 @@ async function mountRoute() {
       renderReports(view);
       break;
     case "field":
-      // F-B7 replaces this stub with the full field-detail view.
-      renderFieldStub(view, route.param);
+      renderField(view, route.param);
       break;
     case "home":
     default:
