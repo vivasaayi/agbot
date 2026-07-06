@@ -708,6 +708,183 @@ pub async fn derive_vhi_raster(
     })
 }
 
+/// A standalone index-climatology derivation request (batch S-12). Unlike
+/// [`derive_drought_raster`], which builds a climatology as a byproduct of
+/// scoring one current product, this registers *only* the climatology so the
+/// pipeline can materialize it as its own L3 before any drought scoring runs.
+#[derive(Debug, Clone)]
+pub struct ClimatologyDeriveRequest {
+    /// Index kind to build a climatology for (e.g. `ndvi`).
+    pub index_kind: String,
+    pub field_id: String,
+    pub season_id: String,
+    pub cadence: CompositeCadence,
+    /// Minimum distinct baseline years per pixel/period.
+    pub min_years: u32,
+}
+
+/// Outcome of a standalone climatology derivation.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClimatologyDeriveOutcome {
+    pub climatology_product_id: String,
+    /// Composite product ids that fed the climatology, date order.
+    pub observations_used: Vec<String>,
+    pub observations_skipped: Vec<SkippedObservation>,
+    pub climatology_artifact: PathBuf,
+}
+
+/// Build and register an index climatology from a field's monthly
+/// `temporal_composite` L3s of `index_kind` (batch S-12). The composites are
+/// the pipeline's per-month rollups; two same-calendar-month composites in
+/// different years give the calendar period a 2-year baseline. All composites
+/// must share one grid (the first usable one anchors it; mismatches are
+/// skipped with a reason). Idempotent: identical inputs re-register the same
+/// content-addressed id.
+///
+/// Returns [`DroughtRasterError::NoUsableObservations`] when the field has no
+/// usable composite; the caller (pipeline worker) treats that as a no-op.
+pub async fn derive_index_climatology(
+    pool: &DbPool,
+    data_root: &Path,
+    request: &ClimatologyDeriveRequest,
+) -> Result<ClimatologyDeriveOutcome, DroughtRasterError> {
+    // Field-scoped single-band composites of this index (band_names is
+    // identity-bearing on the composite draft).
+    let mut candidates = catalog::list_products(
+        pool,
+        &ProductFilter {
+            kind: Some("temporal_composite".to_string()),
+            level: Some(ProductLevel::L3),
+            status: Some("registered".to_string()),
+            field_id: Some(request.field_id.clone()),
+            ..ProductFilter::default()
+        },
+    )
+    .await?;
+    candidates.retain(|candidate| {
+        candidate.parameters.get("band_names") == Some(&serde_json::json!([request.index_kind]))
+    });
+    candidates.sort_by(|a, b| {
+        a.temporal_start
+            .cmp(&b.temporal_start)
+            .then(a.product_id.cmp(&b.product_id))
+    });
+
+    let mut skipped = Vec::new();
+    let skip = |product_id: &str, reason: &str, list: &mut Vec<SkippedObservation>| {
+        list.push(SkippedObservation {
+            product_id: product_id.to_string(),
+            reason: reason.to_string(),
+        });
+    };
+
+    let mut reference: Option<LoadedRaster> = None;
+    let mut observations = Vec::new();
+    let mut used_ids = Vec::new();
+    for candidate in &candidates {
+        let Some(date) = observed_on(candidate) else {
+            skip(&candidate.product_id, "bad_temporal", &mut skipped);
+            continue;
+        };
+        let Ok(path) = geotiff_artifact_path(candidate) else {
+            skip(&candidate.product_id, "no_artifact", &mut skipped);
+            continue;
+        };
+        let raster = match load_raster(Path::new(path)) {
+            Ok(raster) => raster,
+            Err(_) => {
+                skip(&candidate.product_id, "unreadable", &mut skipped);
+                continue;
+            }
+        };
+        if let Some(reference) = &reference {
+            if raster.epsg != reference.epsg
+                || raster.geo_transform != reference.geo_transform
+                || (raster.width, raster.height) != (reference.width, reference.height)
+            {
+                skip(&candidate.product_id, "grid_mismatch", &mut skipped);
+                continue;
+            }
+        }
+        let spatial_ref = reference
+            .as_ref()
+            .map(|reference| reference.spatial_ref.clone())
+            .unwrap_or_else(|| raster.spatial_ref.clone());
+        observations.push(ClimatologyObservation {
+            product_id: candidate.product_id.clone(),
+            observed_on: date,
+            values: raster.values.clone(),
+            valid_mask: raster.valid_mask.clone(),
+            spatial_ref,
+        });
+        used_ids.push(candidate.product_id.clone());
+        if reference.is_none() {
+            reference = Some(raster);
+        }
+    }
+    let Some(reference) = reference else {
+        return Err(DroughtRasterError::NoUsableObservations {
+            skipped: skipped.len(),
+        });
+    };
+
+    let climatology = build_index_climatology(&ClimatologyRequest {
+        index_kind: request.index_kind.clone(),
+        cadence: request.cadence,
+        width: reference.width,
+        height: reference.height,
+        spatial_ref: reference.spatial_ref.clone(),
+        min_years: request.min_years,
+        observations,
+    })?;
+
+    let actor = provenance::ActorIdentity::system("geo_hub:drought_rasters");
+    let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let mut climatology_draft = climatology_l3_draft(
+        &climatology,
+        &ClimatologyL3Scope {
+            field_id: request.field_id.clone(),
+            season_id: request.season_id.clone(),
+            scene_id: None,
+            source_id: reference_source_id(&candidates, &request.index_kind),
+        },
+    );
+    if let Some(params) = climatology_draft.parameters.as_object_mut() {
+        params.insert("series".to_string(), serde_json::json!("composites"));
+    }
+    let climatology_dir = data_root.join("derived").join("climatology");
+    std::fs::create_dir_all(&climatology_dir).map_err(|source| DroughtRasterError::Store {
+        what: "climatology directory",
+        source,
+    })?;
+    let climatology_path = climatology_dir.join(format!(
+        "{}.json",
+        artifact_file_component(&climatology_draft.product_id())
+    ));
+    write_climatology_json(&climatology, &climatology_path)?;
+    climatology_draft.spatial_ref = Some(reference.spatial_ref.clone());
+    climatology_draft.artifact = Some(ProductArtifact {
+        format: "json".to_string(),
+        path: climatology_path.to_string_lossy().to_string(),
+        checksum_sha256: Some(file_checksum(&climatology_path, "climatology readback")?),
+    });
+    let climatology_product_id =
+        catalog::register_product_with_actor(pool, &climatology_draft, &actor, &created_at).await?;
+
+    Ok(ClimatologyDeriveOutcome {
+        climatology_product_id,
+        observations_used: used_ids,
+        observations_skipped: skipped,
+        climatology_artifact: climatology_path,
+    })
+}
+
+/// The source id to stamp on a climatology draft: the first candidate's, so
+/// the trace keeps a provider reference when the composites carry one.
+fn reference_source_id(candidates: &[RegisteredProduct], _index_kind: &str) -> Option<String> {
+    candidates.iter().find_map(|c| c.source_id.clone())
+}
+
 /// List registered drought-raster products (climatologies + drought indices),
 /// optionally scoped to a field.
 pub async fn list_drought_raster_products(

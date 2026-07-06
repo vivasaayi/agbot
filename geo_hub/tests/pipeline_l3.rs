@@ -238,6 +238,7 @@ async fn enqueue_l3(ctx: &PipelineWorkerContext, field_id: &str, month: &str) ->
             dataset: FIXTURE_COLLECTION.to_string(),
             index: "ndvi".to_string(),
             month: month.to_string(),
+            product: "monthly_composite".to_string(),
         })?,
         Some(field_id),
         Some(FIXTURE_COLLECTION),

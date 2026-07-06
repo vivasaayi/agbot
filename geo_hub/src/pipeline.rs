@@ -176,13 +176,28 @@ pub struct DerivePayload {
 }
 
 /// Payload for a [`JobKind::L3Recompute`] job.
+///
+/// `product` selects which L3 the recompute produces (batch S-12):
+/// `monthly_composite` (default), `climatology`, `phenology`, or
+/// `drought_stack`. Older `l3_recompute` payloads written before S-12 have no
+/// `product` field and deserialize as `monthly_composite`, preserving the
+/// original monthly-composite behaviour byte-for-byte.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct L3RecomputePayload {
     pub field_id: String,
     pub dataset: String,
     pub index: String,
-    /// Month bucket in `YYYY-MM` form.
+    /// Month bucket in `YYYY-MM` form (the season-end month for phenology).
     pub month: String,
+    /// Which L3 to (re)compute: `monthly_composite` | `climatology` |
+    /// `phenology` | `drought_stack`.
+    #[serde(default = "default_l3_product")]
+    pub product: String,
+}
+
+/// Default `product` for an [`L3RecomputePayload`] with no explicit selector.
+pub fn default_l3_product() -> String {
+    "monthly_composite".to_string()
 }
 
 /// Payload for a [`JobKind::AppRun`] job.
@@ -224,9 +239,29 @@ pub fn derive_job_key(dataset: &str, item_id: &str, index: &str, field_id: &str)
     format!("derive:{dataset}:{item_id}:{index}:{field_id}")
 }
 
-/// Job key for an L3 monthly rollup recompute (`month` is `YYYY-MM`).
+/// Job key for an L3 monthly composite rollup recompute (`month` is
+/// `YYYY-MM`). This is the `monthly_composite` product's key; its format is
+/// preserved from before S-12 so in-flight jobs keep deduplicating.
 pub fn l3_job_key(field_id: &str, dataset: &str, index: &str, month: &str) -> String {
     format!("l3:{dataset}:{index}:{field_id}:{month}")
+}
+
+/// Job key for a non-composite L3 suite recompute (batch S-12:
+/// `climatology` | `phenology` | `drought_stack`). The product is folded into
+/// the index token (`{index}_{product}`) so dedupe stays distinct per
+/// (field, product, bucket) while sharing the `l3:` debounce prefix. `bucket`
+/// is a `YYYY-MM` month (composite/drought) or a season label (phenology).
+///
+/// `monthly_composite` intentionally does not route here — it keeps the
+/// legacy [`l3_job_key`] format for byte-compatible dedupe.
+pub fn l3_suite_job_key(
+    field_id: &str,
+    dataset: &str,
+    index: &str,
+    product: &str,
+    bucket: &str,
+) -> String {
+    format!("l3:{dataset}:{index}_{product}:{field_id}:{bucket}")
 }
 
 /// Job key for a downstream application run (`date` is `YYYY-MM-DD`).
@@ -865,6 +900,43 @@ mod tests {
         assert_eq!(key, "l3:sentinel-2-l2a:ndvi:field-1:2026-06");
         assert!(is_l3_key(&key));
         assert!(!is_l3_key(&discover_job_key("field-1", "sentinel-2-l2a")));
+    }
+
+    #[test]
+    fn l3_suite_job_key_varies_by_product_and_shares_debounce_prefix() {
+        let clim = l3_suite_job_key(
+            "field-1",
+            "sentinel-2-l2a",
+            "ndvi",
+            "climatology",
+            "2026-06",
+        );
+        let stack = l3_suite_job_key(
+            "field-1",
+            "sentinel-2-l2a",
+            "ndvi",
+            "drought_stack",
+            "2026-06",
+        );
+        assert_eq!(clim, "l3:sentinel-2-l2a:ndvi_climatology:field-1:2026-06");
+        assert_ne!(clim, stack, "product distinguishes the dedupe bucket");
+        // Distinct from the monthly composite key for the same (field, month).
+        assert_ne!(
+            clim,
+            l3_job_key("field-1", "sentinel-2-l2a", "ndvi", "2026-06")
+        );
+        // Still an l3 debounce key.
+        assert!(is_l3_key(&clim));
+        assert!(is_l3_key(&stack));
+    }
+
+    #[test]
+    fn l3_payload_product_defaults_to_monthly_composite() {
+        let payload: L3RecomputePayload = serde_json::from_str(
+            r#"{"field_id":"f","dataset":"d","index":"ndvi","month":"2026-06"}"#,
+        )
+        .unwrap();
+        assert_eq!(payload.product, "monthly_composite");
     }
 
     #[test]

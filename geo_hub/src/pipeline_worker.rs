@@ -32,7 +32,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Datelike, Duration as ChronoDuration, Utc};
 use shared::schemas::GeoBounds;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -43,7 +43,9 @@ use crate::catalog::{self, ProductFilter};
 use crate::composite_rasters::{self, CompositeDeriveRequest, CompositeRasterError};
 use crate::config::HubConfig;
 use crate::db::DbPool;
+use crate::drought_rasters::{self, DroughtRasterError};
 use crate::earth_search::{self, EarthSearchItem};
+use crate::landcover_rasters;
 use crate::pipeline::{
     self, AppRunPayload, BackfillEnumeratePayload, DerivePayload, DiscoverPayload, JobKind,
     L3RecomputePayload, PipelineError, PipelineJob,
@@ -51,6 +53,7 @@ use crate::pipeline::{
 use crate::satellite_derivation::{
     derive_satellite_index, index_kind_from_key, CogStoreResolver, DeriveRequest,
 };
+use post_processor::temporal_composite::CompositeCadence;
 use shared::product_graph::ProductLevel;
 use shared::timeseries_naming::{field_entity_ref, satellite_metric, ZonalStat};
 
@@ -862,6 +865,7 @@ async fn enqueue_post_derive_jobs(
         dataset: payload.dataset.clone(),
         index: payload.index.clone(),
         month: month.to_string(),
+        product: pipeline::default_l3_product(),
     })
     .map_err(|err| format!("l3_recompute payload: {err}"))?;
     pipeline::enqueue_job(
@@ -904,17 +908,53 @@ async fn enqueue_post_derive_jobs(
     Ok(())
 }
 
-/// Execute one L3 recompute: composite the field's registered same-index L2
-/// series over the payload's month through the same core the
-/// `POST /api/composites/derive` route uses ([`composite_rasters::derive_composite`]),
-/// then supersede the previous registered composite for that
-/// (field, index, month). A month with no field-scoped inputs completes as
-/// a logged no-op — an empty month is a normal pipeline state, not a fault.
+/// Season-end calendar months that trigger a phenology recompute (batch
+/// S-12, v1 simplification): kharif harvest window. This hardcoded rule is a
+/// placeholder for per-field season configuration; the config follow-up will
+/// read the field's registered season boundaries instead.
+const SEASON_END_MONTHS: &[u32] = &[9, 10];
+
+/// Minimum distinct calendar-year composites a climatology period needs
+/// (batch S-12). Two years is the pipeline floor; the HTTP path defaults
+/// higher (`DEFAULT_MIN_YEARS`), but the automated loop materializes a usable
+/// baseline as soon as two seasons exist.
+const CLIMATOLOGY_MIN_YEARS: u32 = 2;
+
+/// Minimum months in a season before phenology is worth computing (batch
+/// S-12): the phenology engine needs a rising/falling arc to place season
+/// markers.
+const PHENOLOGY_MIN_MONTHS: usize = 3;
+
+/// Execute one L3 recompute. The payload's `product` selects the derivation
+/// (batch S-12): `monthly_composite` (default) composites the month's L2
+/// series and, on success, fans out the climatology / phenology /
+/// drought-stack follow-ups; `climatology`, `phenology`, and `drought_stack`
+/// run their respective cores. Every product supersedes priors of the same
+/// identity and treats missing inputs as a logged no-op success.
 async fn execute_l3_recompute(ctx: &PipelineWorkerContext, job: &PipelineJob) -> JobRunResult {
     let payload: L3RecomputePayload = match serde_json::from_str(&job.payload_json) {
         Ok(payload) => payload,
         Err(err) => return client_failure(format!("invalid l3_recompute payload: {err}")),
     };
+    match payload.product.as_str() {
+        "monthly_composite" => execute_l3_monthly_composite(ctx, &payload).await,
+        "climatology" => execute_l3_climatology(ctx, &payload).await,
+        "phenology" => execute_l3_phenology(ctx, &payload).await,
+        "drought_stack" => execute_l3_drought_stack(ctx, &payload).await,
+        other => client_failure(format!("unknown l3_recompute product {other:?}")),
+    }
+}
+
+/// Composite the field's registered same-index L2 series over the payload's
+/// month through the same core the `POST /api/composites/derive` route uses
+/// ([`composite_rasters::derive_composite`]), then supersede the previous
+/// registered composite for that (field, index, month) and enqueue the S-12
+/// follow-up recomputes. A month with no field-scoped inputs completes as a
+/// logged no-op — an empty month is a normal pipeline state, not a fault.
+async fn execute_l3_monthly_composite(
+    ctx: &PipelineWorkerContext,
+    payload: &L3RecomputePayload,
+) -> JobRunResult {
     let Some((start, end)) = month_window(&payload.month) else {
         return client_failure(format!(
             "l3_recompute month {:?} is not YYYY-MM",
@@ -1012,7 +1052,619 @@ async fn execute_l3_recompute(ctx: &PipelineWorkerContext, job: &PipelineJob) ->
         observations = outcome.observations_used.len(),
         "l3 monthly composite recomputed"
     );
+
+    // Fan out the S-12 follow-up recomputes. The registration above is
+    // durable, so an enqueue failure is transient — the retry re-runs the
+    // idempotent composite and re-attempts the fan-out.
+    if let Err(err) = enqueue_l3_followups(ctx, payload).await {
+        return transient_failure(format!(
+            "composite {} registered but follow-up enqueue failed: {err}",
+            outcome.composite_product_id
+        ));
+    }
     JobRunResult::Succeeded
+}
+
+/// After a month's composite lands, enqueue the follow-up L3 recomputes
+/// (batch S-12), each debounced by its own `l3:` suite job key:
+///
+/// - **climatology** for the composite's calendar month, always (the handler
+///   no-ops when fewer than two same-month years exist);
+/// - **phenology** only when the month is a season-end month (v1 rule:
+///   [`SEASON_END_MONTHS`]; the handler no-ops on a short season);
+/// - **drought_stack** for the month, only when the field has any active
+///   subscription (v1 simplification: any subscription opts the field in).
+async fn enqueue_l3_followups(
+    ctx: &PipelineWorkerContext,
+    payload: &L3RecomputePayload,
+) -> Result<(), PipelineError> {
+    let now = Utc::now();
+    let month = payload.month.as_str();
+
+    // climatology (debounced per calendar month).
+    enqueue_l3_suite_job(ctx, payload, "climatology", month, now).await?;
+
+    // phenology only at a season-end month (v1 rule).
+    let calendar_month: Option<u32> = month
+        .split_once('-')
+        .and_then(|(_, mm)| mm.parse::<u32>().ok());
+    if calendar_month.is_some_and(|m| SEASON_END_MONTHS.contains(&m)) {
+        enqueue_l3_suite_job(ctx, payload, "phenology", month, now).await?;
+    }
+
+    // drought_stack for any field with an active subscription (v1
+    // simplification: any subscription opts the field in).
+    if field_has_active_subscription(ctx, &payload.field_id).await? {
+        enqueue_l3_suite_job(ctx, payload, "drought_stack", month, now).await?;
+    }
+    Ok(())
+}
+
+/// Enqueue one non-composite L3 suite recompute job for `product`/`bucket`.
+async fn enqueue_l3_suite_job(
+    ctx: &PipelineWorkerContext,
+    payload: &L3RecomputePayload,
+    product: &str,
+    bucket: &str,
+    now: DateTime<Utc>,
+) -> Result<(), PipelineError> {
+    let job_payload = serde_json::to_value(L3RecomputePayload {
+        field_id: payload.field_id.clone(),
+        dataset: payload.dataset.clone(),
+        index: payload.index.clone(),
+        month: bucket.to_string(),
+        product: product.to_string(),
+    })?;
+    pipeline::enqueue_job(
+        &ctx.pool,
+        JobKind::L3Recompute,
+        &pipeline::l3_suite_job_key(
+            &payload.field_id,
+            &payload.dataset,
+            &payload.index,
+            product,
+            bucket,
+        ),
+        &job_payload,
+        Some(&payload.field_id),
+        Some(&payload.dataset),
+        0,
+        now,
+        None,
+        now,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// True when the field has at least one active satellite subscription.
+async fn field_has_active_subscription(
+    ctx: &PipelineWorkerContext,
+    field_id: &str,
+) -> Result<bool, PipelineError> {
+    let subs = pipeline::list_subscriptions(&ctx.pool, Some(field_id)).await?;
+    Ok(subs.iter().any(|s| s.status == "active"))
+}
+
+/// Execute a `climatology` L3 recompute (batch S-12): build/refresh the
+/// field's index climatology from its monthly composites through the same
+/// core the drought route uses ([`drought_rasters::derive_index_climatology`]),
+/// then supersede prior climatologies of the same identity. No usable
+/// composites (fewer than two same-month years yields a sentinel-only,
+/// still-registered climatology; zero composites yields
+/// [`DroughtRasterError::NoUsableObservations`]) completes as a logged no-op.
+async fn execute_l3_climatology(
+    ctx: &PipelineWorkerContext,
+    payload: &L3RecomputePayload,
+) -> JobRunResult {
+    // Gate: a usable climatology needs at least one calendar month with
+    // >= CLIMATOLOGY_MIN_YEARS distinct years of composites. Enforced here
+    // (before registration) so an under-populated field is a clean no-op and
+    // no sentinel-only climatology is exposed.
+    match max_calendar_month_year_span(ctx, &payload.field_id, &payload.index).await {
+        Ok(span) if span < CLIMATOLOGY_MIN_YEARS as usize => {
+            tracing::info!(
+                field_id = %payload.field_id,
+                index = %payload.index,
+                span,
+                "l3 climatology: fewer than two same-month years; completing as no-op"
+            );
+            return JobRunResult::Succeeded;
+        }
+        Ok(_) => {}
+        Err(err) => return transient_failure(err.to_string()),
+    }
+
+    let season_id = latest_composite_season(ctx, &payload.field_id, &payload.index)
+        .await
+        .unwrap_or_default();
+    let outcome = match drought_rasters::derive_index_climatology(
+        &ctx.pool,
+        &ctx.config.data_root,
+        &drought_rasters::ClimatologyDeriveRequest {
+            index_kind: payload.index.clone(),
+            field_id: payload.field_id.clone(),
+            season_id,
+            cadence: CompositeCadence::Monthly,
+            min_years: CLIMATOLOGY_MIN_YEARS,
+        },
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(DroughtRasterError::NoUsableObservations { skipped }) => {
+            tracing::info!(
+                field_id = %payload.field_id,
+                index = %payload.index,
+                skipped,
+                "l3 climatology: no usable composites; completing as no-op"
+            );
+            return JobRunResult::Succeeded;
+        }
+        Err(err) => {
+            return JobRunResult::Failed {
+                client_error: err.is_client_error(),
+                error: err.to_string(),
+            }
+        }
+    };
+    if let Err(err) = supersede_previous_climatologies(
+        ctx,
+        &payload.field_id,
+        &payload.index,
+        &outcome.climatology_product_id,
+    )
+    .await
+    {
+        return transient_failure(format!(
+            "climatology {} registered but supersede pass failed: {err}",
+            outcome.climatology_product_id
+        ));
+    }
+    tracing::info!(
+        field_id = %payload.field_id,
+        index = %payload.index,
+        climatology_product_id = %outcome.climatology_product_id,
+        observations = outcome.observations_used.len(),
+        "l3 climatology recomputed"
+    );
+    JobRunResult::Succeeded
+}
+
+/// Execute a `phenology` L3 recompute (batch S-12): run the phenology +
+/// land-cover core ([`landcover_rasters::derive_landcover`]) over the field's
+/// season window (the composite series), superseding prior phenology of the
+/// same identity. A season with fewer than [`PHENOLOGY_MIN_MONTHS`] composites
+/// completes as a logged no-op.
+async fn execute_l3_phenology(
+    ctx: &PipelineWorkerContext,
+    payload: &L3RecomputePayload,
+) -> JobRunResult {
+    let Some((_, end)) = month_window(&payload.month) else {
+        return client_failure(format!(
+            "l3 phenology month {:?} is not YYYY-MM",
+            payload.month
+        ));
+    };
+    // Season window: v1 fixed 6-month lookback ending at the composite month,
+    // covering the kharif arc. Config-driven season boundaries are follow-up.
+    let Some(season_start) = end
+        .with_day(1)
+        .and_then(|d| d.checked_sub_months(chrono::Months::new(5)))
+    else {
+        return client_failure(format!("l3 phenology month {:?} underflows", payload.month));
+    };
+    let start = season_start;
+
+    // Gate: at least PHENOLOGY_MIN_MONTHS composites of the index in the
+    // window (the engine needs an arc to place season markers).
+    let months =
+        match count_composite_months(ctx, &payload.field_id, &payload.index, &start, &end).await {
+            Ok(months) => months,
+            Err(err) => return transient_failure(err.to_string()),
+        };
+    if months < PHENOLOGY_MIN_MONTHS {
+        tracing::info!(
+            field_id = %payload.field_id,
+            index = %payload.index,
+            months,
+            "l3 phenology: fewer than three season months; completing as no-op"
+        );
+        return JobRunResult::Succeeded;
+    }
+
+    let season_id = latest_composite_season(ctx, &payload.field_id, &payload.index)
+        .await
+        .unwrap_or_default();
+    let outcome = match landcover_rasters::derive_landcover(
+        &ctx.pool,
+        &ctx.config.data_root,
+        &landcover_rasters::LandCoverDeriveRequest {
+            field_id: payload.field_id.clone(),
+            season_id,
+            start: start.format("%Y-%m-%d").to_string(),
+            end: end.format("%Y-%m-%d").to_string(),
+            min_observations: PHENOLOGY_MIN_MONTHS as u32,
+            season_threshold_fraction: default_phenology_threshold(),
+            series: "composites".to_string(),
+        },
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(
+            landcover_rasters::LandCoverError::NoSeries { .. }
+            | landcover_rasters::LandCoverError::NoUsableSeries { .. },
+        ) => {
+            tracing::info!(
+                field_id = %payload.field_id,
+                index = %payload.index,
+                "l3 phenology: no usable composite series; completing as no-op"
+            );
+            return JobRunResult::Succeeded;
+        }
+        Err(err) => {
+            return JobRunResult::Failed {
+                client_error: err.is_client_error(),
+                error: err.to_string(),
+            }
+        }
+    };
+    if let Err(err) = supersede_previous_products(
+        ctx,
+        &payload.field_id,
+        "phenology",
+        &outcome.phenology_product_id,
+    )
+    .await
+    {
+        return transient_failure(format!(
+            "phenology {} registered but supersede pass failed: {err}",
+            outcome.phenology_product_id
+        ));
+    }
+    tracing::info!(
+        field_id = %payload.field_id,
+        index = %payload.index,
+        phenology_product_id = %outcome.phenology_product_id,
+        "l3 phenology recomputed"
+    );
+    JobRunResult::Succeeded
+}
+
+/// Default season-detection threshold fraction for the pipeline phenology
+/// recompute (mirrors the core's HTTP default).
+fn default_phenology_threshold() -> f32 {
+    post_processor::phenology::DEFAULT_SEASON_THRESHOLD_FRACTION
+}
+
+/// Execute a `drought_stack` L3 recompute (batch S-12): score the field's
+/// current-month NDVI composite into VCI (needs an NDVI climatology), add TCI
+/// when LST products exist and VHI when both exist, register any SPI when
+/// precipitation exists, then enqueue a `drought_watch` app run over whatever
+/// registered. Every missing input is a logged skip/no-op, never an error.
+async fn execute_l3_drought_stack(
+    ctx: &PipelineWorkerContext,
+    payload: &L3RecomputePayload,
+) -> JobRunResult {
+    let field_id = &payload.field_id;
+    let season_id = latest_composite_season(ctx, field_id, "ndvi")
+        .await
+        .unwrap_or_default();
+    let mut drought_product_ids: Vec<String> = Vec::new();
+
+    // VCI needs an NDVI climatology for the field. Gate on its presence; the
+    // drought core rebuilds the climatology from the composite baselines.
+    let has_ndvi_climatology = field_has_climatology(ctx, field_id, "ndvi").await;
+    if has_ndvi_climatology {
+        match current_month_composite(ctx, field_id, "ndvi", &payload.month).await {
+            Ok(Some(current)) => {
+                match drought_rasters::derive_drought_raster(
+                    &ctx.pool,
+                    &ctx.config.data_root,
+                    &drought_rasters::DroughtRasterRequest {
+                        current_product_id: current,
+                        field_id: field_id.clone(),
+                        season_id: season_id.clone(),
+                        cadence: CompositeCadence::Monthly,
+                        min_years: CLIMATOLOGY_MIN_YEARS,
+                        series: "composites".to_string(),
+                    },
+                )
+                .await
+                {
+                    Ok(outcome) => drought_product_ids.push(outcome.drought_product_id),
+                    Err(DroughtRasterError::NoUsableObservations { .. })
+                    | Err(DroughtRasterError::MissingPeriod(_)) => {
+                        tracing::info!(
+                            field_id,
+                            "drought stack: VCI inputs incomplete; skipping VCI"
+                        );
+                    }
+                    Err(err) => {
+                        return JobRunResult::Failed {
+                            client_error: err.is_client_error(),
+                            error: err.to_string(),
+                        }
+                    }
+                }
+            }
+            Ok(None) => {
+                tracing::info!(field_id, month = %payload.month, "drought stack: no current NDVI composite; skipping VCI");
+            }
+            Err(err) => return transient_failure(err.to_string()),
+        }
+    } else {
+        tracing::info!(
+            field_id,
+            "drought stack: no NDVI climatology yet; skipping VCI"
+        );
+    }
+
+    // TCI needs LST products; VHI needs both VCI and TCI. The satellite path
+    // has no thermal source yet, so TCI/VHI are skipped with a log (v1).
+    if field_has_products(ctx, field_id, "lst").await {
+        tracing::info!(
+            field_id,
+            "drought stack: TCI path not yet wired for pipeline; skipping TCI/VHI"
+        );
+    } else {
+        tracing::info!(
+            field_id,
+            "drought stack: no LST products; skipping TCI and VHI"
+        );
+    }
+
+    // SPI needs a precipitation series (CHIRPS). Absent -> no-op skip.
+    if !field_has_precipitation(ctx).await {
+        tracing::info!(
+            field_id,
+            "drought stack: no precipitation series; skipping SPI"
+        );
+    }
+
+    // Enqueue the drought_watch app run over the registered drought products
+    // (and any prior ones for the field). The app handler no-ops on none.
+    if let Err(err) = enqueue_drought_watch(ctx, field_id, &payload.month).await {
+        return transient_failure(format!(
+            "drought stack registered {} product(s) but drought_watch enqueue failed: {err}",
+            drought_product_ids.len()
+        ));
+    }
+    tracing::info!(
+        field_id,
+        month = %payload.month,
+        registered = drought_product_ids.len(),
+        "l3 drought stack recomputed"
+    );
+    JobRunResult::Succeeded
+}
+
+/// Enqueue a `drought_watch` app run for the field dated by the stack month,
+/// deduplicated on the app job key.
+async fn enqueue_drought_watch(
+    ctx: &PipelineWorkerContext,
+    field_id: &str,
+    month: &str,
+) -> Result<(), PipelineError> {
+    let date = format!("{month}-01");
+    let now = Utc::now();
+    let payload = serde_json::to_value(AppRunPayload {
+        app_id: crate::drought_watch_run::APP_ID.to_string(),
+        field_id: field_id.to_string(),
+        date: date.clone(),
+    })?;
+    pipeline::enqueue_job(
+        &ctx.pool,
+        JobKind::AppRun,
+        &pipeline::app_job_key(crate::drought_watch_run::APP_ID, field_id, &date),
+        &payload,
+        Some(field_id),
+        None,
+        0,
+        now,
+        None,
+        now,
+    )
+    .await
+    .map(|_| ())
+}
+
+/// The season id of the field's latest composite of `index`, for scope
+/// stamping. `None` when the field has no composite yet.
+async fn latest_composite_season(
+    ctx: &PipelineWorkerContext,
+    field_id: &str,
+    index: &str,
+) -> Option<String> {
+    let composites =
+        composite_rasters::list_composite_products(&ctx.pool, Some(field_id.to_string()))
+            .await
+            .ok()?;
+    composites
+        .into_iter()
+        .filter(|p| p.parameters["band_names"] == serde_json::json!([index]))
+        .max_by(|a, b| a.temporal_start.cmp(&b.temporal_start))
+        .and_then(|p| p.season_id)
+}
+
+/// The field's single-band composite of `index` whose month equals `month`
+/// (`YYYY-MM`), if any.
+async fn current_month_composite(
+    ctx: &PipelineWorkerContext,
+    field_id: &str,
+    index: &str,
+    month: &str,
+) -> Result<Option<String>, crate::catalog::CatalogError> {
+    let composites =
+        composite_rasters::list_composite_products(&ctx.pool, Some(field_id.to_string())).await?;
+    Ok(composites
+        .into_iter()
+        .filter(|p| p.parameters["band_names"] == serde_json::json!([index]))
+        .find(|p| {
+            p.temporal_start
+                .as_deref()
+                .is_some_and(|ts| ts.starts_with(month))
+        })
+        .map(|p| p.product_id))
+}
+
+/// Count the field's distinct single-band composite months of `index` inside
+/// `[start, end]` (inclusive).
+async fn count_composite_months(
+    ctx: &PipelineWorkerContext,
+    field_id: &str,
+    index: &str,
+    start: &chrono::NaiveDate,
+    end: &chrono::NaiveDate,
+) -> Result<usize, crate::catalog::CatalogError> {
+    let composites =
+        composite_rasters::list_composite_products(&ctx.pool, Some(field_id.to_string())).await?;
+    let months: std::collections::BTreeSet<String> = composites
+        .into_iter()
+        .filter(|p| p.parameters["band_names"] == serde_json::json!([index]))
+        .filter_map(|p| {
+            let ts = p.temporal_start.as_deref()?;
+            let date = chrono::NaiveDate::parse_from_str(ts.get(..10)?, "%Y-%m-%d").ok()?;
+            (date >= *start && date <= *end).then(|| ts[..7].to_string())
+        })
+        .collect();
+    Ok(months.len())
+}
+
+/// True when the field has a registered `index_climatology` L3 for `index`.
+async fn field_has_climatology(ctx: &PipelineWorkerContext, field_id: &str, index: &str) -> bool {
+    let (climatologies, _) =
+        match drought_rasters::list_drought_raster_products(&ctx.pool, Some(field_id.to_string()))
+            .await
+        {
+            Ok(products) => products,
+            Err(_) => return false,
+        };
+    climatologies
+        .iter()
+        .any(|p| p.parameters["index_kind"] == serde_json::json!(index))
+}
+
+/// True when the field has any registered L2 product of `kind`.
+async fn field_has_products(ctx: &PipelineWorkerContext, field_id: &str, kind: &str) -> bool {
+    catalog::list_products(
+        &ctx.pool,
+        &ProductFilter {
+            field_id: Some(field_id.to_string()),
+            kind: Some(kind.to_string()),
+            level: Some(ProductLevel::L2),
+            status: Some("registered".to_string()),
+            ..ProductFilter::default()
+        },
+    )
+    .await
+    .map(|products| !products.is_empty())
+    .unwrap_or(false)
+}
+
+/// True when any precipitation L2 product is registered (CHIRPS is a global
+/// grid, not field-scoped, so this is a workspace-wide check).
+async fn field_has_precipitation(ctx: &PipelineWorkerContext) -> bool {
+    catalog::list_products(
+        &ctx.pool,
+        &ProductFilter {
+            kind: Some(crate::spi_rasters::PRECIPITATION_KIND.to_string()),
+            level: Some(ProductLevel::L2),
+            status: Some("registered".to_string()),
+            ..ProductFilter::default()
+        },
+    )
+    .await
+    .map(|products| !products.is_empty())
+    .unwrap_or(false)
+}
+
+/// The largest number of distinct years any single calendar month has among
+/// the field's single-band composites of `index` — the climatology's best
+/// per-period year span. Two Junes across years give June a span of 2.
+async fn max_calendar_month_year_span(
+    ctx: &PipelineWorkerContext,
+    field_id: &str,
+    index: &str,
+) -> Result<usize, crate::catalog::CatalogError> {
+    let composites =
+        composite_rasters::list_composite_products(&ctx.pool, Some(field_id.to_string())).await?;
+    let mut by_month: std::collections::BTreeMap<u32, std::collections::BTreeSet<i32>> =
+        std::collections::BTreeMap::new();
+    for product in composites {
+        if product.parameters["band_names"] != serde_json::json!([index]) {
+            continue;
+        }
+        let Some(ts) = product.temporal_start.as_deref() else {
+            continue;
+        };
+        let Some(date) = ts
+            .get(..10)
+            .and_then(|d| chrono::NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+        else {
+            continue;
+        };
+        by_month
+            .entry(date.month())
+            .or_default()
+            .insert(date.year());
+    }
+    Ok(by_month
+        .values()
+        .map(|years| years.len())
+        .max()
+        .unwrap_or(0))
+}
+
+/// Supersede prior registered climatologies for (field, index) with the new
+/// one, so exactly one live climatology exists per series.
+async fn supersede_previous_climatologies(
+    ctx: &PipelineWorkerContext,
+    field_id: &str,
+    index: &str,
+    new_product_id: &str,
+) -> Result<(), crate::catalog::CatalogError> {
+    let (climatologies, _) =
+        drought_rasters::list_drought_raster_products(&ctx.pool, Some(field_id.to_string()))
+            .await?;
+    for previous in climatologies {
+        if previous.product_id == new_product_id {
+            continue;
+        }
+        if previous.parameters["index_kind"] == serde_json::json!(index) {
+            catalog::supersede_product(&ctx.pool, &previous.product_id, new_product_id).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Supersede prior registered field-scoped products of `kind` with the new
+/// one (used for phenology), so exactly one live product exists per series.
+async fn supersede_previous_products(
+    ctx: &PipelineWorkerContext,
+    field_id: &str,
+    kind: &str,
+    new_product_id: &str,
+) -> Result<(), crate::catalog::CatalogError> {
+    let previous = catalog::list_products(
+        &ctx.pool,
+        &ProductFilter {
+            field_id: Some(field_id.to_string()),
+            kind: Some(kind.to_string()),
+            level: Some(ProductLevel::L3),
+            status: Some("registered".to_string()),
+            ..ProductFilter::default()
+        },
+    )
+    .await?;
+    for product in previous {
+        if product.product_id == new_product_id {
+            continue;
+        }
+        catalog::supersede_product(&ctx.pool, &product.product_id, new_product_id).await?;
+    }
+    Ok(())
 }
 
 /// `YYYY-MM` -> inclusive (first day, last day) of that month.
@@ -1141,6 +1793,12 @@ async fn execute_app_run(ctx: &PipelineWorkerContext, job: &PipelineJob) -> JobR
     };
     let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
+    // drought_watch (batch S-12) reads the field's registered drought/SPI
+    // rasters, not the NDVI mean series, so it runs on its own path.
+    if payload.app_id == crate::drought_watch_run::APP_ID {
+        return execute_drought_watch_app(ctx, &payload, &created_at).await;
+    }
+
     // v1 apps read the NDVI mean series; per-app index configuration arrives
     // with subscription-level app config (see `apps_for_index`).
     let series = match field_index_series(&ctx.pool, &payload.field_id, "ndvi", &payload.date).await
@@ -1196,6 +1854,87 @@ async fn execute_app_run(ctx: &PipelineWorkerContext, job: &PipelineJob) -> JobR
         run_id = %run.run_id,
         findings = run.output_finding_ids.len(),
         "application run recorded and alerts evaluated"
+    );
+    JobRunResult::Succeeded
+}
+
+/// Execute a `drought_watch` app run (batch S-12): gather the field's live
+/// `drought_index` (VCI/TCI/VHI) and `spi` L3 products, run the drought-watch
+/// evaluator ([`crate::drought_watch_run::run`]) to record stress findings
+/// with lineage, then screen them into Track C alerts. No drought products
+/// yet is a logged no-op success.
+async fn execute_drought_watch_app(
+    ctx: &PipelineWorkerContext,
+    payload: &AppRunPayload,
+    created_at: &str,
+) -> JobRunResult {
+    let (_climatologies, droughts) = match drought_rasters::list_drought_raster_products(
+        &ctx.pool,
+        Some(payload.field_id.clone()),
+    )
+    .await
+    {
+        Ok(products) => products,
+        Err(err) => return transient_failure(err.to_string()),
+    };
+    let spi = match crate::spi_rasters::list_spi_products(&ctx.pool, Some(payload.field_id.clone()))
+        .await
+    {
+        Ok(products) => products,
+        Err(err) => return transient_failure(err.to_string()),
+    };
+    let mut product_ids: Vec<String> = droughts
+        .into_iter()
+        .map(|p| p.product_id)
+        .chain(spi.into_iter().map(|p| p.product_id))
+        .collect();
+    product_ids.sort();
+    product_ids.dedup();
+    if product_ids.is_empty() {
+        tracing::info!(
+            field_id = %payload.field_id,
+            "drought_watch app run: no drought/spi products; completing as no-op"
+        );
+        return JobRunResult::Succeeded;
+    }
+
+    let run = match crate::drought_watch_run::run(
+        &ctx.pool,
+        &crate::drought_watch_run::DroughtWatchRunRequest {
+            org_id: None,
+            field_id: payload.field_id.clone(),
+            product_ids,
+            warning_stressed_fraction: None,
+            critical_stressed_fraction: None,
+            min_valid_fraction: None,
+        },
+        created_at,
+    )
+    .await
+    {
+        Ok(run) => run,
+        Err(err) => return application_failure(err),
+    };
+
+    if let Err(err) = crate::alert_evaluation::evaluate_field_alerts(
+        &ctx.pool,
+        &payload.field_id,
+        &crate::alert_evaluation::default_ruleset(),
+        false,
+        created_at,
+    )
+    .await
+    {
+        return transient_failure(format!(
+            "drought_watch run {} recorded but alert evaluation failed: {err}",
+            run.run_id
+        ));
+    }
+    tracing::info!(
+        field_id = %payload.field_id,
+        run_id = %run.run_id,
+        findings = run.output_finding_ids.len(),
+        "drought_watch application run recorded and alerts evaluated"
     );
     JobRunResult::Succeeded
 }
