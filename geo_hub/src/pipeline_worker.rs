@@ -5,11 +5,13 @@
 //! every poll tick claim at most one ready job, execute it, and run the
 //! subscription cadence pass (due subscriptions -> `discover` jobs).
 //!
-//! Batch scope: [`JobKind::Derive`] (S-7) and [`JobKind::Discover`] (S-8)
-//! have handlers here. `l3_recompute`, `app_run`, and `backfill_enumerate`
-//! handlers arrive in batches S-9/S-11; until then those jobs dead-letter
-//! immediately with a `handler not implemented` **client** error so they
-//! cannot retry-loop.
+//! Batch scope: [`JobKind::Derive`] (S-7), [`JobKind::Discover`] (S-8), and
+//! the L3/application stage (S-9: a successful derive fans out into a
+//! monthly [`JobKind::L3Recompute`] composite plus [`JobKind::AppRun`] jobs,
+//! whose handlers run the composite/application cores in-process and then
+//! evaluate field alerts) have handlers here. `backfill_enumerate` arrives
+//! in a later batch; until then those jobs dead-letter immediately with a
+//! `handler not implemented` **client** error so they cannot retry-loop.
 //!
 //! Everything the worker touches is injected through
 //! [`PipelineWorkerContext`] — the DB pool, the hub config (data root +
@@ -35,13 +37,21 @@ use shared::schemas::GeoBounds;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
+use crate::applications::ApplicationError;
+use crate::catalog::{self, ProductFilter};
+use crate::composite_rasters::{self, CompositeDeriveRequest, CompositeRasterError};
 use crate::config::HubConfig;
 use crate::db::DbPool;
 use crate::earth_search::{self, EarthSearchItem};
-use crate::pipeline::{self, DerivePayload, DiscoverPayload, JobKind, PipelineError, PipelineJob};
+use crate::pipeline::{
+    self, AppRunPayload, DerivePayload, DiscoverPayload, JobKind, L3RecomputePayload,
+    PipelineError, PipelineJob,
+};
 use crate::satellite_derivation::{
     derive_satellite_index, index_kind_from_key, CogStoreResolver, DeriveRequest,
 };
+use shared::product_graph::ProductLevel;
+use shared::timeseries_naming::{field_entity_ref, satellite_metric, ZonalStat};
 
 /// Priority assigned to cadence-produced discover jobs. Zero keeps them
 /// behind any operator-boosted work while still ahead of nothing by default.
@@ -340,15 +350,14 @@ async fn execute_job(ctx: &PipelineWorkerContext, job: &PipelineJob) -> JobRunRe
     match job.kind {
         JobKind::Derive => execute_derive(ctx, job).await,
         JobKind::Discover => execute_discover(ctx, job).await,
-        // S-9 (l3_recompute), S-11 (app_run), and the backfill batch bring
-        // these handlers; until then the jobs dead-letter as client errors
-        // instead of burning retries.
-        JobKind::L3Recompute | JobKind::AppRun | JobKind::BackfillEnumerate => {
-            client_failure(format!(
-                "handler not implemented for job kind {} (arrives in a later batch)",
-                job.kind.as_str()
-            ))
-        }
+        JobKind::L3Recompute => execute_l3_recompute(ctx, job).await,
+        JobKind::AppRun => execute_app_run(ctx, job).await,
+        // The backfill batch brings this handler; until then the jobs
+        // dead-letter as client errors instead of burning retries.
+        JobKind::BackfillEnumerate => client_failure(format!(
+            "handler not implemented for job kind {} (arrives in a later batch)",
+            job.kind.as_str()
+        )),
     }
 }
 
@@ -519,6 +528,9 @@ async fn execute_discover(ctx: &PipelineWorkerContext, job: &PipelineJob) -> Job
 /// run the exact same derivation the `POST /api/satellite/derive` route uses
 /// ([`derive_satellite_index`]), which registers L0/L1/L2 lineage and — with
 /// the payload's field scope — appends per-field time-series stats (S-3).
+/// A successful derive then fans out the S-9 follow-ups: the month's
+/// `l3_recompute` (debounced by [`pipeline::l3_job_key`]) and one `app_run`
+/// per applicable application.
 async fn execute_derive(ctx: &PipelineWorkerContext, job: &PipelineJob) -> JobRunResult {
     let payload: DerivePayload = match serde_json::from_str(&job.payload_json) {
         Ok(payload) => payload,
@@ -550,10 +562,10 @@ async fn execute_derive(ctx: &PipelineWorkerContext, job: &PipelineJob) -> JobRu
         item,
         aoi,
         index,
-        field_id: Some(payload.field_id),
-        season_id: payload.season_id,
+        field_id: Some(payload.field_id.clone()),
+        season_id: payload.season_id.clone(),
     };
-    match derive_satellite_index(
+    let outcome = match derive_satellite_index(
         &ctx.pool,
         &ctx.config.data_root,
         ctx.cog_resolver.as_ref(),
@@ -561,12 +573,485 @@ async fn execute_derive(ctx: &PipelineWorkerContext, job: &PipelineJob) -> JobRu
     )
     .await
     {
-        Ok(_) => JobRunResult::Succeeded,
-        Err(err) => JobRunResult::Failed {
-            client_error: err.is_client_error(),
-            error: err.to_string(),
-        },
+        Ok(outcome) => outcome,
+        Err(err) => {
+            return JobRunResult::Failed {
+                client_error: err.is_client_error(),
+                error: err.to_string(),
+            }
+        }
+    };
+
+    // Post-derive hook (S-9): the registration is durable, so a follow-up
+    // enqueue failure is transient — the retry re-runs the (idempotent,
+    // content-addressed) derive and re-attempts the fan-out.
+    match enqueue_post_derive_jobs(ctx, &payload, &outcome.product_id).await {
+        Ok(()) => JobRunResult::Succeeded,
+        Err(err) => transient_failure(format!(
+            "derive succeeded (product {}) but follow-up enqueue failed: {err}",
+            outcome.product_id
+        )),
     }
+}
+
+// --- S-9: post-derive fan-out, L3 recompute, and application runs -------------
+
+/// The applications an index feeds, v1: a fixed mapping — `ndvi` drives the
+/// crop-health app, and every index feeds the anomaly screen. Per-field,
+/// subscription-level application configuration is future work; when it
+/// lands, this becomes a lookup on the field's subscription instead.
+pub fn apps_for_index(index: &str) -> Vec<&'static str> {
+    match index {
+        "ndvi" => vec![crate::crop_health_run::APP_ID, crate::anomaly_run::APP_ID],
+        _ => vec![crate::anomaly_run::APP_ID],
+    }
+}
+
+/// After a successful derive, enqueue the month's L3 composite recompute
+/// (the `l3:` job key debounces a burst of same-month derives into one
+/// rollup) and one app-run job per applicable application, dated by the L2
+/// product's `temporal_start`.
+async fn enqueue_post_derive_jobs(
+    ctx: &PipelineWorkerContext,
+    payload: &DerivePayload,
+    product_id: &str,
+) -> Result<(), String> {
+    let product = catalog::get_product(&ctx.pool, product_id)
+        .await
+        .map_err(|err| format!("catalog lookup failed: {err}"))?;
+    let temporal_start = product.as_ref().and_then(|p| p.temporal_start.clone());
+    let Some(temporal_start) = temporal_start.filter(|ts| ts.len() >= 10) else {
+        tracing::warn!(
+            product_id = %product_id,
+            "derived product has no usable temporal_start; skipping L3/app fan-out"
+        );
+        return Ok(());
+    };
+    let date = &temporal_start[..10];
+    let month = &temporal_start[..7];
+    let now = Utc::now();
+
+    let l3_payload = serde_json::to_value(L3RecomputePayload {
+        field_id: payload.field_id.clone(),
+        dataset: payload.dataset.clone(),
+        index: payload.index.clone(),
+        month: month.to_string(),
+    })
+    .map_err(|err| format!("l3_recompute payload: {err}"))?;
+    pipeline::enqueue_job(
+        &ctx.pool,
+        JobKind::L3Recompute,
+        &pipeline::l3_job_key(&payload.field_id, &payload.dataset, &payload.index, month),
+        &l3_payload,
+        Some(&payload.field_id),
+        Some(&payload.dataset),
+        0,
+        now,
+        None,
+        now,
+    )
+    .await
+    .map_err(|err| format!("l3_recompute enqueue: {err}"))?;
+
+    for app_id in apps_for_index(&payload.index) {
+        let app_payload = serde_json::to_value(AppRunPayload {
+            app_id: app_id.to_string(),
+            field_id: payload.field_id.clone(),
+            date: date.to_string(),
+        })
+        .map_err(|err| format!("app_run payload: {err}"))?;
+        pipeline::enqueue_job(
+            &ctx.pool,
+            JobKind::AppRun,
+            &pipeline::app_job_key(app_id, &payload.field_id, date),
+            &app_payload,
+            Some(&payload.field_id),
+            None,
+            0,
+            now,
+            None,
+            now,
+        )
+        .await
+        .map_err(|err| format!("app_run enqueue for {app_id}: {err}"))?;
+    }
+    Ok(())
+}
+
+/// Execute one L3 recompute: composite the field's registered same-index L2
+/// series over the payload's month through the same core the
+/// `POST /api/composites/derive` route uses ([`composite_rasters::derive_composite`]),
+/// then supersede the previous registered composite for that
+/// (field, index, month). A month with no field-scoped inputs completes as
+/// a logged no-op — an empty month is a normal pipeline state, not a fault.
+async fn execute_l3_recompute(ctx: &PipelineWorkerContext, job: &PipelineJob) -> JobRunResult {
+    let payload: L3RecomputePayload = match serde_json::from_str(&job.payload_json) {
+        Ok(payload) => payload,
+        Err(err) => return client_failure(format!("invalid l3_recompute payload: {err}")),
+    };
+    let Some((start, end)) = month_window(&payload.month) else {
+        return client_failure(format!(
+            "l3_recompute month {:?} is not YYYY-MM",
+            payload.month
+        ));
+    };
+
+    // Field-scoped input pre-check: the composite core composites every
+    // same-kind L2 on the grid, so gate on the field's own series first.
+    let inputs = match catalog::list_products(
+        &ctx.pool,
+        &ProductFilter {
+            field_id: Some(payload.field_id.clone()),
+            kind: Some(payload.index.clone()),
+            level: Some(ProductLevel::L2),
+            status: Some("registered".to_string()),
+            temporal_start: Some(format!("{start}T00:00:00Z")),
+            temporal_end: Some(format!("{end}T23:59:59Z")),
+            ..ProductFilter::default()
+        },
+    )
+    .await
+    {
+        Ok(inputs) => inputs,
+        Err(err) => return transient_failure(err.to_string()),
+    };
+    if inputs.is_empty() {
+        tracing::info!(
+            field_id = %payload.field_id,
+            index = %payload.index,
+            month = %payload.month,
+            "l3 recompute: no field-scoped L2 inputs in month; completing as no-op"
+        );
+        return JobRunResult::Succeeded;
+    }
+    // Latest input's season labels the composite scope.
+    let season_id = inputs
+        .iter()
+        .max_by(|a, b| a.temporal_start.cmp(&b.temporal_start))
+        .and_then(|p| p.season_id.clone())
+        .unwrap_or_default();
+
+    let outcome = match composite_rasters::derive_composite(
+        &ctx.pool,
+        &ctx.config.data_root,
+        &CompositeDeriveRequest {
+            kind: payload.index.clone(),
+            start: start.to_string(),
+            end: end.to_string(),
+            method: "median".to_string(),
+            field_id: payload.field_id.clone(),
+            season_id,
+        },
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(CompositeRasterError::NoUsableObservations { skipped, .. }) => {
+            tracing::info!(
+                field_id = %payload.field_id,
+                index = %payload.index,
+                month = %payload.month,
+                skipped,
+                "l3 recompute: no usable observations; completing as no-op"
+            );
+            return JobRunResult::Succeeded;
+        }
+        Err(err) => {
+            return JobRunResult::Failed {
+                client_error: err.is_client_error(),
+                error: err.to_string(),
+            }
+        }
+    };
+
+    if let Err(err) = supersede_previous_composites(
+        ctx,
+        &payload.field_id,
+        &payload.index,
+        &payload.month,
+        &outcome.composite_product_id,
+    )
+    .await
+    {
+        return transient_failure(format!(
+            "composite {} registered but supersede pass failed: {err}",
+            outcome.composite_product_id
+        ));
+    }
+    tracing::info!(
+        field_id = %payload.field_id,
+        index = %payload.index,
+        month = %payload.month,
+        composite_product_id = %outcome.composite_product_id,
+        observations = outcome.observations_used.len(),
+        "l3 monthly composite recomputed"
+    );
+    JobRunResult::Succeeded
+}
+
+/// `YYYY-MM` -> inclusive (first day, last day) of that month.
+fn month_window(month: &str) -> Option<(chrono::NaiveDate, chrono::NaiveDate)> {
+    let start = chrono::NaiveDate::parse_from_str(&format!("{month}-01"), "%Y-%m-%d").ok()?;
+    let end = start
+        .checked_add_months(chrono::Months::new(1))?
+        .pred_opt()?;
+    Some((start, end))
+}
+
+/// Mark every other registered `temporal_composite` for the same
+/// (field, index, month) as superseded by the freshly registered one, so the
+/// catalog always exposes exactly one live monthly composite per series.
+async fn supersede_previous_composites(
+    ctx: &PipelineWorkerContext,
+    field_id: &str,
+    index: &str,
+    month: &str,
+    new_product_id: &str,
+) -> Result<(), crate::catalog::CatalogError> {
+    let registered =
+        composite_rasters::list_composite_products(&ctx.pool, Some(field_id.to_string())).await?;
+    for previous in registered {
+        if previous.product_id == new_product_id {
+            continue;
+        }
+        let same_month = previous
+            .temporal_start
+            .as_deref()
+            .is_some_and(|ts| ts.starts_with(month));
+        let same_index = previous.parameters["band_names"]
+            .as_array()
+            .is_some_and(|bands| bands.iter().any(|band| band == index));
+        if same_month && same_index {
+            catalog::supersede_product(&ctx.pool, &previous.product_id, new_product_id).await?;
+        }
+    }
+    Ok(())
+}
+
+/// One observation of a field index series: acquisition time, field-mean
+/// value, and the L2 product it was extracted from.
+struct SeriesObservation {
+    t: String,
+    mean: f64,
+    product_id: String,
+}
+
+/// The field's `sat.{index}.mean` observations at or before the run date,
+/// oldest first, from the S-3 per-field time-series store.
+async fn field_index_series(
+    pool: &DbPool,
+    field_id: &str,
+    index: &str,
+    date: &str,
+) -> Result<Vec<SeriesObservation>, sqlx::Error> {
+    let rows: Vec<(String, f64, String)> = sqlx::query_as(
+        r#"
+        SELECT t, scalar_value, source_ref FROM time_series_points
+        WHERE entity_ref = ? AND metric = ? AND t <= ?
+        ORDER BY t ASC
+        "#,
+    )
+    .bind(field_entity_ref(field_id))
+    .bind(satellite_metric(index, ZonalStat::Mean))
+    .bind(format!("{date}T23:59:59Z"))
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(t, mean, source_ref)| SeriesObservation {
+            t,
+            mean,
+            product_id: source_ref
+                .strip_prefix("product:")
+                .unwrap_or(&source_ref)
+                .to_string(),
+        })
+        .collect())
+}
+
+/// Best-effort field area from the backing product's bbox (CRS units are
+/// meters for the projected L2 grids this pipeline derives). `0.0` when the
+/// product or bbox is unavailable — area only grades finding priority.
+async fn product_area_m2(pool: &DbPool, product_id: &str) -> f32 {
+    match catalog::get_product(pool, product_id).await {
+        Ok(Some(product)) => product
+            .bbox
+            .map(|b| (((b[2] - b[0]) * (b[3] - b[1])).abs()) as f32)
+            .unwrap_or(0.0),
+        _ => 0.0,
+    }
+}
+
+/// Classify an application-core failure: unregistered/non-L2-L3 inputs and
+/// serialization problems are permanent client errors; catalog/provenance/DB
+/// failures are transient.
+fn application_failure(err: ApplicationError) -> JobRunResult {
+    let client_error = matches!(
+        err,
+        ApplicationError::InputNotFound(_)
+            | ApplicationError::InputNotL2OrL3 { .. }
+            | ApplicationError::Serialize { .. }
+    );
+    JobRunResult::Failed {
+        error: err.to_string(),
+        client_error,
+    }
+}
+
+/// Number of trailing observations the anomaly screen uses as its
+/// population. Bounded so a long-lived field cannot grow the run unbounded.
+const ANOMALY_POPULATION_LIMIT: usize = 12;
+
+/// Execute one app-run job: assemble the field's observation series into the
+/// application core's zone inputs, record the governed run (findings +
+/// lineage via `applications::record_run`), then run alert evaluation for
+/// the field ([`crate::alert_evaluation::evaluate_field_alerts`]) so new
+/// findings screen into fired alerts. Zero available inputs complete as a
+/// logged no-op.
+async fn execute_app_run(ctx: &PipelineWorkerContext, job: &PipelineJob) -> JobRunResult {
+    let payload: AppRunPayload = match serde_json::from_str(&job.payload_json) {
+        Ok(payload) => payload,
+        Err(err) => return client_failure(format!("invalid app_run payload: {err}")),
+    };
+    let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    // v1 apps read the NDVI mean series; per-app index configuration arrives
+    // with subscription-level app config (see `apps_for_index`).
+    let series = match field_index_series(&ctx.pool, &payload.field_id, "ndvi", &payload.date).await
+    {
+        Ok(series) => series,
+        Err(err) => return transient_failure(err.to_string()),
+    };
+    if series.is_empty() {
+        tracing::info!(
+            app_id = %payload.app_id,
+            field_id = %payload.field_id,
+            date = %payload.date,
+            "app run: no field observations on or before date; completing as no-op"
+        );
+        return JobRunResult::Succeeded;
+    }
+
+    let run = match payload.app_id.as_str() {
+        crate::crop_health_run::APP_ID => {
+            run_crop_health_from_series(ctx, &payload, &series, &created_at).await
+        }
+        crate::anomaly_run::APP_ID => {
+            run_anomaly_from_series(ctx, &payload, &series, &created_at).await
+        }
+        other => return client_failure(format!("unknown app_id {other:?}")),
+    };
+    let run = match run {
+        Ok(run) => run,
+        Err(err) => return application_failure(err),
+    };
+
+    // Alert hook: screen the field's findings (including this run's) into
+    // fired alerts through the existing Track C evaluation. propose_action
+    // stays off — alert evaluation alone never creates proposals.
+    if let Err(err) = crate::alert_evaluation::evaluate_field_alerts(
+        &ctx.pool,
+        &payload.field_id,
+        &crate::alert_evaluation::default_ruleset(),
+        false,
+        &created_at,
+    )
+    .await
+    {
+        return transient_failure(format!(
+            "app run {} recorded but alert evaluation failed: {err}",
+            run.run_id
+        ));
+    }
+    tracing::info!(
+        app_id = %payload.app_id,
+        field_id = %payload.field_id,
+        date = %payload.date,
+        run_id = %run.run_id,
+        findings = run.output_finding_ids.len(),
+        "application run recorded and alerts evaluated"
+    );
+    JobRunResult::Succeeded
+}
+
+/// Crop health over the field series: one whole-field zone whose mean is the
+/// latest observation and whose delta is the change from the previous one
+/// (0 for a first observation), with both backing L2 products as inputs.
+async fn run_crop_health_from_series(
+    ctx: &PipelineWorkerContext,
+    payload: &AppRunPayload,
+    series: &[SeriesObservation],
+    created_at: &str,
+) -> Result<crate::applications::ApplicationRunRecord, ApplicationError> {
+    let latest = series.last().expect("caller checked non-empty");
+    let previous = series.len().checked_sub(2).map(|i| &series[i]);
+    let mut input_product_ids = vec![latest.product_id.clone()];
+    if let Some(previous) = previous {
+        if previous.product_id != latest.product_id {
+            input_product_ids.push(previous.product_id.clone());
+        }
+    }
+    let zone = post_processor::crop_health_app::ZoneHealthInput {
+        zone_id: field_entity_ref(&payload.field_id),
+        mean_ndvi: latest.mean as f32,
+        ndvi_delta: previous
+            .map(|p| (latest.mean - p.mean) as f32)
+            .unwrap_or(0.0),
+        area_m2: product_area_m2(&ctx.pool, &latest.product_id).await,
+        input_product_ids,
+    };
+    crate::crop_health_run::run(
+        &ctx.pool,
+        &crate::crop_health_run::CropHealthRunRequest {
+            org_id: None,
+            field_id: payload.field_id.clone(),
+            zones: vec![zone],
+            trend_epsilon: None,
+            no_vegetation_threshold: None,
+        },
+        created_at,
+    )
+    .await
+}
+
+/// Anomaly screen over the field series: the population is the trailing
+/// window of whole-field observations (one zone per observation), so the
+/// statistical band flags an observation that departs from the field's own
+/// recent history.
+async fn run_anomaly_from_series(
+    ctx: &PipelineWorkerContext,
+    payload: &AppRunPayload,
+    series: &[SeriesObservation],
+    created_at: &str,
+) -> Result<crate::applications::ApplicationRunRecord, ApplicationError> {
+    let window = &series[series.len().saturating_sub(ANOMALY_POPULATION_LIMIT)..];
+    let area_m2 = product_area_m2(
+        &ctx.pool,
+        &window.last().expect("caller checked non-empty").product_id,
+    )
+    .await;
+    let zones: Vec<post_processor::anomaly_app::ZoneIndexInput> = window
+        .iter()
+        .map(|observation| post_processor::anomaly_app::ZoneIndexInput {
+            zone_id: format!("obs:{}", observation.t),
+            index_value: observation.mean as f32,
+            area_m2,
+            input_product_ids: vec![observation.product_id.clone()],
+        })
+        .collect();
+    crate::anomaly_run::run(
+        &ctx.pool,
+        &crate::anomaly_run::AnomalyRunRequest {
+            org_id: None,
+            field_id: payload.field_id.clone(),
+            zones,
+            low_threshold: None,
+            high_threshold: None,
+            std_dev_multiplier: None,
+        },
+        created_at,
+    )
+    .await
 }
 
 // --- AOI decoding -------------------------------------------------------------
@@ -707,6 +1192,30 @@ mod tests {
                 .is_err()
         );
         assert!(aoi_bounds_from_geojson(&json!({ "type": "Polygon", "coordinates": [] })).is_err());
+    }
+
+    #[test]
+    fn apps_for_index_maps_ndvi_to_crop_health_and_everything_to_anomaly() {
+        assert_eq!(
+            apps_for_index("ndvi"),
+            vec!["crop_health", "anomaly_detection"]
+        );
+        assert_eq!(apps_for_index("mndwi"), vec!["anomaly_detection"]);
+        assert_eq!(apps_for_index("lst"), vec!["anomaly_detection"]);
+    }
+
+    #[test]
+    fn month_window_covers_whole_month_and_rejects_garbage() {
+        let (start, end) = month_window("2026-06").unwrap();
+        assert_eq!(start.to_string(), "2026-06-01");
+        assert_eq!(end.to_string(), "2026-06-30");
+        let (start, end) = month_window("2025-12").unwrap();
+        assert_eq!(start.to_string(), "2025-12-01");
+        assert_eq!(end.to_string(), "2025-12-31");
+        let (_, feb_end) = month_window("2024-02").unwrap();
+        assert_eq!(feb_end.to_string(), "2024-02-29");
+        assert!(month_window("2026-13").is_none());
+        assert!(month_window("junk").is_none());
     }
 
     #[test]

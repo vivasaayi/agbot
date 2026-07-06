@@ -273,10 +273,21 @@ async fn worker_drains_derive_job_and_registers_product() -> Result<()> {
     assert_eq!(outcome.result, Some(JobRunResult::Succeeded));
     assert!(outcome.hit_provider, "derive jobs touch the COG provider");
 
+    // The derive job succeeded; the S-9 fan-out queued its L3/app follow-ups
+    // (covered in detail by tests/pipeline_l3.rs).
     let jobs = pipeline::list_jobs(&ctx.pool, None).await?;
-    assert_eq!(jobs.len(), 1);
-    assert_eq!(jobs[0].status, JobStatus::Succeeded);
-    assert_eq!(jobs[0].last_error, None);
+    let derive = jobs
+        .iter()
+        .find(|job| job.kind == JobKind::Derive)
+        .expect("derive job present");
+    assert_eq!(derive.status, JobStatus::Succeeded);
+    assert_eq!(derive.last_error, None);
+    assert!(
+        jobs.iter()
+            .filter(|job| job.kind != JobKind::Derive)
+            .all(|job| job.status == JobStatus::Queued),
+        "{jobs:?}"
+    );
 
     // The derive registered a field-scoped L2 ndvi product.
     let products = catalog::list_products(
@@ -382,9 +393,9 @@ async fn unimplemented_kinds_go_dead() -> Result<()> {
     let now = Utc::now();
     pipeline::enqueue_job(
         &ctx.pool,
-        JobKind::AppRun,
-        &pipeline::app_job_key("drought_watch", "field-42", "2026-07-06"),
-        &json!({ "app_id": "drought_watch", "field_id": "field-42", "date": "2026-07-06" }),
+        JobKind::BackfillEnumerate,
+        "backfill:field-42:2020..2024",
+        &json!({ "field_id": "field-42", "start": "2020-01-01", "end": "2024-12-31" }),
         Some("field-42"),
         None,
         0,
@@ -397,7 +408,7 @@ async fn unimplemented_kinds_go_dead() -> Result<()> {
     let outcome = run_one_tick(&ctx).await?;
 
     assert!(outcome.claimed);
-    assert_eq!(outcome.kind, Some(JobKind::AppRun));
+    assert_eq!(outcome.kind, Some(JobKind::BackfillEnumerate));
     match outcome.result {
         Some(JobRunResult::Failed {
             ref error,
