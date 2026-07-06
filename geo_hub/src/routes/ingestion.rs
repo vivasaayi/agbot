@@ -71,6 +71,32 @@ pub async fn register_hls(
     Ok(Json(outcome))
 }
 
+impl From<crate::landsat_derive::LandsatDeriveError> for AppError {
+    fn from(err: crate::landsat_derive::LandsatDeriveError) -> Self {
+        match &err {
+            crate::landsat_derive::LandsatDeriveError::BandNotFound { .. } => AppError::NotFound,
+            _ if err.is_client_error() => AppError::BadRequest(err.to_string()),
+            _ => AppError::Anyhow(err.into()),
+        }
+    }
+}
+
+/// Derive NDVI or LST locally from a registered Landsat C2 scene's band
+/// products (batch 35): C2L2 calibration, QA_PIXEL cloud masking, L2
+/// registration with band + QA lineage.
+pub async fn derive_landsat_product_route(
+    State(state): State<AppState>,
+    Json(request): Json<crate::landsat_derive::LandsatDeriveRequest>,
+) -> AppResult<Json<crate::landsat_derive::LandsatDeriveOutcome>> {
+    let outcome = crate::landsat_derive::derive_landsat_product(
+        &state.pool,
+        &state.config.data_root,
+        &request,
+    )
+    .await?;
+    Ok(Json(outcome))
+}
+
 impl From<crate::sen2cor_derive::Sen2CorDeriveError> for AppError {
     fn from(err: crate::sen2cor_derive::Sen2CorDeriveError) -> Self {
         match &err {

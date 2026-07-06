@@ -50,6 +50,10 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::derive_sen2cor_index_route),
         )
         .route(
+            "/api/ingest/landsat/derive",
+            post(routes::derive_landsat_product_route),
+        )
+        .route(
             "/api/catalog/products",
             get(routes::list_catalog_products).post(routes::register_catalog_product),
         )
