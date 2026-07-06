@@ -51,6 +51,25 @@ async fn register_drought(
     name: &str,
     values: Vec<f32>,
 ) -> Result<String> {
+    register_product(
+        pool,
+        tmp,
+        name,
+        "drought_index",
+        json!({ "index_kind": "vci" }),
+        values,
+    )
+    .await
+}
+
+async fn register_product(
+    pool: &db::DbPool,
+    tmp: &TempDir,
+    name: &str,
+    kind: &str,
+    parameters: serde_json::Value,
+    values: Vec<f32>,
+) -> Result<String> {
     let path = tmp.path().join(format!("{name}.tif"));
     write_geotiff_f32(
         &path,
@@ -63,12 +82,14 @@ async fn register_drought(
             nodata: Some(f64::from(NODATA)),
         },
     )?;
+    let mut parameters = parameters;
+    parameters["fixture"] = json!(name);
     let draft = ProductRecordDraft {
         level: ProductLevel::L3,
-        kind: "drought_index".to_string(),
-        algorithm_id: "drought.vci".to_string(),
+        kind: kind.to_string(),
+        algorithm_id: format!("{kind}.fixture"),
         algorithm_version: "1.0.0".to_string(),
-        parameters: json!({ "index_kind": "vci", "fixture": name }),
+        parameters,
         inputs: Vec::new(),
         scope: ProductScope {
             farm_id: None,
@@ -125,6 +146,16 @@ async fn drought_rasters_become_findings_and_fire_an_alert() -> Result<()> {
         register_drought(&pool, &tmp, "vci_stressed", vec![5.0, 25.0, 45.0, 80.0]).await?;
     let healthy =
         register_drought(&pool, &tmp, "vci_healthy", vec![45.0, 50.0, 60.0, 80.0]).await?;
+    // SPI z-scores (McKee scale): [-2.5, -1.2, 0, 1] -> stressed 0.5.
+    let spi = register_product(
+        &pool,
+        &tmp,
+        "spi_dry",
+        "spi",
+        json!({ "window_months": 3 }),
+        vec![-2.5, -1.2, 0.0, 1.0],
+    )
+    .await?;
 
     let (status, record) = send(
         &app,
@@ -132,24 +163,43 @@ async fn drought_rasters_become_findings_and_fire_an_alert() -> Result<()> {
         "/api/applications/drought-watch/runs",
         Some(json!({
             "field_id": "field-1",
-            "product_ids": [stressed, healthy],
+            "product_ids": [stressed, healthy, spi],
         })),
     )
     .await?;
     assert_eq!(status, StatusCode::OK, "{record}");
     assert_eq!(record["app_id"], "drought_watch");
-    assert_eq!(record["output_finding_ids"].as_array().unwrap().len(), 2);
+    assert_eq!(record["output_finding_ids"].as_array().unwrap().len(), 3);
 
     // Findings surface on the field with kinds, metrics, and lineage.
     let (status, findings) = send(&app, "GET", "/api/fields/field-1/findings", None).await?;
     assert_eq!(status, StatusCode::OK, "{findings}");
     let findings = findings.as_array().unwrap();
-    assert_eq!(findings.len(), 2);
+    assert_eq!(findings.len(), 3);
+
+    // The SPI product classifies on the McKee z-score scale, not percent.
+    let spi_finding = findings
+        .iter()
+        .find(|f| f["finding"]["metrics"]["index_kind"] == "spi")
+        .expect("spi finding");
+    assert_eq!(spi_finding["finding"]["kind"], "drought_stress_zone");
+    assert!(
+        (spi_finding["finding"]["metrics"]["stressed_fraction"]
+            .as_f64()
+            .unwrap()
+            - 0.5)
+            .abs()
+            < 1e-6
+    );
+    assert_eq!(spi_finding["finding"]["evidence_refs"], json!([spi]));
 
     // Stressed VCI: stressed fraction 0.5 -> warning-priority drought zone.
     let drought = findings
         .iter()
-        .find(|f| f["finding"]["kind"] == "drought_stress_zone")
+        .find(|f| {
+            f["finding"]["kind"] == "drought_stress_zone"
+                && f["finding"]["metrics"]["index_kind"] == "vci"
+        })
         .expect("drought finding");
     assert_eq!(drought["finding"]["severity"], "high");
     let metrics = &drought["finding"]["metrics"];
@@ -171,7 +221,7 @@ async fn drought_rasters_become_findings_and_fire_an_alert() -> Result<()> {
         .iter()
         .filter(|a| a["event_type"] == "drought_stress_zone")
         .collect();
-    assert_eq!(drought_alerts.len(), 1, "{alerts}");
+    assert_eq!(drought_alerts.len(), 2, "vci + spi stress alerts: {alerts}");
     assert_eq!(drought_alerts[0]["severity"], "warning");
 
     // A non-drought product id is refused with a reason.

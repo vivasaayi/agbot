@@ -152,6 +152,10 @@ export function anomalyRunsPath() {
   return "/api/applications/anomaly/runs";
 }
 
+export function droughtWatchRunsPath() {
+  return "/api/applications/drought-watch/runs";
+}
+
 /** Fields belonging to a farm. */
 export function farmFieldsPath(farmId) {
   return `/api/farms/${encodeURIComponent(farmId)}/fields`;

@@ -34,7 +34,8 @@ pub struct DroughtWatchRunRequest {
     #[serde(default)]
     pub org_id: Option<String>,
     pub field_id: String,
-    /// Catalog ids of registered `drought_index` L3 products (VCI/TCI/VHI).
+    /// Catalog ids of registered `drought_index` (VCI/TCI/VHI) and/or
+    /// `spi` L3 products.
     pub product_ids: Vec<String>,
     #[serde(default)]
     pub warning_stressed_fraction: Option<f32>,
@@ -56,11 +57,11 @@ pub async fn run(
         let product = catalog::get_product(pool, product_id)
             .await?
             .ok_or_else(|| ApplicationError::InputNotFound(product_id.clone()))?;
-        if product.kind != "drought_index" {
+        if product.kind != "drought_index" && product.kind != "spi" {
             return Err(ApplicationError::InputNotL2OrL3 {
                 product_id: product_id.clone(),
                 level: format!(
-                    "kind {} (drought_watch consumes drought_index L3s)",
+                    "kind {} (drought_watch consumes drought_index/spi L3s)",
                     product.kind
                 ),
             });
@@ -71,12 +72,16 @@ pub async fn run(
             .map_err(|_| ApplicationError::InputNotFound(product_id.clone()))?;
         readings.push(DroughtProductReading {
             product_id: product_id.clone(),
-            index_kind: product
-                .parameters
-                .get("index_kind")
-                .and_then(|v| v.as_str())
-                .unwrap_or("unknown")
-                .to_string(),
+            index_kind: if product.kind == "spi" {
+                "spi".to_string()
+            } else {
+                product
+                    .parameters
+                    .get("index_kind")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string()
+            },
             values: raster.values,
             valid_mask: raster.valid_mask,
         });

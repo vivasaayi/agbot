@@ -11,6 +11,7 @@ import {
   cropHealthRunsPath,
   waterPriorityRunsPath,
   anomalyRunsPath,
+  droughtWatchRunsPath,
   catalogProductsPath,
 } from "../api.js";
 
@@ -40,6 +41,7 @@ const APPS = {
     label: "Anomaly detection",
     productKind: "ndvi",
     runsPath: anomalyRunsPath,
+  droughtWatchRunsPath,
     fields: [["index_value", "index value"]],
   },
 };
@@ -124,9 +126,9 @@ function zoneInputRow(app) {
 
 // Resolve the field's cataloged L2 products of `kind`; these are the run's
 // inputs so findings trace to source. Returns product-id strings.
-async function fieldProductIds(fieldId, kind) {
+async function fieldProductIds(fieldId, kind, level = "L2") {
   const page = await apiGet(
-    catalogProductsPath({ field_id: fieldId, level: "L2", kind }),
+    catalogProductsPath({ field_id: fieldId, level, kind }),
   );
   return asItems(page, "products")
     .map((p) => p.product_id ?? p.id)
@@ -169,16 +171,27 @@ function runForm(fieldId, list, note) {
   form.appendChild(rows);
 
   const currentApp = () => APPS[picker.value];
-  const resetRows = () => rows.replaceChildren(zoneInputRow(currentApp()));
-  picker.addEventListener("change", resetRows);
-  resetRows();
-
   const addRow = document.createElement("button");
+  const resetRows = () => {
+    const app = currentApp();
+    if (app.mode === "products") {
+      rows.replaceChildren(
+        status("Runs over the field's registered drought products (VCI/TCI/VHI/SPI)."),
+      );
+      addRow.style.display = "none";
+    } else {
+      rows.replaceChildren(zoneInputRow(app));
+      addRow.style.display = "";
+    }
+  };
+  picker.addEventListener("change", resetRows);
+
   addRow.type = "button";
   addRow.className = "link-button add-zone";
   addRow.textContent = "+ zone";
   addRow.addEventListener("click", () => rows.appendChild(zoneInputRow(currentApp())));
   form.appendChild(addRow);
+  resetRows();
 
   const submit = document.createElement("button");
   submit.type = "submit";
@@ -191,6 +204,28 @@ function runForm(fieldId, list, note) {
     const app = currentApp();
     note.replaceChildren(status("Resolving inputs…"));
     try {
+      if (app.mode === "products") {
+        const productIds = (
+          await Promise.all(
+            app.products.map(({ kind, level }) => fieldProductIds(fieldId, kind, level)),
+          )
+        ).flat();
+        if (productIds.length === 0) {
+          note.replaceChildren(
+            status("No registered drought products for this field yet.", true),
+          );
+          return;
+        }
+        const run = await apiPost(app.runsPath(), {
+          field_id: fieldId,
+          product_ids: productIds,
+        });
+        note.replaceChildren(
+          status(`Run ${run.run_id} recorded ${run.output_finding_ids.length} finding(s).`),
+        );
+        await loadFindings(list, fieldId);
+        return;
+      }
       const inputProductIds = await fieldProductIds(fieldId, app.productKind);
       if (inputProductIds.length === 0) {
         note.replaceChildren(
