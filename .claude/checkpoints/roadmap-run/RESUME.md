@@ -7,9 +7,11 @@ continues on enhance-satellite-image-pipeline. Batch 30 (4dc8d1a): index surface
 affordance on band_b* items. Batch 29 (da46205): spec-driven multi-index
 (ndvi/mndwi/ndmi), cross-resolution B11 replication, SCL native/replicated.
 Batch 28 (7b6e26e): SCL cloud masking.
-NEXT: batch 31 candidates = local dNBR composition test over two sen2cor
-NBR products (pre/post) through the batch-14 route; temporal compositing
-over sen2cor index series.
+Batch 31 (263805e): local dNBR composition proof (test-only; pre/post
+sen2cor NBR pair -> dNBR moderate-high, chronology enforced).
+NEXT: batch 32 candidates = temporal compositing over sen2cor index series
+(post_processor temporal_composite over cataloged local index L2s);
+Landsat Collection-2 local band derivation parity.
 
 ## MERGED HISTORY: satellite intelligence pipeline (2026-07)
 Active plan + per-batch ledger: `docs/design/satellite-intelligence-pipeline.md`
