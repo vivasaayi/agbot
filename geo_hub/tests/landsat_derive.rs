@@ -58,7 +58,17 @@ async fn ctx(tmp: &TempDir) -> Result<Ctx> {
 }
 
 async fn register_band(ctx: &Ctx, tmp: &TempDir, kind: &str, dn: Vec<u16>) -> Result<String> {
-    let path = tmp.path().join(format!("{kind}.tif"));
+    register_band_for(ctx, tmp, SCENE_ID, kind, dn).await
+}
+
+async fn register_band_for(
+    ctx: &Ctx,
+    tmp: &TempDir,
+    scene_id: &str,
+    kind: &str,
+    dn: Vec<u16>,
+) -> Result<String> {
+    let path = tmp.path().join(format!("{scene_id}_{kind}.tif"));
     write_geotiff_u16(
         &path,
         2,
@@ -75,13 +85,13 @@ async fn register_band(ctx: &Ctx, tmp: &TempDir, kind: &str, dn: Vec<u16>) -> Re
         kind: kind.to_string(),
         algorithm_id: "usgs.landsat.surface_reflectance".to_string(),
         algorithm_version: "1.0.0".to_string(),
-        parameters: json!({ "scene_id": SCENE_ID, "band": kind }),
+        parameters: json!({ "scene_id": scene_id, "band": kind }),
         inputs: Vec::new(),
         scope: ProductScope {
             farm_id: None,
             field_id: None,
             season_id: None,
-            scene_id: Some(SCENE_ID.to_string()),
+            scene_id: Some(scene_id.to_string()),
             temporal_start: "2024-06-01T05:16:51Z".to_string(),
             temporal_end: "2024-06-01T05:16:51Z".to_string(),
         },
@@ -226,6 +236,133 @@ async fn landsat_bands_derive_qa_masked_ndvi_and_lst() -> Result<()> {
         "POST",
         "/api/ingest/landsat/derive",
         Some(json!({ "scene_id": "LC08_NOPE" })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    Ok(())
+}
+
+/// Batch 38 (Landsat parity): the spec table derives the water/moisture/
+/// burn/enhanced-vegetation indices from the already-ingested OLI bands —
+/// hand-computed MNDWI/NBR 0.5 and EVI ~0.4124 — and the ST_QA band turns
+/// into an honest LST confidence (low-uncertainty fraction).
+#[tokio::test]
+async fn parity_indices_and_st_qa_confidence_derive_from_oli_bands() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = ctx(&tmp).await?;
+
+    register_band(&ctx, &tmp, "band_sr_b2", vec![9091; 4]).await?; // blue ~0.05
+    register_band(&ctx, &tmp, "band_sr_b3", vec![29091; 4]).await?; // green ~0.6
+    register_band(&ctx, &tmp, "band_sr_b4", vec![14545; 4]).await?; // red ~0.2
+    register_band(&ctx, &tmp, "band_sr_b5", vec![29091; 4]).await?; // nir ~0.6
+    register_band(&ctx, &tmp, "band_sr_b6", vec![14545; 4]).await?; // swir1 ~0.2
+    register_band(&ctx, &tmp, "band_sr_b7", vec![14545; 4]).await?; // swir2 ~0.2
+    register_band(&ctx, &tmp, "band_st_b10", vec![44177; 4]).await?; // ~300 K
+    register_band(&ctx, &tmp, "band_qa_pixel", vec![64, 8, 64, 64]).await?;
+    // ST_QA (Kelvin*100): pixels 0/1/3 at 1.5 K, pixel 2 at 3.5 K.
+    register_band(&ctx, &tmp, "band_st_qa", vec![150, 150, 350, 150]).await?;
+
+    // MNDWI = (0.6-0.2)/0.8 = 0.5; NBR likewise; EVI =
+    // 2.5*(0.6-0.2)/(0.6 + 6*0.2 - 7.5*0.05 + 1) ~= 0.4124.
+    for (product, expected) in [
+        ("mndwi", 0.5f32),
+        ("nbr", 0.5),
+        ("ndmi", 0.5),
+        ("evi", 0.4124),
+    ] {
+        let (status, outcome) = send(
+            &ctx.app,
+            "POST",
+            "/api/ingest/landsat/derive",
+            Some(json!({ "scene_id": SCENE_ID, "product": product })),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{product}: {outcome}");
+        assert_eq!(outcome["instrument"], "oli");
+        assert_eq!(outcome["qa_applied"], true);
+        let registered = catalog::get_product(&ctx.pool, outcome["product_id"].as_str().unwrap())
+            .await?
+            .unwrap();
+        assert_eq!(registered.kind, product);
+        let values = {
+            let mut reader = GeoTiffReader::open(registered.path.as_deref().unwrap())?;
+            reader.read_band()?.to_f32()
+        };
+        assert_eq!(values[1], NODATA, "{product}: cloud pixel masked");
+        for pixel in [0usize, 2, 3] {
+            assert!(
+                (values[pixel] - expected).abs() < 1e-3,
+                "{product} pixel {pixel}: {} != {expected}",
+                values[pixel]
+            );
+        }
+    }
+
+    // LST with ST_QA: computed pixels are 0/2/3 (pixel 1 is cloud);
+    // uncertainties 1.5/3.5/1.5 K -> low-uncertainty fraction 2/3, recorded
+    // as the product confidence with the ST_QA product in the lineage.
+    let (status, outcome) = send(
+        &ctx.app,
+        "POST",
+        "/api/ingest/landsat/derive",
+        Some(json!({ "scene_id": SCENE_ID, "product": "lst" })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{outcome}");
+    let fraction = outcome["st_qa_low_uncertainty_fraction"].as_f64().unwrap();
+    assert!((fraction - 2.0 / 3.0).abs() < 1e-6, "{fraction}");
+    let lst = catalog::get_product(&ctx.pool, outcome["product_id"].as_str().unwrap())
+        .await?
+        .unwrap();
+    assert!((lst.confidence.unwrap() - 2.0 / 3.0).abs() < 1e-6);
+    let edges = catalog::trace_inputs(&ctx.pool, &lst.product_id).await?;
+    assert!(edges.iter().any(|e| e.role == "st_qa"));
+
+    Ok(())
+}
+
+/// Batch 38: TM/ETM+ scenes resolve through their own band numbering —
+/// SR_B3/SR_B4 are red/NIR on Landsat 5 (they would be green/red on OLI),
+/// unlocking the pre-2013 archive with the same C2 calibration.
+#[tokio::test]
+async fn tm_scene_resolves_red_nir_through_its_own_band_numbering() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = ctx(&tmp).await?;
+    let scene = "LT05_L2SP_144051_19950601_02_T1";
+
+    register_band_for(&ctx, &tmp, scene, "band_sr_b3", vec![14545; 4]).await?; // TM red
+    register_band_for(&ctx, &tmp, scene, "band_sr_b4", vec![29091; 4]).await?; // TM nir
+
+    let (status, outcome) = send(
+        &ctx.app,
+        "POST",
+        "/api/ingest/landsat/derive",
+        Some(json!({ "scene_id": scene, "product": "ndvi" })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{outcome}");
+    assert_eq!(outcome["instrument"], "tm_etm");
+    assert_eq!(outcome["qa_applied"], false);
+    let ndvi = catalog::get_product(&ctx.pool, outcome["product_id"].as_str().unwrap())
+        .await?
+        .unwrap();
+    assert_eq!(ndvi.parameters["instrument"], "tm_etm");
+    let values = {
+        let mut reader = GeoTiffReader::open(ndvi.path.as_deref().unwrap())?;
+        reader.read_band()?.to_f32()
+    };
+    for value in &values {
+        assert!((value - 0.5).abs() < 1e-3, "TM NDVI 0.5, got {value}");
+    }
+
+    // The same scene refuses an OLI-only thermal request: TM thermal is
+    // ST_B6, and no band matches.
+    let (status, _) = send(
+        &ctx.app,
+        "POST",
+        "/api/ingest/landsat/derive",
+        Some(json!({ "scene_id": scene, "product": "lst" })),
     )
     .await?;
     assert_eq!(status, StatusCode::NOT_FOUND);
