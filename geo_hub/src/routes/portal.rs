@@ -12,6 +12,10 @@ use crate::portal_auth::{
     access_code_is_usable, generate_access_code, generate_session_token, hash_token,
     parse_stored_timestamp, session_expires_at, session_is_valid, AccessCodeStatus, SessionStatus,
 };
+use crate::portal_overview::{
+    build_field_card, build_field_overview, FieldCard, FieldInput, FieldOverview, FindingInput,
+    RecommendationInput, SceneInput,
+};
 use crate::state::AppState;
 use axum::extract::{FromRequestParts, Path, Query, State};
 use axum::http::request::Parts;
@@ -434,4 +438,241 @@ pub async fn revoke_portal_access_code(
     .ok_or(AppError::NotFound)?;
 
     Ok(Json(portal_access_code_summary(&row)))
+}
+
+// ---------------------------------------------------------------------------
+// Session-scoped portal reads (batch F-B2): farms, field cards, and the
+// per-field overview. Aggregation rules live in `crate::portal_overview`;
+// these handlers only run org-scoped queries and delegate assembly.
+// ---------------------------------------------------------------------------
+
+/// A farm owned by the caller's org, as loaded by [`owned_farm`].
+#[derive(Debug, Clone, Serialize)]
+pub struct PortalFarm {
+    pub farm_id: String,
+    pub name: String,
+    pub notes: Option<String>,
+    pub status: String,
+}
+
+fn portal_farm_from_row(row: &sqlx::sqlite::SqliteRow) -> PortalFarm {
+    PortalFarm {
+        farm_id: row.get("farm_id"),
+        name: row.get("name"),
+        notes: row.get("notes"),
+        status: row.get("status"),
+    }
+}
+
+fn field_input_from_row(row: &sqlx::sqlite::SqliteRow) -> FieldInput {
+    FieldInput {
+        field_id: row.get("field_id"),
+        farm_id: row.get("farm_id"),
+        name: row.get("name"),
+        crop: row.get("crop"),
+        season: row.get("season"),
+    }
+}
+
+/// Load a field only if it belongs to `org_id`. A field owned by another org
+/// is reported as [`AppError::NotFound`] — never `Forbidden` — so the route
+/// does not leak which field IDs exist.
+pub async fn owned_field(state: &AppState, org_id: &str, field_id: &str) -> AppResult<FieldInput> {
+    let row = sqlx::query(
+        "SELECT field_id, farm_id, name, crop, season FROM fields \
+         WHERE field_id = ?1 AND owner = ?2",
+    )
+    .bind(field_id)
+    .bind(org_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?
+    .ok_or(AppError::NotFound)?;
+    Ok(field_input_from_row(&row))
+}
+
+/// Load a farm only if it belongs to `org_id`; cross-org access is
+/// indistinguishable from a missing farm (404, no existence leak).
+pub async fn owned_farm(state: &AppState, org_id: &str, farm_id: &str) -> AppResult<PortalFarm> {
+    let row = sqlx::query(
+        "SELECT farm_id, name, notes, status FROM farms WHERE farm_id = ?1 AND owner = ?2",
+    )
+    .bind(farm_id)
+    .bind(org_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?
+    .ok_or(AppError::NotFound)?;
+    Ok(portal_farm_from_row(&row))
+}
+
+#[derive(Debug, Serialize)]
+pub struct PortalFarmSummary {
+    #[serde(flatten)]
+    pub farm: PortalFarm,
+    pub field_count: i64,
+}
+
+/// GET /api/portal/farms — the caller's org farms with per-farm field counts.
+pub async fn portal_list_farms(
+    identity: PortalIdentity,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<PortalFarmSummary>>> {
+    let rows = sqlx::query(
+        r#"
+        SELECT f.farm_id, f.name, f.notes, f.status,
+               (SELECT COUNT(*) FROM fields fl
+                WHERE fl.farm_id = f.farm_id AND fl.owner = ?1) AS field_count
+        FROM farms f
+        WHERE f.owner = ?1
+        ORDER BY f.name ASC, f.farm_id ASC
+        "#,
+    )
+    .bind(&identity.org_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(Json(
+        rows.iter()
+            .map(|row| PortalFarmSummary {
+                farm: portal_farm_from_row(row),
+                field_count: row.get("field_count"),
+            })
+            .collect(),
+    ))
+}
+
+async fn field_findings(state: &AppState, field_id: &str) -> AppResult<Vec<FindingInput>> {
+    let rows = sqlx::query(
+        "SELECT finding_id, kind, severity, created_at FROM application_findings \
+         WHERE field_id = ?1 ORDER BY created_at DESC, finding_id ASC",
+    )
+    .bind(field_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    Ok(rows
+        .iter()
+        .map(|row| FindingInput {
+            finding_id: row.get("finding_id"),
+            kind: row.get("kind"),
+            severity: row.get("severity"),
+            created_at: row.get("created_at"),
+        })
+        .collect())
+}
+
+async fn field_recommendations(
+    state: &AppState,
+    field_id: &str,
+) -> AppResult<Vec<RecommendationInput>> {
+    let rows = sqlx::query(
+        "SELECT recommendation_id, title, category, priority, status, created_at \
+         FROM recommendations WHERE field_id = ?1 \
+         ORDER BY created_at ASC, recommendation_id ASC",
+    )
+    .bind(field_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    Ok(rows
+        .iter()
+        .map(|row| RecommendationInput {
+            recommendation_id: row.get("recommendation_id"),
+            title: row.get("title"),
+            category: row.get("category"),
+            priority: row.get("priority"),
+            status: row.get("status"),
+            created_at: row.get("created_at"),
+        })
+        .collect())
+}
+
+async fn field_latest_scene(state: &AppState, field_id: &str) -> AppResult<Option<SceneInput>> {
+    let row = sqlx::query(
+        "SELECT scene_id, sensor, acquired_at FROM scenes \
+         WHERE field_id = ?1 ORDER BY acquired_at DESC, scene_id ASC LIMIT 1",
+    )
+    .bind(field_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    Ok(row.map(|row| SceneInput {
+        scene_id: row.get("scene_id"),
+        sensor: row.get("sensor"),
+        acquired_at: row.get("acquired_at"),
+    }))
+}
+
+async fn field_alert_fired_ats(state: &AppState, field_id: &str) -> AppResult<Vec<String>> {
+    let rows =
+        sqlx::query_as::<_, (String,)>("SELECT fired_at FROM fired_alerts WHERE field_id = ?1")
+            .bind(field_id)
+            .fetch_all(&state.pool)
+            .await
+            .map_err(Error::from)?;
+    Ok(rows.into_iter().map(|(fired_at,)| fired_at).collect())
+}
+
+/// GET /api/portal/fields — one dashboard card per field in the caller's org.
+/// Per-field queries run in a simple loop: farms hold tens of fields and the
+/// store is local SQLite, so bounded sequential reads beat query complexity.
+pub async fn portal_list_fields(
+    identity: PortalIdentity,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<FieldCard>>> {
+    let field_rows = sqlx::query(
+        "SELECT field_id, farm_id, name, crop, season FROM fields \
+         WHERE owner = ?1 ORDER BY name ASC, field_id ASC",
+    )
+    .bind(&identity.org_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let now = Utc::now();
+    let mut cards = Vec::with_capacity(field_rows.len());
+    for row in &field_rows {
+        let field = field_input_from_row(row);
+        let findings = field_findings(&state, &field.field_id).await?;
+        let recommendations = field_recommendations(&state, &field.field_id).await?;
+        let latest_scene = field_latest_scene(&state, &field.field_id).await?;
+        let alert_fired_ats = field_alert_fired_ats(&state, &field.field_id).await?;
+        cards.push(build_field_card(
+            field,
+            &findings,
+            &recommendations,
+            latest_scene.map(|scene| scene.acquired_at),
+            &alert_fired_ats,
+            now,
+        ));
+    }
+
+    Ok(Json(cards))
+}
+
+/// GET /api/portal/fields/:field_id/overview — aggregated detail for one
+/// owned field. Ownership is checked first via [`owned_field`], so cross-org
+/// and nonexistent fields are both 404.
+pub async fn portal_field_overview(
+    identity: PortalIdentity,
+    Path(field_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<FieldOverview>> {
+    let field = owned_field(&state, &identity.org_id, &field_id).await?;
+
+    let findings = field_findings(&state, &field.field_id).await?;
+    let recommendations = field_recommendations(&state, &field.field_id).await?;
+    let latest_scene = field_latest_scene(&state, &field.field_id).await?;
+    let alert_fired_ats = field_alert_fired_ats(&state, &field.field_id).await?;
+
+    Ok(Json(build_field_overview(
+        field,
+        latest_scene,
+        findings,
+        recommendations,
+        &alert_fired_ats,
+        Utc::now(),
+    )))
 }

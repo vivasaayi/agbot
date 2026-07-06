@@ -21,6 +21,9 @@ pub mod landsat;
 pub mod landsat_derive;
 pub mod field_timeseries;
 pub mod lst_rasters;
+pub mod pipeline;
+pub mod portal_auth;
+pub mod portal_overview;
 pub mod product_catalog;
 pub mod product_tiler;
 pub mod proposal_adapters;
@@ -48,5 +51,3 @@ pub use ingest::{
     SceneIngestHealth, SceneIngestRecord, SceneIngestStatus,
 };
 pub use server::serve;
-pub mod portal_auth;
-pub mod pipeline;

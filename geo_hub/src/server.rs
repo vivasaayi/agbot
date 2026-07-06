@@ -494,6 +494,23 @@ pub fn build_router(state: AppState) -> Router {
             "/api/portal/marketplace-entry",
             get(routes::get_marketplace_portal_entry),
         )
+        .route("/api/portal/login", post(routes::portal_login))
+        .route("/api/portal/logout", post(routes::portal_logout))
+        .route("/api/portal/me", get(routes::portal_me))
+        .route("/api/portal/farms", get(routes::portal_list_farms))
+        .route("/api/portal/fields", get(routes::portal_list_fields))
+        .route(
+            "/api/portal/fields/:field_id/overview",
+            get(routes::portal_field_overview),
+        )
+        .route(
+            "/api/admin/portal/access-codes",
+            get(routes::list_portal_access_codes).post(routes::issue_portal_access_code),
+        )
+        .route(
+            "/api/admin/portal/access-codes/:code_id/revoke",
+            post(routes::revoke_portal_access_code),
+        )
         .route(
             "/api/marketplace/listings",
             get(routes::list_marketplace_listings).post(routes::publish_marketplace_listing),
@@ -1064,14 +1081,3 @@ async fn shutdown_signal() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     info!("shutdown signal received");
 }
-        .route("/api/portal/login", post(routes::portal_login))
-        .route("/api/portal/logout", post(routes::portal_logout))
-        .route("/api/portal/me", get(routes::portal_me))
-        .route(
-            "/api/admin/portal/access-codes",
-            get(routes::list_portal_access_codes).post(routes::issue_portal_access_code),
-        )
-        .route(
-            "/api/admin/portal/access-codes/:code_id/revoke",
-            post(routes::revoke_portal_access_code),
-        )
