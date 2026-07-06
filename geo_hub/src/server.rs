@@ -76,6 +76,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/satellite/derive", post(routes::satellite_derive))
         .route(
+            "/api/fields/:field_id/modis/ingest",
+            post(routes::ingest_field_modis),
+        )
+        .route(
             "/api/fields/:field_id/timeseries",
             get(routes::get_field_timeseries),
         )

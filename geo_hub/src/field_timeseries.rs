@@ -107,7 +107,7 @@ pub fn source_family(source_id: Option<&str>) -> &'static str {
 /// ranks (the numpy/R-7 default): rank = q * (n - 1), interpolating between
 /// the floor and ceil neighbors. Chosen over nearest-rank so small fields
 /// (few valid pixels) do not quantize p10/p90 onto single pixels.
-fn percentile_sorted(sorted: &[f64], q: f64) -> f64 {
+pub(crate) fn percentile_sorted(sorted: &[f64], q: f64) -> f64 {
     debug_assert!(!sorted.is_empty());
     let rank = q * (sorted.len() - 1) as f64;
     let low = rank.floor() as usize;
@@ -123,7 +123,7 @@ fn percentile_sorted(sorted: &[f64], q: f64) -> f64 {
 /// [`ZonalStat::ALL`] order. A pixel is valid when it is finite and not the
 /// nodata sentinel. Returns `None` when no pixel is valid
 /// (mean/median/percentiles are undefined).
-fn zonal_stats(values: &[f32], nodata: Option<f32>) -> Option<Vec<(ZonalStat, f64)>> {
+pub(crate) fn zonal_stats(values: &[f32], nodata: Option<f32>) -> Option<Vec<(ZonalStat, f64)>> {
     let mut valid: Vec<f64> = values
         .iter()
         .filter(|v| v.is_finite() && Some(**v) != nodata)
