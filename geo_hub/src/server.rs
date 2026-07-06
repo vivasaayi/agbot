@@ -407,6 +407,11 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/thermal/lst/derive", post(routes::derive_lst_route))
         .route(
+            "/api/composites/derive",
+            post(routes::derive_composite_route),
+        )
+        .route("/api/composites", get(routes::list_composites_route))
+        .route(
             "/api/change-detection/dnbr/derive",
             post(routes::derive_dnbr_route),
         )

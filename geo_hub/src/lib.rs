@@ -3,6 +3,7 @@ pub mod alert_lifecycle;
 pub mod anomaly_run;
 pub mod applications;
 pub mod catalog;
+pub mod composite_rasters;
 pub mod config;
 pub mod crop_health_run;
 pub mod db;
