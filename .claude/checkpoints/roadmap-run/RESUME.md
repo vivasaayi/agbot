@@ -1,10 +1,12 @@
 # Resume — field-intel-run-1
 
 ## ACTIVE BRANCHES (2026-07-06)
-- landsat-parity (CURRENT): batch 38 (5ecded5) DONE — spec-driven Landsat
-  derive (8 kinds), TM/ETM+ instrument tables (1982+ archive), ST_QA lst
-  confidence. NEXT candidates: ET research+engine (LST+NDVI SSEBop-style,
-  water-availability demand side); reprojection core (continental blocker).
+- landsat-parity (CURRENT): batches 38-40 DONE — 38 (5ecded5) spec-driven
+  Landsat derive + TM/ETM+ archive + ST_QA; 39 (372cb3f) water-body
+  seasonality (persistence classes + availability areas); 40 (b3deea0) ET
+  fraction via Ts-VI triangle + FAO-56 Ra (verified vs Example 8).
+  NEXT candidates: Hargreaves-Samani ETo + ETa mm/day (needs Tmin/Tmax
+  source); water-balance summary product; reprojection core (parked).
 - crop-type-classification: foundation done (b898192) — CropType /
   WorldCerealSeason / EwocCode+legend / ClassLabel trait. Next: generalize
   NearestCentroidModel over ClassLabel.
