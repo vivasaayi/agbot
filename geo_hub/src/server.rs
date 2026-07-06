@@ -110,6 +110,10 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::run_anomaly_app),
         )
         .route(
+            "/api/applications/drought-watch/runs",
+            post(routes::run_drought_watch_app),
+        )
+        .route(
             "/api/fields/:field_id/alert-evaluation",
             post(routes::evaluate_field_alerts),
         )

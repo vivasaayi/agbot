@@ -90,6 +90,13 @@ pub fn default_ruleset() -> Vec<AlertRule> {
             severity: AlertSeverityHint::Warning,
             channels: Vec::new(),
         },
+        AlertRule {
+            rule_id: "drought-stress-warning".to_string(),
+            event_type: "drought_stress_zone".to_string(),
+            subject_ref: None,
+            severity: AlertSeverityHint::Warning,
+            channels: Vec::new(),
+        },
     ]
 }
 
@@ -170,10 +177,15 @@ pub async fn evaluate_field_alerts(
 /// plan's opt-in `propose_action`). These are the actionable finding kinds; any
 /// other kind fires an alert without proposing.
 pub fn propose_action_event_types() -> std::collections::BTreeSet<String> {
-    ["index_anomaly_zone", "water_deficit_zone", "declining_zone"]
-        .into_iter()
-        .map(String::from)
-        .collect()
+    [
+        "index_anomaly_zone",
+        "water_deficit_zone",
+        "declining_zone",
+        "drought_stress_zone",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
 }
 
 /// The proposal `(action_category, priority)` for an actionable finding kind.
@@ -182,6 +194,7 @@ fn finding_action(kind: &str) -> Option<(&'static str, &'static str)> {
         "index_anomaly_zone" => Some(("scout", "high")),
         "water_deficit_zone" => Some(("irrigation", "medium")),
         "declining_zone" => Some(("review", "medium")),
+        "drought_stress_zone" => Some(("irrigation", "high")),
         _ => None,
     }
 }

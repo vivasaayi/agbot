@@ -83,6 +83,21 @@ pub async fn run_water_priority_app(
 /// index values via `post_processor::anomaly_app`, then record a governed run
 /// with lineage back to the zones' cataloged L2/L3 inputs. Its
 /// `index_anomaly_zone` findings feed Track C alert evaluation.
+/// Run the drought-watch application (batch 36): evaluate registered
+/// drought_index L3 rasters (VCI/TCI/VHI) into stress findings via
+/// `post_processor::drought_watch_app`, recorded as a governed run. Its
+/// `drought_stress_zone` findings feed Track C alert evaluation.
+pub async fn run_drought_watch_app(
+    State(state): State<AppState>,
+    Json(request): Json<crate::drought_watch_run::DroughtWatchRunRequest>,
+) -> AppResult<Json<crate::applications::ApplicationRunRecord>> {
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let record = crate::drought_watch_run::run(&state.pool, &request, &now)
+        .await
+        .map_err(application_error)?;
+    Ok(Json(record))
+}
+
 pub async fn run_anomaly_app(
     State(state): State<AppState>,
     Json(request): Json<crate::anomaly_run::AnomalyRunRequest>,
