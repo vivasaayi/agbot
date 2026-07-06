@@ -43,7 +43,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/ingest/hls/register", post(routes::register_hls))
         .route(
             "/api/ingest/sen2cor/ndvi/derive",
-            post(routes::derive_sen2cor_ndvi_route),
+            post(routes::derive_sen2cor_index_route),
+        )
+        .route(
+            "/api/ingest/sen2cor/index/derive",
+            post(routes::derive_sen2cor_index_route),
         )
         .route(
             "/api/catalog/products",

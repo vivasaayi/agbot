@@ -42,6 +42,9 @@ const TILE_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
       <Geoposition resolution="10">
         <ULX>600000</ULX><ULY>1300020</ULY><XDIM>10</XDIM><YDIM>-10</YDIM>
       </Geoposition>
+      <Geoposition resolution="20">
+        <ULX>600000</ULX><ULY>1300020</ULY><XDIM>20</XDIM><YDIM>-20</YDIM>
+      </Geoposition>
     </Tile_Geocoding>
   </n1:Geometric_Info>
 </n1:Level-2A_Tile_ID>"#;
@@ -99,6 +102,27 @@ fn fabricate_l2a(output_dir: &Path) -> Result<()> {
         8,
         8,
         &band_dn(7000),
+    );
+    // Batch 29: green at 10 m, SWIR1 + narrow NIR at their native 20 m.
+    write_jp2_gray(
+        &img.join("T43PFN_20240601T051651_B03_10m.jp2"),
+        8,
+        8,
+        &band_dn(7000),
+    );
+    let img20 = granule.join("IMG_DATA").join("R20m");
+    std::fs::create_dir_all(&img20)?;
+    write_jp2_gray(
+        &img20.join("T43PFN_20240601T051651_B11_20m.jp2"),
+        4,
+        4,
+        &[3000u16; 16],
+    );
+    write_jp2_gray(
+        &img20.join("T43PFN_20240601T051651_B8A_20m.jp2"),
+        4,
+        4,
+        &[7000u16; 16],
     );
     std::fs::write(granule.join("MTD_TL.xml"), TILE_XML)?;
     std::fs::write(output_dir.join(L2A_NAME).join("MTD_MSIL2A.xml"), b"<l2a/>")?;
@@ -177,7 +201,7 @@ async fn sen2cor_jp2_bands_derive_local_ndvi_with_lineage() -> Result<()> {
     assert_eq!(outcome["sensor_profile"], "sentinel2_l2a_baseline_0400");
     assert_eq!(outcome["valid_pixels"], 63);
     assert_eq!(outcome["invalid_pixels"], 1);
-    let ndvi_id = outcome["ndvi_product_id"].as_str().unwrap().to_string();
+    let ndvi_id = outcome["index_product_id"].as_str().unwrap().to_string();
 
     // Registered as an ndvi L2 on the MTD_TL grid, scoped to the scene.
     let product = catalog::get_product(&ctx.pool, &ndvi_id)
@@ -226,7 +250,7 @@ async fn sen2cor_jp2_bands_derive_local_ndvi_with_lineage() -> Result<()> {
     )
     .await?;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(again["ndvi_product_id"], ndvi_id);
+    assert_eq!(again["index_product_id"], ndvi_id);
 
     // Legacy calibration is a DISTINCT product with different values:
     // 3000/10000 = 0.3, 7000/10000 = 0.7 -> NDVI = 0.4.
@@ -239,7 +263,7 @@ async fn sen2cor_jp2_bands_derive_local_ndvi_with_lineage() -> Result<()> {
     .await?;
     assert_eq!(status, StatusCode::OK, "{legacy}");
     assert_eq!(legacy["sensor_profile"], "sentinel2_l2a_legacy");
-    let legacy_id = legacy["ndvi_product_id"].as_str().unwrap();
+    let legacy_id = legacy["index_product_id"].as_str().unwrap();
     assert_ne!(legacy_id, ndvi_id);
     let legacy_product = catalog::get_product(&ctx.pool, legacy_id).await?.unwrap();
     let mut reader = GeoTiffReader::open(legacy_product.path.as_deref().unwrap())?;
@@ -317,7 +341,7 @@ async fn scl_band_masks_clouds_before_the_index() -> Result<()> {
     // the band fill pixel 0 overlaps one of them. 64 - 4 cloud = 60 valid.
     assert_eq!(outcome["valid_pixels"], 60);
     assert_eq!(outcome["invalid_pixels"], 4);
-    let ndvi_id = outcome["ndvi_product_id"].as_str().unwrap().to_string();
+    let ndvi_id = outcome["index_product_id"].as_str().unwrap().to_string();
 
     let product = catalog::get_product(&ctx.pool, &ndvi_id).await?.unwrap();
     assert_eq!(product.parameters["scl_applied"], true);
@@ -346,5 +370,108 @@ async fn scl_band_masks_clouds_before_the_index() -> Result<()> {
         .unwrap();
     assert_eq!(scl_product.kind, "band_scl_20m");
 
+    // On the native 20 m grid (NDMI) the SCL applies without replication:
+    // exactly the one cloud cell is nodata.
+    let (status, outcome) = send(
+        &ctx.app,
+        "POST",
+        "/api/ingest/sen2cor/index/derive",
+        Some(json!({ "scene_id": SCENE_ID, "index": "ndmi" })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{outcome}");
+    assert_eq!(outcome["scl_applied"], true);
+    assert_eq!(outcome["valid_pixels"], 15);
+    assert_eq!(outcome["invalid_pixels"], 1);
+    let ndmi = catalog::get_product(&ctx.pool, outcome["index_product_id"].as_str().unwrap())
+        .await?
+        .unwrap();
+    let values = {
+        let mut reader = GeoTiffReader::open(ndmi.path.as_deref().unwrap())?;
+        reader.read_band()?.to_f32()
+    };
+    assert_eq!(values[0], NODATA, "native-resolution SCL cloud cell");
+    assert!((values[1] - 0.5).abs() < 1e-6);
+
+    Ok(())
+}
+
+/// Batch 29: MNDWI and NDMI derive from the same scene across resolutions.
+/// MNDWI mixes 10 m green (B03) with 20 m SWIR1 (B11, block-replicated 2x)
+/// on the 10 m grid; NDMI runs natively on the 20 m grid (B8A + B11) with
+/// the 20 m geoposition. Baseline-04.00 DN: B03 7000 -> 0.6, B11 3000 ->
+/// 0.2, B8A 7000 -> 0.6, so MNDWI = (0.6-0.2)/0.8 = 0.5 and NDMI =
+/// (0.6-0.2)/0.8 = 0.5. Unknown indices are refused.
+#[tokio::test]
+async fn mndwi_and_ndmi_derive_across_resolutions() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = ctx(&tmp).await?;
+    register_scene(&ctx, &tmp).await?;
+
+    // --- MNDWI on the 10 m grid with the 20 m SWIR replicated.
+    let (status, outcome) = send(
+        &ctx.app,
+        "POST",
+        "/api/ingest/sen2cor/index/derive",
+        Some(json!({ "scene_id": SCENE_ID, "index": "mndwi" })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{outcome}");
+    assert_eq!(outcome["index"], "mndwi");
+    let mndwi = catalog::get_product(&ctx.pool, outcome["index_product_id"].as_str().unwrap())
+        .await?
+        .unwrap();
+    assert_eq!(mndwi.kind, "mndwi");
+    assert_eq!(mndwi.gsd_m_per_px, Some(10.0));
+    assert_eq!(mndwi.parameters["resolution_m"], 10);
+    let mut reader = GeoTiffReader::open(mndwi.path.as_deref().unwrap())?;
+    assert_eq!(reader.info().geo_transform, Some(TRANSFORM));
+    let values = reader.read_band()?.to_f32();
+    assert_eq!(values.len(), 64);
+    assert_eq!(values[0], NODATA, "B03 fill pixel is nodata");
+    for value in &values[1..] {
+        assert!((value - 0.5).abs() < 1e-6, "MNDWI must be 0.5, got {value}");
+    }
+    // Lineage roles are the index roles, not hardcoded red/nir.
+    let edges = catalog::trace_inputs(&ctx.pool, &mndwi.product_id).await?;
+    let mut roles: Vec<&str> = edges.iter().map(|e| e.role.as_str()).collect();
+    roles.sort_unstable();
+    assert_eq!(roles, vec!["green", "swir1"]);
+
+    // --- NDMI natively on the 20 m grid.
+    let (status, outcome) = send(
+        &ctx.app,
+        "POST",
+        "/api/ingest/sen2cor/index/derive",
+        Some(json!({ "scene_id": SCENE_ID, "index": "ndmi" })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{outcome}");
+    let ndmi = catalog::get_product(&ctx.pool, outcome["index_product_id"].as_str().unwrap())
+        .await?
+        .unwrap();
+    assert_eq!(ndmi.kind, "ndmi");
+    assert_eq!(ndmi.gsd_m_per_px, Some(20.0));
+    let mut reader = GeoTiffReader::open(ndmi.path.as_deref().unwrap())?;
+    assert_eq!(
+        reader.info().geo_transform,
+        Some([600_000.0, 20.0, 0.0, 1_300_020.0, 0.0, -20.0]),
+        "NDMI must carry the 20 m geoposition"
+    );
+    let values = reader.read_band()?.to_f32();
+    assert_eq!(values.len(), 16);
+    for value in &values {
+        assert!((value - 0.5).abs() < 1e-6, "NDMI must be 0.5, got {value}");
+    }
+
+    // Unknown index is a caller error.
+    let (status, _) = send(
+        &ctx.app,
+        "POST",
+        "/api/ingest/sen2cor/index/derive",
+        Some(json!({ "scene_id": SCENE_ID, "index": "evi9" })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
     Ok(())
 }

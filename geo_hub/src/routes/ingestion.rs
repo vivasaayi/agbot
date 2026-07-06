@@ -81,15 +81,18 @@ impl From<crate::sen2cor_derive::Sen2CorDeriveError> for AppError {
     }
 }
 
-/// Derive NDVI locally from a registered Sen2Cor scene's 10 m JP2 bands
-/// (batch 24): decode red/NIR via `raster_io`'s JP2 reader, calibrate to
-/// reflectance, register an `ndvi` L2 with lineage to both band products.
-pub async fn derive_sen2cor_ndvi_route(
+/// Derive a spectral index locally from a registered Sen2Cor scene's JP2
+/// bands (batch 24 NDVI; batch 29 generalized to MNDWI/NDMI with 20 m band
+/// replication): decode via `raster_io`'s JP2 reader, calibrate to
+/// reflectance, SCL-mask when available, register an L2 with band lineage.
+/// Served at both `/api/ingest/sen2cor/index/derive` and the original
+/// `/api/ingest/sen2cor/ndvi/derive` path (index defaults to `ndvi`).
+pub async fn derive_sen2cor_index_route(
     State(state): State<AppState>,
-    Json(request): Json<crate::sen2cor_derive::Sen2CorNdviRequest>,
-) -> AppResult<Json<crate::sen2cor_derive::Sen2CorNdviOutcome>> {
+    Json(request): Json<crate::sen2cor_derive::Sen2CorIndexRequest>,
+) -> AppResult<Json<crate::sen2cor_derive::Sen2CorIndexOutcome>> {
     let outcome =
-        crate::sen2cor_derive::derive_sen2cor_ndvi(&state.pool, &state.config.data_root, &request)
+        crate::sen2cor_derive::derive_sen2cor_index(&state.pool, &state.config.data_root, &request)
             .await?;
     Ok(Json(outcome))
 }
