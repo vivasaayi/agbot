@@ -92,6 +92,7 @@ async fn browse_assets_have_correct_content_types() -> Result<()> {
         "/api/drought-management/spi/derive",
         "/api/water-management/extent/derive",
         "/api/ingest/sen2cor/index/derive",
+        "/api/composites/derive",
     ] {
         assert!(
             body.contains(endpoint),
@@ -111,6 +112,8 @@ async fn browse_assets_have_correct_content_types() -> Result<()> {
         "thermal_lst",
         "band_b",
         "index_product_id",
+        "composite_product_id",
+        "COMPOSITABLE_KINDS",
     ] {
         assert!(app_js.contains(marker), "app.js missing {marker}");
     }

@@ -275,3 +275,125 @@ async fn june_window_composites_to_the_per_pixel_median_with_lineage() -> Result
 
     Ok(())
 }
+
+/// Batch 33: monthly composites feed phenology directly. Six cloudy raw
+/// NDVI scenes (two per month, June-August) composite into three monthly
+/// medians, and /api/landcover/derive with series="composites" builds its
+/// phenology from exactly those three composite L3s — a distinct product
+/// from the raw-L2 derivation of the same window (series is
+/// identity-bearing).
+#[tokio::test]
+async fn monthly_composites_feed_phenology_as_a_distinct_series() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = ctx(&tmp).await?;
+
+    // Two raw scenes per month; a crop pulse 0.2 -> 0.8 -> 0.3. Pixel 3
+    // is cloudy in one scene of each month and fills from the other.
+    for (month, value) in [("06", 0.2f32), ("07", 0.8), ("08", 0.3)] {
+        register_ndvi(
+            &ctx,
+            &tmp,
+            &format!("2026-{month}-05"),
+            vec![value, value, value, NODATA],
+            TRANSFORM,
+        )
+        .await?;
+        register_ndvi(
+            &ctx,
+            &tmp,
+            &format!("2026-{month}-20"),
+            vec![value, value, value, value],
+            TRANSFORM,
+        )
+        .await?;
+    }
+    let mut composite_ids = Vec::new();
+    for month in ["06", "07", "08"] {
+        let (status, outcome) = send(
+            &ctx.app,
+            "POST",
+            "/api/composites/derive",
+            Some(json!({
+                "kind": "ndvi",
+                "start": format!("2026-{month}-01"),
+                "end": format!("2026-{month}-28"),
+                "field_id": "field-1",
+                "season_id": "2026-kharif",
+            })),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{outcome}");
+        assert_eq!(outcome["gap_fraction"], 0.0, "cloud gap filled in-month");
+        composite_ids.push(
+            outcome["composite_product_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+
+    // Phenology over the composite series.
+    let derive = |series: &str| {
+        json!({
+            "field_id": "field-1",
+            "season_id": "2026-kharif",
+            "start": "2026-06-01",
+            "end": "2026-08-31",
+            "min_observations": 3,
+            "series": series,
+        })
+    };
+    let (status, composite_fed) = send(
+        &ctx.app,
+        "POST",
+        "/api/landcover/derive",
+        Some(derive("composites")),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{composite_fed}");
+    let used: Vec<&str> = composite_fed["ndvi_observations_used"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    let expected: Vec<&str> = composite_ids.iter().map(String::as_str).collect();
+    assert_eq!(used, expected, "phenology inputs are the three composites");
+    let phenology = catalog::get_product(
+        &ctx.pool,
+        composite_fed["phenology_product_id"].as_str().unwrap(),
+    )
+    .await?
+    .unwrap();
+    assert_eq!(phenology.parameters["series"], "composites");
+
+    // The raw-L2 derivation of the same window is a different product.
+    let (status, raw_fed) = send(
+        &ctx.app,
+        "POST",
+        "/api/landcover/derive",
+        Some(derive("l2")),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{raw_fed}");
+    assert_eq!(
+        raw_fed["ndvi_observations_used"].as_array().unwrap().len(),
+        6,
+        "raw series uses the six scenes"
+    );
+    assert_ne!(
+        raw_fed["phenology_product_id"],
+        composite_fed["phenology_product_id"]
+    );
+
+    // Unknown series population is refused.
+    let (status, _) = send(
+        &ctx.app,
+        "POST",
+        "/api/landcover/derive",
+        Some(derive("mixed")),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    Ok(())
+}

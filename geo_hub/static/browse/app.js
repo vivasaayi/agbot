@@ -278,6 +278,8 @@ function renderItem(item) {
 // routes. The STAC item id IS the catalog product id for catalog products.
 
 const WATER_INDEX_KINDS = ["mndwi", "ndwi", "aweinsh", "aweish", "sar_vv", "sar_vh", "sar_backscatter"];
+/** Single-band raster kinds a temporal composite makes sense over. */
+const COMPOSITABLE_KINDS = ["ndvi", "ndwi", "mndwi", "ndmi", "nbr", "evi", "savi", "gndvi", "ndre", "lst"];
 
 /** Derive actions available for a product kind. Each action: a label, the
  *  endpoint, extra form fields ([name, label, placeholder]), and a body
@@ -329,6 +331,25 @@ function deriveActionsFor(kind, sceneId) {
         season_id: v.season_id,
         ...(v.min_years ? { min_years: Number(v.min_years) } : {}),
         ...(v.window_months ? { window_months: Number(v.window_months) } : {}),
+      }),
+    });
+  }
+  if (COMPOSITABLE_KINDS.includes(kind)) {
+    actions.push({
+      label: "derive temporal composite",
+      endpoint: "/api/composites/derive",
+      extraFields: [
+        ["start", "window start (YYYY-MM-DD)", ""],
+        ["end", "window end (YYYY-MM-DD)", ""],
+        ["method", "method (median/medoid)", "median"],
+      ],
+      body: (_productId, v) => ({
+        kind,
+        start: v.start,
+        end: v.end,
+        ...(v.method ? { method: v.method } : {}),
+        field_id: v.field_id,
+        season_id: v.season_id,
       }),
     });
   }
@@ -426,6 +447,7 @@ function renderDeriveForm(productId, action) {
         outcome.water_extent_product_id ||
         outcome.vhi_product_id ||
         outcome.index_product_id ||
+        outcome.composite_product_id ||
         "(see response)";
       setStatus(`${action.label}: registered ${newId}`);
       // New L3s land in their own collections; refresh whatever is open.
