@@ -22,6 +22,7 @@ pub mod landsat;
 pub mod landsat_derive;
 pub mod field_timeseries;
 pub mod lst_rasters;
+pub mod pc_sign;
 pub mod pipeline;
 pub mod pipeline_worker;
 pub mod portal_auth;

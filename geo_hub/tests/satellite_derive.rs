@@ -389,14 +389,16 @@ async fn derive_route_rejects_bad_requests_with_reason_codes() -> Result<()> {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(body["code"], "missing_item");
 
-    // Landsat items are search-only (requester-pays assets).
-    let landsat: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/earth_search_landsat_item.json"))?;
+    // Collections without a pixel-read path are rejected (Landsat gained one
+    // in batch S-10 and is covered by tests/landsat_remote_derive.rs; HLS and
+    // friends stay unsupported).
+    let mut unsupported = fixture_item();
+    unsupported["collection"] = json!("hls-l30");
     let (status, body) = send(
         &app,
         "POST",
         "/api/satellite/derive",
-        Some(json!({ "item": landsat, "aoi": aoi(), "index": "ndvi" })),
+        Some(json!({ "item": unsupported, "aoi": aoi(), "index": "ndvi" })),
     )
     .await?;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");

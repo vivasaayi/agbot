@@ -122,8 +122,16 @@ pub fn s2_asset_key(role: IndexBandRole) -> &'static str {
 /// Sentinel-2 scene-classification asset key.
 pub const S2_SCL_ASSET_KEY: &str = "scl";
 
-/// Verified Landsat C2 L2 asset key for an index band role (search metadata
-/// only: Earth Search Landsat hrefs are requester-pays `s3://usgs-landsat`).
+/// Landsat C2 L2 pixel-quality bitmask asset key (same key on every
+/// instrument family).
+pub const LANDSAT_QA_PIXEL_ASSET_KEY: &str = "qa_pixel";
+
+/// Verified Landsat C2 L2 asset key for an index band role. The keys are
+/// common across TM/ETM+/OLI instrument families (the `_SR_Bn` file
+/// numbering diverges underneath, but the STAC keys do not). Earth Search
+/// Landsat hrefs are requester-pays `s3://usgs-landsat`; readable pixels
+/// come from the Planetary Computer mirror's blob assets signed via
+/// [`crate::pc_sign`].
 pub fn landsat_asset_key(role: IndexBandRole) -> Option<&'static str> {
     match role {
         IndexBandRole::Blue => Some("blue"),

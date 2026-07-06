@@ -7,10 +7,16 @@
 //! the scene's data_root products directory -> L0/L1/L2 registration in the
 //! product graph (visible via `/api/stac` and `/browse`).
 //!
-//! Scope: **Sentinel-2 L2A only.** Earth Search's Landsat C2 L2 asset hrefs
-//! point at the requester-pays `s3://usgs-landsat` bucket (verified fixture),
-//! so there is no free Landsat band-read path here; Landsat search stays in
-//! `landsat.rs` and QA_PIXEL-masked derivation is future work.
+//! Supported collections (batch S-10 extended the original Sentinel-2-only
+//! scope):
+//! - `sentinel-2-l2a`: free HTTPS COGs on `sentinel-cogs`, SCL cloud mask,
+//!   baseline-dependent DN offset.
+//! - `landsat-c2-l2`: common STAC band keys (`red`, `nir08`, ...) across
+//!   TM/ETM+/OLI, Collection-2 L2 scaling (DN * 0.0000275 - 0.2), and an
+//!   opportunistic QA_PIXEL clear mask (`landsat_derive::qa_pixel_clear`).
+//!   Earth Search Landsat hrefs are requester-pays `s3://usgs-landsat`;
+//!   readable pixels come from Planetary Computer blob assets signed via
+//!   [`crate::pc_sign::PcSignedCogResolver`].
 //!
 //! The module separates pure, unit-tested geometry/pixel math (`project_aoi`,
 //! `snap_rect_outward`, `window_from_rect`, `resample_nearest`,
@@ -37,8 +43,13 @@ use shared::schemas::{GeoBounds, RasterSpatialRef};
 use thiserror::Error;
 
 use crate::db::DbPool;
-use crate::earth_search::{s2_asset_key, EarthSearchItem, S2_SCL_ASSET_KEY};
+use crate::earth_search::{
+    landsat_asset_key, s2_asset_key, EarthSearchItem, LANDSAT_QA_PIXEL_ASSET_KEY, S2_SCL_ASSET_KEY,
+};
 use crate::ingest_contract::{commit_ingest, IngestScene, NormalizedIngest};
+use crate::landsat_derive::{
+    instrument_for_scene, qa_pixel_clear, LandsatInstrument, QA_PIXEL_REJECT_BITS,
+};
 use crate::utm::{utm_to_wgs84, wgs84_to_utm, UtmError, UtmZone};
 
 /// Nodata value written to derived index GeoTIFFs (matches
@@ -46,11 +57,12 @@ use crate::utm::{utm_to_wgs84, wgs84_to_utm, UtmError, UtmZone};
 pub const INDEX_NODATA: f32 = -9999.0;
 
 const SENTINEL2_COLLECTION: &str = "sentinel-2-l2a";
+const LANDSAT_COLLECTION: &str = "landsat-c2-l2";
 const ALGORITHM_VERSION: &str = "1.0.0";
 
 #[derive(Debug, Error)]
 pub enum DerivationError {
-    #[error("collection {0:?} is not derivable locally: only sentinel-2-l2a has free COG assets (Earth Search Landsat bands are requester-pays s3://usgs-landsat)")]
+    #[error("collection {0:?} is not derivable: supported collections are sentinel-2-l2a (free Earth Search COGs) and landsat-c2-l2 (Planetary Computer SAS-signed COGs)")]
     UnsupportedDataset(Option<String>),
     #[error("unknown index kind {0}; expected one of the imagery_processor index catalog (e.g. ndvi, mndwi, ndmi)")]
     UnknownIndexKind(String),
@@ -550,6 +562,103 @@ fn s2_sensor_profile(item: &EarthSearchItem) -> (SensorProfile, serde_json::Valu
     }
 }
 
+/// Landsat Collection-2 Level-2 surface reflectance: one radiometric scale
+/// across every instrument family (the same profile `landsat_derive` uses
+/// for local band files).
+fn landsat_sensor_profile() -> (SensorProfile, serde_json::Value) {
+    let profile = SensorProfile::LandsatC2L2Sr;
+    (
+        profile,
+        serde_json::json!({
+            "profile": "landsat_c2l2_sr",
+            "scale": profile.scale(),
+            "offset": profile.offset(),
+        }),
+    )
+}
+
+/// Collections `derive_satellite_index` can read pixels for, with their
+/// per-collection band naming, calibration, and mask scheme. The geometry,
+/// masking-then-index math, product writing, and registration are shared.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CollectionProfile {
+    /// Earth Search `sentinel-2-l2a` (free HTTPS COGs, SCL mask).
+    Sentinel2,
+    /// `landsat-c2-l2` (Planetary Computer blob assets need SAS signing —
+    /// see [`crate::pc_sign::PcSignedCogResolver`]; QA_PIXEL mask).
+    LandsatC2L2,
+}
+
+impl CollectionProfile {
+    fn from_collection(collection: Option<&str>) -> Option<Self> {
+        match collection {
+            Some(SENTINEL2_COLLECTION) => Some(Self::Sentinel2),
+            Some(LANDSAT_COLLECTION) => Some(Self::LandsatC2L2),
+            _ => None,
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Sentinel2 => SENTINEL2_COLLECTION,
+            Self::LandsatC2L2 => LANDSAT_COLLECTION,
+        }
+    }
+
+    /// Asset key of the collection's pixel-quality mask band.
+    fn mask_asset_key(self) -> &'static str {
+        match self {
+            Self::Sentinel2 => S2_SCL_ASSET_KEY,
+            Self::LandsatC2L2 => LANDSAT_QA_PIXEL_ASSET_KEY,
+        }
+    }
+
+    /// Whether derivation fails when the mask band is missing. Sentinel-2
+    /// L2A always ships SCL (and its 20 m grid snaps the shared window);
+    /// Landsat QA_PIXEL is applied opportunistically, mirroring
+    /// `landsat_derive`'s local-band behavior.
+    fn mask_is_required(self) -> bool {
+        matches!(self, Self::Sentinel2)
+    }
+
+    /// Lineage role recorded for the mask's L1 product.
+    fn mask_input_role(self) -> &'static str {
+        match self {
+            Self::Sentinel2 => "mask:scl",
+            Self::LandsatC2L2 => "mask:qa_pixel",
+        }
+    }
+
+    /// STAC asset key carrying an index band role. Landsat keys are common
+    /// across TM/ETM+/OLI; roles a collection lacks (e.g. red-edge on
+    /// Landsat) are reason-coded as a missing asset.
+    fn band_asset_key(
+        self,
+        role: IndexBandRole,
+        item_id: &str,
+    ) -> Result<&'static str, DerivationError> {
+        match self {
+            Self::Sentinel2 => Ok(s2_asset_key(role)),
+            Self::LandsatC2L2 => {
+                landsat_asset_key(role).ok_or_else(|| DerivationError::MissingAsset {
+                    item_id: item_id.to_string(),
+                    asset_key: format!("{role:?}").to_lowercase(),
+                })
+            }
+        }
+    }
+
+    fn sensor_label(self, item_id: &str) -> &'static str {
+        match self {
+            Self::Sentinel2 => "Sentinel-2 MSI",
+            Self::LandsatC2L2 => match instrument_for_scene(item_id) {
+                LandsatInstrument::Oli => "Landsat OLI/TIRS",
+                LandsatInstrument::TmEtm => "Landsat TM/ETM+",
+            },
+        }
+    }
+}
+
 fn item_wgs84_spatial_ref(item: &EarthSearchItem) -> Option<RasterSpatialRef> {
     let bbox = item.bbox.as_ref().filter(|bbox| bbox.len() == 4)?;
     Some(RasterSpatialRef {
@@ -600,11 +709,9 @@ pub async fn derive_satellite_index(
     request: &DeriveRequest,
 ) -> Result<DerivationOutcome, DerivationError> {
     let item = &request.item;
-    let collection = item.collection.clone();
-    if collection.as_deref() != Some(SENTINEL2_COLLECTION) {
-        return Err(DerivationError::UnsupportedDataset(collection));
-    }
-    let collection = SENTINEL2_COLLECTION.to_string();
+    let profile_kind = CollectionProfile::from_collection(item.collection.as_deref())
+        .ok_or_else(|| DerivationError::UnsupportedDataset(item.collection.clone()))?;
+    let collection = profile_kind.id().to_string();
     let item_epsg = item
         .epsg()
         .ok_or_else(|| DerivationError::MissingEpsg(item.id.clone()))?;
@@ -615,25 +722,38 @@ pub async fn derive_satellite_index(
     let zone = UtmZone::from_epsg(item_epsg)?;
     let aoi_rect = project_aoi(&request.aoi, zone)?;
 
-    // SCL (20 m) is the coarsest grid in play for the supported indices, so
-    // it snaps the shared projected rect; 10 m band windows then align 2:1.
-    let (scl_read, snapped) =
-        read_band_window(resolver, item, S2_SCL_ASSET_KEY, item_epsg, &aoi_rect, None).await?;
+    // Mask band first: for Sentinel-2 the SCL (20 m) is the coarsest grid in
+    // play for the supported indices, so it snaps the shared projected rect
+    // (10 m band windows then align 2:1). Landsat's optional QA_PIXEL shares
+    // the bands' 30 m grid; when absent, the first index band snaps.
+    let mut snapped: Option<ProjRect> = None;
+    let mask_key = profile_kind.mask_asset_key();
+    let mask_read: Option<BandRead> =
+        if profile_kind.mask_is_required() || item.asset(mask_key).is_some() {
+            let (read, rect) =
+                read_band_window(resolver, item, mask_key, item_epsg, &aoi_rect, None).await?;
+            snapped = Some(rect);
+            Some(read)
+        } else {
+            None
+        };
 
     let roles = request.index.required_bands();
     let mut band_reads: Vec<(IndexBandRole, BandRead)> = Vec::with_capacity(roles.len());
     for role in roles {
-        let (read, _) = read_band_window(
+        let (read, rect) = read_band_window(
             resolver,
             item,
-            s2_asset_key(*role),
+            profile_kind.band_asset_key(*role, &item.id)?,
             item_epsg,
             &aoi_rect,
-            Some(&snapped),
+            snapped.as_ref(),
         )
         .await?;
+        snapped.get_or_insert(rect);
         band_reads.push((*role, read));
     }
+    let snapped = snapped.expect("the mask or first band read snapped the rect");
 
     // Target grid: the finest band feeding the index.
     let (target_grid, target_window) = band_reads
@@ -648,29 +768,78 @@ pub async fn derive_satellite_index(
     let (out_width, out_height) = (target_window.width, target_window.height);
     let pixel_count = out_width as usize * out_height as usize;
 
-    // Clear-sky mask on the SCL native window grid (dilation at SCL
-    // resolution, per the design masking rule), then nearest-resampled to
-    // the target grid.
-    let scl_config = SclMaskConfig::default();
-    let scl_masks = scl_kind_masks(
-        &scl_read.dns,
-        scl_read.window.width,
-        scl_read.window.height,
-        &scl_config,
-    );
-    let clear_native = scl_masks
-        .get(&MaskKind::Clear)
-        .expect("scl_kind_masks always emits Clear");
-    let clear_mask = resample_nearest(
-        clear_native,
-        scl_read.window.width,
-        scl_read.window.height,
-        out_width,
-        out_height,
-    );
+    // Clear-sky mask on the mask band's native window grid, then
+    // nearest-resampled to the target grid. Sentinel-2 uses SCL class
+    // masking with dilation at SCL resolution (per the design masking rule);
+    // Landsat uses the Collection-2 QA_PIXEL bitmask when the asset exists.
+    let (clear_mask, mask_json) = match profile_kind {
+        CollectionProfile::Sentinel2 => {
+            let scl_read = mask_read
+                .as_ref()
+                .expect("sentinel-2 requires the SCL read");
+            let scl_config = SclMaskConfig::default();
+            let scl_masks = scl_kind_masks(
+                &scl_read.dns,
+                scl_read.window.width,
+                scl_read.window.height,
+                &scl_config,
+            );
+            let clear_native = scl_masks
+                .get(&MaskKind::Clear)
+                .expect("scl_kind_masks always emits Clear");
+            let clear_mask = resample_nearest(
+                clear_native,
+                scl_read.window.width,
+                scl_read.window.height,
+                out_width,
+                out_height,
+            );
+            let mask_json = serde_json::json!({
+                "scheme": "scl",
+                "keep_classes": scl_config.keep_classes.iter().collect::<Vec<_>>(),
+                "dilate_radius_px": scl_config.dilate_radius,
+                "scl_window": window_json(scl_read.window),
+            });
+            (clear_mask, mask_json)
+        }
+        CollectionProfile::LandsatC2L2 => match mask_read.as_ref() {
+            Some(qa_read) => {
+                let clear_native: Vec<bool> = qa_read
+                    .dns
+                    .iter()
+                    .map(|code| qa_pixel_clear(*code))
+                    .collect();
+                let clear_mask = resample_nearest(
+                    &clear_native,
+                    qa_read.window.width,
+                    qa_read.window.height,
+                    out_width,
+                    out_height,
+                );
+                let mask_json = serde_json::json!({
+                    "scheme": "qa_pixel",
+                    "applied": true,
+                    "reject_bits": QA_PIXEL_REJECT_BITS,
+                    "qa_window": window_json(qa_read.window),
+                });
+                (clear_mask, mask_json)
+            }
+            None => (
+                vec![true; pixel_count],
+                serde_json::json!({
+                    "scheme": "qa_pixel",
+                    "applied": false,
+                    "note": "item has no qa_pixel asset; all pixels treated as clear",
+                }),
+            ),
+        },
+    };
 
     // Calibrate each band (resampling DNs to the target grid first).
-    let (profile, calibration_json) = s2_sensor_profile(item);
+    let (profile, calibration_json) = match profile_kind {
+        CollectionProfile::Sentinel2 => s2_sensor_profile(item),
+        CollectionProfile::LandsatC2L2 => landsat_sensor_profile(),
+    };
     let mut calibrated: BTreeMap<IndexBandRole, Vec<IndexPixelValue>> = BTreeMap::new();
     let mut band_evidence = Vec::new();
     for (role, read) in &band_reads {
@@ -783,7 +952,11 @@ pub async fn derive_satellite_index(
     let all_reads = band_reads
         .iter()
         .map(|(role, read)| (format!("band:{}", format!("{role:?}").to_lowercase()), read))
-        .chain(std::iter::once(("mask:scl".to_string(), &scl_read)));
+        .chain(
+            mask_read
+                .as_ref()
+                .map(|read| (profile_kind.mask_input_role().to_string(), read)),
+        );
     for (input_role, read) in all_reads {
         let draft = ProductRecordDraft {
             level: ProductLevel::L1,
@@ -832,7 +1005,7 @@ pub async fn derive_satellite_index(
         source_id: source_id.clone(),
         source_kind: "satellite".to_string(),
         platform: Some(collection.clone()),
-        sensor: Some("Sentinel-2 MSI".to_string()),
+        sensor: Some(profile_kind.sensor_label(&item.id).to_string()),
         source_config: None,
         scene: Some(IngestScene {
             scene_id: item.id.clone(),
@@ -855,7 +1028,7 @@ pub async fn derive_satellite_index(
 
     // --- L2 index product with full evidence.
     let out_bbox_wgs84 = rect_to_wgs84(&snapped, zone);
-    let evidence = serde_json::json!({
+    let mut evidence = serde_json::json!({
         "item_id": item.id,
         "collection": collection,
         "index": index_key,
@@ -864,17 +1037,8 @@ pub async fn derive_satellite_index(
         "window": window_json(target_window),
         "geo_transform": out_transform,
         "calibration": calibration_json,
-        "mask": {
-            "scheme": "scl",
-            "keep_classes": scl_config.keep_classes.iter().collect::<Vec<_>>(),
-            "dilate_radius_px": scl_config.dilate_radius,
-            "scl_window": window_json(scl_read.window),
-        },
+        "mask": mask_json,
         "bands": band_evidence,
-        "scl_fetch": {
-            "range_requests": scl_read.metrics.range_requests,
-            "bytes_fetched": scl_read.metrics.bytes_fetched,
-        },
         "pixels": {
             "total": pixel_count,
             "valid": index_grid.valid_pixels,
@@ -883,6 +1047,19 @@ pub async fn derive_satellite_index(
         },
         "nodata": INDEX_NODATA,
     });
+    if let Some(read) = &mask_read {
+        // Same fetch-metrics shape either way; the Sentinel-2 key is kept as
+        // the historical `scl_fetch` so existing evidence consumers see an
+        // unchanged document.
+        let fetch_key = match profile_kind {
+            CollectionProfile::Sentinel2 => "scl_fetch",
+            CollectionProfile::LandsatC2L2 => "mask_fetch",
+        };
+        evidence[fetch_key] = serde_json::json!({
+            "range_requests": read.metrics.range_requests,
+            "bytes_fetched": read.metrics.bytes_fetched,
+        });
+    }
     let l2 = ProductRecordDraft {
         level: ProductLevel::L2,
         kind: index_key.clone(),
