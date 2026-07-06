@@ -5,13 +5,13 @@
 //! every poll tick claim at most one ready job, execute it, and run the
 //! subscription cadence pass (due subscriptions -> `discover` jobs).
 //!
-//! Batch scope: [`JobKind::Derive`] (S-7), [`JobKind::Discover`] (S-8), and
-//! the L3/application stage (S-9: a successful derive fans out into a
-//! monthly [`JobKind::L3Recompute`] composite plus [`JobKind::AppRun`] jobs,
-//! whose handlers run the composite/application cores in-process and then
-//! evaluate field alerts) have handlers here. `backfill_enumerate` arrives
-//! in a later batch; until then those jobs dead-letter immediately with a
-//! `handler not implemented` **client** error so they cannot retry-loop.
+//! Batch scope: [`JobKind::Derive`] (S-7), [`JobKind::Discover`] (S-8), the
+//! L3/application stage (S-9: a successful derive fans out into a monthly
+//! [`JobKind::L3Recompute`] composite plus [`JobKind::AppRun`] jobs, whose
+//! handlers run the composite/application cores in-process and then
+//! evaluate field alerts), and [`JobKind::BackfillEnumerate`] (S-11: walk a
+//! historical range in 90-day chunks, chaining one enumerate job per chunk;
+//! see `crate::backfill`) all have handlers here.
 //!
 //! Everything the worker touches is injected through
 //! [`PipelineWorkerContext`] — the DB pool, the hub config (data root +
@@ -38,14 +38,15 @@ use tokio::sync::watch;
 use tokio::task::JoinHandle;
 
 use crate::applications::ApplicationError;
+use crate::backfill::{self, BACKFILL_CHUNK_DAYS, BACKFILL_PRIORITY};
 use crate::catalog::{self, ProductFilter};
 use crate::composite_rasters::{self, CompositeDeriveRequest, CompositeRasterError};
 use crate::config::HubConfig;
 use crate::db::DbPool;
 use crate::earth_search::{self, EarthSearchItem};
 use crate::pipeline::{
-    self, AppRunPayload, DerivePayload, DiscoverPayload, JobKind, L3RecomputePayload,
-    PipelineError, PipelineJob,
+    self, AppRunPayload, BackfillEnumeratePayload, DerivePayload, DiscoverPayload, JobKind,
+    L3RecomputePayload, PipelineError, PipelineJob,
 };
 use crate::satellite_derivation::{
     derive_satellite_index, index_kind_from_key, CogStoreResolver, DeriveRequest,
@@ -235,9 +236,12 @@ pub async fn run_one_tick(ctx: &PipelineWorkerContext) -> Result<TickOutcome, Pi
         outcome.job_id = Some(job.job_id.clone());
         outcome.kind = Some(job.kind);
         // Conservative politeness: derive jobs hit the imagery provider
-        // (item fetch and/or COG range reads) and discover jobs hit the
-        // STAC search endpoint.
-        outcome.hit_provider = matches!(job.kind, JobKind::Derive | JobKind::Discover);
+        // (item fetch and/or COG range reads); discover and backfill
+        // enumerate jobs hit the STAC search endpoint.
+        outcome.hit_provider = matches!(
+            job.kind,
+            JobKind::Derive | JobKind::Discover | JobKind::BackfillEnumerate
+        );
         let result = execute_job(ctx, &job).await;
         match &result {
             JobRunResult::Succeeded => {
@@ -352,13 +356,235 @@ async fn execute_job(ctx: &PipelineWorkerContext, job: &PipelineJob) -> JobRunRe
         JobKind::Discover => execute_discover(ctx, job).await,
         JobKind::L3Recompute => execute_l3_recompute(ctx, job).await,
         JobKind::AppRun => execute_app_run(ctx, job).await,
-        // The backfill batch brings this handler; until then the jobs
-        // dead-letter as client errors instead of burning retries.
-        JobKind::BackfillEnumerate => client_failure(format!(
-            "handler not implemented for job kind {} (arrives in a later batch)",
-            job.kind.as_str()
-        )),
+        JobKind::BackfillEnumerate => execute_backfill_enumerate(ctx, job).await,
     }
+}
+
+/// Execute one link of a backfill's enumerate chain (S-11): search one
+/// 90-day chunk of the first incomplete dataset, fan `item x index` out
+/// into priority [`BACKFILL_PRIORITY`] derive jobs tagged with the run id,
+/// advance the run's cursor to the chunk end, and enqueue the next link.
+///
+/// - A run that is not `running` completes the job as a parked no-op; the
+///   resume route re-enqueues the chain under the same cursor fingerprint.
+/// - A search failure fails the job (retry with backoff for transient
+///   upstream errors) **without** advancing the cursor, so the retry
+///   re-walks the same chunk.
+/// - When every dataset's cursor reaches `end_date`, the run is marked
+///   `completed` and the chain stops.
+async fn execute_backfill_enumerate(
+    ctx: &PipelineWorkerContext,
+    job: &PipelineJob,
+) -> JobRunResult {
+    let payload: BackfillEnumeratePayload = match serde_json::from_str(&job.payload_json) {
+        Ok(payload) => payload,
+        Err(err) => return client_failure(format!("invalid backfill_enumerate payload: {err}")),
+    };
+    let run = match backfill::get_backfill_run(&ctx.pool, &payload.backfill_id).await {
+        Ok(Some(run)) => run,
+        Ok(None) => {
+            return client_failure(format!("backfill run {} not found", payload.backfill_id))
+        }
+        Err(err) => return transient_failure(err.to_string()),
+    };
+    if run.status != "running" {
+        tracing::info!(
+            backfill_id = %run.backfill_id,
+            status = %run.status,
+            "backfill enumerate: run not running; parking as no-op"
+        );
+        return JobRunResult::Succeeded;
+    }
+
+    let Some((dataset, cursor)) = run.next_incomplete_dataset() else {
+        // Every dataset already reached end_date: close the run out.
+        if let Err(err) =
+            backfill::set_status(&ctx.pool, &run.backfill_id, "completed", Utc::now()).await
+        {
+            return transient_failure(err.to_string());
+        }
+        return JobRunResult::Succeeded;
+    };
+    let Some((chunk_start, chunk_end)) =
+        backfill::next_chunk(cursor, &run.end_date, BACKFILL_CHUNK_DAYS)
+    else {
+        // Unreachable while next_incomplete_dataset holds, unless the stored
+        // dates are corrupt — that cannot be fixed by retrying.
+        return client_failure(format!(
+            "backfill run {} has an unchunkable range {cursor} .. {}",
+            run.backfill_id, run.end_date
+        ));
+    };
+
+    // Field boundary -> WGS84 search envelope + derive AOI (same contract
+    // as the discover handler).
+    let boundary_json: Option<(String,)> =
+        match sqlx::query_as("SELECT boundary_json FROM fields WHERE field_id = ?")
+            .bind(&run.field_id)
+            .fetch_optional(&ctx.pool)
+            .await
+        {
+            Ok(row) => row,
+            Err(err) => return transient_failure(err.to_string()),
+        };
+    let Some((boundary_json,)) = boundary_json else {
+        return client_failure(format!("field {} not found", run.field_id));
+    };
+    let boundary: serde_json::Value = match serde_json::from_str(&boundary_json) {
+        Ok(value) => value,
+        Err(err) => {
+            return client_failure(format!(
+                "field {} boundary_json is not valid JSON: {err}",
+                run.field_id
+            ))
+        }
+    };
+    let bbox = match aoi_bounds_from_geojson(&boundary) {
+        Ok(bounds) => bounds,
+        Err(message) => {
+            return client_failure(format!(
+                "field {} boundary is not a usable AOI: {message}",
+                run.field_id
+            ))
+        }
+    };
+
+    // Search the chunk as a half-open window [start, end): the next chunk
+    // starts at this chunk's end date, and derive job_key dedupe absorbs
+    // any boundary-instant overlap.
+    let query = StacSearchQuery {
+        bbox: [bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat],
+        start_iso: format!("{chunk_start}T00:00:00Z"),
+        end_iso: format!("{chunk_end}T00:00:00Z"),
+        max_cloud_cover: run.max_cloud_cover,
+        dataset: dataset.to_string(),
+    };
+    let items = match ctx.item_fetcher.search(&query).await {
+        Ok(items) => items,
+        Err(err) => {
+            return JobRunResult::Failed {
+                client_error: err.is_client_error(),
+                error: err.to_string(),
+            }
+        }
+    };
+
+    // Fan out: item x index -> derive job at backfill priority. Terminal
+    // succeeded derives are skipped outright (re-enqueue would reset them
+    // and re-derive the product); queued/running rows deduplicate.
+    let mut enqueued = 0_i64;
+    for item in &items {
+        let collection = item
+            .collection
+            .clone()
+            .or_else(|| earth_search::collection_for_dataset(dataset).map(String::from))
+            .unwrap_or_else(|| dataset.to_string());
+        for index in &run.indices {
+            let job_key = pipeline::derive_job_key(dataset, &item.id, index, &run.field_id);
+            match pipeline::find_job_by_key(&ctx.pool, &job_key).await {
+                Ok(Some(existing)) if existing.status == pipeline::JobStatus::Succeeded => {
+                    continue;
+                }
+                Ok(_) => {}
+                Err(err) => return transient_failure(err.to_string()),
+            }
+            let derive_payload = match serde_json::to_value(DerivePayload {
+                dataset: dataset.to_string(),
+                collection: collection.clone(),
+                item_id: item.id.clone(),
+                index: index.clone(),
+                field_id: run.field_id.clone(),
+                season_id: None,
+                aoi_geojson: boundary.clone(),
+            }) {
+                Ok(value) => value,
+                Err(err) => return client_failure(format!("derive payload: {err}")),
+            };
+            let now = Utc::now();
+            match pipeline::enqueue_job(
+                &ctx.pool,
+                JobKind::Derive,
+                &job_key,
+                &derive_payload,
+                Some(&run.field_id),
+                Some(dataset),
+                BACKFILL_PRIORITY,
+                now,
+                Some(&run.backfill_id),
+                now,
+            )
+            .await
+            {
+                Ok(pipeline::EnqueueOutcome::Enqueued) => enqueued += 1,
+                Ok(pipeline::EnqueueOutcome::Deduplicated) => {}
+                Err(err) => return transient_failure(err.to_string()),
+            }
+        }
+    }
+
+    // Durable progress: cursor to chunk end, counters bumped. Only after
+    // this point is the chunk considered done.
+    let now = Utc::now();
+    let dataset = dataset.to_string();
+    if let Err(err) =
+        backfill::advance_cursor(&ctx.pool, &run.backfill_id, &dataset, &chunk_end, now).await
+    {
+        return transient_failure(err.to_string());
+    }
+    if let Err(err) = backfill::add_progress_counts(
+        &ctx.pool,
+        &run.backfill_id,
+        items.len() as i64,
+        enqueued,
+        now,
+    )
+    .await
+    {
+        return transient_failure(err.to_string());
+    }
+
+    // Chain or complete, from the freshly advanced cursor.
+    let updated = match backfill::get_backfill_run(&ctx.pool, &run.backfill_id).await {
+        Ok(Some(updated)) => updated,
+        Ok(None) => {
+            return client_failure(format!(
+                "backfill run {} vanished mid-enumerate",
+                run.backfill_id
+            ))
+        }
+        Err(err) => return transient_failure(err.to_string()),
+    };
+    if updated.next_incomplete_dataset().is_none() {
+        if let Err(err) =
+            backfill::set_status(&ctx.pool, &updated.backfill_id, "completed", Utc::now()).await
+        {
+            return transient_failure(err.to_string());
+        }
+        tracing::info!(
+            backfill_id = %updated.backfill_id,
+            scenes_discovered = updated.scenes_discovered,
+            jobs_enqueued = updated.jobs_enqueued,
+            "backfill run completed"
+        );
+        return JobRunResult::Succeeded;
+    }
+    let delay = ChronoDuration::milliseconds(ctx.config.pipeline.provider_min_delay_ms as i64);
+    let now = Utc::now();
+    if let Err(err) = backfill::enqueue_enumerate_job(&ctx.pool, &updated, now + delay, now).await {
+        return transient_failure(format!(
+            "chunk {chunk_start}..{chunk_end} ({dataset}) enumerated but chaining failed: {err}"
+        ));
+    }
+    tracing::info!(
+        backfill_id = %updated.backfill_id,
+        dataset = %dataset,
+        chunk_start = %chunk_start,
+        chunk_end = %chunk_end,
+        items = items.len(),
+        enqueued,
+        "backfill chunk enumerated"
+    );
+    JobRunResult::Succeeded
 }
 
 /// Execute one discover job: search the upstream STAC catalog for new items

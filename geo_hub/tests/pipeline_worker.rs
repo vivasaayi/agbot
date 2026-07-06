@@ -386,16 +386,19 @@ async fn worker_enqueues_discover_for_due_subscription() -> Result<()> {
     Ok(())
 }
 
+/// S-11 gave `backfill_enumerate` a real handler; the surviving dead-letter
+/// contract is that a job pointing at no stored run (or carrying a
+/// malformed payload) is a permanent client error, not a retry loop.
 #[tokio::test]
-async fn unimplemented_kinds_go_dead() -> Result<()> {
+async fn backfill_enumerate_without_run_goes_dead() -> Result<()> {
     let (_tmp, ctx) = worker_ctx(1000).await?;
 
     let now = Utc::now();
     pipeline::enqueue_job(
         &ctx.pool,
         JobKind::BackfillEnumerate,
-        "backfill:field-42:2020..2024",
-        &json!({ "field_id": "field-42", "start": "2020-01-01", "end": "2024-12-31" }),
+        "backfill_enum:backfill:missing:landsat:2020-01-01",
+        &json!({ "backfill_id": "backfill:missing" }),
         Some("field-42"),
         None,
         0,
@@ -414,10 +417,11 @@ async fn unimplemented_kinds_go_dead() -> Result<()> {
             ref error,
             client_error,
         }) => {
-            assert!(client_error, "unimplemented handler must not retry-loop");
-            assert!(error.contains("handler not implemented"), "{error}");
+            assert!(client_error, "a missing run must not retry-loop");
+            assert!(error.contains("backfill:missing"), "{error}");
+            assert!(error.contains("not found"), "{error}");
         }
-        other => panic!("expected handler-not-implemented failure, got {other:?}"),
+        other => panic!("expected missing-run failure, got {other:?}"),
     }
 
     let jobs = pipeline::list_jobs(&ctx.pool, None).await?;
@@ -426,7 +430,7 @@ async fn unimplemented_kinds_go_dead() -> Result<()> {
         .last_error
         .as_deref()
         .expect("last_error recorded")
-        .contains("handler not implemented"));
+        .contains("not found"));
     Ok(())
 }
 

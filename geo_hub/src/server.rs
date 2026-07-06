@@ -1090,6 +1090,24 @@ pub fn build_router(state: AppState) -> Router {
             "/api/subscriptions/:subscription_id",
             patch(routes::patch_subscription_status),
         )
+        // Historical backfill (batch S-11): resumable 1982+ range walks.
+        .route(
+            "/api/fields/:field_id/backfill",
+            post(routes::start_field_backfill),
+        )
+        .route(
+            "/api/fields/:field_id/backfills",
+            get(routes::list_field_backfills),
+        )
+        .route("/api/backfills/:backfill_id", get(routes::get_backfill))
+        .route(
+            "/api/backfills/:backfill_id/pause",
+            post(routes::pause_backfill),
+        )
+        .route(
+            "/api/backfills/:backfill_id/resume",
+            post(routes::resume_backfill),
+        )
         .route("/api/pipeline/run", post(routes::run_pipeline_now))
         .route("/api/pipeline/jobs", get(routes::list_pipeline_jobs))
         .route("/api/pipeline/jobs/:job_id", get(routes::get_pipeline_job))

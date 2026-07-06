@@ -299,6 +299,7 @@ fn farm_field_list_page<T>(
 mod alert_rules;
 mod alerts;
 mod applications;
+mod backfill_routes;
 mod browse;
 mod catalog;
 mod change_detection_routes;
@@ -337,6 +338,7 @@ mod workspace;
 pub use alert_rules::*;
 pub use alerts::*;
 pub use applications::*;
+pub use backfill_routes::*;
 pub use browse::*;
 pub use catalog::*;
 pub use change_detection_routes::*;

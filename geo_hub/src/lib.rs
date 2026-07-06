@@ -2,6 +2,7 @@ pub mod alert_evaluation;
 pub mod alert_lifecycle;
 pub mod anomaly_run;
 pub mod applications;
+pub mod backfill;
 pub mod catalog;
 pub mod composite_rasters;
 pub mod config;

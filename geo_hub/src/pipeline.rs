@@ -194,6 +194,14 @@ pub struct AppRunPayload {
     pub date: String,
 }
 
+/// Payload for a [`JobKind::BackfillEnumerate`] job. Deliberately just the
+/// run id: the durable `backfill_runs` row (range, datasets, cursor) is the
+/// source of truth, so a re-executed job always reads the current cursor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackfillEnumeratePayload {
+    pub backfill_id: String,
+}
+
 /// Result of an enqueue attempt against the deduplicating queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -224,6 +232,14 @@ pub fn l3_job_key(field_id: &str, dataset: &str, index: &str, month: &str) -> St
 /// Job key for a downstream application run (`date` is `YYYY-MM-DD`).
 pub fn app_job_key(app_id: &str, field_id: &str, date: &str) -> String {
     format!("app:{app_id}:{field_id}:{date}")
+}
+
+/// Job key for one link of a backfill's enumerate chain. `fingerprint`
+/// identifies the next chunk (`{dataset}:{cursor_date}`, or `final`), so
+/// each link has a distinct key and dedupe cannot swallow the chain, while
+/// a crashed link re-enqueued under the same cursor still deduplicates.
+pub fn backfill_enum_job_key(backfill_id: &str, fingerprint: &str) -> String {
+    format!("backfill_enum:{backfill_id}:{fingerprint}")
 }
 
 /// True when the job key belongs to an L3 recompute, which debounces instead

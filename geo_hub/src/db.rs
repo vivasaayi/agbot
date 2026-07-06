@@ -3492,6 +3492,31 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // Historical backfill runs (batch S-11): resumable 1982+ range walks
+    // that expand into chunked `backfill_enumerate` jobs. `cursor_json`
+    // maps each dataset to the next unprocessed chunk start date.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS backfill_runs (
+            backfill_id TEXT PRIMARY KEY,
+            field_id TEXT NOT NULL,
+            datasets_json TEXT NOT NULL,
+            indices_json TEXT NOT NULL,
+            start_date TEXT NOT NULL,
+            end_date TEXT NOT NULL,
+            max_cloud_cover REAL NOT NULL DEFAULT 70.0,
+            status TEXT NOT NULL DEFAULT 'running',
+            cursor_json TEXT,
+            scenes_discovered INTEGER NOT NULL DEFAULT 0,
+            jobs_enqueued INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     info!("database ready");
     Ok(())
 }
