@@ -46,3 +46,4 @@ pub use ingest::{
     SceneIngestHealth, SceneIngestRecord, SceneIngestStatus,
 };
 pub use server::serve;
+pub mod portal_auth;

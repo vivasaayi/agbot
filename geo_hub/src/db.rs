@@ -3317,6 +3317,52 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // Portal auth (farmer portal): admin-issued access codes and bearer
+    // sessions. Only sha256 hashes of codes/tokens are stored at rest.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS portal_access_codes (
+            code_id TEXT PRIMARY KEY,
+            code_hash TEXT NOT NULL UNIQUE,
+            account_id TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            label TEXT,
+            created_at TEXT NOT NULL,
+            expires_at TEXT,
+            revoked_at TEXT,
+            last_used_at TEXT
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS portal_sessions (
+            session_id TEXT PRIMARY KEY,
+            token_hash TEXT NOT NULL UNIQUE,
+            account_id TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            revoked_at TEXT
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_portal_sessions_account
+        ON portal_sessions(account_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     info!("database ready");
     Ok(())
 }
