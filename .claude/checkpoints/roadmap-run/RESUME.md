@@ -2,14 +2,14 @@
 
 ## CURRENT: satellite pipeline ENHANCEMENTS (2026-07, branch enhance-satellite-image-pipeline)
 field-intelligence-pipeline was merged to main via PR #5 (26b084a); work
-continues on enhance-satellite-image-pipeline. Batch 29 (da46205): multi-index sen2cor derivation — spec-driven
-index_spec (ndvi/mndwi/ndmi), cross-resolution B11 replication, native or
-replicated SCL masking, POST /api/ingest/sen2cor/index/derive (+ndvi alias).
-Batch 28 (7b6e26e): SCL cloud masking (scl_clear code table, scl_mask
-lineage).
-NEXT: batch 30 = NBR from B8A+B12 at 20 m (add band_b12_20m to index_spec;
-feeds batch-14 dNBR burn severity from local sen2cor scenes); then /browse
-affordance for the sen2cor index route; then NDWI (B03+B8A).
+continues on enhance-satellite-image-pipeline. Batch 30 (4dc8d1a): index surface complete — nbr (B8A+B12, 20 m) + ndwi
+(B03+B08, 10 m) spec rows; /browse scene-scoped 'derive sen2cor index'
+affordance on band_b* items. Batch 29 (da46205): spec-driven multi-index
+(ndvi/mndwi/ndmi), cross-resolution B11 replication, SCL native/replicated.
+Batch 28 (7b6e26e): SCL cloud masking.
+NEXT: batch 31 candidates = local dNBR composition test over two sen2cor
+NBR products (pre/post) through the batch-14 route; temporal compositing
+over sen2cor index series.
 
 ## MERGED HISTORY: satellite intelligence pipeline (2026-07)
 Active plan + per-batch ledger: `docs/design/satellite-intelligence-pipeline.md`
