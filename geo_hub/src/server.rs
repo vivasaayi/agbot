@@ -28,6 +28,10 @@ pub fn build_router(state: AppState) -> Router {
             "/workspace",
             ServeDir::new(state.config.workspace_web_dir()),
         )
+        .nest_service(
+            "/portal",
+            ServeDir::new(state.config.workspace_web_dir().join("portal")),
+        )
         .route("/", get(routes::mobile_app))
         .route("/app", get(routes::mobile_app))
         .route("/browse", get(routes::browse_app))

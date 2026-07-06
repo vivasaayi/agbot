@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#2e7d32">
+  <title>AGBot Farm</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="css/portal.css">
+</head>
+<body>
+  <header class="app-header">
+    <span class="app-title">AGBot Farm</span>
+    <span class="header-actions">
+      <button id="install-button" class="header-button" hidden>Install app</button>
+      <a href="#/reports" id="notification-badge" class="badge" hidden
+         aria-label="Unread notifications">0</a>
+      <button id="logout-button" class="header-button" hidden>Log out</button>
+    </span>
+  </header>
+
+  <div id="offline-banner" class="offline-banner" hidden>
+    Offline &mdash; showing cached data
+  </div>
+
+  <main id="view" class="view-container" aria-live="polite"></main>
+
+  <nav id="tab-bar" class="tab-bar" hidden>
+    <a href="#/home" data-tab="home" class="tab">Home</a>
+    <a href="#/reports" data-tab="reports" class="tab">Reports</a>
+  </nav>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
