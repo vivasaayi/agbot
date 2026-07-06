@@ -564,3 +564,207 @@ mod tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Water-body seasonality (batch 39)
+// ---------------------------------------------------------------------------
+
+/// A seasonality derivation request over a field's extent series.
+#[derive(Debug, Clone, Deserialize)]
+pub struct WaterSeasonalityDeriveRequest {
+    pub field_id: String,
+    pub season_id: String,
+    /// Inclusive ISO date window selecting the water_extent series.
+    pub start: String,
+    pub end: String,
+    #[serde(default = "default_min_seasonality_observations")]
+    pub min_observations: u32,
+}
+
+fn default_min_seasonality_observations() -> u32 {
+    post_processor::water_seasonality::DEFAULT_MIN_OBSERVATIONS
+}
+
+/// Outcome of one seasonality derivation.
+#[derive(Debug, Clone, Serialize)]
+pub struct WaterSeasonalityDeriveOutcome {
+    pub water_seasonality_product_id: String,
+    pub observations_used: Vec<String>,
+    pub observations_skipped: Vec<crate::drought_rasters::SkippedObservation>,
+    pub counts: post_processor::water_seasonality::SeasonalityCounts,
+    pub permanent_area_m2: Option<f64>,
+    pub seasonal_area_m2: Option<f64>,
+    pub water_area_min_m2: Option<f64>,
+    pub water_area_mean_m2: Option<f64>,
+    pub water_area_max_m2: Option<f64>,
+    pub water_seasonality_artifact: PathBuf,
+    pub stac_item_href: String,
+    pub tiles_href: String,
+}
+
+/// Fold the field's registered water_extent series in the window into a
+/// per-pixel seasonality L3 (permanent / seasonal / ephemeral / never)
+/// with the water-availability area accounting. Idempotent.
+pub async fn derive_water_seasonality(
+    pool: &DbPool,
+    data_root: &Path,
+    request: &WaterSeasonalityDeriveRequest,
+) -> Result<WaterSeasonalityDeriveOutcome, WaterExtentRasterError> {
+    use post_processor::water_seasonality::{
+        analyze_water_seasonality, water_seasonality_l3_draft, WaterExtentObservation,
+        WaterSeasonalityL3Scope, WaterSeasonalityRequest,
+    };
+
+    let mut candidates = catalog::list_products(
+        pool,
+        &ProductFilter {
+            kind: Some("water_extent".to_string()),
+            level: Some(shared::product_graph::ProductLevel::L3),
+            status: Some("registered".to_string()),
+            field_id: Some(request.field_id.clone()),
+            temporal_start: Some(format!("{}T00:00:00Z", request.start)),
+            temporal_end: Some(format!("{}T23:59:59Z", request.end)),
+            ..ProductFilter::default()
+        },
+    )
+    .await?;
+    candidates.sort_by_key(|product| {
+        (
+            product.temporal_start.clone().unwrap_or_default(),
+            product.product_id.clone(),
+        )
+    });
+
+    let mut skipped = Vec::new();
+    let mut reference: Option<crate::drought_rasters::LoadedRaster> = None;
+    let mut observations = Vec::new();
+    let mut used = Vec::new();
+    for candidate in &candidates {
+        let Some(date) = crate::drought_rasters::observed_on(candidate) else {
+            skipped.push(crate::drought_rasters::SkippedObservation {
+                product_id: candidate.product_id.clone(),
+                reason: "bad_temporal".to_string(),
+            });
+            continue;
+        };
+        let Ok(path) = geotiff_artifact_path(candidate) else {
+            skipped.push(crate::drought_rasters::SkippedObservation {
+                product_id: candidate.product_id.clone(),
+                reason: "no_artifact".to_string(),
+            });
+            continue;
+        };
+        let raster = match load_raster(Path::new(path)) {
+            Ok(raster) => raster,
+            Err(_) => {
+                skipped.push(crate::drought_rasters::SkippedObservation {
+                    product_id: candidate.product_id.clone(),
+                    reason: "unreadable".to_string(),
+                });
+                continue;
+            }
+        };
+        if let Some(reference) = &reference {
+            if raster.epsg != reference.epsg
+                || raster.geo_transform != reference.geo_transform
+                || (raster.width, raster.height) != (reference.width, reference.height)
+            {
+                skipped.push(crate::drought_rasters::SkippedObservation {
+                    product_id: candidate.product_id.clone(),
+                    reason: "grid_mismatch".to_string(),
+                });
+                continue;
+            }
+        }
+        observations.push(WaterExtentObservation {
+            product_id: candidate.product_id.clone(),
+            observed_on: date,
+            values: raster.values.clone(),
+            valid_mask: raster.valid_mask.clone(),
+        });
+        used.push(candidate.product_id.clone());
+        if reference.is_none() {
+            reference = Some(raster);
+        }
+    }
+    let Some(reference) = reference else {
+        return Err(WaterExtentRasterError::Extent(
+            post_processor::water_extent::WaterExtentError::NoValidPixels,
+        ));
+    };
+
+    let result = analyze_water_seasonality(&WaterSeasonalityRequest {
+        width: reference.width,
+        height: reference.height,
+        spatial_ref: reference.spatial_ref.clone(),
+        observations,
+        min_observations: request.min_observations,
+        gsd_m_per_px: reference.geo_transform.map(|t| t[1].abs()),
+    })
+    .map_err(|err| WaterExtentRasterError::Store {
+        what: "water seasonality analysis",
+        source: std::io::Error::other(err.to_string()),
+    })?;
+
+    let mut draft = water_seasonality_l3_draft(
+        &result,
+        &WaterSeasonalityL3Scope {
+            field_id: request.field_id.clone(),
+            season_id: request.season_id.clone(),
+            source_id: None,
+        },
+    );
+    let out_dir = data_root.join("derived").join("water_seasonality");
+    std::fs::create_dir_all(&out_dir).map_err(|source| WaterExtentRasterError::Store {
+        what: "water_seasonality directory",
+        source,
+    })?;
+    let out_path = out_dir.join(format!(
+        "{}.tif",
+        artifact_file_component(&draft.product_id())
+    ));
+    let class_values: Vec<f32> = result
+        .classes
+        .iter()
+        .map(|class| class.code().map(f32::from).unwrap_or(WATER_EXTENT_NODATA))
+        .collect();
+    write_geotiff_f32(
+        &out_path,
+        result.width,
+        result.height,
+        &class_values,
+        &GeoTiffTags {
+            epsg: reference.epsg,
+            geo_transform: reference.geo_transform,
+            nodata: Some(f64::from(WATER_EXTENT_NODATA)),
+        },
+    )?;
+    let checksum = file_checksum(&out_path, "water seasonality readback")?;
+    draft.spatial_ref = Some(reference.spatial_ref.clone());
+    draft.gsd_m_per_px = reference.geo_transform.map(|t| t[1].abs());
+    draft.artifact = Some(ProductArtifact {
+        format: "tif".to_string(),
+        path: out_path.to_string_lossy().to_string(),
+        checksum_sha256: Some(checksum.clone()),
+    });
+    draft.evidence_digests.push(checksum);
+    let actor = provenance::ActorIdentity::system("geo_hub:water_seasonality");
+    let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let product_id =
+        catalog::register_product_with_actor(pool, &draft, &actor, &created_at).await?;
+
+    Ok(WaterSeasonalityDeriveOutcome {
+        stac_item_href: format!("/api/stac/collections/water_seasonality/items/{product_id}"),
+        tiles_href: format!("/api/catalog/products/{product_id}/tiles/{{z}}/{{x}}/{{y}}.png"),
+        water_seasonality_product_id: product_id,
+        observations_used: used,
+        observations_skipped: skipped,
+        counts: result.counts,
+        permanent_area_m2: result.permanent_area_m2,
+        seasonal_area_m2: result.seasonal_area_m2,
+        water_area_min_m2: result.water_area_min_m2,
+        water_area_mean_m2: result.water_area_mean_m2,
+        water_area_max_m2: result.water_area_max_m2,
+        water_seasonality_artifact: out_path,
+    })
+}

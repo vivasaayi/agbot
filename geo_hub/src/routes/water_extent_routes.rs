@@ -8,9 +8,10 @@ use serde::Deserialize;
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
 use crate::water_extent_rasters::{
-    derive_water_extent, list_water_extent_products, register_jrc_dir, register_sentinel1_dir,
-    JrcRegisterOutcome, SarRegisterOutcome, WaterExtentDeriveOutcome, WaterExtentDeriveRequest,
-    WaterExtentRasterError,
+    derive_water_extent, derive_water_seasonality, list_water_extent_products, register_jrc_dir,
+    register_sentinel1_dir, JrcRegisterOutcome, SarRegisterOutcome, WaterExtentDeriveOutcome,
+    WaterExtentDeriveRequest, WaterExtentRasterError, WaterSeasonalityDeriveOutcome,
+    WaterSeasonalityDeriveRequest,
 };
 
 impl From<WaterExtentRasterError> for AppError {
@@ -58,6 +59,17 @@ pub async fn derive_water_extent_route(
     Json(request): Json<WaterExtentDeriveRequest>,
 ) -> AppResult<Json<WaterExtentDeriveOutcome>> {
     let outcome = derive_water_extent(&state.pool, &state.config.data_root, &request).await?;
+    Ok(Json(outcome))
+}
+
+/// Fold a field's water_extent series into a per-pixel seasonality L3
+/// (batch 39): permanent / seasonal / ephemeral / never-water classes plus
+/// the water-availability area accounting.
+pub async fn derive_water_seasonality_route(
+    State(state): State<AppState>,
+    Json(request): Json<WaterSeasonalityDeriveRequest>,
+) -> AppResult<Json<WaterSeasonalityDeriveOutcome>> {
+    let outcome = derive_water_seasonality(&state.pool, &state.config.data_root, &request).await?;
     Ok(Json(outcome))
 }
 

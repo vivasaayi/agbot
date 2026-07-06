@@ -500,3 +500,149 @@ async fn jrc_prior_gates_otsu_polarity_flips() -> Result<()> {
 
     Ok(())
 }
+
+/// Batch 39: a field's water_extent series folds into a per-pixel
+/// seasonality L3. Four monthly MNDWI-derived extents over a shrinking
+/// pond: pixel 0 stays wet (permanent), pixel 1 is wet half the time
+/// (seasonal), pixels 2-3 stay dry (never). Areas trace the shrinkage:
+/// 200/200/100/100 m^2 at 10 m GSD (2, 2, 1, 1 water pixels).
+#[tokio::test]
+async fn extent_series_folds_into_seasonality_with_areas() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = ctx(&tmp).await?;
+
+    // Monthly MNDWI scenes: values > 0 read as water under the fixed
+    // fallback... but bimodal scenes use Otsu; keep it simple with clear
+    // bimodal +0.5 water / -0.5 land pixels.
+    // Month:      Jan            Apr            Jul            Oct
+    // pixel 0:    water          water          water          water
+    // pixel 1:    water          water          land           land
+    // pixel 2/3:  land           land           land           land
+    let series = [
+        ("2026-01-15", vec![0.5f32, 0.5, -0.5, -0.5]),
+        ("2026-04-15", vec![0.5, 0.5, -0.5, -0.5]),
+        ("2026-07-15", vec![0.5, -0.5, -0.5, -0.5]),
+        ("2026-10-15", vec![0.5, -0.5, -0.5, -0.5]),
+    ];
+    for (stamp, values) in series {
+        let mndwi_id = register_index_dated(&ctx, &tmp, "mndwi", stamp, values).await?;
+        let (status, bytes) = send(
+            &ctx.app,
+            "POST",
+            "/api/water-management/extent/derive",
+            Some(json!({
+                "product_id": mndwi_id,
+                "field_id": "field-1",
+                "season_id": "2026",
+            })),
+        )
+        .await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{}",
+            String::from_utf8_lossy(&bytes)
+        );
+    }
+
+    let (status, bytes) = send(
+        &ctx.app,
+        "POST",
+        "/api/water-management/seasonality/derive",
+        Some(json!({
+            "field_id": "field-1",
+            "season_id": "2026",
+            "start": "2026-01-01",
+            "end": "2026-12-31",
+        })),
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let outcome: serde_json::Value = serde_json::from_slice(&bytes)?;
+    assert_eq!(outcome["observations_used"].as_array().unwrap().len(), 4);
+    assert_eq!(outcome["counts"]["permanent"], 1);
+    assert_eq!(outcome["counts"]["seasonal"], 1);
+    assert_eq!(outcome["counts"]["never_water"], 2);
+    // 10 m GSD: permanent 100 m^2; per-observation areas 200/200/100/100
+    // -> min 100, mean 150, max 200.
+    assert_eq!(outcome["permanent_area_m2"], 100.0);
+    assert_eq!(outcome["water_area_min_m2"], 100.0);
+    assert_eq!(outcome["water_area_mean_m2"], 150.0);
+    assert_eq!(outcome["water_area_max_m2"], 200.0);
+
+    // The raster carries the class codes on the extent grid.
+    let seasonality_id = outcome["water_seasonality_product_id"].as_str().unwrap();
+    let product = catalog::get_product(&ctx.pool, seasonality_id)
+        .await?
+        .unwrap();
+    assert_eq!(product.kind, "water_seasonality");
+    let values = {
+        let mut reader = GeoTiffReader::open(product.path.as_deref().unwrap())?;
+        reader.read_band()?.to_f32()
+    };
+    assert_eq!(values, vec![3.0, 2.0, 0.0, 0.0]);
+
+    // Lineage covers all four extent products.
+    let edges = catalog::trace_inputs(&ctx.pool, seasonality_id).await?;
+    assert_eq!(edges.len(), 4);
+
+    Ok(())
+}
+
+/// Dated variant of `register_index` for series fixtures (2x2 grid).
+async fn register_index_dated(
+    ctx: &Ctx,
+    tmp: &TempDir,
+    kind: &str,
+    stamp: &str,
+    values: Vec<f32>,
+) -> Result<String> {
+    use shared::product_graph::{ProductArtifact, ProductRecordDraft, ProductScope};
+    let path = tmp.path().join(format!("{kind}_{stamp}.tif"));
+    write_geotiff_f32(
+        &path,
+        2,
+        2,
+        &values,
+        &GeoTiffTags {
+            epsg: Some(EPSG),
+            geo_transform: Some(TRANSFORM),
+            nodata: Some(f64::from(NODATA)),
+        },
+    )?;
+    let draft = ProductRecordDraft {
+        level: ProductLevel::L2,
+        kind: kind.to_string(),
+        algorithm_id: "test.seasonality".to_string(),
+        algorithm_version: "1.0.0".to_string(),
+        parameters: json!({ "kind": kind, "stamp": stamp }),
+        inputs: Vec::new(),
+        scope: ProductScope {
+            farm_id: None,
+            field_id: None,
+            season_id: None,
+            scene_id: Some(format!("scene-{stamp}")),
+            temporal_start: format!("{stamp}T10:30:00Z"),
+            temporal_end: format!("{stamp}T10:30:00Z"),
+        },
+        spatial_ref: None,
+        gsd_m_per_px: Some(10.0),
+        artifact: Some(ProductArtifact {
+            format: "tif".to_string(),
+            path: path.to_string_lossy().to_string(),
+            checksum_sha256: None,
+        }),
+        quality_mask: None,
+        confidence: None,
+        confidence_method: None,
+        quality_summary: None,
+        evidence_digests: Vec::new(),
+        source_id: None,
+    };
+    Ok(catalog::register_product(&ctx.pool, &draft, "2026-07-06T00:00:00Z").await?)
+}

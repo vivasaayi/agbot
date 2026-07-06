@@ -433,6 +433,10 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::register_sentinel1_route),
         )
         .route(
+            "/api/water-management/seasonality/derive",
+            post(routes::derive_water_seasonality_route),
+        )
+        .route(
             "/api/water-management/extent/derive",
             post(routes::derive_water_extent_route),
         )

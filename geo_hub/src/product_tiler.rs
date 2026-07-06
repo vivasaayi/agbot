@@ -153,6 +153,14 @@ const RAMP_DNBR: &[[u8; 3]] = &[
 const RAMP_THERMAL: &[[u8; 3]] = &[[49, 54, 149], [255, 255, 191], [165, 0, 38]];
 /// Binary water-mask colors: land tan, water blue.
 const RAMP_WATER_MASK: &[[u8; 3]] = &[[210, 180, 140], [24, 100, 190]];
+/// Seasonality classes 0..=3: never-water tan, ephemeral pale blue,
+/// seasonal medium blue, permanent dark blue.
+const RAMP_WATER_SEASONALITY: &[[u8; 3]] = &[
+    [210, 180, 140],
+    [158, 202, 225],
+    [66, 146, 198],
+    [8, 48, 107],
+];
 /// Categorical land-cover class colors, codes 1..=6: water blue, bare tan,
 /// annual crop yellow, tree/perennial dark green, grassland light green,
 /// unknown gray.
@@ -220,6 +228,12 @@ pub fn colormap_for_kind(kind: &str) -> Colormap {
         "water_extent" => Colormap {
             domain: (0.0, 1.0),
             stops: RAMP_WATER_MASK,
+            categorical: true,
+        },
+        // Persistence classes 0..=3 (never/ephemeral/seasonal/permanent).
+        "water_seasonality" => Colormap {
+            domain: (0.0, 3.0),
+            stops: RAMP_WATER_SEASONALITY,
             categorical: true,
         },
         // Tier-1 rule + tier-3 learned land-cover classes share the code

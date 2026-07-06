@@ -36,6 +36,7 @@ pub mod thermal_spots;
 pub mod vegetation_summary;
 pub mod water_extent;
 pub mod water_priority_app;
+pub mod water_seasonality;
 pub mod zonal_statistics;
 pub mod zone_delineation;
 pub mod zone_recommendations;
