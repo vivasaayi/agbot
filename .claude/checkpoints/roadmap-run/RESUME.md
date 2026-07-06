@@ -1,5 +1,25 @@
 # Resume — field-intel-run-1
 
+## CURRENT: crop-type (species) classification (2026-07, branch crop-type-classification)
+New capability closing the founding goal's one gap: classify crop SPECIES
+(maize/cereals), not just land-cover type. Grounded in ESA WorldCereal
+research (see docs/design/crop-type-classification.md — cited, honest about
+the ewoc_code table not being public).
+FOUNDATION DONE (b898192): post_processor/src/crop_type.rs — CropType (5
+WorldCereal-published classes), WorldCerealSeason (5 verified tokens),
+EwocCode + data-driven CropTypeLegend (never a fabricated table), ClassLabel
+trait implemented by BOTH CropType and LandCoverClass. 5 tests; post_processor
+190 lib green.
+NEXT (phased plan in the design doc): (1) generalize NearestCentroidModel /
+build_training_samples over the ClassLabel trait (29 LandCoverClass sites in
+crop_features.rs, behavior-preserving); (2) multi-season crop features
+(per-season NDVI percentiles); (3) WorldCereal RDM reference ingestion
+(crop_type_reference product + legend mapping); (4) crop-type derivation
+route + crop_type L3 (class + confidence bands); (5) browse + crop
+intelligence surface.
+Prior satellite work is on merged main + pushed enhance-satellite-image-pipeline.
+
+
 ## CURRENT: satellite pipeline ENHANCEMENTS (2026-07, branch enhance-satellite-image-pipeline)
 field-intelligence-pipeline was merged to main via PR #5 (26b084a); work
 continues on enhance-satellite-image-pipeline. Batch 30 (4dc8d1a): index surface complete — nbr (B8A+B12, 20 m) + ndwi
