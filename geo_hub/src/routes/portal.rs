@@ -13,8 +13,9 @@ use crate::portal_auth::{
     parse_stored_timestamp, session_expires_at, session_is_valid, AccessCodeStatus, SessionStatus,
 };
 use crate::portal_overview::{
-    boundary_to_svg, build_field_card, build_field_overview, FieldCard, FieldInput, FieldOverview,
-    FindingInput, RecommendationInput, SceneInput,
+    boundary_to_svg, build_field_card, build_field_overview, count_within_days, FieldCard,
+    FieldInput, FieldOverview, FindingInput, RecommendationInput, SceneInput,
+    RECENT_ALERT_WINDOW_DAYS,
 };
 use crate::state::AppState;
 use axum::extract::{FromRequestParts, Path, Query, State};
@@ -1139,5 +1140,228 @@ pub async fn portal_generate_grower_report(
         recommendation_count,
         created_at: generated_at,
         read: false,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Portal recommendation acknowledgement, alert feed, and notifications
+// summary (batch F-B4). Recommendations and alerts reach the portal through
+// their field (`fields.owner = org`), so cross-org IDs stay 404.
+// ---------------------------------------------------------------------------
+
+/// Statuses a portal caller may set on a recommendation — the stored lowercase
+/// lifecycle used across the `recommendations` table.
+const PORTAL_RECOMMENDATION_STATUSES: [&str; 5] =
+    ["open", "reviewed", "completed", "dismissed", "closed"];
+
+/// Cap on the portal alert feed.
+const PORTAL_ALERT_FEED_LIMIT: i64 = 100;
+
+/// Validate a caller-supplied recommendation status. This deliberately does
+/// not reuse `parse_recommendation_status` (routes.rs): that parser guards
+/// trusted stored rows and maps bad values to an internal error, while the
+/// portal must answer caller typos with 400.
+fn validate_portal_recommendation_status(value: &str) -> AppResult<String> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if PORTAL_RECOMMENDATION_STATUSES.contains(&normalized.as_str()) {
+        Ok(normalized)
+    } else {
+        Err(AppError::BadRequest(format!(
+            "invalid recommendation status {value:?}; expected one of: {}",
+            PORTAL_RECOMMENDATION_STATUSES.join(", ")
+        )))
+    }
+}
+
+/// Body for the portal status transition. Serde ignores unknown fields by
+/// default, which leaves the seam for the F-B5 `log_activity` companion.
+#[derive(Debug, Deserialize)]
+pub struct PortalRecommendationStatusRequest {
+    pub status: String,
+}
+
+/// PUT /api/portal/recommendations/:recommendation_id/status — acknowledge or
+/// otherwise transition an owned recommendation.
+///
+/// Mirrors the org-side `update_scene_recommendation` persistence exactly:
+/// one UPDATE of the `recommendations` row (status + updated_at). The org
+/// route records no separate transition row and writes lineage only at create
+/// time, so the portal adds none either.
+pub async fn portal_update_recommendation_status(
+    identity: PortalIdentity,
+    Path(recommendation_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<PortalRecommendationStatusRequest>,
+) -> AppResult<Json<RecommendationRecord>> {
+    let status = validate_portal_recommendation_status(&request.status)?;
+
+    let row = sqlx::query("SELECT field_id FROM recommendations WHERE recommendation_id = ?1")
+        .bind(&recommendation_id)
+        .fetch_optional(&state.pool)
+        .await
+        .map_err(Error::from)?
+        .ok_or(AppError::NotFound)?;
+    // A recommendation with no field cannot be tied to any org, so the portal
+    // treats it as missing — the same 404 as a cross-org or unknown ID.
+    let field_id = row
+        .get::<Option<String>, _>("field_id")
+        .ok_or(AppError::NotFound)?;
+    owned_field(&state, &identity.org_id, &field_id).await?;
+
+    sqlx::query(
+        "UPDATE recommendations SET status = ?1, updated_at = ?2 WHERE recommendation_id = ?3",
+    )
+    .bind(&status)
+    .bind(current_record_timestamp())
+    .bind(&recommendation_id)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let row = sqlx::query(
+        "SELECT recommendation_id, scene_id, field_id, title, note, category, priority, status, \
+                evidence_refs_json, created_at, updated_at \
+         FROM recommendations WHERE recommendation_id = ?1",
+    )
+    .bind(&recommendation_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    Ok(Json(decode_recommendation_record(&state, &row).await?))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PortalAlertsQuery {
+    pub since: Option<String>,
+    pub severity: Option<String>,
+}
+
+/// One entry in the portal alert feed: a fired alert joined to its field name
+/// and, when a lifecycle record exists, the alert's current lifecycle state.
+#[derive(Debug, Serialize)]
+pub struct PortalAlert {
+    pub alert_id: String,
+    pub field_id: String,
+    pub field_name: String,
+    pub event_type: String,
+    pub severity: String,
+    pub explanation: Option<String>,
+    pub fired_at: String,
+    /// Current `alert_lifecycle.state`; `None` until a lifecycle is opened.
+    pub lifecycle_state: Option<String>,
+}
+
+/// GET /api/portal/alerts?since=&severity= — fired alerts on the caller's org
+/// fields, newest first, capped at [`PORTAL_ALERT_FEED_LIMIT`].
+pub async fn portal_list_alerts(
+    identity: PortalIdentity,
+    Query(query): Query<PortalAlertsQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<Vec<PortalAlert>>> {
+    let since = normalize_optional_text(query.since);
+    if let Some(since) = since.as_deref() {
+        if parse_stored_timestamp(since).is_none() {
+            return Err(AppError::BadRequest(
+                "since must be an RFC 3339 timestamp".to_string(),
+            ));
+        }
+    }
+    let severity = normalize_optional_text(query.severity).map(|value| value.to_ascii_lowercase());
+
+    let rows = sqlx::query(
+        r#"
+        SELECT a.alert_id, a.field_id, a.event_type, a.severity, a.explanation, a.fired_at,
+               f.name AS field_name, l.state AS lifecycle_state
+        FROM fired_alerts a
+        JOIN fields f ON f.field_id = a.field_id
+        LEFT JOIN alert_lifecycle l ON l.alert_id = a.alert_id
+        WHERE f.owner = ?1
+          AND (?2 IS NULL OR a.fired_at >= ?2)
+          AND (?3 IS NULL OR LOWER(a.severity) = ?3)
+        ORDER BY a.fired_at DESC, a.alert_id ASC
+        LIMIT ?4
+        "#,
+    )
+    .bind(&identity.org_id)
+    .bind(&since)
+    .bind(&severity)
+    .bind(PORTAL_ALERT_FEED_LIMIT)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(Json(
+        rows.iter()
+            .map(|row| PortalAlert {
+                alert_id: row.get("alert_id"),
+                field_id: row.get("field_id"),
+                field_name: row.get("field_name"),
+                event_type: row.get("event_type"),
+                severity: row.get("severity"),
+                explanation: row.get("explanation"),
+                fired_at: row.get("fired_at"),
+                lifecycle_state: row.get("lifecycle_state"),
+            })
+            .collect(),
+    ))
+}
+
+/// GET /api/portal/notifications/summary response.
+#[derive(Debug, Serialize)]
+pub struct PortalNotificationsSummary {
+    /// Org reports without a read receipt for the caller's account.
+    pub unread_reports: i64,
+    /// Recommendations with status `open` across the org's fields.
+    pub open_recommendations: i64,
+    /// Alerts fired on org fields within the trailing
+    /// [`RECENT_ALERT_WINDOW_DAYS`].
+    pub alerts_last_7d: i64,
+}
+
+/// GET /api/portal/notifications/summary — badge counts for the portal shell.
+pub async fn portal_notifications_summary(
+    identity: PortalIdentity,
+    State(state): State<AppState>,
+) -> AppResult<Json<PortalNotificationsSummary>> {
+    let (unread_reports,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM reports r \
+         JOIN fields f ON f.field_id = r.field_id \
+         LEFT JOIN portal_report_reads rr \
+           ON rr.report_id = r.report_id AND rr.account_id = ?2 \
+         WHERE f.owner = ?1 AND rr.report_id IS NULL",
+    )
+    .bind(&identity.org_id)
+    .bind(&identity.account_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let (open_recommendations,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM recommendations rec \
+         JOIN fields f ON f.field_id = rec.field_id \
+         WHERE f.owner = ?1 AND rec.status = 'open'",
+    )
+    .bind(&identity.org_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    // Reuse the shared trailing-window rule so the badge agrees with the
+    // per-field `recent_alerts_7d` counts on cards and overviews.
+    let fired_ats: Vec<(String,)> = sqlx::query_as(
+        "SELECT a.fired_at FROM fired_alerts a \
+         JOIN fields f ON f.field_id = a.field_id WHERE f.owner = ?1",
+    )
+    .bind(&identity.org_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    let fired_ats: Vec<String> = fired_ats.into_iter().map(|(fired_at,)| fired_at).collect();
+    let alerts_last_7d = count_within_days(&fired_ats, Utc::now(), RECENT_ALERT_WINDOW_DAYS) as i64;
+
+    Ok(Json(PortalNotificationsSummary {
+        unread_reports,
+        open_recommendations,
+        alerts_last_7d,
     }))
 }

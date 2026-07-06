@@ -74,6 +74,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/fields/:field_id/timeseries/metrics",
             get(routes::get_field_timeseries_metrics),
         )
+        .route(
+            "/api/fields/:field_id/timeseries/summary",
+            get(routes::get_field_timeseries_summary),
+        )
         .route("/api/stac", get(routes::stac_landing_page))
         .route("/api/stac/conformance", get(routes::stac_conformance))
         .route("/api/stac/collections", get(routes::stac_list_collections))
@@ -523,6 +527,15 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/portal/fields/:field_id/grower-report",
             post(routes::portal_generate_grower_report),
+        )
+        .route(
+            "/api/portal/recommendations/:recommendation_id/status",
+            put(routes::portal_update_recommendation_status),
+        )
+        .route("/api/portal/alerts", get(routes::portal_list_alerts))
+        .route(
+            "/api/portal/notifications/summary",
+            get(routes::portal_notifications_summary),
         )
         .route(
             "/api/admin/portal/access-codes",
@@ -1102,7 +1115,3 @@ async fn shutdown_signal() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     info!("shutdown signal received");
 }
-        .route(
-            "/api/fields/:field_id/timeseries/summary",
-            get(routes::get_field_timeseries_summary),
-        )
