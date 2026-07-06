@@ -1102,3 +1102,7 @@ async fn shutdown_signal() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     info!("shutdown signal received");
 }
+        .route(
+            "/api/fields/:field_id/timeseries/summary",
+            get(routes::get_field_timeseries_summary),
+        )

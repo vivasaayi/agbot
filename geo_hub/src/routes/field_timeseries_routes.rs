@@ -10,7 +10,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{AppError, AppResult};
 use crate::field_timeseries::{
-    list_field_metrics, query_field_series, FieldSeriesResponse, FieldTimeseriesError,
+    list_field_metrics, query_field_series, summarize_field_series, FieldSeriesResponse,
+    FieldSeriesSummary, FieldTimeseriesError,
 };
 use crate::state::AppState;
 
@@ -65,6 +66,36 @@ pub async fn get_field_timeseries(
     )
     .await?;
     Ok(Json(response))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FieldTimeseriesSummaryQuery {
+    pub metric: Option<String>,
+    pub source: Option<String>,
+}
+
+/// `GET /api/fields/:field_id/timeseries/summary?metric=sat.ndvi.mean&source=`
+///
+/// `metric` is required. Without `source` the summary runs over the
+/// harmonized merged series; with it, over that source's raw series.
+pub async fn get_field_timeseries_summary(
+    State(state): State<AppState>,
+    Path(field_id): Path<String>,
+    Query(query): Query<FieldTimeseriesSummaryQuery>,
+) -> AppResult<Json<FieldSeriesSummary>> {
+    let metric = query
+        .metric
+        .as_deref()
+        .map(str::trim)
+        .filter(|metric| !metric.is_empty())
+        .ok_or_else(|| {
+            AppError::BadRequest(
+                "metric query parameter is required (e.g. metric=sat.ndvi.mean)".to_string(),
+            )
+        })?;
+    let summary =
+        summarize_field_series(&state.pool, &field_id, metric, query.source.as_deref()).await?;
+    Ok(Json(summary))
 }
 
 #[derive(Debug, Serialize)]

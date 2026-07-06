@@ -24,6 +24,11 @@ use shared::timeseries_naming::{
 };
 use sqlx::Row;
 use thiserror::Error;
+use timeseries::{
+    MetricDefinition, MetricKind, RollingBaselineConfig, SeasonalComparisonConfig,
+    SeasonalComparisonTarget, SeriesPoint as EngineSeriesPoint, SeriesValue as EngineSeriesValue,
+    TimeRange, TimeSeriesEngine, TimeSeriesError, ZonalTrendTarget,
+};
 
 use crate::catalog;
 use crate::db::DbPool;
@@ -56,6 +61,8 @@ pub enum FieldTimeseriesError {
     },
     #[error(transparent)]
     Catalog(#[from] crate::catalog::CatalogError),
+    #[error("time-series engine rejected the series: {0}")]
+    Engine(#[from] TimeSeriesError),
     #[error("time-series persistence failed: {0}")]
     Db(#[from] sqlx::Error),
 }
@@ -512,6 +519,260 @@ pub async fn list_field_metrics(
     .fetch_all(pool)
     .await?;
     Ok(metrics)
+}
+
+// --- Summary layer (batch S-5) -------------------------------------------------
+
+/// Rolling-baseline window: the anomaly verdict compares the latest
+/// observation against the mean of the trailing five before it. Fixed in v1;
+/// no query knob.
+const ROLLING_WINDOW_POINTS: usize = 5;
+
+/// Deviation (|latest - baseline_mean|) at or beyond which the latest
+/// observation is flagged anomalous. Sized for the [-1, 1] vegetation-index
+/// metrics this series carries. Fixed in v1.
+const ROLLING_ANOMALY_BAND: f64 = 0.15;
+
+/// Prior-years comparison: an observation from an earlier year counts as
+/// "same season" when its day-of-year is within this many days of the latest
+/// observation's. Fixed in v1.
+const SEASONAL_DOY_TOLERANCE: u32 = 15;
+
+/// At least one prior-year observation is required before a comparison is
+/// reported; with none the block is omitted rather than fabricated.
+const SEASONAL_MIN_POINTS: usize = 1;
+
+/// `time_series_points` does not persist units, so the in-memory engine
+/// series is registered with this placeholder unit.
+const SUMMARY_UNIT: &str = "unitless";
+const SUMMARY_CADENCE: &str = "per_scene";
+
+/// Latest-vs-recent-history verdict from the engine's rolling baseline:
+/// the latest observation against the mean of the trailing
+/// [`ROLLING_WINDOW_POINTS`] observations before it.
+#[derive(Debug, Clone, Serialize)]
+pub struct AnomalySummary {
+    pub latest_t: String,
+    pub latest_value: f64,
+    pub baseline_mean: f64,
+    /// `latest_value - baseline_mean`.
+    pub deviation: f64,
+    /// `|deviation| >= anomaly_band`.
+    pub is_anomalous: bool,
+    pub baseline_points: usize,
+    pub anomaly_band: f64,
+}
+
+/// Latest observation vs the same-day-of-year window of prior years, from
+/// the engine's seasonal comparison.
+#[derive(Debug, Clone, Serialize)]
+pub struct PriorYearsComparison {
+    pub current_t: String,
+    pub current_value: f64,
+    pub prior_point_count: usize,
+    pub seasonal_mean: f64,
+    /// `current_value - seasonal_mean`.
+    pub delta_from_seasonal_mean: f64,
+    pub day_of_year_tolerance: u32,
+}
+
+/// Per-season statistics. v1 simplification: a "season" is the calendar year
+/// of `t` (multi-season climates and southern-hemisphere wrap-around are not
+/// modeled).
+#[derive(Debug, Clone, Serialize)]
+pub struct YearStats {
+    pub year: i32,
+    pub count: usize,
+    pub mean: f64,
+    pub max: f64,
+    /// Timestamp of the seasonal peak (first occurrence on ties).
+    pub max_t: String,
+}
+
+/// Response of `GET /api/fields/:field_id/timeseries/summary`.
+///
+/// `series_basis` documents which series the statistics were computed over:
+/// `"merged"` (the harmonized multi-source series, so multi-source history
+/// reads as one line) or `"single_source"` (a `source` filter was given; raw
+/// values of that source only).
+#[derive(Debug, Clone, Serialize)]
+pub struct FieldSeriesSummary {
+    pub field_id: String,
+    pub metric: String,
+    pub series_basis: String,
+    pub observation_count: usize,
+    pub first_t: Option<String>,
+    pub last_t: Option<String>,
+    pub per_year: Vec<YearStats>,
+    pub anomaly: Option<AnomalySummary>,
+    pub vs_prior_years: Option<PriorYearsComparison>,
+}
+
+/// Group observations by calendar year of `t` (v1 season rule) and reduce to
+/// [`YearStats`]. Observations whose `t` does not start with a parsable
+/// 4-digit year are left out of the per-year stats (they still count toward
+/// `observation_count`).
+fn per_year_stats(points: &[SeriesPointOut]) -> Vec<YearStats> {
+    let mut by_year: BTreeMap<i32, Vec<&SeriesPointOut>> = BTreeMap::new();
+    for point in points {
+        let Some(year) = point.t.get(0..4).and_then(|y| y.parse::<i32>().ok()) else {
+            continue;
+        };
+        by_year.entry(year).or_default().push(point);
+    }
+    by_year
+        .into_iter()
+        .map(|(year, year_points)| {
+            let mean = year_points.iter().map(|p| p.value).sum::<f64>() / year_points.len() as f64;
+            let mut peak = year_points[0];
+            for point in &year_points[1..] {
+                if point.value > peak.value {
+                    peak = point;
+                }
+            }
+            YearStats {
+                year,
+                count: year_points.len(),
+                mean,
+                max: peak.value,
+                max_t: peak.t.clone(),
+            }
+        })
+        .collect()
+}
+
+/// Summarize one field metric: season (calendar-year) statistics computed in
+/// plain code, plus the `timeseries` engine's rolling-baseline anomaly
+/// verdict and same-DOY prior-years comparison for the latest observation.
+///
+/// Without a `source` filter the summary runs over the harmonized merged
+/// series (`series_basis: "merged"`); with one, over that source's raw
+/// series (`series_basis: "single_source"`).
+///
+/// The engine keys points by `(entity_ref, metric, t)`, so when two sources
+/// observe the same timestamp in the merged series only the first (sorted by
+/// source) feeds the engine computations; all observations still feed
+/// `observation_count` and `per_year`.
+///
+/// `anomaly` is omitted when fewer than [`ROLLING_WINDOW_POINTS`] + 1
+/// observations exist; `vs_prior_years` when no prior-year observation falls
+/// within [`SEASONAL_DOY_TOLERANCE`] days of the latest observation's
+/// day-of-year (or its timestamp has no parsable date).
+pub async fn summarize_field_series(
+    pool: &DbPool,
+    field_id: &str,
+    metric: &str,
+    source: Option<&str>,
+) -> Result<FieldSeriesSummary, FieldTimeseriesError> {
+    let response = query_field_series(pool, field_id, metric, None, None, source).await?;
+    let points = response.merged;
+    let series_basis = if source.is_some() {
+        "single_source"
+    } else {
+        "merged"
+    };
+
+    let mut summary = FieldSeriesSummary {
+        field_id: field_id.to_string(),
+        metric: metric.to_string(),
+        series_basis: series_basis.to_string(),
+        observation_count: points.len(),
+        first_t: points.first().map(|p| p.t.clone()),
+        last_t: points.last().map(|p| p.t.clone()),
+        per_year: per_year_stats(&points),
+        anomaly: None,
+        vs_prior_years: None,
+    };
+    let Some(latest) = points.last() else {
+        return Ok(summary);
+    };
+
+    let entity_ref = field_entity_ref(field_id);
+    let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let mut engine = TimeSeriesEngine::default();
+    engine.register_metric(MetricDefinition {
+        metric: metric.to_string(),
+        unit: SUMMARY_UNIT.to_string(),
+        kind: MetricKind::Scalar,
+        expected_cadence: SUMMARY_CADENCE.to_string(),
+    })?;
+    for point in &points {
+        match engine.append(EngineSeriesPoint {
+            entity_ref: entity_ref.clone(),
+            metric: metric.to_string(),
+            unit: SUMMARY_UNIT.to_string(),
+            t: point.t.clone(),
+            value: EngineSeriesValue::Scalar { value: point.value },
+            source_ref: point.product_ref.clone(),
+            created_at: created_at.clone(),
+        }) {
+            Ok(()) => {}
+            // Two sources at the same timestamp: keep the first, skip the rest.
+            Err(TimeSeriesError::DuplicateSeriesPoint { .. }) => {}
+            Err(other) => return Err(other.into()),
+        }
+    }
+
+    match engine.compute_rolling_baseline(
+        ZonalTrendTarget {
+            entity_ref: entity_ref.clone(),
+            metric: metric.to_string(),
+            // Field-level summary: the whole field is the "zone".
+            zone_ref: entity_ref.clone(),
+            zone_crs: "EPSG:4326".to_string(),
+            range: TimeRange::default(),
+        },
+        RollingBaselineConfig {
+            window_points: ROLLING_WINDOW_POINTS,
+            anomaly_band: ROLLING_ANOMALY_BAND,
+        },
+    ) {
+        Ok(result) => {
+            summary.anomaly = Some(AnomalySummary {
+                latest_t: result.latest_point.t.clone(),
+                latest_value: result.latest_value,
+                baseline_mean: result.baseline_mean,
+                deviation: result.delta_from_baseline,
+                is_anomalous: result.anomaly,
+                baseline_points: result.baseline_window.len(),
+                anomaly_band: ROLLING_ANOMALY_BAND,
+            });
+        }
+        Err(TimeSeriesError::InsufficientBaselineHistory { .. }) => {}
+        Err(other) => return Err(other.into()),
+    }
+
+    match engine.compute_seasonal_comparison(
+        SeasonalComparisonTarget {
+            entity_ref: entity_ref.clone(),
+            metric: metric.to_string(),
+            zone_ref: entity_ref,
+            zone_crs: "EPSG:4326".to_string(),
+            current_t: latest.t.clone(),
+        },
+        SeasonalComparisonConfig {
+            min_seasonal_points: SEASONAL_MIN_POINTS,
+            day_of_year_tolerance: SEASONAL_DOY_TOLERANCE,
+        },
+    ) {
+        Ok(result) => {
+            summary.vs_prior_years = Some(PriorYearsComparison {
+                current_t: result.current_point.t.clone(),
+                current_value: result.seasonal_mean + result.delta_from_seasonal_baseline,
+                prior_point_count: result.seasonal_points.len(),
+                seasonal_mean: result.seasonal_mean,
+                delta_from_seasonal_mean: result.delta_from_seasonal_baseline,
+                day_of_year_tolerance: SEASONAL_DOY_TOLERANCE,
+            });
+        }
+        Err(TimeSeriesError::NoSeasonalBaseline { .. }) => {}
+        // Non-date timestamps cannot anchor a day-of-year comparison: omit
+        // the block instead of failing the whole summary.
+        Err(TimeSeriesError::InvalidTrendTimestamp { .. }) => {}
+        Err(other) => return Err(other.into()),
+    }
+
+    Ok(summary)
 }
 
 #[cfg(test)]
