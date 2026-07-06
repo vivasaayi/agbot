@@ -1,11 +1,16 @@
+use crate::pipeline_worker::{
+    spawn_pipeline_worker, EarthSearchItemFetcher, PipelineWorkerContext,
+};
+use crate::satellite_derivation::UrlCogResolver;
 use crate::{config::HubConfig, routes, state::AppState};
 use anyhow::Result;
 use axum::{
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tower_http::services::ServeDir;
 use tracing::{info, warn};
 
@@ -1059,6 +1064,23 @@ pub fn build_router(state: AppState) -> Router {
             "/api/scenes/:scene_id/products/:kind/tiles/:z/:x/:y.png",
             get(routes::stream_product_tile),
         )
+        // Satellite pipeline (batch S-8): subscriptions, manual trigger,
+        // job queue inspection and retry.
+        .route(
+            "/api/fields/:field_id/subscriptions",
+            get(routes::list_field_subscriptions).post(routes::upsert_field_subscription),
+        )
+        .route(
+            "/api/subscriptions/:subscription_id",
+            patch(routes::patch_subscription_status),
+        )
+        .route("/api/pipeline/run", post(routes::run_pipeline_now))
+        .route("/api/pipeline/jobs", get(routes::list_pipeline_jobs))
+        .route("/api/pipeline/jobs/:job_id", get(routes::get_pipeline_job))
+        .route(
+            "/api/pipeline/jobs/:job_id/retry",
+            post(routes::retry_pipeline_job),
+        )
         .with_state(state)
 }
 
@@ -1074,6 +1096,23 @@ pub async fn serve(config: HubConfig, pool: crate::db::DbPool) -> Result<()> {
 
     let router = build_router(state);
 
+    // Satellite pipeline worker (batch S-8): a serial background loop that
+    // drains the job queue and runs the subscription cadence pass. Off by
+    // default (`[pipeline] enabled = false`), so tests/CI are unaffected.
+    let (worker_shutdown_tx, worker_shutdown_rx) = watch::channel(false);
+    let worker_handle = if shared_config.pipeline.enabled {
+        info!("satellite pipeline worker enabled");
+        let worker_ctx = PipelineWorkerContext {
+            pool: pool.clone(),
+            config: Arc::clone(&shared_config),
+            cog_resolver: Arc::new(UrlCogResolver),
+            item_fetcher: Arc::new(EarthSearchItemFetcher),
+        };
+        Some(spawn_pipeline_worker(worker_ctx, worker_shutdown_rx))
+    } else {
+        None
+    };
+
     let listener = TcpListener::bind(addr).await?;
     info!(%addr, "geo_hub listening");
 
@@ -1083,6 +1122,15 @@ pub async fn serve(config: HubConfig, pool: crate::db::DbPool) -> Result<()> {
     )
     .with_graceful_shutdown(shutdown_signal())
     .await?;
+
+    // The HTTP server drained after the shutdown signal; flip the worker's
+    // watch channel and wait for the loop to exit before returning.
+    let _ = worker_shutdown_tx.send(true);
+    if let Some(handle) = worker_handle {
+        if let Err(err) = handle.await {
+            warn!(%err, "pipeline worker task join failed");
+        }
+    }
 
     Ok(())
 }

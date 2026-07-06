@@ -29,6 +29,8 @@ pub enum PipelineError {
     JobNotFound(String),
     #[error("subscription {0} not found")]
     SubscriptionNotFound(String),
+    #[error("job {job_id} is not retryable from status {status}")]
+    NotRetryable { job_id: String, status: String },
     #[error("unknown enum value: {0}")]
     UnknownEnum(String),
     #[error(transparent)]
@@ -512,6 +514,99 @@ pub async fn list_jobs(
     rows.iter().map(job_from_row).collect()
 }
 
+/// Look up one job by id.
+pub async fn get_job(pool: &DbPool, job_id: &str) -> Result<Option<PipelineJob>, PipelineError> {
+    let row = sqlx::query("SELECT * FROM pipeline_jobs WHERE job_id = ?")
+        .bind(job_id)
+        .fetch_optional(pool)
+        .await?;
+    row.as_ref().map(job_from_row).transpose()
+}
+
+/// Look up one job by its deterministic job key.
+pub async fn find_job_by_key(
+    pool: &DbPool,
+    job_key: &str,
+) -> Result<Option<PipelineJob>, PipelineError> {
+    let row = sqlx::query("SELECT * FROM pipeline_jobs WHERE job_key = ?")
+        .bind(job_key)
+        .fetch_optional(pool)
+        .await?;
+    row.as_ref().map(job_from_row).transpose()
+}
+
+/// Filters for the job listing API.
+#[derive(Debug, Clone, Default)]
+pub struct JobFilter {
+    pub field_id: Option<String>,
+    pub status: Option<JobStatus>,
+    pub limit: Option<i64>,
+}
+
+/// List jobs newest first for the API: optional field/status filters, with a
+/// limit (default 100, clamped to 1..=500).
+pub async fn list_jobs_filtered(
+    pool: &DbPool,
+    filter: &JobFilter,
+) -> Result<Vec<PipelineJob>, PipelineError> {
+    let limit = filter.limit.unwrap_or(100).clamp(1, 500);
+    let mut sql = String::from("SELECT * FROM pipeline_jobs WHERE 1 = 1");
+    if filter.field_id.is_some() {
+        sql.push_str(" AND field_id = ?");
+    }
+    if filter.status.is_some() {
+        sql.push_str(" AND status = ?");
+    }
+    sql.push_str(" ORDER BY created_at DESC, job_key DESC LIMIT ?");
+
+    let mut query = sqlx::query(&sql);
+    if let Some(field_id) = &filter.field_id {
+        query = query.bind(field_id);
+    }
+    if let Some(status) = filter.status {
+        query = query.bind(status.as_str());
+    }
+    let rows = query.bind(limit).fetch_all(pool).await?;
+    rows.iter().map(job_from_row).collect()
+}
+
+/// Reset a `dead` or `failed` job back to `queued` for an immediate re-run
+/// (operator retry). Attempts and errors are cleared, mirroring the terminal
+/// re-enqueue reset in [`enqueue_job`].
+pub async fn retry_job(
+    pool: &DbPool,
+    job_id: &str,
+    now: DateTime<Utc>,
+) -> Result<PipelineJob, PipelineError> {
+    let job = get_job(pool, job_id)
+        .await?
+        .ok_or_else(|| PipelineError::JobNotFound(job_id.to_string()))?;
+    if !matches!(job.status, JobStatus::Dead | JobStatus::Failed) {
+        return Err(PipelineError::NotRetryable {
+            job_id: job_id.to_string(),
+            status: job.status.as_str().to_string(),
+        });
+    }
+    let now_ts = format_ts(now);
+    sqlx::query(
+        r#"
+        UPDATE pipeline_jobs
+        SET status = 'queued', attempts = 0, run_after = ?,
+            claimed_at = NULL, started_at = NULL, finished_at = NULL,
+            last_error = NULL, updated_at = ?
+        WHERE job_id = ?
+        "#,
+    )
+    .bind(&now_ts)
+    .bind(&now_ts)
+    .bind(job_id)
+    .execute(pool)
+    .await?;
+    get_job(pool, job_id)
+        .await?
+        .ok_or_else(|| PipelineError::JobNotFound(job_id.to_string()))
+}
+
 // ---------------------------------------------------------------------------
 // Subscriptions
 // ---------------------------------------------------------------------------
@@ -631,6 +726,21 @@ pub async fn list_subscriptions(
         }
     };
     rows.iter().map(subscription_from_row).collect()
+}
+
+/// Look up the subscription for one `(field_id, dataset)` pair.
+pub async fn find_subscription(
+    pool: &DbPool,
+    field_id: &str,
+    dataset: &str,
+) -> Result<Option<SubscriptionRecord>, PipelineError> {
+    let row =
+        sqlx::query("SELECT * FROM satellite_subscriptions WHERE field_id = ? AND dataset = ?")
+            .bind(field_id)
+            .bind(dataset)
+            .fetch_optional(pool)
+            .await?;
+    row.as_ref().map(subscription_from_row).transpose()
 }
 
 /// Set a subscription's status (`active` / `paused`).

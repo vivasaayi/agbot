@@ -207,6 +207,91 @@ pub async fn search_items(
     Ok(items)
 }
 
+/// Earth Search collection id for a subscription dataset key. Accepts both
+/// the short subscription form (`sentinel2`, `landsat`) and the collection
+/// id itself. `hls` (and anything else) has no Earth Search collection and
+/// maps to `None` — HLS lives on NASA LP DAAC, not Element84.
+pub fn collection_for_dataset(dataset: &str) -> Option<&'static str> {
+    match dataset {
+        "sentinel2" | "sentinel-2-l2a" => Some("sentinel-2-l2a"),
+        "landsat" | "landsat-c2-l2" => Some("landsat-c2-l2"),
+        _ => None,
+    }
+}
+
+/// Build the STAC `POST /search` body for an explicit bbox + date range.
+/// Pure, so the request shape is unit-testable without network access.
+pub fn build_range_search_body(
+    collections: &[&str],
+    bbox: [f64; 4],
+    start_iso: &str,
+    end_iso: &str,
+    max_cloud_cover: f64,
+    limit: usize,
+) -> serde_json::Value {
+    serde_json::json!({
+        "collections": collections,
+        "bbox": bbox,
+        "datetime": format!("{start_iso}/{end_iso}"),
+        "limit": limit.clamp(1, 100),
+        "query": { "eo:cloud_cover": { "lt": max_cloud_cover } },
+    })
+}
+
+/// Sort items chronologically (oldest first, undated items last), then by id
+/// for a stable order. Pure.
+pub fn sort_items_by_datetime(items: &mut [EarthSearchItem]) {
+    items.sort_by(|left, right| {
+        match (left.datetime(), right.datetime()) {
+            (Some(l), Some(r)) => l.cmp(r),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+        .then_with(|| left.id.cmp(&right.id))
+    });
+}
+
+/// Search Earth Search over an explicit bbox (WGS84
+/// `[min_lon, min_lat, max_lon, max_lat]`, e.g. a field-boundary envelope)
+/// and an explicit ISO date range, filtered by max cloud cover. Returns
+/// items oldest first — the natural order for discover fan-out.
+pub async fn search_items_range(
+    collections: &[&str],
+    bbox: [f64; 4],
+    start_iso: &str,
+    end_iso: &str,
+    max_cloud_cover: f64,
+    limit: usize,
+) -> Result<Vec<EarthSearchItem>> {
+    let body = build_range_search_body(
+        collections,
+        bbox,
+        start_iso,
+        end_iso,
+        max_cloud_cover,
+        limit,
+    );
+    let response = http_client()?
+        .post(format!("{EARTH_SEARCH_API}/search"))
+        .header(reqwest::header::USER_AGENT, "agbot-geo-hub/0.1")
+        .json(&body)
+        .send()
+        .await
+        .context("failed to call Earth Search STAC search")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(anyhow!(
+            "Earth Search STAC search failed with {status}: {text}"
+        ));
+    }
+    let text = response.text().await?;
+    let mut items = parse_search_response(&text)?;
+    sort_items_by_datetime(&mut items);
+    Ok(items)
+}
+
 /// Fetch a single item by collection + id.
 pub async fn fetch_item(collection: &str, item_id: &str) -> Result<EarthSearchItem> {
     let url = format!("{EARTH_SEARCH_API}/collections/{collection}/items/{item_id}");
@@ -305,6 +390,77 @@ mod tests {
 
         assert!(parse_search_response("{}").unwrap().is_empty());
         assert!(parse_search_response("not json").is_err());
+    }
+
+    #[test]
+    fn collection_for_dataset_maps_short_and_full_forms() {
+        assert_eq!(collection_for_dataset("sentinel2"), Some("sentinel-2-l2a"));
+        assert_eq!(
+            collection_for_dataset("sentinel-2-l2a"),
+            Some("sentinel-2-l2a")
+        );
+        assert_eq!(collection_for_dataset("landsat"), Some("landsat-c2-l2"));
+        assert_eq!(
+            collection_for_dataset("landsat-c2-l2"),
+            Some("landsat-c2-l2")
+        );
+        assert_eq!(
+            collection_for_dataset("hls"),
+            None,
+            "HLS is not on Earth Search"
+        );
+        assert_eq!(collection_for_dataset("modis"), None);
+    }
+
+    #[test]
+    fn range_search_body_carries_bbox_range_and_cloud_filter() {
+        let body = build_range_search_body(
+            &["sentinel-2-l2a"],
+            [76.64, 11.34, 76.65, 11.35],
+            "2026-06-22T00:00:00Z",
+            "2026-07-06T00:00:00Z",
+            60.0,
+            50,
+        );
+        assert_eq!(body["collections"], serde_json::json!(["sentinel-2-l2a"]));
+        assert_eq!(
+            body["bbox"],
+            serde_json::json!([76.64, 11.34, 76.65, 11.35])
+        );
+        assert_eq!(
+            body["datetime"],
+            "2026-06-22T00:00:00Z/2026-07-06T00:00:00Z"
+        );
+        assert_eq!(body["limit"], 50);
+        assert_eq!(body["query"]["eo:cloud_cover"]["lt"], 60.0);
+        // Limit clamps into the API-accepted page size.
+        let clamped = build_range_search_body(&["x"], [0.0; 4], "a", "b", 10.0, 100_000);
+        assert_eq!(clamped["limit"], 100);
+    }
+
+    #[test]
+    fn sort_items_by_datetime_orders_oldest_first_undated_last() {
+        let item = |id: &str, datetime: Option<&str>| -> EarthSearchItem {
+            let properties = match datetime {
+                Some(dt) => serde_json::json!({ "datetime": dt }),
+                None => serde_json::json!({}),
+            };
+            serde_json::from_value(serde_json::json!({
+                "id": id,
+                "properties": properties,
+                "assets": {},
+            }))
+            .unwrap()
+        };
+        let mut items = vec![
+            item("c", Some("2026-02-01T00:00:00Z")),
+            item("undated", None),
+            item("a", Some("2026-01-01T00:00:00Z")),
+            item("b", Some("2026-01-01T00:00:00Z")),
+        ];
+        sort_items_by_datetime(&mut items);
+        let ids: Vec<&str> = items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b", "c", "undated"]);
     }
 
     #[test]

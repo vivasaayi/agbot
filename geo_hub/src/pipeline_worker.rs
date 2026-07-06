@@ -5,24 +5,32 @@
 //! every poll tick claim at most one ready job, execute it, and run the
 //! subscription cadence pass (due subscriptions -> `discover` jobs).
 //!
-//! Batch scope: only [`JobKind::Derive`] has a handler here. `discover`,
-//! `l3_recompute`, `app_run`, and `backfill_enumerate` handlers arrive in
-//! batches S-8/S-9/S-11; until then those jobs dead-letter immediately with a
-//! `handler not implemented` **client** error so they cannot retry-loop.
+//! Batch scope: [`JobKind::Derive`] (S-7) and [`JobKind::Discover`] (S-8)
+//! have handlers here. `l3_recompute`, `app_run`, and `backfill_enumerate`
+//! handlers arrive in batches S-9/S-11; until then those jobs dead-letter
+//! immediately with a `handler not implemented` **client** error so they
+//! cannot retry-loop.
 //!
 //! Everything the worker touches is injected through
 //! [`PipelineWorkerContext`] — the DB pool, the hub config (data root +
 //! `[pipeline]` cadence/politeness knobs), the COG store resolver, and the
-//! STAC item fetcher — so tests drive [`run_one_tick`] deterministically
-//! against in-memory fixtures with no network access. The server wiring
-//! (spawning the loop when `pipeline.enabled` is set) lands in batch S-8.
+//! STAC item fetcher/searcher — so tests drive [`run_one_tick`]
+//! deterministically against in-memory fixtures with no network access.
+//! `server::serve` spawns the loop when `pipeline.enabled` is set (S-8).
+//!
+//! `last_checked_at` ownership: the cadence pass touches the subscription
+//! when it *enqueues* a discover job (so the subscription cannot re-fire on
+//! every tick while the job waits in the queue), and the discover *handler*
+//! touches it again after a successful STAC search (the authoritative record
+//! of the last actual check). The small forward drift between the two
+//! touches is covered by the subscription's `lookback_days` search margin.
 
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use shared::schemas::GeoBounds;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -39,6 +47,10 @@ use crate::satellite_derivation::{
 /// behind any operator-boosted work while still ahead of nothing by default.
 const DISCOVER_PRIORITY: i64 = 0;
 
+/// Page size for one discover STAC range search. A field-scale bbox over a
+/// lookback window of days sees a handful of scenes; 50 leaves headroom.
+const DISCOVER_SEARCH_LIMIT: usize = 50;
+
 /// Boxed future alias so [`StacItemFetcher`] stays object-safe without an
 /// `async-trait` dependency.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -52,23 +64,60 @@ pub enum ItemFetchError {
     /// Transient upstream/network failure: eligible for retry with backoff.
     #[error("item fetch failed: {0}")]
     Upstream(String),
+    /// The fetcher cannot search this dataset at all (no upstream collection
+    /// or the seam does not implement search): permanent, client-class.
+    #[error("stac search unsupported: {0}")]
+    SearchUnsupported(String),
 }
 
 impl ItemFetchError {
     fn is_client_error(&self) -> bool {
-        matches!(self, ItemFetchError::NotFound { .. })
+        matches!(
+            self,
+            ItemFetchError::NotFound { .. } | ItemFetchError::SearchUnsupported(_)
+        )
     }
 }
 
+/// One discover-stage STAC range search: a WGS84 bbox (field-boundary
+/// envelope), an ISO-8601 UTC time range, a cloud ceiling, and the
+/// subscription's dataset key (`sentinel2` / `landsat` / `hls`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct StacSearchQuery {
+    /// `[min_lon, min_lat, max_lon, max_lat]`.
+    pub bbox: [f64; 4],
+    pub start_iso: String,
+    pub end_iso: String,
+    pub max_cloud_cover: f64,
+    pub dataset: String,
+}
+
 /// Seam for resolving a derive payload's `(collection, item_id)` to the full
-/// STAC item. Production uses [`EarthSearchItemFetcher`]; tests inject a
-/// fixture fetcher so the worker never touches the network.
+/// STAC item, and for the discover stage's range search. Production uses
+/// [`EarthSearchItemFetcher`]; tests inject a fixture fetcher so the worker
+/// never touches the network.
+///
+/// `search` has a default body returning
+/// [`ItemFetchError::SearchUnsupported`], so fetch-only fixtures keep
+/// compiling; any fetcher whose context executes discover jobs overrides it.
 pub trait StacItemFetcher: Send + Sync {
     fn fetch_item<'a>(
         &'a self,
         collection: &'a str,
         item_id: &'a str,
     ) -> BoxFuture<'a, Result<EarthSearchItem, ItemFetchError>>;
+
+    fn search<'a>(
+        &'a self,
+        query: &'a StacSearchQuery,
+    ) -> BoxFuture<'a, Result<Vec<EarthSearchItem>, ItemFetchError>> {
+        Box::pin(async move {
+            Err(ItemFetchError::SearchUnsupported(format!(
+                "this fetcher does not implement search (dataset {})",
+                query.dataset
+            )))
+        })
+    }
 }
 
 /// Production fetcher: live Earth Search item lookup. A `404` in the
@@ -96,6 +145,31 @@ impl StacItemFetcher for EarthSearchItemFetcher {
                         ItemFetchError::Upstream(message)
                     }
                 })
+        })
+    }
+
+    fn search<'a>(
+        &'a self,
+        query: &'a StacSearchQuery,
+    ) -> BoxFuture<'a, Result<Vec<EarthSearchItem>, ItemFetchError>> {
+        Box::pin(async move {
+            let collection =
+                earth_search::collection_for_dataset(&query.dataset).ok_or_else(|| {
+                    ItemFetchError::SearchUnsupported(format!(
+                        "no Earth Search collection for dataset {}",
+                        query.dataset
+                    ))
+                })?;
+            earth_search::search_items_range(
+                &[collection],
+                query.bbox,
+                &query.start_iso,
+                &query.end_iso,
+                query.max_cloud_cover,
+                DISCOVER_SEARCH_LIMIT,
+            )
+            .await
+            .map_err(|err| ItemFetchError::Upstream(err.to_string()))
         })
     }
 }
@@ -150,9 +224,10 @@ pub async fn run_one_tick(ctx: &PipelineWorkerContext) -> Result<TickOutcome, Pi
         outcome.claimed = true;
         outcome.job_id = Some(job.job_id.clone());
         outcome.kind = Some(job.kind);
-        // Conservative politeness: every derive job is assumed to have hit
-        // the imagery provider (item fetch and/or COG range reads).
-        outcome.hit_provider = matches!(job.kind, JobKind::Derive);
+        // Conservative politeness: derive jobs hit the imagery provider
+        // (item fetch and/or COG range reads) and discover jobs hit the
+        // STAC search endpoint.
+        outcome.hit_provider = matches!(job.kind, JobKind::Derive | JobKind::Discover);
         let result = execute_job(ctx, &job).await;
         match &result {
             JobRunResult::Succeeded => {
@@ -254,19 +329,190 @@ fn client_failure(error: String) -> JobRunResult {
     }
 }
 
+fn transient_failure(error: String) -> JobRunResult {
+    JobRunResult::Failed {
+        error,
+        client_error: false,
+    }
+}
+
 async fn execute_job(ctx: &PipelineWorkerContext, job: &PipelineJob) -> JobRunResult {
     match job.kind {
         JobKind::Derive => execute_derive(ctx, job).await,
-        // S-8 (discover, backfill_enumerate), S-9 (l3_recompute), and S-11
-        // (app_run) bring these handlers; until then the jobs dead-letter as
-        // client errors instead of burning retries.
-        JobKind::Discover | JobKind::L3Recompute | JobKind::AppRun | JobKind::BackfillEnumerate => {
+        JobKind::Discover => execute_discover(ctx, job).await,
+        // S-9 (l3_recompute), S-11 (app_run), and the backfill batch bring
+        // these handlers; until then the jobs dead-letter as client errors
+        // instead of burning retries.
+        JobKind::L3Recompute | JobKind::AppRun | JobKind::BackfillEnumerate => {
             client_failure(format!(
                 "handler not implemented for job kind {} (arrives in a later batch)",
                 job.kind.as_str()
             ))
         }
     }
+}
+
+/// Execute one discover job: search the upstream STAC catalog for new items
+/// covering the field's boundary within the subscription's lookback window,
+/// and fan each `item x subscribed index` out into a derive job.
+///
+/// Skip semantics: a derive `job_key` whose row already **succeeded** is
+/// skipped outright (plain re-enqueue would reset the terminal row and
+/// re-derive the product); anything still queued/running deduplicates via
+/// the normal `enqueue_job` no-op. After a successful search the handler
+/// touches the subscription's `last_checked_at` (see the module docs for the
+/// touch-ownership contract with the cadence pass).
+async fn execute_discover(ctx: &PipelineWorkerContext, job: &PipelineJob) -> JobRunResult {
+    let payload: DiscoverPayload = match serde_json::from_str(&job.payload_json) {
+        Ok(payload) => payload,
+        Err(err) => return client_failure(format!("invalid discover payload: {err}")),
+    };
+
+    let subscription =
+        match pipeline::find_subscription(&ctx.pool, &payload.field_id, &payload.dataset).await {
+            Ok(Some(subscription)) => subscription,
+            Ok(None) => {
+                return client_failure(format!(
+                    "no subscription for field {} dataset {}",
+                    payload.field_id, payload.dataset
+                ))
+            }
+            Err(err) => return transient_failure(err.to_string()),
+        };
+
+    // Field boundary -> WGS84 search envelope + derive AOI.
+    let boundary_json: Option<(String,)> =
+        match sqlx::query_as("SELECT boundary_json FROM fields WHERE field_id = ?")
+            .bind(&payload.field_id)
+            .fetch_optional(&ctx.pool)
+            .await
+        {
+            Ok(row) => row,
+            Err(err) => return transient_failure(err.to_string()),
+        };
+    let Some((boundary_json,)) = boundary_json else {
+        return client_failure(format!("field {} not found", payload.field_id));
+    };
+    let boundary: serde_json::Value = match serde_json::from_str(&boundary_json) {
+        Ok(value) => value,
+        Err(err) => {
+            return client_failure(format!(
+                "field {} boundary_json is not valid JSON: {err}",
+                payload.field_id
+            ))
+        }
+    };
+    let bbox = match aoi_bounds_from_geojson(&boundary) {
+        Ok(bounds) => bounds,
+        Err(message) => {
+            return client_failure(format!(
+                "field {} boundary is not a usable AOI: {message}",
+                payload.field_id
+            ))
+        }
+    };
+
+    // Search window: [anchor - lookback_days, now], where the anchor is the
+    // last successful check (or now for a never-checked subscription). The
+    // lookback margin absorbs late-published scenes and touch drift.
+    let now = Utc::now();
+    let anchor = subscription
+        .last_checked_at
+        .as_deref()
+        .and_then(|ts| DateTime::parse_from_rfc3339(ts).ok())
+        .map(|ts| ts.with_timezone(&Utc))
+        .unwrap_or(now);
+    let start = anchor - ChronoDuration::days(subscription.lookback_days.max(0));
+    let query = StacSearchQuery {
+        bbox: [bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat],
+        start_iso: pipeline::format_ts(start),
+        end_iso: pipeline::format_ts(now),
+        max_cloud_cover: subscription.max_cloud_cover,
+        dataset: payload.dataset.clone(),
+    };
+    let items = match ctx.item_fetcher.search(&query).await {
+        Ok(items) => items,
+        Err(err) => {
+            return JobRunResult::Failed {
+                client_error: err.is_client_error(),
+                error: err.to_string(),
+            }
+        }
+    };
+
+    // Fan out: item x subscribed index -> derive job.
+    let mut enqueued = 0_usize;
+    let mut deduplicated = 0_usize;
+    let mut skipped_done = 0_usize;
+    for item in &items {
+        let collection = item
+            .collection
+            .clone()
+            .or_else(|| earth_search::collection_for_dataset(&payload.dataset).map(String::from))
+            .unwrap_or_else(|| payload.dataset.clone());
+        for index in &subscription.indices {
+            let job_key =
+                pipeline::derive_job_key(&payload.dataset, &item.id, index, &payload.field_id);
+            match pipeline::find_job_by_key(&ctx.pool, &job_key).await {
+                Ok(Some(existing)) if existing.status == pipeline::JobStatus::Succeeded => {
+                    skipped_done += 1;
+                    continue;
+                }
+                Ok(_) => {}
+                Err(err) => return transient_failure(err.to_string()),
+            }
+            let derive_payload = match serde_json::to_value(DerivePayload {
+                dataset: payload.dataset.clone(),
+                collection: collection.clone(),
+                item_id: item.id.clone(),
+                index: index.clone(),
+                field_id: payload.field_id.clone(),
+                season_id: None,
+                aoi_geojson: boundary.clone(),
+            }) {
+                Ok(value) => value,
+                Err(err) => return client_failure(format!("derive payload: {err}")),
+            };
+            let outcome = pipeline::enqueue_job(
+                &ctx.pool,
+                JobKind::Derive,
+                &job_key,
+                &derive_payload,
+                Some(&payload.field_id),
+                Some(&payload.dataset),
+                0,
+                now,
+                job.backfill_id.as_deref(),
+                now,
+            )
+            .await;
+            match outcome {
+                Ok(pipeline::EnqueueOutcome::Enqueued) => enqueued += 1,
+                Ok(pipeline::EnqueueOutcome::Deduplicated) => deduplicated += 1,
+                Err(err) => return transient_failure(err.to_string()),
+            }
+        }
+    }
+
+    // Authoritative check record (module docs: cadence touches at enqueue,
+    // the handler touches after the search actually ran).
+    if let Err(err) =
+        pipeline::touch_subscription_checked(&ctx.pool, &subscription.subscription_id, now).await
+    {
+        return transient_failure(err.to_string());
+    }
+
+    // `complete_job` stores only the status, so the summary goes to the log.
+    tracing::info!(
+        field_id = %payload.field_id,
+        dataset = %payload.dataset,
+        items = items.len(),
+        enqueued,
+        deduplicated,
+        skipped_done,
+        "discover fan-out complete"
+    );
+    JobRunResult::Succeeded
 }
 
 /// Execute one derive job: decode the payload, resolve the STAC item, and
