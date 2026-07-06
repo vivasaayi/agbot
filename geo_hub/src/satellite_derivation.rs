@@ -410,6 +410,11 @@ pub struct DeriveRequest {
     /// WGS84 lon/lat AOI.
     pub aoi: GeoBounds,
     pub index: IndexKind,
+    /// Field this derivation is scoped to; threaded into every registered
+    /// product's [`ProductScope`] so the per-field time series can find it.
+    pub field_id: Option<String>,
+    /// Season the field observation belongs to.
+    pub season_id: Option<String>,
 }
 
 /// Outcome of a completed derivation, with registration references.
@@ -751,8 +756,8 @@ pub async fn derive_satellite_index(
         inputs: Vec::new(),
         scope: ProductScope {
             farm_id: None,
-            field_id: None,
-            season_id: None,
+            field_id: request.field_id.clone(),
+            season_id: request.season_id.clone(),
             scene_id: Some(item.id.clone()),
             temporal_start: acquired_at.clone(),
             temporal_end: acquired_at.clone(),
@@ -796,8 +801,8 @@ pub async fn derive_satellite_index(
             }],
             scope: ProductScope {
                 farm_id: None,
-                field_id: None,
-                season_id: None,
+                field_id: request.field_id.clone(),
+                season_id: request.season_id.clone(),
                 scene_id: Some(item.id.clone()),
                 temporal_start: acquired_at.clone(),
                 temporal_end: acquired_at.clone(),
@@ -887,8 +892,8 @@ pub async fn derive_satellite_index(
         inputs: l2_inputs,
         scope: ProductScope {
             farm_id: None,
-            field_id: None,
-            season_id: None,
+            field_id: request.field_id.clone(),
+            season_id: request.season_id.clone(),
             scene_id: Some(item.id.clone()),
             temporal_start: acquired_at.clone(),
             temporal_end: acquired_at,

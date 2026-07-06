@@ -307,6 +307,62 @@ async fn derive_route_produces_masked_ndvi_geotiff_and_registers_lineage() -> Re
 }
 
 #[tokio::test]
+async fn derive_registers_field_scope() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let app = ctx(&tmp).await?;
+
+    let mut body = derive_body();
+    body["field_id"] = json!("field-42");
+    body["season_id"] = json!("season-2026-kharif");
+    let (status, response) = send(&app, "POST", "/api/satellite/derive", Some(body)).await?;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let product_id = response["product_id"].as_str().unwrap().to_string();
+
+    // The L2 index product row carries the requested field/season scope.
+    let (status, product) = send(
+        &app,
+        "GET",
+        &format!("/api/catalog/products/{product_id}"),
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{product}");
+    assert_eq!(product["field_id"], "field-42", "{product}");
+    assert_eq!(product["season_id"], "season-2026-kharif", "{product}");
+
+    // Every registration site threads the scope: filtering the catalog by
+    // field_id returns the L0 raw scene, 3 L1 bands (red, nir, scl), and the
+    // L2 index product.
+    let (status, products) =
+        send(&app, "GET", "/api/catalog/products?field_id=field-42", None).await?;
+    assert_eq!(status, StatusCode::OK, "{products}");
+    let products = products.as_array().expect("product list");
+    assert_eq!(products.len(), 5, "L0 + 3xL1 + L2: {products:?}");
+    for product in products {
+        assert_eq!(product["field_id"], "field-42", "{product}");
+        assert_eq!(product["season_id"], "season-2026-kharif", "{product}");
+    }
+
+    // Omitting the scope keeps the existing unscoped behavior.
+    let tmp2 = TempDir::new()?;
+    let app2 = ctx(&tmp2).await?;
+    let (status, response) =
+        send(&app2, "POST", "/api/satellite/derive", Some(derive_body())).await?;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let product_id = response["product_id"].as_str().unwrap();
+    let (_, product) = send(
+        &app2,
+        "GET",
+        &format!("/api/catalog/products/{product_id}"),
+        None,
+    )
+    .await?;
+    assert_eq!(product["field_id"], serde_json::Value::Null, "{product}");
+    assert_eq!(product["season_id"], serde_json::Value::Null, "{product}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn derive_route_rejects_bad_requests_with_reason_codes() -> Result<()> {
     let tmp = TempDir::new()?;
     let app = ctx(&tmp).await?;
