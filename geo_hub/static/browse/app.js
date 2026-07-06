@@ -282,9 +282,26 @@ const WATER_INDEX_KINDS = ["mndwi", "ndwi", "aweinsh", "aweish", "sar_vv", "sar_
 /** Derive actions available for a product kind. Each action: a label, the
  *  endpoint, extra form fields ([name, label, placeholder]), and a body
  *  builder over (productId, values). Empty optional values are omitted so
- *  server defaults apply. */
-function deriveActionsFor(kind) {
+ *  server defaults apply. Actions with `scopeOptional` don't require the
+ *  field/season pair (scene-scoped derives). */
+function deriveActionsFor(kind, sceneId) {
   const actions = [];
+  // Sen2Cor band products (batch 30): derive any supported index for the
+  // band's scene — the server resolves the sibling bands + SCL mask.
+  if (sceneId && typeof kind === "string" && kind.startsWith("band_b")) {
+    actions.push({
+      label: "derive sen2cor index",
+      endpoint: "/api/ingest/sen2cor/index/derive",
+      scopeOptional: true,
+      extraFields: [["index", "index (ndvi/ndwi/mndwi/ndmi/nbr)", "ndvi"]],
+      body: (_productId, v) => ({
+        scene_id: sceneId,
+        ...(v.index ? { index: v.index } : {}),
+        ...(v.field_id ? { field_id: v.field_id } : {}),
+        ...(v.season_id ? { season_id: v.season_id } : {}),
+      }),
+    });
+  }
   if (kind === "ndvi" || kind === "lst" || kind === "thermal_lst") {
     actions.push({
       label: kind === "ndvi" ? "derive drought VCI" : "derive drought TCI",
@@ -335,8 +352,8 @@ function deriveActionsFor(kind) {
 const lastScope = { field_id: "", season_id: "" };
 
 function renderDeriveActions(item) {
-  const kind = (item.properties || {})["agbot:product_kind"];
-  const actions = deriveActionsFor(kind);
+  const props = item.properties || {};
+  const actions = deriveActionsFor(props["agbot:product_kind"], props["agbot:scene_id"]);
   if (actions.length === 0) return null;
 
   const details = document.createElement("details");
@@ -389,7 +406,7 @@ function renderDeriveForm(productId, action) {
     const values = Object.fromEntries(
       Object.entries(inputs).map(([name, input]) => [name, input.value.trim()])
     );
-    if (!values.field_id || !values.season_id) {
+    if (!action.scopeOptional && (!values.field_id || !values.season_id)) {
       setStatus("derive needs a field id and a season id", true);
       return;
     }
@@ -408,6 +425,7 @@ function renderDeriveForm(productId, action) {
         outcome.spi_product_id ||
         outcome.water_extent_product_id ||
         outcome.vhi_product_id ||
+        outcome.index_product_id ||
         "(see response)";
       setStatus(`${action.label}: registered ${newId}`);
       // New L3s land in their own collections; refresh whatever is open.

@@ -57,7 +57,9 @@ pub fn scl_clear(code: u16) -> bool {
 
 #[derive(Debug, Error)]
 pub enum Sen2CorDeriveError {
-    #[error("index {0:?} is not derivable from Sen2Cor bands (supported: ndvi, mndwi, ndmi)")]
+    #[error(
+        "index {0:?} is not derivable from Sen2Cor bands (supported: ndvi, ndwi, mndwi, ndmi, nbr)"
+    )]
     UnsupportedIndex(String),
     #[error("scene {scene_id} has no registered {kind} product (run `geo_hub sen2cor run` first)")]
     BandNotFound { scene_id: String, kind: String },
@@ -179,9 +181,11 @@ struct Sen2CorIndexSpec {
     resolution: u32,
 }
 
-/// Supported indices (batch 29). MNDWI mixes resolutions: B03 is 10 m,
-/// B11 (SWIR1) only exists at 20 m and is block-replicated. NDMI runs
-/// natively on the 20 m grid (B8A + B11).
+/// Supported indices (batch 29, extended batch 30). MNDWI mixes
+/// resolutions: B03 is 10 m, B11 (SWIR1) only exists at 20 m and is
+/// block-replicated. NDMI and NBR run natively on the 20 m grid
+/// (B8A + B11 / B8A + B12); NBR feeds the dNBR burn-severity path.
+/// NDWI (green vs broad NIR) runs fully at 10 m (B03 + B08).
 fn index_spec(index: &str) -> Option<Sen2CorIndexSpec> {
     match index.trim().to_ascii_lowercase().as_str() {
         "ndvi" => Some(Sen2CorIndexSpec {
@@ -217,6 +221,40 @@ fn index_spec(index: &str) -> Option<Sen2CorIndexSpec> {
                 },
             ],
             resolution: 10,
+        }),
+        "ndwi" => Some(Sen2CorIndexSpec {
+            key: "ndwi",
+            kind: IndexKind::Ndwi,
+            bands: [
+                SpecBand {
+                    role: IndexBandRole::Green,
+                    kind: "band_b03_10m",
+                    upsample_2x: false,
+                },
+                SpecBand {
+                    role: IndexBandRole::Nir,
+                    kind: "band_b08_10m",
+                    upsample_2x: false,
+                },
+            ],
+            resolution: 10,
+        }),
+        "nbr" => Some(Sen2CorIndexSpec {
+            key: "nbr",
+            kind: IndexKind::Nbr,
+            bands: [
+                SpecBand {
+                    role: IndexBandRole::Nir,
+                    kind: "band_b8a_20m",
+                    upsample_2x: false,
+                },
+                SpecBand {
+                    role: IndexBandRole::Swir2,
+                    kind: "band_b12_20m",
+                    upsample_2x: false,
+                },
+            ],
+            resolution: 20,
         }),
         "ndmi" => Some(Sen2CorIndexSpec {
             key: "ndmi",

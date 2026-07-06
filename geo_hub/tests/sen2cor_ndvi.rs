@@ -124,6 +124,12 @@ fn fabricate_l2a(output_dir: &Path) -> Result<()> {
         4,
         &[7000u16; 16],
     );
+    write_jp2_gray(
+        &img20.join("T43PFN_20240601T051651_B12_20m.jp2"),
+        4,
+        4,
+        &[3000u16; 16],
+    );
     std::fs::write(granule.join("MTD_TL.xml"), TILE_XML)?;
     std::fs::write(output_dir.join(L2A_NAME).join("MTD_MSIL2A.xml"), b"<l2a/>")?;
     Ok(())
@@ -462,6 +468,56 @@ async fn mndwi_and_ndmi_derive_across_resolutions() -> Result<()> {
     assert_eq!(values.len(), 16);
     for value in &values {
         assert!((value - 0.5).abs() < 1e-6, "NDMI must be 0.5, got {value}");
+    }
+
+    // --- NBR natively on the 20 m grid (batch 30; feeds dNBR):
+    // (B8A 0.6 - B12 0.2) / 0.8 = 0.5.
+    let (status, outcome) = send(
+        &ctx.app,
+        "POST",
+        "/api/ingest/sen2cor/index/derive",
+        Some(json!({ "scene_id": SCENE_ID, "index": "nbr" })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{outcome}");
+    let nbr = catalog::get_product(&ctx.pool, outcome["index_product_id"].as_str().unwrap())
+        .await?
+        .unwrap();
+    assert_eq!(nbr.kind, "nbr");
+    assert_eq!(nbr.gsd_m_per_px, Some(20.0));
+    let values = {
+        let mut reader = GeoTiffReader::open(nbr.path.as_deref().unwrap())?;
+        reader.read_band()?.to_f32()
+    };
+    for value in &values {
+        assert!((value - 0.5).abs() < 1e-6, "NBR must be 0.5, got {value}");
+    }
+    let edges = catalog::trace_inputs(&ctx.pool, &nbr.product_id).await?;
+    let mut roles: Vec<&str> = edges.iter().map(|e| e.role.as_str()).collect();
+    roles.sort_unstable();
+    assert_eq!(roles, vec!["nir", "swir2"]);
+
+    // --- NDWI at 10 m (batch 30): green 0.6, NIR 0.6 -> exactly 0.
+    let (status, outcome) = send(
+        &ctx.app,
+        "POST",
+        "/api/ingest/sen2cor/index/derive",
+        Some(json!({ "scene_id": SCENE_ID, "index": "ndwi" })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{outcome}");
+    let ndwi = catalog::get_product(&ctx.pool, outcome["index_product_id"].as_str().unwrap())
+        .await?
+        .unwrap();
+    assert_eq!(ndwi.kind, "ndwi");
+    assert_eq!(ndwi.gsd_m_per_px, Some(10.0));
+    let values = {
+        let mut reader = GeoTiffReader::open(ndwi.path.as_deref().unwrap())?;
+        reader.read_band()?.to_f32()
+    };
+    assert_eq!(values[0], NODATA, "fill pixel is nodata");
+    for value in &values[1..] {
+        assert!(value.abs() < 1e-6, "NDWI must be 0, got {value}");
     }
 
     // Unknown index is a caller error.
