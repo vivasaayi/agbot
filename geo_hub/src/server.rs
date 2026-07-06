@@ -66,6 +66,14 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::catalog_product_web_tile),
         )
         .route("/api/satellite/derive", post(routes::satellite_derive))
+        .route(
+            "/api/fields/:field_id/timeseries",
+            get(routes::get_field_timeseries),
+        )
+        .route(
+            "/api/fields/:field_id/timeseries/metrics",
+            get(routes::get_field_timeseries_metrics),
+        )
         .route("/api/stac", get(routes::stac_landing_page))
         .route("/api/stac/conformance", get(routes::stac_conformance))
         .route("/api/stac/collections", get(routes::stac_list_collections))

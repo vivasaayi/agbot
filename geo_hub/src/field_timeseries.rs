@@ -1,4 +1,5 @@
-//! Per-field satellite time-series extraction (batch S-3).
+//! Per-field satellite time-series extraction (batch S-3) and the
+//! multi-source query/harmonization layer over it (batch S-4).
 //!
 //! Reduces a registered L2 index raster (single-band GeoTIFF with a nodata
 //! sentinel for masked pixels) to five zonal statistics over its field scope
@@ -16,10 +17,12 @@
 
 use std::collections::BTreeMap;
 
+use serde::Serialize;
 use shared::timeseries_naming::{
     field_entity_ref, product_source_ref, satellite_metric, ZonalStat, SOURCE_HLS, SOURCE_LANDSAT,
     SOURCE_MODIS, SOURCE_SENTINEL2,
 };
+use sqlx::Row;
 use thiserror::Error;
 
 use crate::catalog;
@@ -258,6 +261,259 @@ pub async fn append_field_stats_best_effort(pool: &DbPool, product_id: &str) {
     }
 }
 
+// --- Query and harmonization layer (batch S-4) --------------------------------
+
+/// Fixed caveat attached to every harmonization entry: the adjustment is a
+/// per-pair statistical alignment, not a physical cross-calibration.
+pub const HARMONIZATION_CAVEAT: &str =
+    "bandpass/BRDF differences are not corrected; merged view is for visual continuity and coarse trends";
+
+/// Maximum |Δt| for a source observation to pair with a reference
+/// observation when fitting the harmonization mapping.
+const PAIR_WINDOW_SECONDS: i64 = 3 * 24 * 60 * 60;
+
+/// One observation of a field metric, tagged with its origin source family
+/// and the L2 product it was extracted from.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SeriesPointOut {
+    pub t: String,
+    pub value: f64,
+    pub source: String,
+    pub product_ref: String,
+}
+
+/// How one non-reference source was mapped onto the reference series.
+/// `method` is `"least_squares"` (>= 8 overlap pairs), `"offset_only"`
+/// (3-7 pairs), or `"none"` (< 3 pairs; identity mapping).
+#[derive(Debug, Clone, Serialize)]
+pub struct HarmonizationEntry {
+    pub source: String,
+    pub method: String,
+    pub gain: f64,
+    pub offset: f64,
+    pub pair_count: usize,
+    pub caveat: String,
+}
+
+/// Response of the per-field multi-source time-series query: raw series per
+/// source family, a harmonized merged series, and the mapping evidence.
+#[derive(Debug, Clone, Serialize)]
+pub struct FieldSeriesResponse {
+    pub field_id: String,
+    pub metric: String,
+    pub per_source: BTreeMap<String, Vec<SeriesPointOut>>,
+    pub merged: Vec<SeriesPointOut>,
+    pub harmonization: Vec<HarmonizationEntry>,
+}
+
+/// Parse an RFC 3339 timestamp to epoch seconds; `None` keeps unparsable
+/// observations out of the pair matching (they still appear in the series).
+fn epoch_seconds(t: &str) -> Option<i64> {
+    chrono::DateTime::parse_from_rfc3339(t)
+        .ok()
+        .map(|dt| dt.timestamp())
+}
+
+/// Reference source for harmonization: `hls` when present (it is already a
+/// cross-sensor harmonized product), else `landsat` (the longest-calibrated
+/// archive), else the source with the most observations (ties resolve to
+/// the alphabetically first source via the BTreeMap iteration order).
+fn reference_source(per_source: &BTreeMap<String, Vec<SeriesPointOut>>) -> Option<String> {
+    for preferred in [SOURCE_HLS, SOURCE_LANDSAT] {
+        if per_source.contains_key(preferred) {
+            return Some(preferred.to_string());
+        }
+    }
+    per_source
+        .iter()
+        .max_by_key(|(_, points)| points.len())
+        .map(|(source, _)| source.clone())
+}
+
+/// Overlap pairs `(source_value, reference_value)`: walking the source
+/// series in time order, each observation takes the nearest still-unused
+/// reference observation within [`PAIR_WINDOW_SECONDS`]; each reference
+/// observation is used at most once.
+fn overlap_pairs(source: &[SeriesPointOut], reference: &[SeriesPointOut]) -> Vec<(f64, f64)> {
+    let ref_times: Vec<Option<i64>> = reference.iter().map(|p| epoch_seconds(&p.t)).collect();
+    let mut used = vec![false; reference.len()];
+    let mut pairs = Vec::new();
+    for point in source {
+        let Some(t) = epoch_seconds(&point.t) else {
+            continue;
+        };
+        let nearest = ref_times
+            .iter()
+            .enumerate()
+            .filter_map(|(index, ref_t)| {
+                let ref_t = (*ref_t)?;
+                let distance = (ref_t - t).abs();
+                (!used[index] && distance <= PAIR_WINDOW_SECONDS).then_some((index, distance))
+            })
+            .min_by_key(|(index, distance)| (*distance, *index));
+        if let Some((index, _)) = nearest {
+            used[index] = true;
+            pairs.push((point.value, reference[index].value));
+        }
+    }
+    pairs
+}
+
+/// Fit the source -> reference mapping from overlap pairs:
+/// - >= 8 pairs: ordinary least squares `y = gain * x + offset`;
+/// - 3-7 pairs: offset only (mean difference), gain 1;
+/// - < 3 pairs: identity (`"none"`).
+///
+/// A degenerate least-squares design (all source values equal) falls back to
+/// the offset-only mapping since the gain is unidentifiable.
+fn fit_mapping(pairs: &[(f64, f64)]) -> (&'static str, f64, f64) {
+    let n = pairs.len();
+    if n < 3 {
+        return ("none", 1.0, 0.0);
+    }
+    let mean_offset = pairs.iter().map(|(x, y)| y - x).sum::<f64>() / n as f64;
+    if n < 8 {
+        return ("offset_only", 1.0, mean_offset);
+    }
+    let mean_x = pairs.iter().map(|(x, _)| x).sum::<f64>() / n as f64;
+    let mean_y = pairs.iter().map(|(_, y)| y).sum::<f64>() / n as f64;
+    let var_x = pairs.iter().map(|(x, _)| (x - mean_x).powi(2)).sum::<f64>();
+    if var_x <= 1e-12 {
+        return ("offset_only", 1.0, mean_offset);
+    }
+    let cov = pairs
+        .iter()
+        .map(|(x, y)| (x - mean_x) * (y - mean_y))
+        .sum::<f64>();
+    let gain = cov / var_x;
+    ("least_squares", gain, mean_y - gain * mean_x)
+}
+
+/// Harmonize the per-source series onto the reference source and merge.
+///
+/// The per-source inputs stay untouched; the merged series holds the
+/// reference points as-is plus each non-reference point mapped through its
+/// fitted gain/offset, sorted by `(t, source)`, every point keeping its
+/// origin source tag. One [`HarmonizationEntry`] is emitted per
+/// non-reference source.
+pub fn harmonize(
+    per_source: &BTreeMap<String, Vec<SeriesPointOut>>,
+) -> (Vec<SeriesPointOut>, Vec<HarmonizationEntry>) {
+    let Some(reference) = reference_source(per_source) else {
+        return (Vec::new(), Vec::new());
+    };
+    let reference_points = &per_source[&reference];
+    let mut merged = reference_points.clone();
+    let mut entries = Vec::new();
+    for (source, points) in per_source {
+        if *source == reference {
+            continue;
+        }
+        let pairs = overlap_pairs(points, reference_points);
+        let (method, gain, offset) = fit_mapping(&pairs);
+        merged.extend(points.iter().map(|point| SeriesPointOut {
+            value: gain * point.value + offset,
+            ..point.clone()
+        }));
+        entries.push(HarmonizationEntry {
+            source: source.clone(),
+            method: method.to_string(),
+            gain,
+            offset,
+            pair_count: pairs.len(),
+            caveat: HARMONIZATION_CAVEAT.to_string(),
+        });
+    }
+    merged.sort_by(|a, b| (&a.t, &a.source).cmp(&(&b.t, &b.source)));
+    (merged, entries)
+}
+
+/// Query one field metric across all satellite sources, grouped by the
+/// `"source"` tag the extraction stored in `metadata_json` (rows without a
+/// tag group under `"unknown"`). `start`/`end` bound `t` inclusively
+/// (RFC 3339 strings compare lexicographically). With a `source` filter the
+/// merged series is that raw series and no harmonization is fitted;
+/// otherwise the merged series is harmonized via [`harmonize`].
+pub async fn query_field_series(
+    pool: &DbPool,
+    field_id: &str,
+    metric: &str,
+    start: Option<&str>,
+    end: Option<&str>,
+    source: Option<&str>,
+) -> Result<FieldSeriesResponse, FieldTimeseriesError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT t, scalar_value, source_ref, metadata_json
+        FROM time_series_points
+        WHERE entity_ref = ?1 AND metric = ?2
+          AND value_kind = 'scalar' AND scalar_value IS NOT NULL
+          AND (?3 IS NULL OR t >= ?3)
+          AND (?4 IS NULL OR t <= ?4)
+        ORDER BY t, source_ref
+        "#,
+    )
+    .bind(field_entity_ref(field_id))
+    .bind(metric)
+    .bind(start)
+    .bind(end)
+    .fetch_all(pool)
+    .await?;
+
+    let mut per_source: BTreeMap<String, Vec<SeriesPointOut>> = BTreeMap::new();
+    for row in rows {
+        let point_source = row
+            .get::<Option<String>, _>("metadata_json")
+            .as_deref()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(raw).ok())
+            .and_then(|metadata| metadata["source"].as_str().map(str::to_string))
+            .unwrap_or_else(|| "unknown".to_string());
+        if source.is_some_and(|wanted| wanted != point_source) {
+            continue;
+        }
+        per_source
+            .entry(point_source.clone())
+            .or_default()
+            .push(SeriesPointOut {
+                t: row.get("t"),
+                value: row.get("scalar_value"),
+                source: point_source,
+                product_ref: row.get("source_ref"),
+            });
+    }
+
+    let (merged, harmonization) = if source.is_some() {
+        // Single-source view: nothing to harmonize against.
+        let merged = per_source.values().next().cloned().unwrap_or_default();
+        (merged, Vec::new())
+    } else {
+        harmonize(&per_source)
+    };
+
+    Ok(FieldSeriesResponse {
+        field_id: field_id.to_string(),
+        metric: metric.to_string(),
+        per_source,
+        merged,
+        harmonization,
+    })
+}
+
+/// Distinct metrics recorded for a field, sorted; the discovery companion
+/// to [`query_field_series`].
+pub async fn list_field_metrics(
+    pool: &DbPool,
+    field_id: &str,
+) -> Result<Vec<String>, FieldTimeseriesError> {
+    let metrics = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT metric FROM time_series_points WHERE entity_ref = ?1 ORDER BY metric",
+    )
+    .bind(field_entity_ref(field_id))
+    .fetch_all(pool)
+    .await?;
+    Ok(metrics)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +546,117 @@ mod tests {
         assert!((stat(ZonalStat::ValidFraction) - 4.0 / 6.0).abs() < 1e-12);
         // All masked -> undefined.
         assert!(zonal_stats(&[f32::NAN, -9999.0], Some(-9999.0)).is_none());
+    }
+
+    fn point(t: &str, value: f64, source: &str) -> SeriesPointOut {
+        SeriesPointOut {
+            t: t.to_string(),
+            value,
+            source: source.to_string(),
+            product_ref: format!("product:p-{source}-{t}"),
+        }
+    }
+
+    #[test]
+    fn reference_source_prefers_hls_then_landsat_then_largest() {
+        let series = |source: &str, n: usize| {
+            (
+                source.to_string(),
+                (0..n)
+                    .map(|i| point(&format!("2026-01-{:02}T00:00:00Z", i + 1), 0.5, source))
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let all: BTreeMap<_, _> = [
+            series(SOURCE_HLS, 1),
+            series(SOURCE_LANDSAT, 2),
+            series(SOURCE_SENTINEL2, 9),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(reference_source(&all).as_deref(), Some(SOURCE_HLS));
+
+        let no_hls: BTreeMap<_, _> = [series(SOURCE_LANDSAT, 1), series(SOURCE_SENTINEL2, 9)]
+            .into_iter()
+            .collect();
+        assert_eq!(reference_source(&no_hls).as_deref(), Some(SOURCE_LANDSAT));
+
+        let neither: BTreeMap<_, _> = [series(SOURCE_MODIS, 3), series(SOURCE_SENTINEL2, 5)]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            reference_source(&neither).as_deref(),
+            Some(SOURCE_SENTINEL2),
+            "largest series wins without hls/landsat"
+        );
+        assert_eq!(reference_source(&BTreeMap::new()), None);
+    }
+
+    #[test]
+    fn overlap_pairs_take_nearest_reference_within_window_once() {
+        let reference = vec![
+            point("2026-01-10T00:00:00Z", 0.5, "hls"),
+            point("2026-01-20T00:00:00Z", 0.6, "hls"),
+        ];
+        let source = vec![
+            // 1 day from ref[0]: pairs with it.
+            point("2026-01-09T00:00:00Z", 0.55, "sentinel2"),
+            // 2 days from ref[0] (already used) and 8 days from ref[1]: no pair.
+            point("2026-01-12T00:00:00Z", 0.57, "sentinel2"),
+            // 3 days from ref[1]: inclusive window boundary pairs.
+            point("2026-01-23T00:00:00Z", 0.65, "sentinel2"),
+            // 4 days out: beyond the window.
+            point("2026-01-27T00:00:00Z", 0.70, "sentinel2"),
+        ];
+        assert_eq!(
+            overlap_pairs(&source, &reference),
+            vec![(0.55, 0.5), (0.65, 0.6)]
+        );
+    }
+
+    #[test]
+    fn fit_mapping_ladder_matches_pair_count() {
+        assert_eq!(fit_mapping(&[(0.1, 0.2), (0.2, 0.3)]), ("none", 1.0, 0.0));
+
+        let (method, gain, offset) = fit_mapping(&[(0.1, 0.2), (0.2, 0.3), (0.3, 0.5)]);
+        assert_eq!(method, "offset_only");
+        assert_eq!(gain, 1.0);
+        assert!((offset - 0.4 / 3.0).abs() < 1e-12);
+
+        let pairs: Vec<(f64, f64)> = (0..8)
+            .map(|i| {
+                let x = 0.1 * f64::from(i);
+                (x, 1.5 * x - 0.2)
+            })
+            .collect();
+        let (method, gain, offset) = fit_mapping(&pairs);
+        assert_eq!(method, "least_squares");
+        assert!((gain - 1.5).abs() < 1e-12, "gain {gain}");
+        assert!((offset + 0.2).abs() < 1e-12, "offset {offset}");
+
+        // Degenerate design (constant x): gain is unidentifiable, fall back
+        // to the mean offset.
+        let flat: Vec<(f64, f64)> = (0..8).map(|i| (0.4, 0.5 + 0.01 * f64::from(i))).collect();
+        let (method, gain, offset) = fit_mapping(&flat);
+        assert_eq!(method, "offset_only");
+        assert_eq!(gain, 1.0);
+        assert!((offset - 0.135).abs() < 1e-12);
+    }
+
+    #[test]
+    fn harmonize_single_source_is_identity() {
+        let per_source: BTreeMap<_, _> = [(
+            SOURCE_SENTINEL2.to_string(),
+            vec![
+                point("2026-01-01T00:00:00Z", 0.4, SOURCE_SENTINEL2),
+                point("2026-01-05T00:00:00Z", 0.5, SOURCE_SENTINEL2),
+            ],
+        )]
+        .into_iter()
+        .collect();
+        let (merged, entries) = harmonize(&per_source);
+        assert_eq!(merged, per_source[SOURCE_SENTINEL2]);
+        assert!(entries.is_empty(), "no non-reference sources");
     }
 
     #[test]
