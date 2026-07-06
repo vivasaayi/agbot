@@ -3387,6 +3387,42 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
     .execute(pool)
     .await?;
 
+    // Farm activity log (batch F-B5): operations a portal caller records
+    // against an owned field (planting, irrigation, ...). `source`/`linked_ref`
+    // tie recommendation-driven entries back to their origin.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS field_activities (
+            activity_id TEXT PRIMARY KEY,
+            field_id TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            activity_type TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            note TEXT,
+            quantity REAL,
+            unit TEXT,
+            cost REAL,
+            geometry_json TEXT,
+            created_by TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'manual',
+            linked_ref TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_field_activities_field_time
+        ON field_activities(field_id, occurred_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     // Satellite pipeline (batch S-6): per-field dataset subscriptions and the
     // durable job queue that drives discover -> derive -> L3 -> app runs.
     sqlx::query(

@@ -537,6 +537,18 @@ pub fn build_router(state: AppState) -> Router {
             "/api/portal/recommendations/:recommendation_id/status",
             put(routes::portal_update_recommendation_status),
         )
+        .route(
+            "/api/portal/fields/:field_id/activities",
+            get(routes::portal_list_activities).post(routes::portal_create_activity),
+        )
+        .route(
+            "/api/portal/fields/:field_id/activities/summary",
+            get(routes::portal_field_activity_summary),
+        )
+        .route(
+            "/api/portal/activities/:activity_id",
+            put(routes::portal_update_activity).delete(routes::portal_delete_activity),
+        )
         .route("/api/portal/alerts", get(routes::portal_list_alerts))
         .route(
             "/api/portal/notifications/summary",

@@ -13,6 +13,7 @@ pub mod drought_watch_run;
 pub mod earth_search;
 pub mod error;
 pub mod et_rasters;
+pub mod field_activities;
 pub mod hls;
 pub mod ingest;
 pub mod ingest_contract;

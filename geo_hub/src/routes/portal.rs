@@ -8,6 +8,11 @@
 
 use super::*;
 use crate::error::{AppError, AppResult};
+use crate::field_activities::{
+    activity_from_recommendation, apply_activity_update, build_activity_record,
+    normalize_range_bound, summarize_activities, ActivityDraft, ActivityPatch, ActivityRecord,
+    ActivitySource, ActivitySummary, ActivityType,
+};
 use crate::portal_auth::{
     access_code_is_usable, generate_access_code, generate_session_token, hash_token,
     parse_stored_timestamp, session_expires_at, session_is_valid, AccessCodeStatus, SessionStatus,
@@ -1173,11 +1178,25 @@ fn validate_portal_recommendation_status(value: &str) -> AppResult<String> {
     }
 }
 
-/// Body for the portal status transition. Serde ignores unknown fields by
-/// default, which leaves the seam for the F-B5 `log_activity` companion.
+/// Body for the portal status transition. `log_activity` (batch F-B5) is an
+/// optional companion draft: when the transition is to `completed`, it is
+/// recorded in the farm activity log linked back to the recommendation.
+/// Serde defaults keep pre-F-B5 callers (bare `{"status": ...}`) working.
 #[derive(Debug, Deserialize)]
 pub struct PortalRecommendationStatusRequest {
     pub status: String,
+    #[serde(default)]
+    pub log_activity: Option<ActivityDraft>,
+}
+
+/// Response for the portal status transition: the updated recommendation
+/// plus, when a `log_activity` companion was recorded, the new activity's ID.
+#[derive(Debug, Serialize)]
+pub struct PortalRecommendationStatusResponse {
+    #[serde(flatten)]
+    pub recommendation: RecommendationRecord,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logged_activity_id: Option<String>,
 }
 
 /// PUT /api/portal/recommendations/:recommendation_id/status — acknowledge or
@@ -1192,7 +1211,7 @@ pub async fn portal_update_recommendation_status(
     Path(recommendation_id): Path<String>,
     State(state): State<AppState>,
     Json(request): Json<PortalRecommendationStatusRequest>,
-) -> AppResult<Json<RecommendationRecord>> {
+) -> AppResult<Json<PortalRecommendationStatusResponse>> {
     let status = validate_portal_recommendation_status(&request.status)?;
 
     let row = sqlx::query("SELECT field_id FROM recommendations WHERE recommendation_id = ?1")
@@ -1208,6 +1227,25 @@ pub async fn portal_update_recommendation_status(
         .ok_or(AppError::NotFound)?;
     owned_field(&state, &identity.org_id, &field_id).await?;
 
+    // F-B5 companion: a `log_activity` draft rides along only on a transition
+    // to `completed` (it is ignored on any other status). It is validated
+    // *before* the status write so a bad draft leaves the recommendation
+    // untouched (400, no partial write).
+    let logged_activity = match (status.as_str(), request.log_activity) {
+        ("completed", Some(draft)) => Some(
+            activity_from_recommendation(
+                &recommendation_id,
+                draft,
+                &field_id,
+                &identity.org_id,
+                &identity.account_id,
+                &current_record_timestamp(),
+            )
+            .map_err(|err| AppError::BadRequest(err.to_string()))?,
+        ),
+        _ => None,
+    };
+
     sqlx::query(
         "UPDATE recommendations SET status = ?1, updated_at = ?2 WHERE recommendation_id = ?3",
     )
@@ -1218,6 +1256,14 @@ pub async fn portal_update_recommendation_status(
     .await
     .map_err(Error::from)?;
 
+    let logged_activity_id = match logged_activity {
+        Some(record) => {
+            insert_activity_record(&state, &record).await?;
+            Some(record.activity_id)
+        }
+        None => None,
+    };
+
     let row = sqlx::query(
         "SELECT recommendation_id, scene_id, field_id, title, note, category, priority, status, \
                 evidence_refs_json, created_at, updated_at \
@@ -1227,7 +1273,10 @@ pub async fn portal_update_recommendation_status(
     .fetch_one(&state.pool)
     .await
     .map_err(Error::from)?;
-    Ok(Json(decode_recommendation_record(&state, &row).await?))
+    Ok(Json(PortalRecommendationStatusResponse {
+        recommendation: decode_recommendation_record(&state, &row).await?,
+        logged_activity_id,
+    }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -1364,4 +1413,329 @@ pub async fn portal_notifications_summary(
         open_recommendations,
         alerts_last_7d,
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Farm activity log (batch F-B5). Validation and aggregation rules live in
+// `crate::field_activities`; these handlers stay thin over the
+// `field_activities` table. Every row carries the owning `org_id`, so
+// cross-org activity IDs are indistinguishable from missing ones (404).
+// ---------------------------------------------------------------------------
+
+/// Default and maximum page sizes for the activity listing.
+const ACTIVITY_DEFAULT_PAGE_SIZE: u32 = 50;
+const ACTIVITY_MAX_PAGE_SIZE: u32 = 200;
+
+fn activity_record_from_row(row: &sqlx::sqlite::SqliteRow) -> AppResult<ActivityRecord> {
+    let activity_type = ActivityType::parse(&row.get::<String, _>("activity_type"))
+        .map_err(|err| AppError::Anyhow(Error::new(err).context("stored activity_type")))?;
+    let source = ActivitySource::parse(&row.get::<String, _>("source"))
+        .map_err(|err| AppError::Anyhow(Error::new(err).context("stored activity source")))?;
+    Ok(ActivityRecord {
+        activity_id: row.get("activity_id"),
+        field_id: row.get("field_id"),
+        org_id: row.get("org_id"),
+        activity_type,
+        occurred_at: row.get("occurred_at"),
+        note: row.get("note"),
+        quantity: row.get("quantity"),
+        unit: row.get("unit"),
+        cost: row.get("cost"),
+        geometry_json: row.get("geometry_json"),
+        created_by: row.get("created_by"),
+        source,
+        linked_ref: row.get("linked_ref"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    })
+}
+
+async fn insert_activity_record(state: &AppState, record: &ActivityRecord) -> AppResult<()> {
+    sqlx::query(
+        r#"
+        INSERT INTO field_activities
+            (activity_id, field_id, org_id, activity_type, occurred_at, note,
+             quantity, unit, cost, geometry_json, created_by, source,
+             linked_ref, created_at, updated_at)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+        "#,
+    )
+    .bind(&record.activity_id)
+    .bind(&record.field_id)
+    .bind(&record.org_id)
+    .bind(record.activity_type.as_str())
+    .bind(&record.occurred_at)
+    .bind(&record.note)
+    .bind(record.quantity)
+    .bind(&record.unit)
+    .bind(record.cost)
+    .bind(&record.geometry_json)
+    .bind(&record.created_by)
+    .bind(record.source.as_str())
+    .bind(&record.linked_ref)
+    .bind(&record.created_at)
+    .bind(&record.updated_at)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    Ok(())
+}
+
+/// Load an activity only if it belongs to the caller's org; cross-org access
+/// is indistinguishable from a missing activity (404, no existence leak).
+async fn owned_activity(
+    state: &AppState,
+    org_id: &str,
+    activity_id: &str,
+) -> AppResult<ActivityRecord> {
+    let row = sqlx::query(
+        "SELECT activity_id, field_id, org_id, activity_type, occurred_at, note, \
+                quantity, unit, cost, geometry_json, created_by, source, linked_ref, \
+                created_at, updated_at \
+         FROM field_activities WHERE activity_id = ?1 AND org_id = ?2",
+    )
+    .bind(activity_id)
+    .bind(org_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?
+    .ok_or(AppError::NotFound)?;
+    activity_record_from_row(&row)
+}
+
+/// POST /api/portal/fields/:field_id/activities — record a manual activity
+/// against an owned field. Validation lives in
+/// `field_activities::build_activity_record`; failures are 400 with the
+/// reason string.
+pub async fn portal_create_activity(
+    identity: PortalIdentity,
+    Path(field_id): Path<String>,
+    State(state): State<AppState>,
+    Json(draft): Json<ActivityDraft>,
+) -> AppResult<Json<ActivityRecord>> {
+    let field = owned_field(&state, &identity.org_id, &field_id).await?;
+    let record = build_activity_record(
+        draft,
+        &field.field_id,
+        &identity.org_id,
+        &identity.account_id,
+        &current_record_timestamp(),
+    )
+    .map_err(|err| AppError::BadRequest(err.to_string()))?;
+    insert_activity_record(&state, &record).await?;
+    Ok(Json(record))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PortalActivityListQuery {
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub activity_type: Option<String>,
+    pub page: Option<u32>,
+    pub page_size: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PortalActivityListResponse {
+    pub activities: Vec<ActivityRecord>,
+    pub page: u32,
+    pub page_size: u32,
+    pub total: i64,
+}
+
+/// GET /api/portal/fields/:field_id/activities?from=&to=&activity_type=&page=&page_size=
+/// — the field's activity log, newest occurrence first. `from`/`to` accept
+/// RFC 3339 or bare dates (a bare `to` date is inclusive through end of day).
+pub async fn portal_list_activities(
+    identity: PortalIdentity,
+    Path(field_id): Path<String>,
+    Query(query): Query<PortalActivityListQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<PortalActivityListResponse>> {
+    let field = owned_field(&state, &identity.org_id, &field_id).await?;
+
+    let from = normalize_optional_text(query.from)
+        .map(|value| normalize_range_bound(&value, false))
+        .transpose()
+        .map_err(|err| AppError::BadRequest(format!("from: {err}")))?;
+    let to = normalize_optional_text(query.to)
+        .map(|value| normalize_range_bound(&value, true))
+        .transpose()
+        .map_err(|err| AppError::BadRequest(format!("to: {err}")))?;
+    let activity_type = normalize_optional_text(query.activity_type)
+        .map(|value| ActivityType::parse(&value))
+        .transpose()
+        .map_err(|err| AppError::BadRequest(err.to_string()))?
+        .map(|value| value.as_str().to_string());
+    let page = query.page.unwrap_or(1).max(1);
+    let page_size = query
+        .page_size
+        .unwrap_or(ACTIVITY_DEFAULT_PAGE_SIZE)
+        .clamp(1, ACTIVITY_MAX_PAGE_SIZE);
+    let offset = i64::from(page - 1) * i64::from(page_size);
+
+    let (total,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM field_activities \
+         WHERE field_id = ?1 AND org_id = ?2 \
+           AND (?3 IS NULL OR occurred_at >= ?3) \
+           AND (?4 IS NULL OR occurred_at <= ?4) \
+           AND (?5 IS NULL OR activity_type = ?5)",
+    )
+    .bind(&field.field_id)
+    .bind(&identity.org_id)
+    .bind(&from)
+    .bind(&to)
+    .bind(&activity_type)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let rows = sqlx::query(
+        "SELECT activity_id, field_id, org_id, activity_type, occurred_at, note, \
+                quantity, unit, cost, geometry_json, created_by, source, linked_ref, \
+                created_at, updated_at \
+         FROM field_activities \
+         WHERE field_id = ?1 AND org_id = ?2 \
+           AND (?3 IS NULL OR occurred_at >= ?3) \
+           AND (?4 IS NULL OR occurred_at <= ?4) \
+           AND (?5 IS NULL OR activity_type = ?5) \
+         ORDER BY occurred_at DESC, activity_id ASC \
+         LIMIT ?6 OFFSET ?7",
+    )
+    .bind(&field.field_id)
+    .bind(&identity.org_id)
+    .bind(&from)
+    .bind(&to)
+    .bind(&activity_type)
+    .bind(i64::from(page_size))
+    .bind(offset)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let activities = rows
+        .iter()
+        .map(activity_record_from_row)
+        .collect::<AppResult<Vec<_>>>()?;
+    Ok(Json(PortalActivityListResponse {
+        activities,
+        page,
+        page_size,
+        total,
+    }))
+}
+
+/// PUT /api/portal/activities/:activity_id — patch an owned activity. Only
+/// provided fields change; the same validations as creation apply.
+pub async fn portal_update_activity(
+    identity: PortalIdentity,
+    Path(activity_id): Path<String>,
+    State(state): State<AppState>,
+    Json(patch): Json<ActivityPatch>,
+) -> AppResult<Json<ActivityRecord>> {
+    let record = owned_activity(&state, &identity.org_id, &activity_id).await?;
+    let updated = apply_activity_update(&record, patch, &current_record_timestamp())
+        .map_err(|err| AppError::BadRequest(err.to_string()))?;
+
+    sqlx::query(
+        "UPDATE field_activities \
+         SET activity_type = ?1, occurred_at = ?2, note = ?3, quantity = ?4, unit = ?5, \
+             cost = ?6, geometry_json = ?7, updated_at = ?8 \
+         WHERE activity_id = ?9 AND org_id = ?10",
+    )
+    .bind(updated.activity_type.as_str())
+    .bind(&updated.occurred_at)
+    .bind(&updated.note)
+    .bind(updated.quantity)
+    .bind(&updated.unit)
+    .bind(updated.cost)
+    .bind(&updated.geometry_json)
+    .bind(&updated.updated_at)
+    .bind(&updated.activity_id)
+    .bind(&identity.org_id)
+    .execute(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    Ok(Json(updated))
+}
+
+#[derive(Debug, Serialize)]
+pub struct PortalActivityDeleteResponse {
+    pub activity_id: String,
+    pub status: String,
+}
+
+/// DELETE /api/portal/activities/:activity_id — hard delete of an owned
+/// activity. v1 keeps no tombstone; an audit/undo trail is a known follow-up
+/// and would replace this with a soft delete.
+pub async fn portal_delete_activity(
+    identity: PortalIdentity,
+    Path(activity_id): Path<String>,
+    State(state): State<AppState>,
+) -> AppResult<Json<PortalActivityDeleteResponse>> {
+    let result = sqlx::query("DELETE FROM field_activities WHERE activity_id = ?1 AND org_id = ?2")
+        .bind(&activity_id)
+        .bind(&identity.org_id)
+        .execute(&state.pool)
+        .await
+        .map_err(Error::from)?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
+    Ok(Json(PortalActivityDeleteResponse {
+        activity_id,
+        status: "deleted".to_string(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PortalActivitySummaryQuery {
+    pub from: Option<String>,
+    pub to: Option<String>,
+}
+
+/// GET /api/portal/fields/:field_id/activities/summary?from=&to= — season
+/// totals per activity type (count, per-unit quantity sums, cost) over the
+/// inclusive window. Aggregation lives in
+/// `field_activities::summarize_activities`.
+pub async fn portal_field_activity_summary(
+    identity: PortalIdentity,
+    Path(field_id): Path<String>,
+    Query(query): Query<PortalActivitySummaryQuery>,
+    State(state): State<AppState>,
+) -> AppResult<Json<ActivitySummary>> {
+    let field = owned_field(&state, &identity.org_id, &field_id).await?;
+
+    let from = normalize_optional_text(query.from)
+        .map(|value| normalize_range_bound(&value, false))
+        .transpose()
+        .map_err(|err| AppError::BadRequest(format!("from: {err}")))?;
+    let to = normalize_optional_text(query.to)
+        .map(|value| normalize_range_bound(&value, true))
+        .transpose()
+        .map_err(|err| AppError::BadRequest(format!("to: {err}")))?;
+
+    let rows = sqlx::query(
+        "SELECT activity_id, field_id, org_id, activity_type, occurred_at, note, \
+                quantity, unit, cost, geometry_json, created_by, source, linked_ref, \
+                created_at, updated_at \
+         FROM field_activities WHERE field_id = ?1 AND org_id = ?2 \
+         ORDER BY occurred_at ASC, activity_id ASC",
+    )
+    .bind(&field.field_id)
+    .bind(&identity.org_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    let records = rows
+        .iter()
+        .map(activity_record_from_row)
+        .collect::<AppResult<Vec<_>>>()?;
+
+    Ok(Json(summarize_activities(
+        &records,
+        from.as_deref(),
+        to.as_deref(),
+    )))
 }
