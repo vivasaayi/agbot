@@ -397,3 +397,107 @@ async fn monthly_composites_feed_phenology_as_a_distinct_series() -> Result<()> 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     Ok(())
 }
+
+/// Batch 34: composite-fed drought climatology. Three years of June
+/// composites (2024 NDVI 0.2, 2025 0.6, 2026 0.4, each composited from two
+/// raw scenes) form the baseline, and the 2026 composite scores VCI =
+/// 100*(0.4-0.2)/(0.6-0.2) = 50 with series="composites" — the raw L2
+/// scenes never contaminate the composite baseline population.
+#[tokio::test]
+async fn yearly_composites_feed_the_drought_climatology() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = ctx(&tmp).await?;
+
+    let mut composite_ids = Vec::new();
+    for (year, value) in [(2024, 0.2f32), (2025, 0.6), (2026, 0.4)] {
+        for day in ["05", "20"] {
+            register_ndvi(
+                &ctx,
+                &tmp,
+                &format!("{year}-06-{day}"),
+                vec![value; 4],
+                TRANSFORM,
+            )
+            .await?;
+        }
+        let (status, outcome) = send(
+            &ctx.app,
+            "POST",
+            "/api/composites/derive",
+            Some(json!({
+                "kind": "ndvi",
+                "start": format!("{year}-06-01"),
+                "end": format!("{year}-06-30"),
+                "field_id": "field-1",
+                "season_id": format!("{year}-kharif"),
+            })),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{outcome}");
+        composite_ids.push(
+            outcome["composite_product_id"]
+                .as_str()
+                .unwrap()
+                .to_string(),
+        );
+    }
+
+    let (status, outcome) = send(
+        &ctx.app,
+        "POST",
+        "/api/drought-management/rasters/derive",
+        Some(json!({
+            "current_product_id": composite_ids[2],
+            "field_id": "field-1",
+            "season_id": "2026-kharif",
+            "min_years": 2,
+            "series": "composites",
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{outcome}");
+    assert_eq!(outcome["drought_index_kind"], "vci");
+    // Baseline = exactly the three composites, never the six raw scenes.
+    let used: Vec<&str> = outcome["observations_used"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    let mut expected: Vec<&str> = composite_ids.iter().map(String::as_str).collect();
+    expected.sort_unstable();
+    let mut sorted = used.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, expected);
+
+    let values = {
+        let mut reader = GeoTiffReader::open(outcome["drought_artifact"].as_str().unwrap())?;
+        reader.read_band()?.to_f32()
+    };
+    for value in &values {
+        assert!((value - 50.0).abs() < 0.01, "VCI must be 50, got {value}");
+    }
+    // The composite-fed drought product records its population.
+    let drought = catalog::get_product(&ctx.pool, outcome["drought_product_id"].as_str().unwrap())
+        .await?
+        .unwrap();
+    assert_eq!(drought.parameters["series"], "composites");
+
+    // A raw L2 as current with series=composites is refused (not a composite).
+    let raw = register_ndvi(&ctx, &tmp, "2026-06-25", vec![0.4; 4], TRANSFORM).await?;
+    let (status, _) = send(
+        &ctx.app,
+        "POST",
+        "/api/drought-management/rasters/derive",
+        Some(json!({
+            "current_product_id": raw,
+            "field_id": "field-1",
+            "season_id": "2026-kharif",
+            "min_years": 2,
+            "series": "composites",
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    Ok(())
+}

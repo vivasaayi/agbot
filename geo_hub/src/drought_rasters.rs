@@ -56,6 +56,13 @@ pub enum DroughtRasterError {
     NotARasterProduct { product_id: String, detail: String },
     #[error("index kind {0:?} has no drought mapping: ndvi -> vci, lst -> tci (vhi needs an LST/TCI path first)")]
     UnsupportedIndexKind(String),
+    #[error("series {0:?} is not a known input population (supported: l2, composites)")]
+    UnsupportedSeries(String),
+    #[error("current product {product_id} is not a single-band temporal_composite (band_names {band_names:?}); the composites series needs one")]
+    NotAComposite {
+        product_id: String,
+        band_names: Option<serde_json::Value>,
+    },
     #[error("current product {product_id} temporal_start {value:?} is not an ISO date")]
     BadTemporal {
         product_id: String,
@@ -98,6 +105,8 @@ impl DroughtRasterError {
             DroughtRasterError::CurrentNotFound(_)
                 | DroughtRasterError::NotARasterProduct { .. }
                 | DroughtRasterError::UnsupportedIndexKind(_)
+                | DroughtRasterError::UnsupportedSeries(_)
+                | DroughtRasterError::NotAComposite { .. }
                 | DroughtRasterError::BadTemporal { .. }
                 | DroughtRasterError::NoUsableObservations { .. }
                 | DroughtRasterError::MissingPeriod(_)
@@ -124,6 +133,16 @@ pub struct DroughtRasterRequest {
     pub cadence: CompositeCadence,
     #[serde(default = "default_min_years")]
     pub min_years: u32,
+    /// Input population (batch 34, mirroring the phenology semantics):
+    /// `l2` (default) scores a raw index L2 against raw L2 baselines;
+    /// `composites` scores a `temporal_composite` L3 of the index against
+    /// composite baselines — never mixed (mixing double-counts scenes).
+    #[serde(default = "default_series")]
+    pub series: String,
+}
+
+fn default_series() -> String {
+    "l2".to_string()
 }
 
 fn default_cadence() -> CompositeCadence {
@@ -267,24 +286,61 @@ pub async fn derive_drought_raster(
     let current = catalog::get_product(pool, &request.current_product_id)
         .await?
         .ok_or_else(|| DroughtRasterError::CurrentNotFound(request.current_product_id.clone()))?;
-    let drought_kind = drought_kind_for(&current.kind)?;
+    // Resolve the index kind: raw L2s carry it as their catalog kind;
+    // composites carry it in their identity-bearing band_names.
+    let composites = match request.series.trim().to_ascii_lowercase().as_str() {
+        "l2" => false,
+        "composites" => true,
+        other => return Err(DroughtRasterError::UnsupportedSeries(other.to_string())),
+    };
+    let index_kind = if composites {
+        match current
+            .parameters
+            .get("band_names")
+            .and_then(|b| b.as_array())
+        {
+            Some(bands) if bands.len() == 1 && bands[0].is_string() => {
+                bands[0].as_str().expect("checked").to_string()
+            }
+            _ => {
+                return Err(DroughtRasterError::NotAComposite {
+                    product_id: current.product_id.clone(),
+                    band_names: current.parameters.get("band_names").cloned(),
+                })
+            }
+        }
+    } else {
+        current.kind.clone()
+    };
+    let drought_kind = drought_kind_for(&index_kind)?;
     let current_date = observed_on(&current).ok_or_else(|| DroughtRasterError::BadTemporal {
         product_id: current.product_id.clone(),
         value: current.temporal_start.clone(),
     })?;
     let current_raster = load_raster(Path::new(geotiff_artifact_path(&current)?))?;
 
-    // Gather baseline candidates: every active same-kind L2 product.
-    let candidates = catalog::list_products(
+    // Gather baseline candidates from the requested population: raw
+    // same-kind L2s, or same-index temporal composites (never mixed).
+    let (candidate_kind, candidate_level) = if composites {
+        ("temporal_composite".to_string(), ProductLevel::L3)
+    } else {
+        (index_kind.clone(), ProductLevel::L2)
+    };
+    let mut candidates = catalog::list_products(
         pool,
         &ProductFilter {
-            kind: Some(current.kind.clone()),
-            level: Some(ProductLevel::L2),
+            kind: Some(candidate_kind),
+            level: Some(candidate_level),
             status: Some("registered".to_string()),
             ..ProductFilter::default()
         },
     )
     .await?;
+    if composites {
+        candidates.retain(|candidate| {
+            candidate.parameters.get("band_names") == Some(&serde_json::json!([index_kind]))
+        });
+    }
 
     let mut observations = Vec::new();
     let mut used_ids = Vec::new();
@@ -348,7 +404,7 @@ pub async fn derive_drought_raster(
 
     // --- Climatology build + L3 registration.
     let climatology = build_index_climatology(&ClimatologyRequest {
-        index_kind: current.kind.clone(),
+        index_kind: index_kind.clone(),
         cadence: request.cadence,
         width: current_raster.width,
         height: current_raster.height,
@@ -360,6 +416,12 @@ pub async fn derive_drought_raster(
     let actor = provenance::ActorIdentity::system("geo_hub:drought_rasters");
     let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
+    #[allow(clippy::items_after_statements)]
+    fn stamp_series(draft: &mut shared::product_graph::ProductRecordDraft, series: &str) {
+        if let Some(params) = draft.parameters.as_object_mut() {
+            params.insert("series".to_string(), serde_json::json!(series));
+        }
+    }
     let mut climatology_draft = climatology_l3_draft(
         &climatology,
         &ClimatologyL3Scope {
@@ -369,6 +431,7 @@ pub async fn derive_drought_raster(
             source_id: current.source_id.clone(),
         },
     );
+    stamp_series(&mut climatology_draft, &request.series);
     let climatology_dir = data_root.join("derived").join("climatology");
     std::fs::create_dir_all(&climatology_dir).map_err(|source| DroughtRasterError::Store {
         what: "climatology directory",
@@ -424,6 +487,7 @@ pub async fn derive_drought_raster(
             source_id: current.source_id.clone(),
         },
     );
+    stamp_series(&mut drought_draft, &request.series);
     let drought_dir = data_root.join("derived").join("drought");
     std::fs::create_dir_all(&drought_dir).map_err(|source| DroughtRasterError::Store {
         what: "drought directory",
