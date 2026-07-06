@@ -48,6 +48,36 @@
       </label>
     </section>
 
+    <section id="field-timeseries-panel">
+      <details id="ts-details">
+        <summary>Field time series</summary>
+        <label class="ts-row">Field
+          <select id="ts-field">
+            <option value="">— select field —</option>
+          </select>
+        </label>
+        <label class="ts-row">Metric
+          <select id="ts-metric">
+            <option value="sat.ndvi.mean">sat.ndvi.mean</option>
+          </select>
+        </label>
+        <label class="ts-row">From <input type="date" id="ts-start" /></label>
+        <label class="ts-row">To <input type="date" id="ts-end" /></label>
+        <div id="ts-sources" class="ts-sources"></div>
+        <label class="toggle-row">
+          <input type="checkbox" id="ts-merged" checked />
+          Merged (harmonized) overlay
+        </label>
+        <div class="filter-actions">
+          <button id="ts-load" type="button">Load</button>
+        </div>
+        <p id="ts-message" class="hint">Select a field, then Load.</p>
+        <div id="ts-chart"></div>
+        <div id="ts-harmonization"></div>
+        <div id="ts-summary"></div>
+      </details>
+    </section>
+
     <section>
       <h2>Collections</h2>
       <div id="collections"><p class="hint">Loading…</p></div>

@@ -655,9 +655,11 @@ document.getElementById("fields-toggle").addEventListener("change", async (event
         source: FIELDS_SOURCE,
         paint: { "line-color": "#ff7a00", "line-width": 2 },
       });
-      // Field name popup on click.
+      // Field name popup on click; also selects the field in the
+      // time-series panel so a boundary click doubles as field selection.
       map.on("click", FIELDS_LINE_LAYER, (e) => {
         const props = e.features && e.features[0] ? e.features[0].properties : {};
+        if (props.field_id) setTsField(props.field_id);
         new maplibregl.Popup()
           .setLngLat(e.lngLat)
           .setHTML(
@@ -677,6 +679,453 @@ document.getElementById("fields-toggle").addEventListener("change", async (event
     setStatus(err.message, true);
   }
 });
+
+// --- Field time series panel (batch S-13) ------------------------------------------
+//
+//   GET /api/fields/:field_id/timeseries?metric=sat.ndvi.mean&start=&end=
+//     -> { "field_id", "metric",
+//          "per_source": { "<source>": [{ "t", "value", "source", "product_ref" }] },
+//          "merged": [SeriesPoint...],  // harmonized multi-source series
+//          "harmonization": [{ "source", "method", "gain", "offset",
+//                              "pair_count", "caveat" }] }
+//   GET /api/fields/:field_id/timeseries/metrics -> { "field_id", "metrics": [...] }
+//   GET /api/fields/:field_id/timeseries/summary?metric=
+//     -> { "series_basis", "observation_count", "first_t", "last_t",
+//          "per_year": [{ "year", "count", "mean", "max", "max_t" }],
+//          "anomaly"?: { "latest_t", "latest_value", "baseline_mean",
+//                        "deviation", "is_anomalous", ... },
+//          "vs_prior_years"?: { "current_value", "seasonal_mean",
+//                               "delta_from_seasonal_mean", "prior_point_count", ... } }
+//
+// `start`/`end` bound `t` inclusively and compare lexicographically as
+// RFC 3339 strings, so the date inputs map to T00:00:00Z / T23:59:59Z.
+
+const DEFAULT_TS_METRIC = "sat.ndvi.mean";
+const SVG_NS = "http://www.w3.org/2000/svg";
+/** Per-source line colors, assigned by sorted source name so toggling a
+ *  source on/off never recolors the others. Merged gets its own dashed line. */
+const TS_SOURCE_COLORS = ["#1570ef", "#12b76a", "#f79009", "#7a5af8", "#dd2590", "#0e9384"];
+const TS_MERGED_COLOR = "#344054";
+const TWO_YEARS_MS = 2 * 365.25 * 24 * 3600 * 1000;
+
+const tsEls = {
+  details: document.getElementById("ts-details"),
+  field: document.getElementById("ts-field"),
+  metric: document.getElementById("ts-metric"),
+  start: document.getElementById("ts-start"),
+  end: document.getElementById("ts-end"),
+  sources: document.getElementById("ts-sources"),
+  merged: document.getElementById("ts-merged"),
+  load: document.getElementById("ts-load"),
+  message: document.getElementById("ts-message"),
+  chart: document.getElementById("ts-chart"),
+  harmonization: document.getElementById("ts-harmonization"),
+  summary: document.getElementById("ts-summary"),
+};
+
+/** Last loaded response + which sources are toggled on (re-render without refetch). */
+const tsState = { data: null, enabledSources: new Set() };
+
+function tsMessage(text, isError = false) {
+  tsEls.message.textContent = text;
+  tsEls.message.className = isError ? "error" : "hint";
+}
+
+// Field options come from the same export the boundaries overlay uses.
+let tsFieldsPromise = null;
+function ensureTsFields() {
+  if (!tsFieldsPromise) {
+    tsFieldsPromise = fetchJson("/api/fields/export/geojson")
+      .then((geojson) => {
+        for (const feature of geojson.features || []) {
+          const props = feature.properties || {};
+          if (!props.field_id) continue;
+          const option = document.createElement("option");
+          option.value = props.field_id;
+          option.textContent = props.name
+            ? `${props.name} (${props.field_id})`
+            : props.field_id;
+          tsEls.field.appendChild(option);
+        }
+      })
+      .catch((err) => {
+        tsFieldsPromise = null; // allow retry on next open
+        tsMessage(`failed to load fields: ${err.message}`, true);
+      });
+  }
+  return tsFieldsPromise;
+}
+
+tsEls.details.addEventListener("toggle", () => {
+  if (tsEls.details.open) ensureTsFields();
+});
+
+/** Select a field in the panel (used by the map's field-boundary popup). */
+async function setTsField(fieldId) {
+  await ensureTsFields();
+  if (![...tsEls.field.options].some((o) => o.value === fieldId)) return;
+  tsEls.details.open = true;
+  if (tsEls.field.value !== fieldId) {
+    tsEls.field.value = fieldId;
+    loadTsMetrics(fieldId);
+  }
+}
+
+/** Refresh the metric list for the field; keep the default metric available. */
+async function loadTsMetrics(fieldId) {
+  const previous = tsEls.metric.value || DEFAULT_TS_METRIC;
+  try {
+    const body = await fetchJson(
+      `/api/fields/${encodeURIComponent(fieldId)}/timeseries/metrics`
+    );
+    const metrics = body.metrics || [];
+    if (!metrics.includes(DEFAULT_TS_METRIC)) metrics.unshift(DEFAULT_TS_METRIC);
+    tsEls.metric.innerHTML = "";
+    for (const metric of metrics) {
+      const option = document.createElement("option");
+      option.value = metric;
+      option.textContent = metric;
+      tsEls.metric.appendChild(option);
+    }
+    tsEls.metric.value = metrics.includes(previous) ? previous : DEFAULT_TS_METRIC;
+  } catch (err) {
+    tsMessage(`failed to list metrics: ${err.message}`, true);
+  }
+}
+
+tsEls.field.addEventListener("change", () => {
+  if (tsEls.field.value) loadTsMetrics(tsEls.field.value);
+});
+
+tsEls.load.addEventListener("click", () => loadTimeseries());
+tsEls.merged.addEventListener("change", () => renderTsChart());
+
+async function loadTimeseries() {
+  const fieldId = tsEls.field.value.trim();
+  if (!fieldId) {
+    tsMessage("No field selected — pick one above (or click a boundary on the map).");
+    return;
+  }
+  const metric = tsEls.metric.value || DEFAULT_TS_METRIC;
+  const params = new URLSearchParams({ metric });
+  if (tsEls.start.value) params.set("start", `${tsEls.start.value}T00:00:00Z`);
+  if (tsEls.end.value) params.set("end", `${tsEls.end.value}T23:59:59Z`);
+
+  tsEls.load.disabled = true;
+  tsMessage("Loading time series…");
+  tsEls.chart.innerHTML = "";
+  tsEls.harmonization.innerHTML = "";
+  tsEls.summary.innerHTML = "";
+  try {
+    const data = await fetchJson(
+      `/api/fields/${encodeURIComponent(fieldId)}/timeseries?${params}`
+    );
+    tsState.data = data;
+    // Keep prior toggle choices when the sources overlap the previous load
+    // (same field/metric reloaded); otherwise default every source on.
+    const previous = tsState.enabledSources;
+    const sources = Object.keys(data.per_source || {});
+    tsState.enabledSources = new Set(
+      sources.some((s) => previous.has(s)) ? sources.filter((s) => previous.has(s)) : sources
+    );
+    renderTsSourceToggles();
+    renderTsChart();
+    renderTsHarmonization();
+    loadTsSummary(fieldId, metric); // independent fetch; failure reported inline
+  } catch (err) {
+    tsState.data = null;
+    tsMessage(err.message, true);
+  } finally {
+    tsEls.load.disabled = false;
+  }
+}
+
+function renderTsSourceToggles() {
+  tsEls.sources.innerHTML = "";
+  const sources = Object.keys(tsState.data.per_source || {});
+  for (const source of sources) {
+    const label = document.createElement("label");
+    label.className = "toggle-row";
+    const checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = tsState.enabledSources.has(source);
+    checkbox.addEventListener("change", () => {
+      if (checkbox.checked) tsState.enabledSources.add(source);
+      else tsState.enabledSources.delete(source);
+      renderTsChart();
+    });
+    label.appendChild(checkbox);
+    label.appendChild(document.createTextNode(` ${source}`));
+    tsEls.sources.appendChild(label);
+  }
+}
+
+// --- Inline SVG chart ---------------------------------------------------------
+
+function svgEl(tag, attrs) {
+  const el = document.createElementNS(SVG_NS, tag);
+  for (const [key, value] of Object.entries(attrs)) el.setAttribute(key, String(value));
+  return el;
+}
+
+/** Points with a parsable RFC 3339 `t`, as { ms, value, t, source }. */
+function tsParsePoints(points) {
+  return (points || [])
+    .map((p) => ({ ms: Date.parse(p.t), value: p.value, t: p.t, source: p.source }))
+    .filter((p) => Number.isFinite(p.ms) && Number.isFinite(p.value));
+}
+
+/** The series to draw: one per enabled source (stable colors by sorted source
+ *  name) plus the dashed merged overlay when toggled on. */
+function tsVisibleSeries() {
+  const data = tsState.data;
+  const series = [];
+  const sources = Object.keys(data.per_source || {}); // BTreeMap: already sorted
+  sources.forEach((source, i) => {
+    if (!tsState.enabledSources.has(source)) return;
+    series.push({
+      name: source,
+      color: TS_SOURCE_COLORS[i % TS_SOURCE_COLORS.length],
+      dashed: false,
+      points: tsParsePoints(data.per_source[source]),
+    });
+  });
+  if (tsEls.merged.checked && (data.merged || []).length > 0) {
+    series.push({
+      name: "merged",
+      color: TS_MERGED_COLOR,
+      dashed: true,
+      points: tsParsePoints(data.merged),
+    });
+  }
+  return series.filter((s) => s.points.length > 0);
+}
+
+/** X-axis ticks: year boundaries when the span exceeds two years, else month
+ *  boundaries (thinned to at most ~8 labels). */
+function tsTimeTicks(minMs, maxMs) {
+  const ticks = [];
+  const min = new Date(minMs);
+  const max = new Date(maxMs);
+  if (maxMs - minMs > TWO_YEARS_MS) {
+    for (let y = min.getUTCFullYear() + 1; y <= max.getUTCFullYear(); y++) {
+      ticks.push({ ms: Date.UTC(y, 0, 1), label: String(y) });
+    }
+  } else {
+    const months = [];
+    const cursor = new Date(Date.UTC(min.getUTCFullYear(), min.getUTCMonth() + 1, 1));
+    while (cursor.getTime() <= maxMs) {
+      months.push(new Date(cursor.getTime()));
+      cursor.setUTCMonth(cursor.getUTCMonth() + 1);
+    }
+    const step = Math.max(1, Math.ceil(months.length / 8));
+    const names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+      "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    for (let i = 0; i < months.length; i += step) {
+      const d = months[i];
+      const name = names[d.getUTCMonth()];
+      const label =
+        d.getUTCMonth() === 0 ? `${name} ${String(d.getUTCFullYear()).slice(2)}` : name;
+      ticks.push({ ms: d.getTime(), label });
+    }
+  }
+  return ticks;
+}
+
+function renderTsChart() {
+  tsEls.chart.innerHTML = "";
+  if (!tsState.data) return;
+  const series = tsVisibleSeries();
+  if (series.length === 0) {
+    tsMessage("No data points for this metric/range (or all sources toggled off).");
+    return;
+  }
+
+  const all = series.flatMap((s) => s.points);
+  let minMs = Math.min(...all.map((p) => p.ms));
+  let maxMs = Math.max(...all.map((p) => p.ms));
+  if (minMs === maxMs) {
+    minMs -= 24 * 3600 * 1000;
+    maxMs += 24 * 3600 * 1000;
+  }
+  let minV = Math.min(...all.map((p) => p.value));
+  let maxV = Math.max(...all.map((p) => p.value));
+  const pad = (maxV - minV || Math.abs(maxV) || 1) * 0.08;
+  minV -= pad;
+  maxV += pad;
+
+  const W = 320;
+  const H = 200;
+  const M = { left: 44, right: 8, top: 8, bottom: 22 };
+  const x = (ms) => M.left + ((ms - minMs) / (maxMs - minMs)) * (W - M.left - M.right);
+  const y = (v) => H - M.bottom - ((v - minV) / (maxV - minV)) * (H - M.top - M.bottom);
+  const decimals = maxV - minV < 0.5 ? 3 : 2;
+
+  const svg = svgEl("svg", {
+    viewBox: `0 0 ${W} ${H}`,
+    class: "ts-svg",
+    role: "img",
+    "aria-label": `${tsState.data.metric} time series for ${tsState.data.field_id}`,
+  });
+
+  // Horizontal gridlines + y labels (4 intervals).
+  for (let i = 0; i <= 4; i++) {
+    const v = minV + ((maxV - minV) * i) / 4;
+    const gy = y(v);
+    svg.appendChild(svgEl("line", {
+      x1: M.left, y1: gy, x2: W - M.right, y2: gy, class: "ts-grid",
+    }));
+    const label = svgEl("text", { x: M.left - 4, y: gy + 3, class: "ts-axis ts-axis-y" });
+    label.textContent = v.toFixed(decimals);
+    svg.appendChild(label);
+  }
+  // Vertical gridlines + time labels.
+  for (const tick of tsTimeTicks(minMs, maxMs)) {
+    if (tick.ms < minMs || tick.ms > maxMs) continue;
+    const gx = x(tick.ms);
+    svg.appendChild(svgEl("line", {
+      x1: gx, y1: M.top, x2: gx, y2: H - M.bottom, class: "ts-grid",
+    }));
+    const label = svgEl("text", { x: gx, y: H - M.bottom + 12, class: "ts-axis ts-axis-x" });
+    label.textContent = tick.label;
+    svg.appendChild(label);
+  }
+
+  // One polyline per series (merged dashed), circles with <title> tooltips.
+  for (const s of series) {
+    const line = svgEl("polyline", {
+      points: s.points.map((p) => `${x(p.ms).toFixed(1)},${y(p.value).toFixed(1)}`).join(" "),
+      fill: "none",
+      stroke: s.color,
+      "stroke-width": s.dashed ? 1.5 : 1.75,
+    });
+    if (s.dashed) line.setAttribute("stroke-dasharray", "5 3");
+    svg.appendChild(line);
+    for (const p of s.points) {
+      const dot = svgEl("circle", {
+        cx: x(p.ms).toFixed(1), cy: y(p.value).toFixed(1), r: 2.5, fill: s.color,
+      });
+      const title = document.createElementNS(SVG_NS, "title");
+      title.textContent = `${p.t} · ${p.value.toFixed(4)} · ${p.source}`;
+      dot.appendChild(title);
+      svg.appendChild(dot);
+    }
+  }
+  tsEls.chart.appendChild(svg);
+
+  // Legend: colored bullet per series, "(dashed)" marks the merged overlay.
+  const legend = document.createElement("div");
+  legend.className = "ts-legend";
+  for (const s of series) {
+    const entry = document.createElement("span");
+    const bullet = document.createElement("span");
+    bullet.className = "ts-legend-bullet";
+    bullet.style.background = s.color;
+    entry.appendChild(bullet);
+    entry.appendChild(document.createTextNode(s.dashed ? `${s.name} (dashed)` : s.name));
+    legend.appendChild(entry);
+  }
+  tsEls.chart.appendChild(legend);
+  tsMessage(`${all.length} points across ${series.length} series.`);
+}
+
+// --- Harmonization report & summary strip ---------------------------------------
+
+function renderTsHarmonization() {
+  tsEls.harmonization.innerHTML = "";
+  const entries = (tsState.data && tsState.data.harmonization) || [];
+  if (entries.length === 0) return;
+  const heading = document.createElement("div");
+  heading.className = "ts-subhead";
+  heading.textContent = "Harmonization";
+  tsEls.harmonization.appendChild(heading);
+  let caveat = "";
+  for (const e of entries) {
+    const line = document.createElement("div");
+    line.className = "ts-harm-line";
+    line.textContent =
+      `${e.source}: ${e.method} gain=${e.gain.toFixed(4)} ` +
+      `offset=${e.offset.toFixed(4)} (pairs: ${e.pair_count})`;
+    tsEls.harmonization.appendChild(line);
+    if (e.caveat) caveat = e.caveat;
+  }
+  if (caveat) {
+    const note = document.createElement("p");
+    note.className = "hint";
+    note.textContent = caveat;
+    tsEls.harmonization.appendChild(note);
+  }
+}
+
+async function loadTsSummary(fieldId, metric) {
+  tsEls.summary.innerHTML = "";
+  let summary;
+  try {
+    summary = await fetchJson(
+      `/api/fields/${encodeURIComponent(fieldId)}/timeseries/summary?` +
+        new URLSearchParams({ metric })
+    );
+  } catch (err) {
+    const note = document.createElement("p");
+    note.className = "error";
+    note.textContent = `summary unavailable: ${err.message}`;
+    tsEls.summary.appendChild(note);
+    return;
+  }
+  if ((summary.per_year || []).length === 0) return;
+
+  const heading = document.createElement("div");
+  heading.className = "ts-subhead";
+  heading.textContent = `Summary (${summary.series_basis}, ${summary.observation_count} obs)`;
+  tsEls.summary.appendChild(heading);
+
+  if (summary.anomaly && summary.anomaly.is_anomalous) {
+    const badge = document.createElement("span");
+    badge.className = "ts-anomaly-badge";
+    const a = summary.anomaly;
+    badge.textContent =
+      `anomaly: latest ${a.latest_value.toFixed(3)} vs baseline ` +
+      `${a.baseline_mean.toFixed(3)} (Δ ${a.deviation.toFixed(3)})`;
+    badge.title = `latest observation ${a.latest_t}, baseline of ${a.baseline_points} points`;
+    tsEls.summary.appendChild(badge);
+  }
+
+  const table = document.createElement("table");
+  table.className = "ts-year-table";
+  const head = document.createElement("tr");
+  for (const col of ["year", "mean", "max", "peak date"]) {
+    const th = document.createElement("th");
+    th.textContent = col;
+    head.appendChild(th);
+  }
+  table.appendChild(head);
+  for (const yearRow of summary.per_year) {
+    const tr = document.createElement("tr");
+    for (const cell of [
+      String(yearRow.year),
+      yearRow.mean.toFixed(3),
+      yearRow.max.toFixed(3),
+      (yearRow.max_t || "").slice(0, 10),
+    ]) {
+      const td = document.createElement("td");
+      td.textContent = cell;
+      tr.appendChild(td);
+    }
+    table.appendChild(tr);
+  }
+  tsEls.summary.appendChild(table);
+
+  if (summary.vs_prior_years) {
+    const v = summary.vs_prior_years;
+    const note = document.createElement("p");
+    note.className = "hint";
+    note.textContent =
+      `vs prior years: current ${v.current_value.toFixed(3)}, seasonal mean ` +
+      `${v.seasonal_mean.toFixed(3)} (Δ ${v.delta_from_seasonal_mean.toFixed(3)}, ` +
+      `${v.prior_point_count} prior points)`;
+    tsEls.summary.appendChild(note);
+  }
+}
 
 // --- Boot -------------------------------------------------------------------------
 
