@@ -68,11 +68,34 @@ async fn register_band_for(
     kind: &str,
     dn: Vec<u16>,
 ) -> Result<String> {
+    register_band_sized_for(ctx, tmp, scene_id, kind, dn, 2, 2).await
+}
+
+async fn register_band_sized(
+    ctx: &Ctx,
+    tmp: &TempDir,
+    kind: &str,
+    dn: Vec<u16>,
+    width: u32,
+    height: u32,
+) -> Result<String> {
+    register_band_sized_for(ctx, tmp, SCENE_ID, kind, dn, width, height).await
+}
+
+async fn register_band_sized_for(
+    ctx: &Ctx,
+    tmp: &TempDir,
+    scene_id: &str,
+    kind: &str,
+    dn: Vec<u16>,
+    width: u32,
+    height: u32,
+) -> Result<String> {
     let path = tmp.path().join(format!("{scene_id}_{kind}.tif"));
     write_geotiff_u16(
         &path,
-        2,
-        2,
+        width,
+        height,
         &dn,
         &GeoTiffTags {
             epsg: Some(EPSG),
@@ -366,6 +389,133 @@ async fn tm_scene_resolves_red_nir_through_its_own_band_numbering() -> Result<()
     )
     .await?;
     assert_eq!(status, StatusCode::NOT_FOUND);
+
+    Ok(())
+}
+
+/// Batch 40: the water-availability demand side. LST + NDVI (both from
+/// the Landsat local derive on this scene) feed the Ts-VI triangle with
+/// self-calibrated edges. Fixture (4x2): pixels 0-3 bare (NDVI ~0.1),
+/// pixels 4-7 vegetated (~0.8); LST [310, 300, 305, 290 | 300, 290,
+/// 295, 292.5] K -> wet edge 290; bare dry edge 310, vegetated 300 ->
+/// fractions [0, 0.5, 0.25, 1 | 0, 1, 0.5, 0.75].
+#[tokio::test]
+async fn landsat_lst_and_ndvi_pair_derives_the_triangle_et_fraction() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = ctx(&tmp).await?;
+
+    // DN for the target reflectances/temperatures (SR: DN*0.0000275-0.2;
+    // ST: DN*0.00341802+149). Bare: red 0.45 (23636) / nir 0.55 (27273)
+    // -> NDVI 0.1; vegetated: red 0.05 (9091) / nir 0.45 (23636) -> 0.8.
+    register_band_sized(
+        &ctx,
+        &tmp,
+        "band_sr_b4",
+        vec![23636, 23636, 23636, 23636, 9091, 9091, 9091, 9091],
+        4,
+        2,
+    )
+    .await?;
+    register_band_sized(
+        &ctx,
+        &tmp,
+        "band_sr_b5",
+        vec![27273, 27273, 27273, 27273, 23636, 23636, 23636, 23636],
+        4,
+        2,
+    )
+    .await?;
+    // ST DN: 310 K -> 47103, 300 -> 44177, 305 -> 45640, 290 -> 41252,
+    // 295 -> 42715, 292.5 -> 41983.
+    register_band_sized(
+        &ctx,
+        &tmp,
+        "band_st_b10",
+        vec![47103, 44177, 45640, 41252, 44177, 41252, 42715, 41983],
+        4,
+        2,
+    )
+    .await?;
+
+    let mut ids = std::collections::BTreeMap::new();
+    for product in ["ndvi", "lst"] {
+        let (status, outcome) = send(
+            &ctx.app,
+            "POST",
+            "/api/ingest/landsat/derive",
+            Some(json!({ "scene_id": SCENE_ID, "product": product })),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "{product}: {outcome}");
+        ids.insert(
+            product.to_string(),
+            outcome["product_id"].as_str().unwrap().to_string(),
+        );
+    }
+
+    let (status, outcome) = send(
+        &ctx.app,
+        "POST",
+        "/api/water-management/et/derive",
+        Some(json!({
+            "lst_product_id": ids["lst"],
+            "ndvi_product_id": ids["ndvi"],
+            "field_id": "field-1",
+            "season_id": "2024",
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{outcome}");
+    assert!((outcome["wet_edge_k"].as_f64().unwrap() - 290.0).abs() < 0.01);
+    assert_eq!(outcome["valid_fraction"], 1.0);
+
+    let et = catalog::get_product(&ctx.pool, outcome["et_product_id"].as_str().unwrap())
+        .await?
+        .unwrap();
+    assert_eq!(et.kind, "et_fraction");
+    assert_eq!(
+        et.parameters["method"],
+        "jiang_islam_triangle_phi_normalized"
+    );
+    let values = {
+        let mut reader = GeoTiffReader::open(et.path.as_deref().unwrap())?;
+        reader.read_band()?.to_f32()
+    };
+    for (pixel, expected) in [
+        (0usize, 0.0f32),
+        (1, 0.5),
+        (2, 0.25),
+        (3, 1.0),
+        (4, 0.0),
+        (5, 1.0),
+        (6, 0.5),
+        (7, 0.75),
+    ] {
+        assert!(
+            (values[pixel] - expected).abs() < 0.01,
+            "pixel {pixel}: {} != {expected}",
+            values[pixel]
+        );
+    }
+
+    // Lineage covers both inputs under their roles.
+    let edges = catalog::trace_inputs(&ctx.pool, &et.product_id).await?;
+    let mut roles: Vec<&str> = edges.iter().map(|e| e.role.as_str()).collect();
+    roles.sort_unstable();
+    assert_eq!(roles, vec!["lst", "ndvi"]);
+
+    // Wrong-kind input is refused.
+    let (status, _) = send(
+        &ctx.app,
+        "POST",
+        "/api/water-management/et/derive",
+        Some(json!({
+            "lst_product_id": ids["ndvi"],
+            "ndvi_product_id": ids["ndvi"],
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 
     Ok(())
 }

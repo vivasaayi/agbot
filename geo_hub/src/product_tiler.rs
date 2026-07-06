@@ -198,6 +198,13 @@ pub fn colormap_for_kind(kind: &str) -> Colormap {
                 categorical: false,
             }
         }
+        // Evaporative fraction 0..1: dry red -> yellow -> wet green
+        // (condition semantics: high = well-watered).
+        "et_fraction" => Colormap {
+            domain: (0.0, 1.0),
+            stops: RAMP_CONDITION,
+            categorical: false,
+        },
         // LST in Kelvin: cool blue -> pale yellow -> hot red over the
         // terrestrial 250-330 K range (matches the CLI thermal viz range).
         "lst" | "thermal_lst" => Colormap {

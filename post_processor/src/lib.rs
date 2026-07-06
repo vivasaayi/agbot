@@ -13,6 +13,7 @@ pub mod crop_features;
 pub mod crop_health_app;
 pub mod drought_indices;
 pub mod drought_watch_app;
+pub mod et_fraction;
 pub mod evidence;
 pub mod findings_export;
 pub mod grower_report;
