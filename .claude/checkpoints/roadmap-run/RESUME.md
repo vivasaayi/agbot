@@ -7,13 +7,14 @@ continues on enhance-satellite-image-pipeline. Batch 30 (4dc8d1a): index surface
 affordance on band_b* items. Batch 29 (da46205): spec-driven multi-index
 (ndvi/mndwi/ndmi), cross-resolution B11 replication, SCL native/replicated.
 Batch 28 (7b6e26e): SCL cloud masking.
-Batch 33 (114b917): composite-fed phenology (series=l2|composites on
-/api/landcover/derive, identity-bearing) + /browse composite window form.
-Batch 32 (f26b796): temporal compositing catalog-wired. Batch 31 (263805e):
-local dNBR composition proof.
-NEXT: batch 34 candidates = Landsat C2 local band derivation parity
-(sen2cor-style spec over USGS band products); composite-fed drought
-climatology baselines.
+ENHANCEMENT TRACK COMPLETE: batches 28-35 committed (SCL masking 7b6e26e,
+multi-index sen2cor da46205, NBR/NDWI+browse 4dc8d1a, dNBR proof 263805e,
+compositing f26b796, composite-fed phenology 114b917, composite-fed drought
+climatology 1242b97, Landsat C2 local derive c60320c). Final gates green:
+geo_hub 38 suites, shared 323, post_processor 181, geo_viewer 60,
+acceptance 5, workspace check clean.
+NEXT: none recorded — branch ready for PR/merge; further direction is a
+user decision (e.g. weather advisory domain 15 for SPEI/early warnings).
 
 ## MERGED HISTORY: satellite intelligence pipeline (2026-07)
 Active plan + per-batch ledger: `docs/design/satellite-intelligence-pipeline.md`
