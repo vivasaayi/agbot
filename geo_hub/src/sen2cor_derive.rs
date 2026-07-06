@@ -633,6 +633,11 @@ pub async fn derive_sen2cor_index(
     let index_product_id =
         catalog::register_product_with_actor(pool, &draft, &actor, &created_at).await?;
 
+    // Per-field time series (batch S-3): best-effort, never fails the derive.
+    if request.field_id.is_some() {
+        crate::field_timeseries::append_field_stats_best_effort(pool, &index_product_id).await;
+    }
+
     Ok(Sen2CorIndexOutcome {
         stac_item_href: format!(
             "/api/stac/collections/{}/items/{index_product_id}",

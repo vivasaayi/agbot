@@ -19,6 +19,7 @@ pub mod ingest_contract;
 pub mod landcover_rasters;
 pub mod landsat;
 pub mod landsat_derive;
+pub mod field_timeseries;
 pub mod lst_rasters;
 pub mod product_catalog;
 pub mod product_tiler;

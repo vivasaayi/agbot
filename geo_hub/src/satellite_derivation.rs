@@ -928,6 +928,11 @@ pub async fn derive_satellite_index(
     let product_id =
         crate::catalog::register_product_with_actor(pool, &l2, &actor, &created_at).await?;
 
+    // Per-field time series (batch S-3): best-effort, never fails the derive.
+    if request.field_id.is_some() {
+        crate::field_timeseries::append_field_stats_best_effort(pool, &product_id).await;
+    }
+
     Ok(DerivationOutcome {
         stac_item_href: format!("/api/stac/collections/{index_key}/items/{product_id}"),
         product_id,

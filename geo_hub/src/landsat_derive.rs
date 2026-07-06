@@ -594,6 +594,11 @@ pub async fn derive_landsat_product(
     let product_id =
         catalog::register_product_with_actor(pool, &draft, &actor, &created_at).await?;
 
+    // Per-field time series (batch S-3): best-effort, never fails the derive.
+    if request.field_id.is_some() {
+        crate::field_timeseries::append_field_stats_best_effort(pool, &product_id).await;
+    }
+
     Ok(LandsatDeriveOutcome {
         stac_item_href: format!("/api/stac/collections/{product_key}/items/{product_id}"),
         tiles_href: format!("/api/catalog/products/{product_id}/tiles/{{z}}/{{x}}/{{y}}.png"),
