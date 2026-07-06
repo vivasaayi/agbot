@@ -7,6 +7,7 @@ continues on enhance-satellite-image-pipeline. Batch 30 (4dc8d1a): index surface
 affordance on band_b* items. Batch 29 (da46205): spec-driven multi-index
 (ndvi/mndwi/ndmi), cross-resolution B11 replication, SCL native/replicated.
 Batch 28 (7b6e26e): SCL cloud masking.
+Batch 37 (ccfa9ea): drought watch SPI scale + web product-mode trigger.
 Batch 36 (5411288): drought_watch application (drought L3 rasters ->
 stress findings -> Track C warning alerts + irrigation proposals).
 ENHANCEMENT TRACK batches 28-35 committed (SCL masking 7b6e26e,
@@ -15,9 +16,9 @@ compositing f26b796, composite-fed phenology 114b917, composite-fed drought
 climatology 1242b97, Landsat C2 local derive c60320c). Final gates green:
 geo_hub 38 suites, shared 323, post_processor 181, geo_viewer 60,
 acceptance 5, workspace check clean.
-NEXT: continuing on user directive. Candidates: web findings panel entry
-for drought_watch (product-based, needs a non-zone form variant); SPI in
-drought watch; weather advisory (15) fusion for SPEI.
+NEXT: drought-watch surface complete (36+37). Remaining candidates on this
+branch are larger jumps: weather advisory (15) fusion for SPEI; or wrap the
+branch for PR. Ask the user before starting domain 15 (scope change).
 
 ## MERGED HISTORY: satellite intelligence pipeline (2026-07)
 Active plan + per-batch ledger: `docs/design/satellite-intelligence-pipeline.md`
