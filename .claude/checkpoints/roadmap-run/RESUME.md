@@ -4,11 +4,41 @@
   (hash e1b595dd4972a5a0eda85068fc9712c749c32542f1f9afe09cb0c047292d014d).
   21 features: S-01..S-14 (satellite engine) + F-B1..F-B7 (farmer portal).
 - Branch: `satellite-farmer-expansion` (from landsat-parity @ 04d748f).
-- Committed: wave 1 — S-01 timeseries prune (7551ca2), S-02 naming+field scope
-  (3ef9964), F-B1 portal auth (3dd5f00).
-- Current: wave 2 agents running — S-03 field_timeseries extraction (lane1),
-  S-06 pipeline job queue + WAL (lane2), F-B2 portal scoped reads (lane3).
-  lib.rs module lines pre-seeded by coordinator with stub files.
+- Committed (12/21): wave1 S-01 7551ca2, S-02 3ef9964, F-B1 3dd5f00; wave2
+  S-06, S-03 0192c68, F-B2 928db88 (repaired foreign ec512a5 server.rs break);
+  wave3 S-04 8b57d76, S-07 998762c, F-B3 cf1184b (+ReportFormat::Pdf /
+  ReportVisibility::Grower enum fix); wave4 S-05 cf6cef3 (server.rs line was
+  misplaced at EOF by a staging patch — repaired in F-B4 b4e6151), F-B4
+  b4e6151, S-08 0ff43c2 (worker wired into serve(), disabled by default).
+- Committed (19/21): +wave3.. S-05 cf6cef3, F-B4 b4e6151, S-08 0ff43c2;
+  wave5 F-B5 8fb05e0, S-09 9c5a163, S-10 2c9506d; wave6 S-13 39e7096,
+  F-B6 2b3d8c6 (amended from f3543a3 to strip S-11's in-flight route lines),
+  S-11 406bf4f; wave7 F-B7 a47bf1d.
+- Wave 7 hit the Fable-5 token limit mid-flight: F-B7 was ~complete on disk
+  (field.js 900 lines + chart.js, node-valid, route-manifest test green) →
+  verified + committed a47bf1d on resume. S-12 left nothing; S-14 left only
+  a stray fixture (pc_modis_13q1_search.json). Both RE-DISPATCHED fresh on
+  Opus 4.8 (disjoint files: S-12 owns pipeline_worker/pipeline; S-14 owns
+  new modis.rs/routes).
+- COMPLETE (21/21): S-12 5d880f0, S-14 faad49c committed on resume; plus a
+  follow-up (ff fix) draining the pipeline_l3 composite-supersede test for
+  S-12's new fan-out. 24 commits total (04d748f..HEAD).
+- Verification all green: satellite suites (pipeline_jobs/worker/discover/l3/
+  l3_suite/backfill, field_timeseries x3, modis, pc_sign, landsat/satellite
+  derive), portal suites (auth/farms/reports/recommendations/alerts/
+  activities/static + workspace_static), pruned timeseries + consumers
+  (shared/timeseries/post_processor/fleet_health/soil_iot), and `just
+  gis-test` exit 0 (198-suite geo_hub gis + shared 323 + geo_viewer 60).
+  New source files rustfmt-clean.
+- LEFT UNCOMMITTED ON PURPOSE: a concurrent session's water-balance work
+  (water_balance_rasters.rs, water_balance_run.rs, post_processor water_balance,
+  fmt-only diffs across many routes files, landsat.rs). NOT mine — do not
+  commit or revert.
+- (superseded) earlier wave-5 line:
+- STAGING LESSON: do NOT use zero-context `git apply --cached` patches on
+  server.rs/lib.rs — they can land hunks at EOF (happened twice). Use
+  update-index with sed-constructed content, or commit the full file when no
+  foreign hunks remain.
 - WORKTREE CAUTION: another session has uncommitted water-balance work here
   (water_balance_rasters.rs, post_processor water_balance, fmt-only diffs in
   many routes files; one foreign hunk each in geo_hub/src/lib.rs, server.rs,
