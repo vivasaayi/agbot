@@ -472,4 +472,3 @@ pub async fn list_content_items(
         .collect::<AppResult<Vec<_>>>()
         .map(Json)
 }
-

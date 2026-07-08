@@ -771,4 +771,3 @@ pub async fn list_collaboration_stream_frames(
 
     Ok(Json(frames))
 }
-

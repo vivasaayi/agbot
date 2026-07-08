@@ -769,4 +769,3 @@ pub async fn stream_product_tile(
 
     Ok((headers, body).into_response())
 }
-

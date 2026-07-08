@@ -308,4 +308,3 @@ pub async fn get_fired_alert(
         .map(Json)
         .ok_or(AppError::NotFound)
 }
-

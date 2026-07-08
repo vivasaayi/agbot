@@ -310,7 +310,11 @@ async fn advisor_draft_funnels_into_queue_with_lineage() -> Result<()> {
     let (_, queue) = send(&app, "GET", "/api/fields/field-1/proposals", None).await?;
     assert_eq!(queue.as_array().unwrap().len(), 1);
     let trace = provenance_store::trace_backward(&pool, &proposal.proposal_id).await?;
-    assert!(trace.gaps.is_empty(), "advisor proposal->L0: {:?}", trace.gaps);
+    assert!(
+        trace.gaps.is_empty(),
+        "advisor proposal->L0: {:?}",
+        trace.gaps
+    );
     assert!(trace.records.iter().any(|r| r.artifact_id == l2));
 
     // Re-funneling the same draft is idempotent (one proposal per finding).

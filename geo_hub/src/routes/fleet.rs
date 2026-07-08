@@ -222,4 +222,3 @@ pub async fn validate_tractor_motion_command(
 
     Ok(Json(tractor).into_response())
 }
-

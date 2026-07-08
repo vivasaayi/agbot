@@ -274,6 +274,10 @@ async fn actionable_alert_enqueues_a_proposal_from_its_finding() -> Result<()> {
     )
     .await?;
     let (_, again) = send(&app, "GET", "/api/fields/field-1/proposals", None).await?;
-    assert_eq!(again.as_array().unwrap().len(), 1, "still exactly one proposal");
+    assert_eq!(
+        again.as_array().unwrap().len(),
+        1,
+        "still exactly one proposal"
+    );
     Ok(())
 }

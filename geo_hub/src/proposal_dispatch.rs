@@ -76,8 +76,7 @@ pub async fn governed_dispatch(
 ) -> Result<GuardedDispatchOutcome, GovernedDispatchError> {
     assert_dispatch_authorized(approval)?;
 
-    let outcome =
-        dispatch_guarded_simulation_command(mission, command, context, ack_tracker)?;
+    let outcome = dispatch_guarded_simulation_command(mission, command, context, ack_tracker)?;
 
     provenance_store::append_lineage(
         pool,

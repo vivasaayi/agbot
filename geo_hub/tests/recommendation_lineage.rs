@@ -122,8 +122,9 @@ async fn created_recommendation_is_directly_traceable_to_its_evidence() -> Resul
     )
     .await?;
 
-    let l0 = catalog::register_product(&pool, &product(ProductLevel::L0, "raw_capture", vec![]), T0)
-        .await?;
+    let l0 =
+        catalog::register_product(&pool, &product(ProductLevel::L0, "raw_capture", vec![]), T0)
+            .await?;
     let l1 = catalog::register_product(
         &pool,
         &product(

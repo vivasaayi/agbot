@@ -142,9 +142,7 @@ pub fn recommendation_draft_from_accepted(
 mod tests {
     use super::*;
     use copilot::advisor_rules::RemedyKind;
-    use crop_intelligence::{
-        CropClosedLoopFindingEvidence, CropModelTask, DetectionZoneGeometry,
-    };
+    use crop_intelligence::{CropClosedLoopFindingEvidence, CropModelTask, DetectionZoneGeometry};
     use shared::schemas::GeoBounds;
 
     fn zone_geometry() -> DetectionZoneGeometry {

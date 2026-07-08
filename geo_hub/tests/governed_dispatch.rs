@@ -257,7 +257,11 @@ async fn accepted_proposal_dispatches_and_records_action_lineage() -> Result<()>
     // The dispatch recorded an Action that traces back to the proposal and L0.
     let action_id = proposal_dispatch::action_id_for(&approval);
     let trace = provenance_store::trace_backward(&pool, &action_id).await?;
-    assert!(trace.gaps.is_empty(), "action->L0 gap-free: {:?}", trace.gaps);
+    assert!(
+        trace.gaps.is_empty(),
+        "action->L0 gap-free: {:?}",
+        trace.gaps
+    );
     assert!(
         trace
             .records

@@ -754,4 +754,3 @@ pub async fn export_scene_recommendations_geojson(
         "recommendations.geojson",
     )
 }
-

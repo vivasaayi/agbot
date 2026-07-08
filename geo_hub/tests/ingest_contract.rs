@@ -339,8 +339,14 @@ async fn commit_usgs_full_band_ingest_registers_l0_and_l1_with_trace() -> Result
 
     // One L0 and two L1 band products.
     let products = catalog::list_products(&pool, &ProductFilter::default()).await?;
-    let l0: Vec<_> = products.iter().filter(|p| p.level == ProductLevel::L0).collect();
-    let l1: Vec<_> = products.iter().filter(|p| p.level == ProductLevel::L1).collect();
+    let l0: Vec<_> = products
+        .iter()
+        .filter(|p| p.level == ProductLevel::L0)
+        .collect();
+    let l1: Vec<_> = products
+        .iter()
+        .filter(|p| p.level == ProductLevel::L1)
+        .collect();
     assert_eq!(l0.len(), 1);
     assert_eq!(l1.len(), 2);
 
@@ -348,7 +354,11 @@ async fn commit_usgs_full_band_ingest_registers_l0_and_l1_with_trace() -> Result
     let l0_id = &l0[0].product_id;
     for band in &l1 {
         let trace = provenance_store::trace_backward(&pool, &band.product_id).await?;
-        assert!(trace.gaps.is_empty(), "L1 {} -> L0 gap-free", band.product_id);
+        assert!(
+            trace.gaps.is_empty(),
+            "L1 {} -> L0 gap-free",
+            band.product_id
+        );
         assert!(
             trace.records.iter().any(|r| &r.artifact_id == l0_id),
             "L1 band lists the L0 raw-scene as input"

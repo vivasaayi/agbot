@@ -410,4 +410,3 @@ pub async fn export_fields_geojson(State(state): State<AppState>) -> AppResult<J
 
     Ok(Json(geojson_from_fields(fields)))
 }
-
