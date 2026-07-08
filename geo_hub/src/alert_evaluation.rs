@@ -97,6 +97,20 @@ pub fn default_ruleset() -> Vec<AlertRule> {
             severity: AlertSeverityHint::Warning,
             channels: Vec::new(),
         },
+        AlertRule {
+            rule_id: "water-balance-deficit-critical".to_string(),
+            event_type: "water_balance_deficit_zone".to_string(),
+            subject_ref: None,
+            severity: AlertSeverityHint::Critical,
+            channels: Vec::new(),
+        },
+        AlertRule {
+            rule_id: "water-balance-watch-warning".to_string(),
+            event_type: "water_balance_watch_zone".to_string(),
+            subject_ref: None,
+            severity: AlertSeverityHint::Warning,
+            channels: Vec::new(),
+        },
     ]
 }
 
@@ -182,6 +196,8 @@ pub fn propose_action_event_types() -> std::collections::BTreeSet<String> {
         "water_deficit_zone",
         "declining_zone",
         "drought_stress_zone",
+        "water_balance_deficit_zone",
+        "water_balance_watch_zone",
     ]
     .into_iter()
     .map(String::from)
@@ -195,6 +211,8 @@ fn finding_action(kind: &str) -> Option<(&'static str, &'static str)> {
         "water_deficit_zone" => Some(("irrigation", "medium")),
         "declining_zone" => Some(("review", "medium")),
         "drought_stress_zone" => Some(("irrigation", "high")),
+        "water_balance_deficit_zone" => Some(("irrigation", "high")),
+        "water_balance_watch_zone" => Some(("review", "medium")),
         _ => None,
     }
 }
@@ -279,6 +297,16 @@ fn severity_evidence(
             0.05,
             0.10,
             0.20,
+        ),
+        // Water-balance deficit graded by supply-decline rate: how fast the
+        // water area is shrinking (relative_area_change, more negative =
+        // worse). Escalates warning -> critical -> emergency.
+        "water_balance_deficit_zone" => (
+            "supply_decline_rate",
+            (-metrics.get("relative_area_change")?.as_f64()?).max(0.0),
+            0.10,
+            0.30,
+            0.50,
         ),
         _ => return None,
     };

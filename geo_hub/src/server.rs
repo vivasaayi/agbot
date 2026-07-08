@@ -139,6 +139,10 @@ pub fn build_router(state: AppState) -> Router {
             post(routes::run_drought_watch_app),
         )
         .route(
+            "/api/applications/water-balance-watch/runs",
+            post(routes::run_water_balance_watch_app),
+        )
+        .route(
             "/api/fields/:field_id/alert-evaluation",
             post(routes::evaluate_field_alerts),
         )

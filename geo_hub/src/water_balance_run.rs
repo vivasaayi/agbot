@@ -123,7 +123,10 @@ mod tests {
             finding_kind("deficit_risk"),
             ("water_balance_deficit_zone", "critical")
         );
-        assert_eq!(finding_kind("watch"), ("water_balance_watch_zone", "medium"));
+        assert_eq!(
+            finding_kind("watch"),
+            ("water_balance_watch_zone", "medium")
+        );
         assert_eq!(finding_kind("adequate"), ("nominal_zone", "low"));
         assert_eq!(finding_kind("surplus"), ("nominal_zone", "low"));
         assert_eq!(
