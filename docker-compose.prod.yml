@@ -34,6 +34,9 @@ services:
       # Per-client-IP request cap over a 60s window (0 disables). Requires the
       # reverse proxy to forward the real client IP for meaningful buckets.
       GEO_HUB__SECURITY__RATE_LIMIT_PER_MIN: ${AGBOT_RATE_LIMIT_PER_MIN:-0}
+      # Delete a product's artifact as it is superseded so regenerated rasters
+      # don't fill the data volume. On by default for the appliance.
+      GEO_HUB__STORAGE__DELETE_SUPERSEDED_ARTIFACTS: ${AGBOT_DELETE_SUPERSEDED:-true}
     volumes:
       - geo_hub_db:/opt/agbot/db
       - geo_hub_data:/opt/agbot/data

@@ -137,6 +137,19 @@ impl SecurityConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct StorageConfig {
+    /// When true, a product's on-disk artifact is deleted as it is superseded,
+    /// so regenerated rasters (monthly composites, climatologies, phenology)
+    /// don't accumulate unbounded and exhaust the data volume. Off by default
+    /// so dev/test runs keep every artifact; enable it
+    /// (`GEO_HUB__STORAGE__DELETE_SUPERSEDED_ARTIFACTS=true`) on the appliance.
+    /// Deletion is best-effort and safety-guarded: only files under
+    /// `data_root` that no other product still references are removed.
+    pub delete_superseded_artifacts: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BootstrapConfig {
@@ -185,6 +198,7 @@ pub struct HubConfig {
     pub pipeline: PipelineConfig,
     pub bootstrap: BootstrapConfig,
     pub security: SecurityConfig,
+    pub storage: StorageConfig,
 }
 
 impl Default for HubConfig {
@@ -199,6 +213,7 @@ impl Default for HubConfig {
             pipeline: PipelineConfig::default(),
             bootstrap: BootstrapConfig::default(),
             security: SecurityConfig::default(),
+            storage: StorageConfig::default(),
         }
     }
 }

@@ -1623,6 +1623,35 @@ async fn max_calendar_month_year_span(
 
 /// Supersede prior registered climatologies for (field, index) with the new
 /// one, so exactly one live climatology exists per series.
+/// Mark `old_product_id` as superseded by `new_product_id` and, when storage
+/// retention is enabled, reclaim the old artifact's disk. The reclaim is
+/// best-effort: the supersession already committed, so a failed delete is
+/// logged, not propagated.
+async fn supersede_and_reclaim(
+    ctx: &PipelineWorkerContext,
+    old_product_id: &str,
+    new_product_id: &str,
+) -> Result<(), crate::catalog::CatalogError> {
+    catalog::supersede_product(&ctx.pool, old_product_id, new_product_id).await?;
+    if ctx.config.storage.delete_superseded_artifacts {
+        match catalog::reclaim_product_artifact(&ctx.pool, &ctx.config.data_root, old_product_id)
+            .await
+        {
+            Ok(Some(path)) => {
+                tracing::info!(product_id = old_product_id, path = %path.display(), "reclaimed superseded artifact")
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(
+                    product_id = old_product_id,
+                    "failed to reclaim superseded artifact: {err}"
+                )
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn supersede_previous_climatologies(
     ctx: &PipelineWorkerContext,
     field_id: &str,
@@ -1637,7 +1666,7 @@ async fn supersede_previous_climatologies(
             continue;
         }
         if previous.parameters["index_kind"] == serde_json::json!(index) {
-            catalog::supersede_product(&ctx.pool, &previous.product_id, new_product_id).await?;
+            supersede_and_reclaim(ctx, &previous.product_id, new_product_id).await?;
         }
     }
     Ok(())
@@ -1666,7 +1695,7 @@ async fn supersede_previous_products(
         if product.product_id == new_product_id {
             continue;
         }
-        catalog::supersede_product(&ctx.pool, &product.product_id, new_product_id).await?;
+        supersede_and_reclaim(ctx, &product.product_id, new_product_id).await?;
     }
     Ok(())
 }
@@ -1704,7 +1733,7 @@ async fn supersede_previous_composites(
             .as_array()
             .is_some_and(|bands| bands.iter().any(|band| band == index));
         if same_month && same_index {
-            catalog::supersede_product(&ctx.pool, &previous.product_id, new_product_id).await?;
+            supersede_and_reclaim(ctx, &previous.product_id, new_product_id).await?;
         }
     }
     Ok(())

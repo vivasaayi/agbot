@@ -20,6 +20,7 @@ use crate::provenance_store::{self, ProvenanceStoreError};
 use provenance::{lineage_record_for_product_draft, ActorIdentity};
 use shared::product_graph::{ProductLevel, ProductRecordDraft};
 use sqlx::Row;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use thiserror::Error;
 
@@ -44,6 +45,11 @@ pub enum CatalogError {
     InvalidLevel { product_id: String, value: String },
     #[error("failed to persist provenance lineage: {0}")]
     Lineage(#[from] ProvenanceStoreError),
+    #[error("failed to reclaim artifact file {path}: {source}")]
+    Io {
+        path: String,
+        source: std::io::Error,
+    },
     #[error(transparent)]
     Db(#[from] sqlx::Error),
 }
@@ -462,6 +468,60 @@ pub async fn supersede_product(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Delete a product's on-disk artifact to reclaim space (used after a product
+/// is superseded, so regenerated rasters don't accumulate unbounded).
+///
+/// Safety-guarded so it can never delete outside the managed data tree or a
+/// still-referenced file:
+/// - the product must have a non-empty artifact path;
+/// - the resolved path must live under `data_root`;
+/// - no other catalog product may still reference the same path (content-
+///   addressed products can share a file).
+///
+/// Returns the removed path, or `None` when nothing was eligible/present. A
+/// missing file is treated as already reclaimed (`Ok(None)`), not an error.
+pub async fn reclaim_product_artifact(
+    pool: &DbPool,
+    data_root: &Path,
+    product_id: &str,
+) -> Result<Option<PathBuf>, CatalogError> {
+    let Some(product) = get_product(pool, product_id).await? else {
+        return Ok(None);
+    };
+    let Some(path) = product.path.filter(|p| !p.is_empty()) else {
+        return Ok(None);
+    };
+    let path_buf = PathBuf::from(&path);
+
+    // Never touch a file outside the managed data tree. canonicalize also
+    // fails when the file is already gone -> treated as nothing to reclaim.
+    let under_root = match (path_buf.canonicalize(), data_root.canonicalize()) {
+        (Ok(resolved), Ok(root)) => resolved.starts_with(&root),
+        _ => false,
+    };
+    if !under_root {
+        return Ok(None);
+    }
+
+    // Never delete an artifact another product still points at.
+    let others: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM catalog_products WHERE path = ? AND product_id != ?",
+    )
+    .bind(&path)
+    .bind(product_id)
+    .fetch_one(pool)
+    .await?;
+    if others > 0 {
+        return Ok(None);
+    }
+
+    match std::fs::remove_file(&path_buf) {
+        Ok(()) => Ok(Some(path_buf)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CatalogError::Io { path, source }),
+    }
 }
 
 fn row_to_product(row: sqlx::sqlite::SqliteRow) -> Result<RegisteredProduct, CatalogError> {

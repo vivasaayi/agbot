@@ -38,6 +38,16 @@ State is persisted in two named Docker volumes so upgrades never lose data:
 - `geo_hub_db`   → `/opt/agbot/db`   (SQLite database)
 - `geo_hub_data` → `/opt/agbot/data` (ingested scenes / products)
 
+### Disk retention
+
+The pipeline regenerates monthly composites, climatologies, and phenology
+products, superseding the prior version each time. By default the appliance
+deletes a superseded product's artifact file as it is superseded
+(`GEO_HUB__STORAGE__DELETE_SUPERSEDED_ARTIFACTS=true`) so rasters don't
+accumulate unbounded on the data volume. Deletion is safety-guarded — only
+files under the data root that no other product still references are removed.
+Set `AGBOT_DELETE_SUPERSEDED=false` to keep every superseded artifact.
+
 ### Backup & restore
 
 The `geo_hub` binary can snapshot and restore its SQLite database. Backup uses
