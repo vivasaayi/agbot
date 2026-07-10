@@ -135,6 +135,17 @@ agbot.example.com {
 }
 ```
 
+### Health & readiness probes
+
+Two endpoints, both public:
+
+- `GET /health` — **liveness**: the process is up. Dependency-free, so it never
+  flaps on a transient database hiccup. The container healthcheck uses this.
+- `GET /ready` (alias `GET /readyz`) — **readiness**: returns `200 ready` only
+  when the SQLite pool answers a query, else `503`. Point an orchestrator's
+  readiness/traffic-gate at this so requests aren't routed before the database
+  is reachable.
+
 ## Mac role (desktop GUIs)
 
 Requires `just`, a Rust toolchain, and (for the sim) a C++/CMake toolchain.

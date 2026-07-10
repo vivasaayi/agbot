@@ -5,8 +5,10 @@ use crate::satellite_derivation::UrlCogResolver;
 use crate::{config::HubConfig, routes, state::AppState};
 use anyhow::Result;
 use axum::{
-    extract::DefaultBodyLimit,
+    extract::{DefaultBodyLimit, State},
+    http::StatusCode,
     middleware::from_fn_with_state,
+    response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
     Router,
 };
@@ -16,12 +18,24 @@ use tokio::sync::watch;
 use tower_http::services::ServeDir;
 use tracing::{info, warn};
 
+/// Liveness probe: the process is up and serving. Deliberately dependency-free
+/// so it never flaps on a transient database hiccup (that is `/ready`'s job).
 async fn health_handler() -> &'static str {
     "ok"
 }
 
-async fn ready_handler() -> &'static str {
-    "ready"
+/// Readiness probe: the process can serve real traffic, which for geo_hub means
+/// the SQLite pool answers a trivial query. Returns 200 `ready` or 503 with a
+/// reason so orchestrators / the appliance healthcheck can gate traffic.
+async fn ready_handler(State(state): State<AppState>) -> Response {
+    match sqlx::query("SELECT 1").execute(&state.pool).await {
+        Ok(_) => (StatusCode::OK, "ready").into_response(),
+        Err(err) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("not ready: database unavailable: {err}"),
+        )
+            .into_response(),
+    }
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -46,6 +60,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/mobile/analyze", post(routes::mobile_analyze))
         .route("/health", get(health_handler))
         .route("/ready", get(ready_handler))
+        .route("/readyz", get(ready_handler))
         .route("/api/ingest/health", get(routes::get_ingest_health))
         .route(
             "/api/ingest/drone-session",
