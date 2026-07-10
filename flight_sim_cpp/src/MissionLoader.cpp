@@ -1,5 +1,7 @@
 #include "agbot_flight_sim/MissionLoader.hpp"
 
+#include "agbot_flight_sim/AssetPaths.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -432,7 +434,7 @@ void MissionLoader::save_to_file(const Mission& mission, const std::filesystem::
 }
 
 std::filesystem::path default_sample_mission_path() {
-    return std::filesystem::path(AGBOT_FLIGHT_SIM_SOURCE_DIR) / "samples" / "sample_field_loop.json";
+    return sim_samples_dir() / "sample_field_loop.json";
 }
 
 std::string mission_to_json(const Mission& mission) {

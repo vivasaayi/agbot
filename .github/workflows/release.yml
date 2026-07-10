@@ -1,0 +1,165 @@
+name: Release
+
+# Publishes the geo_hub appliance image (farmer portal + web workspace/browse
+# + APIs + satellite ingestion) to GHCR. Linux-only: no macOS runners. The Mac
+# desktop apps (geo_viewer, flight_sim_cpp) are built locally via `agbot`.
+#
+#   push to main          -> dated pre-release  vYYYY.MM.DD-<sha>  + :edge tag
+#   tag push  v*          -> semver release      <tag>             + :latest tag
+#   workflow_dispatch      -> semver release      inputs.version    + :latest tag
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Semver release tag to publish (e.g. v1.2.3). Promotes to :latest.'
+        required: true
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/geo-hub
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    name: Build & publish geo_hub appliance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate appliance Dockerfile contract
+        run: bash scripts/verify-appliance-build.sh
+
+      - name: Resolve release version and channel
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="${GITHUB_SHA::7}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            version="${{ inputs.version }}"
+            channel="stable"
+            prerelease="false"
+          elif [ "${{ github.ref_type }}" = "tag" ]; then
+            version="${GITHUB_REF_NAME}"
+            channel="stable"
+            prerelease="false"
+          else
+            version="v$(date -u +%Y.%m.%d)-${sha}"
+            channel="edge"
+            prerelease="true"
+          fi
+          # Normalise the image tag (strip a leading refs/ just in case).
+          image_tag="${version#v}"
+          {
+            echo "version=${version}"
+            echo "image_tag=${image_tag}"
+            echo "channel=${channel}"
+            echo "prerelease=${prerelease}"
+            echo "sha=${sha}"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved release ${version} (channel=${channel}, prerelease=${prerelease})"
+
+      - name: Compute image tags
+        id: tags
+        shell: bash
+        run: |
+          set -euo pipefail
+          base="${REGISTRY}/${IMAGE_NAME}"
+          base="$(echo "$base" | tr '[:upper:]' '[:lower:]')"
+          tags="${base}:${{ steps.version.outputs.image_tag }}"
+          tags="${tags}
+          ${base}:sha-${{ steps.version.outputs.sha }}"
+          if [ "${{ steps.version.outputs.channel }}" = "stable" ]; then
+            tags="${tags}
+          ${base}:latest"
+          else
+            tags="${tags}
+          ${base}:edge"
+          fi
+          {
+            echo "base=${base}"
+            echo "list<<EOF"
+            echo "${tags}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push appliance image
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          target: runtime-appliance
+          push: true
+          tags: ${{ steps.tags.outputs.list }}
+          build-args: |
+            AGRODRONE_COMMIT=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Write build manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > build-manifest.json <<EOF
+          {
+            "schema_version": 1,
+            "component": "geo_hub-appliance",
+            "version": "${{ steps.version.outputs.version }}",
+            "channel": "${{ steps.version.outputs.channel }}",
+            "prerelease": ${{ steps.version.outputs.prerelease }},
+            "source_commit": "${{ github.sha }}",
+            "image": "${{ steps.tags.outputs.base }}:${{ steps.version.outputs.image_tag }}",
+            "image_digest": "${{ steps.build.outputs.digest }}",
+            "built_at": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+          cat build-manifest.json
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          name: geo_hub ${{ steps.version.outputs.version }}
+          prerelease: ${{ steps.version.outputs.prerelease == 'true' }}
+          generate_release_notes: true
+          files: build-manifest.json
+          body: |
+            geo_hub appliance image (`${{ steps.version.outputs.channel }}` channel).
+
+            **Pull:**
+            ```
+            docker pull ${{ steps.tags.outputs.base }}:${{ steps.version.outputs.image_tag }}
+            ```
+
+            **Deploy on the Linux server:**
+            ```
+            agbot upgrade --channel ${{ steps.version.outputs.channel }}
+            ```
+
+            Digest: `${{ steps.build.outputs.digest }}`

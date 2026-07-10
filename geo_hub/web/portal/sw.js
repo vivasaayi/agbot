@@ -11,7 +11,7 @@
 // - There is intentionally NO background sync: mutations made while offline
 //   are not queued or replayed. The user must retry once back online.
 
-const CACHE_VERSION = "agbot-portal-v2";
+const CACHE_VERSION = "agbot-portal-v3";
 
 const PRECACHE_URLS = [
   "/portal/",

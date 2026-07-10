@@ -1,0 +1,36 @@
+# Production deployment for the geo_hub appliance (farmer portal + web
+# workspace/browse + APIs + satellite ingestion). SQLite-backed, single
+# service, no Postgres. Driven by the `agbot` CLI, which resolves the image
+# tag for the selected channel and writes the .env consumed here.
+#
+#   AGBOT_IMAGE   full image ref, e.g. ghcr.io/vivasaayi/geo-hub:latest
+#   AGBOT_PORT    host port to expose the portal on (default 8080)
+#
+# State lives in named volumes so `agbot upgrade` can re-pull the image
+# without losing the database or ingested data.
+
+services:
+  geo_hub:
+    image: ${AGBOT_IMAGE:-ghcr.io/vivasaayi/geo-hub:latest}
+    container_name: agbot-geo-hub
+    restart: unless-stopped
+    ports:
+      - "${AGBOT_PORT:-8080}:8080"
+    environment:
+      # The image bakes absolute GEO_HUB__* defaults; override here only to
+      # opt into the pipeline worker or point at a different runtime mode.
+      GEO_HUB__PIPELINE__ENABLED: ${AGBOT_PIPELINE_ENABLED:-false}
+      GEO_HUB__RUNTIME_MODE: ${AGBOT_RUNTIME_MODE:-local}
+    volumes:
+      - geo_hub_db:/opt/agbot/db
+      - geo_hub_data:/opt/agbot/data
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
+
+volumes:
+  geo_hub_db:
+  geo_hub_data:

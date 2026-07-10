@@ -1,5 +1,7 @@
 #include "agbot_flight_sim/SimulationOps.hpp"
 
+#include "agbot_flight_sim/AssetPaths.hpp"
+
 #include <algorithm>
 #include <fstream>
 #include <sstream>
@@ -202,11 +204,11 @@ std::uintmax_t clear_tile_cache(const std::filesystem::path& cache_dir) {
 }
 
 std::filesystem::path default_map_tile_cache_dir() {
-    return std::filesystem::path(AGBOT_FLIGHT_SIM_SOURCE_DIR) / "out" / "map_tiles";
+    return sim_out_dir() / "map_tiles";
 }
 
 std::filesystem::path default_elevation_tile_cache_dir() {
-    return std::filesystem::path(AGBOT_FLIGHT_SIM_SOURCE_DIR) / "out" / "elevation_tiles";
+    return sim_out_dir() / "elevation_tiles";
 }
 
 } // namespace agbot::flight_sim

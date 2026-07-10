@@ -17,6 +17,12 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to connect database")?;
 
+    // First-run bootstrap: seed a default org/account/access code on a fresh
+    // server so the farmer PWA is usable immediately. No-op once provisioned.
+    geo_hub::bootstrap::ensure_bootstrap(&pool, &config.bootstrap)
+        .await
+        .context("first-run bootstrap failed")?;
+
     // Subcommands: `geo_hub catalog register <dir>` walks product_record.json
     // sidecars and registers them; no args runs the server.
     let args: Vec<String> = std::env::args().skip(1).collect();

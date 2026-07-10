@@ -82,6 +82,37 @@ impl Default for PipelineConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BootstrapConfig {
+    /// When true, a fresh server (no marketplace accounts yet) is seeded with a
+    /// default org + account + portal access code so the farmer PWA works
+    /// out-of-the-box. Seeding is skipped entirely once any account exists, so
+    /// it never touches a real deployment.
+    pub enabled: bool,
+    /// Org id assigned to the seeded account and demo farm/field.
+    pub org_id: String,
+    /// Account id the seeded access code authenticates as.
+    pub account_id: String,
+    /// Plaintext access code the operator logs in with on a fresh server. Only
+    /// its sha256 hash is stored. Override in any exposed deployment.
+    pub access_code: String,
+    /// When true, also seed one demo farm + field so the portal is not empty.
+    pub seed_demo: bool,
+}
+
+impl Default for BootstrapConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            org_id: "org-local".to_string(),
+            account_id: "acct-local".to_string(),
+            access_code: "agb-demo".to_string(),
+            seed_demo: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct HubConfig {
@@ -97,6 +128,7 @@ pub struct HubConfig {
     pub workspace_web_root: PathBuf,
     pub landsat: LandsatConfig,
     pub pipeline: PipelineConfig,
+    pub bootstrap: BootstrapConfig,
 }
 
 impl Default for HubConfig {
@@ -109,6 +141,7 @@ impl Default for HubConfig {
             workspace_web_root: PathBuf::from("geo_hub/web"),
             landsat: LandsatConfig::default(),
             pipeline: PipelineConfig::default(),
+            bootstrap: BootstrapConfig::default(),
         }
     }
 }
@@ -162,7 +195,28 @@ impl HubConfig {
     pub fn ensure_data_dirs(&self) -> Result<()> {
         std::fs::create_dir_all(&self.data_root)?;
         std::fs::create_dir_all(self.data_root.join("scenes"))?;
+        if let Some(parent) = self.sqlite_db_parent() {
+            std::fs::create_dir_all(&parent)?;
+        }
         Ok(())
+    }
+
+    /// For a `sqlite://` database URL backed by a file, return the parent
+    /// directory of that file so it can be created ahead of connecting. This
+    /// keeps a relocated appliance (e.g. `sqlite:///opt/agbot/db/geo_hub.db`)
+    /// working even when the enclosing directory does not yet exist. Returns
+    /// `None` for in-memory databases and non-sqlite URLs.
+    fn sqlite_db_parent(&self) -> Option<PathBuf> {
+        let rest = self.database_url.strip_prefix("sqlite://")?;
+        // Strip any `?mode=rwc` style query suffix and in-memory markers.
+        let path_part = rest.split('?').next().unwrap_or(rest);
+        if path_part.is_empty() || path_part == ":memory:" {
+            return None;
+        }
+        Path::new(path_part)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(Path::to_path_buf)
     }
 
     /// Resolve the directory of the static web workspace served at
@@ -293,6 +347,38 @@ provider_min_delay_ms = 500
         assert!(config.pipeline.enabled);
         assert_eq!(config.pipeline.poll_interval_ms, 2500);
         assert_eq!(config.pipeline.provider_min_delay_ms, 500);
+    }
+
+    #[test]
+    fn ensure_data_dirs_creates_absolute_sqlite_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_dir = tmp.path().join("db");
+        let data_dir = tmp.path().join("data");
+        let config = HubConfig {
+            database_url: format!("sqlite://{}/geo_hub.db?mode=rwc", db_dir.display()),
+            data_root: data_dir.clone(),
+            ..HubConfig::default()
+        };
+
+        config.ensure_data_dirs().unwrap();
+
+        assert!(db_dir.is_dir());
+        assert!(data_dir.join("scenes").is_dir());
+    }
+
+    #[test]
+    fn sqlite_db_parent_ignores_relative_and_memory_urls() {
+        let relative = HubConfig {
+            database_url: "sqlite://geo_hub.db?mode=rwc".to_string(),
+            ..HubConfig::default()
+        };
+        assert_eq!(relative.sqlite_db_parent(), None);
+
+        let memory = HubConfig {
+            database_url: "sqlite://:memory:".to_string(),
+            ..HubConfig::default()
+        };
+        assert_eq!(memory.sqlite_db_parent(), None);
     }
 
     #[test]
