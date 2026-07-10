@@ -49,6 +49,14 @@ export const endpoints = {
   fieldTimeseries: "/api/fields/:field_id/timeseries",
 };
 
+/**
+ * Leaflet XYZ tile-url template for a catalog product (e.g. a true-color RGB
+ * composite). Leaflet fills the `{z}/{x}/{y}` placeholders per tile request.
+ */
+export function catalogProductTilesUrlTemplate(productId) {
+  return `/api/catalog/products/${encodeURIComponent(productId)}/tiles/{z}/{x}/{y}.png`;
+}
+
 /** A field's multi-source metric time-series (requires `metric`). */
 export function fieldTimeseriesPath(fieldId, query) {
   const params = new URLSearchParams();

@@ -1125,9 +1125,123 @@ pub async fn derive_satellite_index(
     })
 }
 
+/// The catalog `kind` for a natural-color composite. The tile route
+/// (`routes::product_tiles`) recognises this kind and composites the three
+/// band artifacts named in the product's parameters via
+/// [`crate::product_tiler::render_rgb_web_tile`].
+pub const RGB_PRODUCT_KIND: &str = "rgb";
+
+/// One band of a true-color composite: the GeoTIFF artifact path plus, when
+/// known, the catalog product id it came from (recorded as lineage input).
+#[derive(Debug, Clone)]
+pub struct RgbBandRef {
+    pub path: String,
+    pub product_id: Option<String>,
+}
+
+impl RgbBandRef {
+    pub fn new(path: impl Into<String>, product_id: Option<String>) -> Self {
+        Self {
+            path: path.into(),
+            product_id,
+        }
+    }
+}
+
+/// Build a true-color (`rgb`) composite product draft that references three
+/// single-band GeoTIFF artifacts (red, green, blue) rather than storing a
+/// raster of its own. The tiler composites the bands on demand, so no pixels
+/// are re-encoded at derivation time. An optional `(lo, hi)` per-channel
+/// stretch overrides the tiler's auto min/max scaling.
+pub fn rgb_composite_draft(
+    scope: ProductScope,
+    red: &RgbBandRef,
+    green: &RgbBandRef,
+    blue: &RgbBandRef,
+    stretch: Option<([f32; 3], [f32; 3])>,
+    source_id: Option<String>,
+) -> ProductRecordDraft {
+    let mut parameters = serde_json::json!({
+        "bands": {
+            "red": red.path,
+            "green": green.path,
+            "blue": blue.path,
+        },
+    });
+    if let Some((lo, hi)) = stretch {
+        parameters["stretch"] = serde_json::json!({
+            "lo": [lo[0], lo[1], lo[2]],
+            "hi": [hi[0], hi[1], hi[2]],
+        });
+    }
+
+    let inputs = [("red", red), ("green", green), ("blue", blue)]
+        .into_iter()
+        .filter_map(|(role, band)| {
+            band.product_id.clone().map(|product_id| ProductInputRef {
+                product_id,
+                role: role.to_string(),
+            })
+        })
+        .collect();
+
+    ProductRecordDraft {
+        level: ProductLevel::L2,
+        kind: RGB_PRODUCT_KIND.to_string(),
+        algorithm_id: "geo_hub.true_color".to_string(),
+        algorithm_version: "1.0.0".to_string(),
+        parameters,
+        inputs,
+        scope,
+        spatial_ref: None,
+        gsd_m_per_px: None,
+        artifact: None,
+        quality_mask: None,
+        confidence: None,
+        confidence_method: None,
+        quality_summary: None,
+        evidence_digests: Vec::new(),
+        source_id,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rgb_composite_draft_encodes_bands_stretch_and_lineage() {
+        let scope = ProductScope {
+            farm_id: None,
+            field_id: None,
+            season_id: None,
+            scene_id: Some("scene-x".to_string()),
+            temporal_start: "2026-07-01T00:00:00Z".to_string(),
+            temporal_end: "2026-07-01T00:00:00Z".to_string(),
+        };
+        let draft = rgb_composite_draft(
+            scope,
+            &RgbBandRef::new("/data/red.tif", Some("prod-red".to_string())),
+            &RgbBandRef::new("/data/green.tif", Some("prod-green".to_string())),
+            &RgbBandRef::new("/data/blue.tif", None),
+            Some(([0.0, 0.0, 0.0], [3000.0, 3000.0, 3000.0])),
+            Some("sentinel-2".to_string()),
+        );
+
+        assert_eq!(draft.kind, RGB_PRODUCT_KIND);
+        assert_eq!(draft.level, ProductLevel::L2);
+        assert!(
+            draft.artifact.is_none(),
+            "composite stores no raster of its own"
+        );
+        assert_eq!(draft.parameters["bands"]["red"], "/data/red.tif");
+        assert_eq!(draft.parameters["stretch"]["hi"][0], 3000.0);
+        // Only bands with a known product id become lineage inputs.
+        assert_eq!(draft.inputs.len(), 2);
+        assert_eq!(draft.inputs[0].role, "red");
+        assert_eq!(draft.inputs[0].product_id, "prod-red");
+        assert_eq!(draft.source_id.as_deref(), Some("sentinel-2"));
+    }
 
     /// Sentinel-2 tile 43PFN 10 m grid (matches the captured fixture item).
     fn grid_10m() -> BandGrid {

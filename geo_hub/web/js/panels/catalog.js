@@ -10,6 +10,13 @@ import {
   catalogProductsPath,
   fieldTimeseriesPath,
 } from "../api.js";
+import {
+  addCatalogProductLayer,
+  removeCatalogProductLayer,
+  hasCatalogProductLayer,
+} from "../map.js";
+
+const TRUE_COLOR_KINDS = new Set(["rgb", "truecolor", "true_color"]);
 
 function asItems(page) {
   if (Array.isArray(page)) return page;
@@ -209,6 +216,28 @@ async function renderLevelBrowser(inspector, sceneId) {
         line.textContent += ` · ${product.temporal_start.slice(0, 10)}`;
       }
       li.appendChild(line);
+
+      // True-color composites: toggle the RGB tile layer on the map.
+      if (TRUE_COLOR_KINDS.has(product.kind)) {
+        const toggle = document.createElement("button");
+        toggle.type = "button";
+        toggle.className = "pipeline-refresh";
+        const sync = () => {
+          toggle.textContent = hasCatalogProductLayer(product.product_id)
+            ? "Hide true-color"
+            : "Show true-color";
+        };
+        toggle.addEventListener("click", () => {
+          if (hasCatalogProductLayer(product.product_id)) {
+            removeCatalogProductLayer(product.product_id);
+          } else {
+            addCatalogProductLayer(product.product_id);
+          }
+          sync();
+        });
+        sync();
+        li.appendChild(toggle);
+      }
 
       // L2/L3 metric products: offer to plot the field's series for the
       // conventional `sat.<kind>.mean` metric.
