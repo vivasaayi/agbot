@@ -20,11 +20,78 @@ pub async fn connect_pool(config: &HubConfig) -> Result<DbPool> {
     Ok(pool)
 }
 
+/// The full baseline schema is version 1; add ordered `(version, sql)` steps to
+/// [`INCREMENTAL_MIGRATIONS`] for forward-only changes beyond it.
+const BASELINE_SCHEMA_VERSION: i64 = 1;
+
+/// Ordered incremental migrations applied after the baseline, each stamped into
+/// `PRAGMA user_version` on success and run exactly once (gated by version).
+/// Steps must be forward-only and ordered by ascending version.
+const INCREMENTAL_MIGRATIONS: &[(i64, &str)] = &[];
+
+/// The highest schema version this build knows how to reach.
+fn target_schema_version() -> i64 {
+    INCREMENTAL_MIGRATIONS
+        .iter()
+        .map(|(version, _)| *version)
+        .max()
+        .unwrap_or(BASELINE_SCHEMA_VERSION)
+        .max(BASELINE_SCHEMA_VERSION)
+}
+
+/// The database's recorded schema version (`PRAGMA user_version`, 0 on a fresh
+/// or pre-versioning database).
+pub async fn schema_version(pool: &Pool<Sqlite>) -> Result<i64> {
+    let row = sqlx::query("PRAGMA user_version").fetch_one(pool).await?;
+    Ok(row.get::<i64, _>(0))
+}
+
+async fn set_schema_version(pool: &Pool<Sqlite>, version: i64) -> Result<()> {
+    // PRAGMA does not accept bound parameters; `version` is an internal constant.
+    sqlx::query(&format!("PRAGMA user_version = {version};"))
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Bring the database schema up to [`target_schema_version`], recording progress
+/// in `PRAGMA user_version` so upgrades are ordered and idempotent.
+///
+/// A database at version 0 (fresh, or one created before versioning) runs the
+/// idempotent baseline DDL and is stamped to version 1; one already at >= 1
+/// skips the baseline entirely (a fast startup path). Incremental steps then
+/// run in order, each stamped on success, so a step never re-runs.
 async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
+    // Per-connection PRAGMA; runs on every startup regardless of version so it
+    // is not lost when the baseline is skipped.
     sqlx::query("PRAGMA foreign_keys = ON;")
         .execute(pool)
         .await?;
 
+    let current = schema_version(pool).await?;
+
+    if current < BASELINE_SCHEMA_VERSION {
+        apply_baseline_schema(pool).await?;
+        set_schema_version(pool, BASELINE_SCHEMA_VERSION).await?;
+    }
+
+    let mut version = schema_version(pool).await?;
+    for (step_version, sql) in INCREMENTAL_MIGRATIONS {
+        if *step_version > version {
+            sqlx::query(sql).execute(pool).await?;
+            set_schema_version(pool, *step_version).await?;
+            version = *step_version;
+            info!(version = *step_version, "applied schema migration");
+        }
+    }
+
+    let target = target_schema_version();
+    debug_assert_eq!(version, target, "migrations must reach the target version");
+    info!(schema_version = version, target, "database schema ready");
+    Ok(())
+}
+
+async fn apply_baseline_schema(pool: &Pool<Sqlite>) -> Result<()> {
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS farms (
@@ -3517,7 +3584,7 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
     .execute(pool)
     .await?;
 
-    info!("database ready");
+    info!("baseline schema applied");
     Ok(())
 }
 
