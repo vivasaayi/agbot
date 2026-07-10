@@ -75,6 +75,11 @@ pub struct PipelineConfig {
     /// the serial worker forever; on timeout the job is failed transiently and
     /// retried with backoff, so the worker keeps draining. `0` disables the cap.
     pub job_timeout_secs: u64,
+    /// Minimum product confidence the derive QA gate accepts. A derived product
+    /// scoring below this is quarantined (excluded from serving and downstream
+    /// L3/app fan-out) instead of silently entering the graph. `0` disables the
+    /// gate (every product with a defined confidence passes).
+    pub qa_min_confidence: f64,
 }
 
 impl Default for PipelineConfig {
@@ -86,6 +91,9 @@ impl Default for PipelineConfig {
             // 30 minutes: far above any legitimate derive/composite, low enough
             // to bound a wedged worker. Always on by default.
             job_timeout_secs: 1800,
+            // Off by default so existing behavior (accept all) is preserved;
+            // the appliance can raise it to quarantine low-confidence products.
+            qa_min_confidence: 0.0,
         }
     }
 }

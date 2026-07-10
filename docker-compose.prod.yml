@@ -28,6 +28,9 @@ services:
       # Hard cap on a single pipeline job's run time (seconds; 0 disables). A
       # hung handler is failed transiently so the serial worker keeps draining.
       GEO_HUB__PIPELINE__JOB_TIMEOUT_SECS: ${AGBOT_JOB_TIMEOUT_SECS:-1800}
+      # Minimum confidence a derived product must score to enter the graph; below
+      # it the product is quarantined (failed_qa) and its fan-out skipped. 0 off.
+      GEO_HUB__PIPELINE__QA_MIN_CONFIDENCE: ${AGBOT_QA_MIN_CONFIDENCE:-0}
       GEO_HUB__RUNTIME_MODE: ${AGBOT_RUNTIME_MODE:-local}
       # Admin access-code API bearer token. Empty → API disabled (fail-closed).
       GEO_HUB__SECURITY__ADMIN_TOKEN: ${AGBOT_ADMIN_TOKEN:-}

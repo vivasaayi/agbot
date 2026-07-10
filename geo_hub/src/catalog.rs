@@ -470,6 +470,51 @@ pub async fn supersede_product(
     Ok(())
 }
 
+/// Product status for one that failed the QA gate (an allowed value of the
+/// `catalog_products.status` CHECK constraint): present in the graph for
+/// audit/lineage but excluded from `status = 'registered'` queries (serving and
+/// downstream fan-out), so low-quality data does not propagate.
+pub const STATUS_FAILED_QA: &str = "failed_qa";
+
+/// QA-gate policy: the minimum acceptable product confidence. `0` accepts
+/// everything (gate disabled).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QaPolicy {
+    pub min_confidence: f64,
+}
+
+/// The QA gate's decision for a product.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QaVerdict {
+    Pass,
+    Quarantine { reason: String },
+}
+
+/// Evaluate a product's `confidence` against `policy`. An unknown confidence
+/// (`None`) passes — the gate rejects only a *measured* low score, never the
+/// absence of a measurement — as does any score at or above the minimum.
+pub fn qa_verdict(confidence: Option<f64>, policy: &QaPolicy) -> QaVerdict {
+    match confidence {
+        Some(score) if score < policy.min_confidence => QaVerdict::Quarantine {
+            reason: format!(
+                "confidence {score:.3} below minimum {:.3}",
+                policy.min_confidence
+            ),
+        },
+        _ => QaVerdict::Pass,
+    }
+}
+
+/// Mark a product as `failed_qa` so it is excluded from `registered` queries.
+pub async fn quarantine_product(pool: &DbPool, product_id: &str) -> Result<(), CatalogError> {
+    sqlx::query("UPDATE catalog_products SET status = ? WHERE product_id = ?")
+        .bind(STATUS_FAILED_QA)
+        .bind(product_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Delete a product's on-disk artifact to reclaim space (used after a product
 /// is superseded, so regenerated rasters don't accumulate unbounded).
 ///
@@ -685,4 +730,31 @@ pub async fn register_sidecar_dir(
         ));
     }
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qa_verdict_quarantines_only_a_measured_below_threshold_score() {
+        let policy = QaPolicy {
+            min_confidence: 0.5,
+        };
+        // Measured below threshold -> quarantine with a reason.
+        match qa_verdict(Some(0.4), &policy) {
+            QaVerdict::Quarantine { reason } => assert!(reason.contains("below minimum")),
+            other => panic!("expected quarantine, got {other:?}"),
+        }
+        // At or above threshold -> pass.
+        assert_eq!(qa_verdict(Some(0.5), &policy), QaVerdict::Pass);
+        assert_eq!(qa_verdict(Some(0.9), &policy), QaVerdict::Pass);
+        // Unknown confidence -> pass (the gate never rejects a missing measure).
+        assert_eq!(qa_verdict(None, &policy), QaVerdict::Pass);
+        // Disabled policy (0) accepts everything, including a 0 score.
+        let off = QaPolicy {
+            min_confidence: 0.0,
+        };
+        assert_eq!(qa_verdict(Some(0.0), &off), QaVerdict::Pass);
+    }
 }

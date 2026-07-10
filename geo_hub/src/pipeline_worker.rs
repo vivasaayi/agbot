@@ -845,6 +845,35 @@ async fn execute_derive(ctx: &PipelineWorkerContext, job: &PipelineJob) -> JobRu
         }
     };
 
+    // QA gate: a derived product scoring below the configured minimum is
+    // quarantined and its L3/app fan-out skipped, so low-quality data never
+    // propagates. Disabled when qa_min_confidence == 0.
+    if ctx.config.pipeline.qa_min_confidence > 0.0 {
+        let confidence = catalog::get_product(&ctx.pool, &outcome.product_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|product| product.confidence);
+        let policy = catalog::QaPolicy {
+            min_confidence: ctx.config.pipeline.qa_min_confidence,
+        };
+        if let catalog::QaVerdict::Quarantine { reason } = catalog::qa_verdict(confidence, &policy)
+        {
+            if let Err(err) = catalog::quarantine_product(&ctx.pool, &outcome.product_id).await {
+                return transient_failure(format!(
+                    "product {} failed QA but quarantine failed: {err}",
+                    outcome.product_id
+                ));
+            }
+            tracing::warn!(
+                product_id = %outcome.product_id,
+                reason,
+                "QA gate quarantined product; skipping L3/app fan-out"
+            );
+            return JobRunResult::Succeeded;
+        }
+    }
+
     // Post-derive hook (S-9): the registration is durable, so a follow-up
     // enqueue failure is transient — the retry re-runs the (idempotent,
     // content-addressed) derive and re-attempts the fan-out.
