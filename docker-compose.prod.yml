@@ -37,6 +37,9 @@ services:
       # Delete a product's artifact as it is superseded so regenerated rasters
       # don't fill the data volume. On by default for the appliance.
       GEO_HUB__STORAGE__DELETE_SUPERSEDED_ARTIFACTS: ${AGBOT_DELETE_SUPERSEDED:-true}
+      # Structured JSON logs for aggregation (RUST_LOG still sets levels).
+      GEO_HUB__OBSERVABILITY__LOG_FORMAT: ${AGBOT_LOG_FORMAT:-json}
+      RUST_LOG: ${AGBOT_RUST_LOG:-info}
     volumes:
       - geo_hub_db:/opt/agbot/db
       - geo_hub_data:/opt/agbot/data

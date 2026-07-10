@@ -167,6 +167,13 @@ agbot.example.com {
 }
 ```
 
+### Logging
+
+The appliance emits **structured JSON logs** by default
+(`GEO_HUB__OBSERVABILITY__LOG_FORMAT=json`) — one JSON object per record, ready
+for a log aggregator. `RUST_LOG` sets levels (default `info`) in either format.
+For human-readable local runs set `AGBOT_LOG_FORMAT=text`.
+
 ### Health & readiness probes
 
 Two endpoints, both public:

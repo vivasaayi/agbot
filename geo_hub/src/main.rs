@@ -1,13 +1,26 @@
 use anyhow::{bail, Context};
+use geo_hub::config::LogFormat;
 use geo_hub::{catalog, db, serve, HubConfig};
 use tracing::info;
 
+/// Initialize tracing. `RUST_LOG` controls levels (default `info`); the config
+/// selects text (default) or JSON output for log aggregation.
+fn init_logging(config: &HubConfig) {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let builder = fmt().with_env_filter(filter);
+    match config.observability.log_format {
+        LogFormat::Json => builder.json().init(),
+        LogFormat::Text => builder.init(),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt::init();
-
-    // Load configuration (from GEO_HUB_* env vars or geo_hub.{toml})
+    // Load configuration (from GEO_HUB_* env vars or geo_hub.{toml}) before
+    // logging so the log format can be configured.
     let config = HubConfig::load().context("failed to load hub config")?;
+    init_logging(&config);
     config
         .ensure_data_dirs()
         .context("failed to create data directories")?;

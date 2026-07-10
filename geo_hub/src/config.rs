@@ -137,6 +137,25 @@ impl SecurityConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogFormat {
+    /// Human-readable single-line records (default; good for a terminal).
+    #[default]
+    Text,
+    /// One JSON object per record, for log aggregators / structured search.
+    Json,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ObservabilityConfig {
+    /// Log output format. `RUST_LOG` still controls levels in both formats.
+    /// Set `GEO_HUB__OBSERVABILITY__LOG_FORMAT=json` on the appliance so logs
+    /// are machine-parseable.
+    pub log_format: LogFormat,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct StorageConfig {
@@ -199,6 +218,7 @@ pub struct HubConfig {
     pub bootstrap: BootstrapConfig,
     pub security: SecurityConfig,
     pub storage: StorageConfig,
+    pub observability: ObservabilityConfig,
 }
 
 impl Default for HubConfig {
@@ -214,6 +234,7 @@ impl Default for HubConfig {
             bootstrap: BootstrapConfig::default(),
             security: SecurityConfig::default(),
             storage: StorageConfig::default(),
+            observability: ObservabilityConfig::default(),
         }
     }
 }
@@ -450,6 +471,31 @@ admin_token = "  s3cret-admin  "
         let config = HubConfig::load_with_path(Some(&path)).unwrap();
         // The accessor trims surrounding whitespace and rejects empties.
         assert_eq!(config.security.admin_token(), Some("s3cret-admin"));
+    }
+
+    #[test]
+    fn hub_config_observability_log_format_defaults_text_and_parses_json() {
+        assert_eq!(
+            HubConfig::default().observability.log_format,
+            LogFormat::Text
+        );
+
+        let (_tmp, path) = write_config(
+            r#"
+runtime_mode = "local"
+bind_address = "127.0.0.1:8787"
+database_url = "sqlite://geo_hub_test.db"
+data_root = "tmp/geo_hub"
+
+[landsat]
+source = "sample"
+
+[observability]
+log_format = "json"
+"#,
+        );
+        let config = HubConfig::load_with_path(Some(&path)).unwrap();
+        assert_eq!(config.observability.log_format, LogFormat::Json);
     }
 
     #[test]
