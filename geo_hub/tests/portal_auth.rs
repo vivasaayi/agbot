@@ -32,13 +32,21 @@ async fn test_app() -> Result<TestApp> {
 }
 
 async fn test_app_with_admin_token(admin_token: Option<String>) -> Result<TestApp> {
+    test_app_with_security(SecurityConfig {
+        admin_token,
+        ..SecurityConfig::default()
+    })
+    .await
+}
+
+async fn test_app_with_security(security: SecurityConfig) -> Result<TestApp> {
     let tmp = TempDir::new()?;
     let db_path = tmp.path().join("geo_hub_test.db");
     let config = HubConfig {
         bind_address: "127.0.0.1:0".to_string(),
         database_url: format!("sqlite://{}?mode=rwc", db_path.display()),
         data_root: tmp.path().join("data"),
-        security: SecurityConfig { admin_token },
+        security,
         ..HubConfig::default()
     };
 
@@ -385,6 +393,47 @@ async fn mint_route_rejects_missing_or_wrong_admin_token() -> Result<()> {
             .fetch_one(&app.pool)
             .await?;
     assert_eq!(count, 0, "unauthorized calls must not mint codes");
+    Ok(())
+}
+
+#[tokio::test]
+async fn require_session_gate_rejects_anonymous_api_but_allows_public_paths() -> Result<()> {
+    let app = test_app_with_security(SecurityConfig {
+        admin_token: Some(ADMIN_TOKEN.to_string()),
+        require_session: true,
+        ..SecurityConfig::default()
+    })
+    .await?;
+    seed_account(&app.pool, "acct-1", "org-1", "active").await?;
+
+    // Public paths stay reachable without a session.
+    let (status, _) = request(&app, "GET", "/health", None, None).await?;
+    assert_eq!(status, StatusCode::OK, "health must stay public");
+
+    // Anonymous access to a gated /api route is 401.
+    let (status, _) = request(&app, "GET", "/api/portal/me", None, None).await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "gated api must be 401");
+    let (status, _) = request(&app, "GET", "/api/farms", None, None).await?;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "non-portal api must also be gated"
+    );
+
+    // Login is public, and the minted session then passes the gate.
+    let issued = issue_access_code(&app, "acct-1").await?;
+    let access_code = issued["access_code"].as_str().unwrap().to_string();
+    let (status, session) = login(&app, &access_code).await?;
+    assert_eq!(status, StatusCode::OK, "login must be public");
+    let token = session["token"].as_str().unwrap().to_string();
+
+    let (status, body) = request(&app, "GET", "/api/portal/me", Some(&token), None).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "valid session must pass gate: {body}"
+    );
+    assert_eq!(body["account_id"], "acct-1");
     Ok(())
 }
 

@@ -54,6 +54,71 @@ pub struct PortalIdentity {
     pub session_id: String,
 }
 
+/// Extract a non-empty `Authorization: Bearer <token>` from request headers.
+pub fn bearer_token(headers: &axum::http::HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+}
+
+/// Resolve a bearer token to an authenticated [`PortalIdentity`], or reject
+/// with 401. Shared by the `PortalIdentity` extractor and the global
+/// require-session middleware so both enforce identical validity rules
+/// (session unrevoked + unexpired, account `active`). Best-effort updates
+/// `last_seen_at`.
+pub async fn resolve_portal_session(
+    state: &AppState,
+    token: &str,
+) -> Result<PortalIdentity, AppError> {
+    let row = sqlx::query(
+        r#"
+        SELECT s.session_id, s.account_id, s.org_id, s.expires_at, s.revoked_at,
+               a.party_type, a.status
+        FROM portal_sessions s
+        JOIN marketplace_accounts a ON a.account_id = s.account_id
+        WHERE s.token_hash = ?1
+        "#,
+    )
+    .bind(hash_token(token))
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(|_| AppError::Unauthorized)?
+    .ok_or(AppError::Unauthorized)?;
+
+    let session = SessionStatus {
+        revoked_at: row
+            .get::<Option<String>, _>("revoked_at")
+            .as_deref()
+            .and_then(parse_stored_timestamp),
+        expires_at: parse_stored_timestamp(&row.get::<String, _>("expires_at"))
+            .ok_or(AppError::Unauthorized)?,
+    };
+    let account_active = row.get::<String, _>("status") == "active";
+    if !session_is_valid(&session, Utc::now()) || !account_active {
+        return Err(AppError::Unauthorized);
+    }
+
+    let identity = PortalIdentity {
+        account_id: row.get("account_id"),
+        org_id: row.get("org_id"),
+        party_type: row.get("party_type"),
+        session_id: row.get("session_id"),
+    };
+
+    // Best-effort activity tracking; an update failure must not fail the
+    // authenticated request.
+    let _ = sqlx::query("UPDATE portal_sessions SET last_seen_at = ?1 WHERE session_id = ?2")
+        .bind(current_record_timestamp())
+        .bind(&identity.session_id)
+        .execute(&state.pool)
+        .await;
+
+    Ok(identity)
+}
+
 #[axum::async_trait]
 impl FromRequestParts<AppState> for PortalIdentity {
     type Rejection = AppError;
@@ -62,59 +127,8 @@ impl FromRequestParts<AppState> for PortalIdentity {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let token = parts
-            .headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .map(str::trim)
-            .filter(|token| !token.is_empty())
-            .ok_or(AppError::Unauthorized)?;
-
-        let row = sqlx::query(
-            r#"
-            SELECT s.session_id, s.account_id, s.org_id, s.expires_at, s.revoked_at,
-                   a.party_type, a.status
-            FROM portal_sessions s
-            JOIN marketplace_accounts a ON a.account_id = s.account_id
-            WHERE s.token_hash = ?1
-            "#,
-        )
-        .bind(hash_token(token))
-        .fetch_optional(&state.pool)
-        .await
-        .map_err(|_| AppError::Unauthorized)?
-        .ok_or(AppError::Unauthorized)?;
-
-        let session = SessionStatus {
-            revoked_at: row
-                .get::<Option<String>, _>("revoked_at")
-                .as_deref()
-                .and_then(parse_stored_timestamp),
-            expires_at: parse_stored_timestamp(&row.get::<String, _>("expires_at"))
-                .ok_or(AppError::Unauthorized)?,
-        };
-        let account_active = row.get::<String, _>("status") == "active";
-        if !session_is_valid(&session, Utc::now()) || !account_active {
-            return Err(AppError::Unauthorized);
-        }
-
-        let identity = PortalIdentity {
-            account_id: row.get("account_id"),
-            org_id: row.get("org_id"),
-            party_type: row.get("party_type"),
-            session_id: row.get("session_id"),
-        };
-
-        // Best-effort activity tracking; an update failure must not fail the
-        // authenticated request.
-        let _ = sqlx::query("UPDATE portal_sessions SET last_seen_at = ?1 WHERE session_id = ?2")
-            .bind(current_record_timestamp())
-            .bind(&identity.session_id)
-            .execute(&state.pool)
-            .await;
-
-        Ok(identity)
+        let token = bearer_token(&parts.headers).ok_or(AppError::Unauthorized)?;
+        resolve_portal_session(state, token).await
     }
 }
 

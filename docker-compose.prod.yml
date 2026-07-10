@@ -28,6 +28,9 @@ services:
       GEO_HUB__RUNTIME_MODE: ${AGBOT_RUNTIME_MODE:-local}
       # Admin access-code API bearer token. Empty → API disabled (fail-closed).
       GEO_HUB__SECURITY__ADMIN_TOKEN: ${AGBOT_ADMIN_TOKEN:-}
+      # Require a valid portal session on every /api/* route (anonymous → 401).
+      # Off by default; turn on once the portal is exposed beyond a trusted LAN.
+      GEO_HUB__SECURITY__REQUIRE_SESSION: ${AGBOT_REQUIRE_SESSION:-false}
     volumes:
       - geo_hub_db:/opt/agbot/db
       - geo_hub_data:/opt/agbot/data

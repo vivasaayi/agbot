@@ -82,6 +82,25 @@ Treat the token as a secret (it is not baked into the image). Until a full
 operator-auth layer lands, keep the server behind a private network or a
 TLS-terminating reverse proxy.
 
+### Require a session on the API
+
+By default the `/api/*` surface is open (single-user / trusted-LAN loop). Once
+the portal is reachable beyond a network you control, require a valid portal
+session on every API call:
+
+```sh
+export AGBOT_REQUIRE_SESSION=true   # GEO_HUB__SECURITY__REQUIRE_SESSION
+agbot up
+```
+
+Anonymous calls then get `401 Unauthorized`. Health checks, the access-code
+login endpoint, the static app shell / PWA / browse assets, public share links,
+and the admin API (which uses its own token) stay reachable. Note: Leaflet
+raster-tile requests do not send an Authorization header, so map tiles under
+`/api/**/tiles/**` require the session too — front the browse/workspace UIs with
+an authenticating proxy if you enable the gate. Request bodies are capped at
+64 MiB (`GEO_HUB__SECURITY__MAX_BODY_BYTES`).
+
 ## Mac role (desktop GUIs)
 
 Requires `just`, a Rust toolchain, and (for the sim) a C++/CMake toolchain.

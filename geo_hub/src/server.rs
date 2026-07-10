@@ -5,6 +5,8 @@ use crate::satellite_derivation::UrlCogResolver;
 use crate::{config::HubConfig, routes, state::AppState};
 use anyhow::Result;
 use axum::{
+    extract::DefaultBodyLimit,
+    middleware::from_fn_with_state,
     routing::{delete, get, patch, post, put},
     Router,
 };
@@ -1124,6 +1126,15 @@ pub fn build_router(state: AppState) -> Router {
             "/api/pipeline/jobs/:job_id/retry",
             post(routes::retry_pipeline_job),
         )
+        // Global request-security layers. The require-session gate is a no-op
+        // unless `security.require_session` is set; the body limit always
+        // applies. `from_fn_with_state` bakes in the state, so these wrap the
+        // fully-stated router.
+        .layer(from_fn_with_state(
+            state.clone(),
+            crate::security::require_session_mw,
+        ))
+        .layer(DefaultBodyLimit::max(state.config.security.max_body_bytes))
         .with_state(state)
 }
 

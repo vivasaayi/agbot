@@ -82,7 +82,11 @@ impl Default for PipelineConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+/// Default request body cap (64 MiB) — generous enough for shapefile / GeoTIFF
+/// imports while still bounding memory per request.
+pub const DEFAULT_MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SecurityConfig {
     /// Bearer token required to call the admin API (portal access-code
@@ -94,6 +98,26 @@ pub struct SecurityConfig {
     /// exposed deployment; first-run login still works via the bootstrap
     /// access code, which is seeded directly into the database.
     pub admin_token: Option<String>,
+    /// When true, every non-public `/api/*` route requires a valid portal
+    /// session (`Authorization: Bearer <token>`); anonymous callers get 401.
+    /// Public paths (health, login, static shell, token-based shares) are
+    /// always allowed. Defaults to **false** so local/dev/test runs are
+    /// unauthenticated; turn it on (`GEO_HUB__SECURITY__REQUIRE_SESSION=true`)
+    /// in any exposed deployment.
+    pub require_session: bool,
+    /// Maximum accepted request body size in bytes. Requests larger than this
+    /// are rejected with 413 before the handler runs.
+    pub max_body_bytes: usize,
+}
+
+impl Default for SecurityConfig {
+    fn default() -> Self {
+        Self {
+            admin_token: None,
+            require_session: false,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+        }
+    }
 }
 
 impl SecurityConfig {
@@ -404,6 +428,7 @@ admin_token = "  s3cret-admin  "
     fn security_admin_token_accessor_rejects_blank() {
         let blank = SecurityConfig {
             admin_token: Some("   ".to_string()),
+            ..SecurityConfig::default()
         };
         assert_eq!(blank.admin_token(), None);
     }
