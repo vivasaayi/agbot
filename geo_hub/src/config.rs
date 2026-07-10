@@ -82,6 +82,30 @@ impl Default for PipelineConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct SecurityConfig {
+    /// Bearer token required to call the admin API (portal access-code
+    /// mint / list / revoke). Minting an access code can forge a portal
+    /// session for any account, so these routes are gated.
+    ///
+    /// When `None` (or empty) the admin API is **disabled** and returns 403 —
+    /// fail-closed, never open. Set `GEO_HUB__SECURITY__ADMIN_TOKEN` in any
+    /// exposed deployment; first-run login still works via the bootstrap
+    /// access code, which is seeded directly into the database.
+    pub admin_token: Option<String>,
+}
+
+impl SecurityConfig {
+    /// The configured admin token, if a non-empty one is set.
+    pub fn admin_token(&self) -> Option<&str> {
+        self.admin_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct BootstrapConfig {
@@ -129,6 +153,7 @@ pub struct HubConfig {
     pub landsat: LandsatConfig,
     pub pipeline: PipelineConfig,
     pub bootstrap: BootstrapConfig,
+    pub security: SecurityConfig,
 }
 
 impl Default for HubConfig {
@@ -142,6 +167,7 @@ impl Default for HubConfig {
             landsat: LandsatConfig::default(),
             pipeline: PipelineConfig::default(),
             bootstrap: BootstrapConfig::default(),
+            security: SecurityConfig::default(),
         }
     }
 }
@@ -347,6 +373,39 @@ provider_min_delay_ms = 500
         assert!(config.pipeline.enabled);
         assert_eq!(config.pipeline.poll_interval_ms, 2500);
         assert_eq!(config.pipeline.provider_min_delay_ms, 500);
+    }
+
+    #[test]
+    fn hub_config_security_admin_token_defaults_off_and_loads_from_file() {
+        let default_config = HubConfig::default();
+        assert_eq!(default_config.security.admin_token(), None);
+
+        let (_tmp, path) = write_config(
+            r#"
+runtime_mode = "simulation"
+bind_address = "127.0.0.1:8787"
+database_url = "sqlite://geo_hub_test.db"
+data_root = "tmp/geo_hub"
+
+[landsat]
+source = "sample"
+
+[security]
+admin_token = "  s3cret-admin  "
+"#,
+        );
+
+        let config = HubConfig::load_with_path(Some(&path)).unwrap();
+        // The accessor trims surrounding whitespace and rejects empties.
+        assert_eq!(config.security.admin_token(), Some("s3cret-admin"));
+    }
+
+    #[test]
+    fn security_admin_token_accessor_rejects_blank() {
+        let blank = SecurityConfig {
+            admin_token: Some("   ".to_string()),
+        };
+        assert_eq!(blank.admin_token(), None);
     }
 
     #[test]

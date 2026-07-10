@@ -118,6 +118,49 @@ impl FromRequestParts<AppState> for PortalIdentity {
     }
 }
 
+/// Proof that the caller presented the configured admin bearer token.
+///
+/// The admin access-code API (mint / list / revoke) can forge a portal session
+/// for any account, so it is gated by a static bearer token from
+/// `GEO_HUB__SECURITY__ADMIN_TOKEN`. When no token is configured the API is
+/// disabled entirely (403 Forbidden) rather than left open; a wrong or missing
+/// token is 401.
+pub struct AdminIdentity;
+
+#[axum::async_trait]
+impl FromRequestParts<AppState> for AdminIdentity {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let configured = state.config.security.admin_token().ok_or_else(|| {
+            AppError::Forbidden(
+                "admin API is disabled: set GEO_HUB__SECURITY__ADMIN_TOKEN to enable it"
+                    .to_string(),
+            )
+        })?;
+
+        let presented = parts
+            .headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+            .ok_or(AppError::Unauthorized)?;
+
+        // Hash both sides to fixed-length hex before comparing so neither the
+        // token length nor an early-mismatch position leaks through timing.
+        if hash_token(presented) == hash_token(configured) {
+            Ok(AdminIdentity)
+        } else {
+            Err(AppError::Unauthorized)
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct PortalLoginRequest {
     pub access_code: String,
@@ -283,9 +326,10 @@ pub async fn portal_me(
 // ---------------------------------------------------------------------------
 // Admin access-code lifecycle.
 //
-// v1 intentionally ships these without authentication: the whole geo_hub API
-// is deployed on a trusted network today and no operator auth layer exists
-// yet. When one lands, these routes must be gated by it.
+// These routes can mint an access code — and therefore a portal session — for
+// any account, so they are gated by the `AdminIdentity` extractor (a static
+// bearer token from `GEO_HUB__SECURITY__ADMIN_TOKEN`). With no token
+// configured the API is disabled (403); a wrong/missing token is 401.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -309,6 +353,7 @@ pub struct PortalAccessCodeIssueResponse {
 /// POST /api/admin/portal/access-codes — mint an access code for an active
 /// marketplace account. The plaintext code appears only in this response.
 pub async fn issue_portal_access_code(
+    _admin: AdminIdentity,
     State(state): State<AppState>,
     Json(request): Json<PortalAccessCodeIssueRequest>,
 ) -> AppResult<Json<PortalAccessCodeIssueResponse>> {
@@ -399,6 +444,7 @@ fn portal_access_code_summary(row: &sqlx::sqlite::SqliteRow) -> PortalAccessCode
 
 /// GET /api/admin/portal/access-codes?account_id= — masked listing.
 pub async fn list_portal_access_codes(
+    _admin: AdminIdentity,
     Query(query): Query<PortalAccessCodeListQuery>,
     State(state): State<AppState>,
 ) -> AppResult<Json<Vec<PortalAccessCodeSummary>>> {
@@ -423,6 +469,7 @@ pub async fn list_portal_access_codes(
 /// POST /api/admin/portal/access-codes/:code_id/revoke — revoke a code so it
 /// can no longer be exchanged for sessions (existing sessions are unaffected).
 pub async fn revoke_portal_access_code(
+    _admin: AdminIdentity,
     Path(code_id): Path<String>,
     State(state): State<AppState>,
 ) -> AppResult<Json<PortalAccessCodeSummary>> {

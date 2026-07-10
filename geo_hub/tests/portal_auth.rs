@@ -7,6 +7,7 @@ use axum::{
     http::{Request, StatusCode},
     Router,
 };
+use geo_hub::config::SecurityConfig;
 use geo_hub::db::DbPool;
 use geo_hub::portal_auth::hash_token;
 use geo_hub::state::AppState;
@@ -16,6 +17,10 @@ use std::sync::Arc;
 use tempfile::TempDir;
 use tower::util::ServiceExt;
 
+/// Admin bearer token the test server is configured with; admin access-code
+/// routes require it.
+const ADMIN_TOKEN: &str = "test-admin-token";
+
 struct TestApp {
     router: Router,
     pool: DbPool,
@@ -23,12 +28,17 @@ struct TestApp {
 }
 
 async fn test_app() -> Result<TestApp> {
+    test_app_with_admin_token(Some(ADMIN_TOKEN.to_string())).await
+}
+
+async fn test_app_with_admin_token(admin_token: Option<String>) -> Result<TestApp> {
     let tmp = TempDir::new()?;
     let db_path = tmp.path().join("geo_hub_test.db");
     let config = HubConfig {
         bind_address: "127.0.0.1:0".to_string(),
         database_url: format!("sqlite://{}?mode=rwc", db_path.display()),
         data_root: tmp.path().join("data"),
+        security: SecurityConfig { admin_token },
         ..HubConfig::default()
     };
 
@@ -98,7 +108,7 @@ async fn issue_access_code(app: &TestApp, account_id: &str) -> Result<Value> {
         app,
         "POST",
         "/api/admin/portal/access-codes",
-        None,
+        Some(ADMIN_TOKEN),
         Some(json!({ "account_id": account_id })),
     )
     .await?;
@@ -168,7 +178,7 @@ async fn revoked_or_expired_access_code_is_unauthorized() -> Result<()> {
         &app,
         "POST",
         &format!("/api/admin/portal/access-codes/{code_id}/revoke"),
-        None,
+        Some(ADMIN_TOKEN),
         None,
     )
     .await?;
@@ -181,7 +191,7 @@ async fn revoked_or_expired_access_code_is_unauthorized() -> Result<()> {
         &app,
         "POST",
         "/api/admin/portal/access-codes",
-        None,
+        Some(ADMIN_TOKEN),
         Some(json!({
             "account_id": "acct-1",
             "expires_at": "2020-01-01T00:00:00Z"
@@ -320,7 +330,7 @@ async fn issued_access_code_is_stored_hashed_and_returned_once() -> Result<()> {
         &app,
         "GET",
         "/api/admin/portal/access-codes?account_id=acct-1",
-        None,
+        Some(ADMIN_TOKEN),
         None,
     )
     .await?;
@@ -335,5 +345,79 @@ async fn issued_access_code_is_stored_hashed_and_returned_once() -> Result<()> {
         "list must not expose plaintext"
     );
     assert_eq!(listing[0]["code_id"], issued["code_id"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn mint_route_rejects_missing_or_wrong_admin_token() -> Result<()> {
+    let app = test_app().await?;
+    seed_account(&app.pool, "acct-1", "org-1", "active").await?;
+
+    // No bearer token at all -> 401.
+    let (status, _) = request(
+        &app,
+        "POST",
+        "/api/admin/portal/access-codes",
+        None,
+        Some(json!({ "account_id": "acct-1" })),
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "missing token must be 401"
+    );
+
+    // Wrong token -> 401.
+    let (status, _) = request(
+        &app,
+        "POST",
+        "/api/admin/portal/access-codes",
+        Some("not-the-admin-token"),
+        Some(json!({ "account_id": "acct-1" })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "wrong token must be 401");
+
+    // No code was minted.
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM portal_access_codes WHERE account_id = 'acct-1'")
+            .fetch_one(&app.pool)
+            .await?;
+    assert_eq!(count, 0, "unauthorized calls must not mint codes");
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_api_is_disabled_when_no_token_configured() -> Result<()> {
+    // Fail-closed: with no admin token configured the admin API is off (403),
+    // even for a caller presenting some bearer token.
+    let app = test_app_with_admin_token(None).await?;
+    seed_account(&app.pool, "acct-1", "org-1", "active").await?;
+
+    let (status, _) = request(
+        &app,
+        "POST",
+        "/api/admin/portal/access-codes",
+        Some("anything"),
+        Some(json!({ "account_id": "acct-1" })),
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "admin API must be disabled without a configured token"
+    );
+
+    // List and revoke are gated the same way.
+    let (status, _) = request(
+        &app,
+        "GET",
+        "/api/admin/portal/access-codes",
+        Some("anything"),
+        None,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::FORBIDDEN);
     Ok(())
 }

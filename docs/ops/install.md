@@ -58,6 +58,30 @@ agbot config set port 9090            # expose on a different host port
 agbot config set image_repo ghcr.io/<org>/geo-hub
 ```
 
+### Admin access-code API (security)
+
+The routes that mint, list, and revoke portal access codes
+(`/api/admin/portal/access-codes*`) can forge a session for any account, so
+they are gated by a static bearer token.
+
+- **Disabled by default.** With no token configured the admin API returns
+  `403 Forbidden` — fail-closed. First-run portal login is unaffected: the
+  bootstrap access code is seeded directly into the database.
+- **Enable it** by setting a strong random token before issuing codes to real
+  users:
+
+  ```sh
+  export AGBOT_ADMIN_TOKEN="$(openssl rand -hex 32)"
+  agbot up          # compose passes it through as GEO_HUB__SECURITY__ADMIN_TOKEN
+  ```
+
+  Then call the admin API with `Authorization: Bearer <token>`. A missing or
+  wrong token is `401 Unauthorized`.
+
+Treat the token as a secret (it is not baked into the image). Until a full
+operator-auth layer lands, keep the server behind a private network or a
+TLS-terminating reverse proxy.
+
 ## Mac role (desktop GUIs)
 
 Requires `just`, a Rust toolchain, and (for the sim) a C++/CMake toolchain.
