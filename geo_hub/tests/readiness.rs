@@ -61,3 +61,22 @@ async fn ready_and_readyz_report_database_backed_readiness() -> Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn metrics_exposes_liveness_and_pipeline_queue_gauges() -> Result<()> {
+    let (router, _tmp) = test_router().await?;
+    let (status, body) = get(&router, "/metrics").await?;
+    assert_eq!(status, StatusCode::OK);
+    // Prometheus text exposition: process liveness plus a gauge per job status
+    // (all present at 0 on a fresh queue).
+    assert!(body.contains("geo_hub_up 1"), "up gauge: {body}");
+    assert!(
+        body.contains("geo_hub_pipeline_jobs{status=\"queued\"} 0"),
+        "queued gauge: {body}"
+    );
+    assert!(
+        body.contains("geo_hub_pipeline_jobs{status=\"dead\"} 0"),
+        "dead gauge: {body}"
+    );
+    Ok(())
+}

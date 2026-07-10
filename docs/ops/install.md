@@ -184,6 +184,11 @@ Two endpoints, both public:
   when the SQLite pool answers a query, else `503`. Point an orchestrator's
   readiness/traffic-gate at this so requests aren't routed before the database
   is reachable.
+- `GET /metrics` — **Prometheus metrics**: process liveness (`geo_hub_up`) and
+  pipeline queue depth by status (`geo_hub_pipeline_jobs{status="…"}`), so
+  alerting can watch a growing `dead`/`failed` count or `queued` backlog. Low
+  sensitivity, but scrape it over the private network (or the reverse proxy),
+  not the public internet.
 
 ## Mac role (desktop GUIs)
 

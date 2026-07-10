@@ -6,7 +6,7 @@ use crate::{config::HubConfig, routes, state::AppState};
 use anyhow::Result;
 use axum::{
     extract::{DefaultBodyLimit, State},
-    http::StatusCode,
+    http::{header, HeaderValue, StatusCode},
     middleware::from_fn_with_state,
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
@@ -38,6 +38,60 @@ async fn ready_handler(State(state): State<AppState>) -> Response {
     }
 }
 
+/// Prometheus text-exposition metrics: process liveness plus pipeline queue
+/// depth by status (the highest-signal ops gauge — a growing `dead`/`failed`
+/// count or `queued` backlog is what alerting watches). No metrics registry is
+/// pulled in; the gauges are read live from the queue table on scrape.
+async fn metrics_handler(State(state): State<AppState>) -> Response {
+    use std::fmt::Write as _;
+
+    let mut body = String::from(
+        "# HELP geo_hub_up 1 when the process is serving.\n\
+         # TYPE geo_hub_up gauge\n\
+         geo_hub_up 1\n",
+    );
+
+    // Emit every known status (0 when absent) so a gauge never silently drops
+    // off a dashboard between scrapes.
+    let mut counts: std::collections::BTreeMap<&str, i64> = [
+        ("queued", 0),
+        ("running", 0),
+        ("succeeded", 0),
+        ("failed", 0),
+        ("dead", 0),
+    ]
+    .into_iter()
+    .collect();
+    if let Ok(rows) = sqlx::query_as::<_, (String, i64)>(
+        "SELECT status, COUNT(*) FROM pipeline_jobs GROUP BY status",
+    )
+    .fetch_all(&state.pool)
+    .await
+    {
+        for (status, n) in rows {
+            if let Some(slot) = counts.get_mut(status.as_str()) {
+                *slot = n;
+            }
+        }
+    }
+    body.push_str(
+        "# HELP geo_hub_pipeline_jobs Pipeline jobs by status.\n\
+         # TYPE geo_hub_pipeline_jobs gauge\n",
+    );
+    for (status, n) in &counts {
+        let _ = writeln!(body, "geo_hub_pipeline_jobs{{status=\"{status}\"}} {n}");
+    }
+
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4"),
+        )],
+        body,
+    )
+        .into_response()
+}
+
 pub fn build_router(state: AppState) -> Router {
     let router = Router::new()
         .nest_service(
@@ -61,6 +115,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/health", get(health_handler))
         .route("/ready", get(ready_handler))
         .route("/readyz", get(ready_handler))
+        .route("/metrics", get(metrics_handler))
         .route("/api/ingest/health", get(routes::get_ingest_health))
         .route(
             "/api/ingest/drone-session",
