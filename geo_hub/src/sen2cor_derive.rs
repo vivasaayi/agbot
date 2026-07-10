@@ -13,6 +13,14 @@
 //! (EPSG code + per-resolution ULX/ULY/XDIM/YDIM) — Sentinel-2 JP2s do not
 //! carry a GeoTIFF-style grid, and the decoder is deliberately a pure pixel
 //! reader.
+//!
+//! **SCL cloud masking (batch 28):** when the scene's registered
+//! `band_scl_20m` product (Sen2Cor's own Scene Classification Layer) is
+//! present, cloud/shadow/defective pixels are masked before the index —
+//! the Sen2Cor parallel of the HLS Fmask path. SCL is 20 m against the
+//! 10 m bands, so codes are block-replicated 2x by deterministic
+//! nearest-neighbor before masking; `scl_applied` is recorded in the
+//! product parameters and the SCL product joins the lineage.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -37,8 +45,22 @@ use crate::sen2cor::SEN2COR_SOURCE_ID;
 /// may sit (`IMG_DATA/R10m/band.jp2` -> granule dir is 2..3 levels up).
 const METADATA_SEARCH_DEPTH: usize = 4;
 
+/// Sen2Cor SCL codes kept as clear-sky ground for index math: vegetation
+/// (4), not-vegetated (5), water (6), unclassified (7 — not positively
+/// cloudy), and snow/ice (11 — valid ground, matching the HLS Fmask
+/// decision). Rejected: no-data (0), saturated/defective (1), cast/dark
+/// shadows (2), cloud shadows (3), cloud medium/high probability (8/9),
+/// thin cirrus (10), and any out-of-range code.
+pub fn scl_clear(code: u16) -> bool {
+    matches!(code, 4 | 5 | 6 | 7 | 11)
+}
+
 #[derive(Debug, Error)]
 pub enum Sen2CorDeriveError {
+    #[error(
+        "index {0:?} is not derivable from Sen2Cor bands (supported: ndvi, ndwi, mndwi, ndmi, nbr)"
+    )]
+    UnsupportedIndex(String),
     #[error("scene {scene_id} has no registered {kind} product (run `geo_hub sen2cor run` first)")]
     BandNotFound { scene_id: String, kind: String },
     #[error("band product {product_id} has no artifact path")]
@@ -49,6 +71,13 @@ pub enum Sen2CorDeriveError {
     GridMismatch {
         red_dims: (u32, u32),
         nir_dims: (u32, u32),
+    },
+    #[error(
+        "SCL band {scl_dims:?} is not the 20 m half-resolution grid of the {band_dims:?} bands"
+    )]
+    SclGridMismatch {
+        scl_dims: (u32, u32),
+        band_dims: (u32, u32),
     },
     #[error("no MTD_TL.xml found within {depth} levels above {band_path}")]
     MetadataNotFound { band_path: PathBuf, depth: usize },
@@ -79,20 +108,25 @@ impl Sen2CorDeriveError {
     pub fn is_client_error(&self) -> bool {
         matches!(
             self,
-            Sen2CorDeriveError::BandNotFound { .. }
+            Sen2CorDeriveError::UnsupportedIndex(_)
+                | Sen2CorDeriveError::BandNotFound { .. }
                 | Sen2CorDeriveError::NoArtifact { .. }
                 | Sen2CorDeriveError::GridMismatch { .. }
+                | Sen2CorDeriveError::SclGridMismatch { .. }
                 | Sen2CorDeriveError::MetadataNotFound { .. }
                 | Sen2CorDeriveError::BadGeocoding { .. }
         )
     }
 }
 
-/// One Sen2Cor NDVI derivation request.
+/// One Sen2Cor index derivation request.
 #[derive(Debug, Clone, Deserialize)]
-pub struct Sen2CorNdviRequest {
+pub struct Sen2CorIndexRequest {
     /// Scene id of a registered Sen2Cor L2A (the L1 band products' scene).
     pub scene_id: String,
+    /// Index to derive: `ndvi` (default), `mndwi`, or `ndmi`.
+    #[serde(default = "default_index")]
+    pub index: String,
     /// Processing-baseline calibration: `true` (default, baseline >= 04.00)
     /// applies the BOA offset `refl = (DN - 1000)/10000`; `false` uses the
     /// legacy `DN/10000`.
@@ -108,17 +142,139 @@ fn default_true() -> bool {
     true
 }
 
+fn default_index() -> String {
+    "ndvi".to_string()
+}
+
 /// Outcome of one derivation, with registration references.
 #[derive(Debug, Clone, Serialize)]
-pub struct Sen2CorNdviOutcome {
-    pub ndvi_product_id: String,
+pub struct Sen2CorIndexOutcome {
+    pub index_product_id: String,
+    /// Index key (`ndvi` / `mndwi` / `ndmi`) — also the catalog kind.
+    pub index: String,
     pub scene_id: String,
     pub valid_pixels: usize,
     pub invalid_pixels: usize,
     pub sensor_profile: String,
-    pub ndvi_artifact: PathBuf,
+    /// Whether Sen2Cor's SCL band masked clouds before the index.
+    pub scl_applied: bool,
+    pub index_artifact: PathBuf,
     pub stac_item_href: String,
     pub tiles_href: String,
+}
+
+/// One input band of an index spec: catalog kind, index role, and whether
+/// its 20 m grid must be block-replicated 2x onto a 10 m output grid.
+struct SpecBand {
+    role: IndexBandRole,
+    kind: &'static str,
+    upsample_2x: bool,
+}
+
+/// A derivable Sen2Cor index: the two bands it needs and the output grid
+/// resolution (the `MTD_TL.xml` geoposition to read).
+struct Sen2CorIndexSpec {
+    key: &'static str,
+    kind: IndexKind,
+    bands: [SpecBand; 2],
+    /// Output grid resolution in meters (10 or 20).
+    resolution: u32,
+}
+
+/// Supported indices (batch 29, extended batch 30). MNDWI mixes
+/// resolutions: B03 is 10 m, B11 (SWIR1) only exists at 20 m and is
+/// block-replicated. NDMI and NBR run natively on the 20 m grid
+/// (B8A + B11 / B8A + B12); NBR feeds the dNBR burn-severity path.
+/// NDWI (green vs broad NIR) runs fully at 10 m (B03 + B08).
+fn index_spec(index: &str) -> Option<Sen2CorIndexSpec> {
+    match index.trim().to_ascii_lowercase().as_str() {
+        "ndvi" => Some(Sen2CorIndexSpec {
+            key: "ndvi",
+            kind: IndexKind::Ndvi,
+            bands: [
+                SpecBand {
+                    role: IndexBandRole::Red,
+                    kind: "band_b04_10m",
+                    upsample_2x: false,
+                },
+                SpecBand {
+                    role: IndexBandRole::Nir,
+                    kind: "band_b08_10m",
+                    upsample_2x: false,
+                },
+            ],
+            resolution: 10,
+        }),
+        "mndwi" => Some(Sen2CorIndexSpec {
+            key: "mndwi",
+            kind: IndexKind::Mndwi,
+            bands: [
+                SpecBand {
+                    role: IndexBandRole::Green,
+                    kind: "band_b03_10m",
+                    upsample_2x: false,
+                },
+                SpecBand {
+                    role: IndexBandRole::Swir1,
+                    kind: "band_b11_20m",
+                    upsample_2x: true,
+                },
+            ],
+            resolution: 10,
+        }),
+        "ndwi" => Some(Sen2CorIndexSpec {
+            key: "ndwi",
+            kind: IndexKind::Ndwi,
+            bands: [
+                SpecBand {
+                    role: IndexBandRole::Green,
+                    kind: "band_b03_10m",
+                    upsample_2x: false,
+                },
+                SpecBand {
+                    role: IndexBandRole::Nir,
+                    kind: "band_b08_10m",
+                    upsample_2x: false,
+                },
+            ],
+            resolution: 10,
+        }),
+        "nbr" => Some(Sen2CorIndexSpec {
+            key: "nbr",
+            kind: IndexKind::Nbr,
+            bands: [
+                SpecBand {
+                    role: IndexBandRole::Nir,
+                    kind: "band_b8a_20m",
+                    upsample_2x: false,
+                },
+                SpecBand {
+                    role: IndexBandRole::Swir2,
+                    kind: "band_b12_20m",
+                    upsample_2x: false,
+                },
+            ],
+            resolution: 20,
+        }),
+        "ndmi" => Some(Sen2CorIndexSpec {
+            key: "ndmi",
+            kind: IndexKind::Ndmi,
+            bands: [
+                SpecBand {
+                    role: IndexBandRole::Nir,
+                    kind: "band_b8a_20m",
+                    upsample_2x: false,
+                },
+                SpecBand {
+                    role: IndexBandRole::Swir1,
+                    kind: "band_b11_20m",
+                    upsample_2x: false,
+                },
+            ],
+            resolution: 20,
+        }),
+        _ => None,
+    }
 }
 
 /// First `<TAG>text</TAG>` payload in an XML fragment. Sentinel tile
@@ -208,6 +364,20 @@ async fn band_product(
         })
 }
 
+/// Like [`band_product`] but absence is not an error (quality bands are
+/// optional).
+async fn optional_band_product(
+    pool: &DbPool,
+    scene_id: &str,
+    kind: &str,
+) -> Result<Option<RegisteredProduct>, Sen2CorDeriveError> {
+    match band_product(pool, scene_id, kind).await {
+        Ok(product) => Ok(Some(product)),
+        Err(Sen2CorDeriveError::BandNotFound { .. }) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
 fn decode_band(product: &RegisteredProduct) -> Result<(Jp2Gray, PathBuf), Sen2CorDeriveError> {
     let path = product
         .path
@@ -219,34 +389,76 @@ fn decode_band(product: &RegisteredProduct) -> Result<(Jp2Gray, PathBuf), Sen2Co
     Ok((read_jp2_gray(&path)?, path))
 }
 
-/// Derive NDVI from a registered Sen2Cor scene's 10 m red/NIR JP2 bands and
-/// register it as an `ndvi` L2 GeoTIFF with lineage to both band products.
-/// Idempotent: identical inputs re-register the same content-addressed id.
-pub async fn derive_sen2cor_ndvi(
+/// Derive one spectral index from a registered Sen2Cor scene's JP2 bands
+/// and register it as an L2 GeoTIFF (kind = the index key) with lineage to
+/// the band products (and the SCL mask when applied). Idempotent: identical
+/// inputs re-register the same content-addressed id.
+pub async fn derive_sen2cor_index(
     pool: &DbPool,
     data_root: &Path,
-    request: &Sen2CorNdviRequest,
-) -> Result<Sen2CorNdviOutcome, Sen2CorDeriveError> {
-    let red_product = band_product(pool, &request.scene_id, "band_b04_10m").await?;
-    let nir_product = band_product(pool, &request.scene_id, "band_b08_10m").await?;
-    let (red, red_path) = decode_band(&red_product)?;
-    let (nir, _) = decode_band(&nir_product)?;
-    if (red.width, red.height) != (nir.width, nir.height) {
-        return Err(Sen2CorDeriveError::GridMismatch {
-            red_dims: (red.width, red.height),
-            nir_dims: (nir.width, nir.height),
+    request: &Sen2CorIndexRequest,
+) -> Result<Sen2CorIndexOutcome, Sen2CorDeriveError> {
+    let spec = index_spec(&request.index)
+        .ok_or_else(|| Sen2CorDeriveError::UnsupportedIndex(request.index.clone()))?;
+
+    // Load both bands; the first spec band is on the output grid by
+    // construction (upsampled bands are never listed first), so it defines
+    // the grid dimensions.
+    let mut products = Vec::new();
+    let mut rasters = Vec::new();
+    let mut first_path = None;
+    for band in &spec.bands {
+        let product = band_product(pool, &request.scene_id, band.kind).await?;
+        let (raster, path) = decode_band(&product)?;
+        if first_path.is_none() {
+            first_path = Some(path);
+        }
+        products.push(product);
+        rasters.push(raster);
+    }
+    let (grid_width, grid_height) = (rasters[0].width, rasters[0].height);
+    debug_assert!(
+        !spec.bands[0].upsample_2x,
+        "first spec band defines the grid"
+    );
+
+    // Bring every band onto the output grid: native bands must match it
+    // exactly; 20 m bands feeding a 10 m grid block-replicate 2x.
+    let mut band_values: Vec<Vec<u16>> = Vec::new();
+    for (band, raster) in spec.bands.iter().zip(&rasters) {
+        let expected = if band.upsample_2x {
+            (grid_width / 2, grid_height / 2)
+        } else {
+            (grid_width, grid_height)
+        };
+        if (raster.width, raster.height) != expected {
+            return Err(Sen2CorDeriveError::GridMismatch {
+                red_dims: (grid_width, grid_height),
+                nir_dims: (raster.width, raster.height),
+            });
+        }
+        band_values.push(if band.upsample_2x {
+            crate::satellite_derivation::resample_nearest(
+                &raster.values,
+                raster.width,
+                raster.height,
+                grid_width,
+                grid_height,
+            )
+        } else {
+            raster.values.clone()
         });
     }
 
-    // Grid from the granule tile metadata (10 m resolution for B04/B08).
-    let metadata_path = find_tile_metadata(&red_path)?;
+    // Grid from the granule tile metadata at the output resolution.
+    let metadata_path = find_tile_metadata(first_path.as_deref().expect("first band path"))?;
     let xml = std::fs::read_to_string(&metadata_path).map_err(|source| {
         Sen2CorDeriveError::MetadataUnreadable {
             path: metadata_path.clone(),
             source,
         }
     })?;
-    let (epsg, transform) = parse_tile_geocoding(&xml, 10)?;
+    let (epsg, transform) = parse_tile_geocoding(&xml, spec.resolution)?;
 
     // DN -> surface reflectance through the canonical sensor profiles
     // (fill DN 0 is reason-coded, reflectance clamped to [0, 1]).
@@ -260,19 +472,61 @@ pub async fn derive_sen2cor_ndvi(
     } else {
         "sentinel2_l2a_legacy"
     };
-    let scaled_red = apply_radiometric_scaling(profile, &red.values);
-    let scaled_nir = apply_radiometric_scaling(profile, &nir.values);
-    let bands = BTreeMap::from([
-        (IndexBandRole::Red, scaled_red.pixels),
-        (IndexBandRole::Nir, scaled_nir.pixels),
-    ]);
-    let clear = vec![true; red.values.len()];
-    let index = compute_masked_index(IndexKind::Ndvi, &bands, &clear)
+    let mut bands = BTreeMap::new();
+    let mut fill_counts = serde_json::Map::new();
+    for (band, values) in spec.bands.iter().zip(&band_values) {
+        let scaled = apply_radiometric_scaling(profile, values);
+        fill_counts.insert(
+            format!("{}_fill_pixels", band.kind),
+            serde_json::json!(scaled.fill_pixel_count),
+        );
+        bands.insert(band.role, scaled.pixels);
+    }
+
+    // Clear-sky mask from Sen2Cor's own SCL band when the scene has one
+    // (native on a 20 m grid, block-replicated 2x onto a 10 m grid);
+    // otherwise keep all.
+    let scl_product = optional_band_product(pool, &request.scene_id, "band_scl_20m").await?;
+    let (clear, scl_applied, scl_input) = match &scl_product {
+        Some(product) => {
+            let (scl, _) = decode_band(product)?;
+            let codes = if (scl.width, scl.height) == (grid_width, grid_height) {
+                scl.values
+            } else if (scl.width * 2, scl.height * 2) == (grid_width, grid_height) {
+                crate::satellite_derivation::resample_nearest(
+                    &scl.values,
+                    scl.width,
+                    scl.height,
+                    grid_width,
+                    grid_height,
+                )
+            } else {
+                return Err(Sen2CorDeriveError::SclGridMismatch {
+                    scl_dims: (scl.width, scl.height),
+                    band_dims: (grid_width, grid_height),
+                });
+            };
+            (
+                codes.iter().map(|code| scl_clear(*code)).collect(),
+                true,
+                Some(ProductInputRef {
+                    product_id: product.product_id.clone(),
+                    role: "scl_mask".to_string(),
+                }),
+            )
+        }
+        None => (
+            vec![true; grid_width as usize * grid_height as usize],
+            false,
+            None,
+        ),
+    };
+    let index = compute_masked_index(spec.kind, &bands, &clear)
         .map_err(|err| Sen2CorDeriveError::Index(err.to_string()))?;
 
     // Spatial reference mirrors raster_io's GeoTIFF reader construction so
     // the registered metadata matches what consumers re-read from disk.
-    let (width_px, height_px) = (f64::from(red.width), f64::from(red.height));
+    let (width_px, height_px) = (f64::from(grid_width), f64::from(grid_height));
     let (min_x, max_x) = (transform[0], transform[0] + width_px * transform[1]);
     let (max_y, min_y) = (transform[3], transform[3] + height_px * transform[5]);
     let spatial_ref = RasterSpatialRef {
@@ -290,36 +544,37 @@ pub async fn derive_sen2cor_ndvi(
 
     let mut draft = ProductRecordDraft {
         level: ProductLevel::L2,
-        kind: "ndvi".to_string(),
-        algorithm_id: "sen2cor.ndvi".to_string(),
+        kind: spec.key.to_string(),
+        algorithm_id: format!("sen2cor.{}", spec.key),
         algorithm_version: "1.0.0".to_string(),
         parameters: serde_json::json!({
             "scene_id": request.scene_id,
-            "index": "ndvi",
-            "red_band": "B04_10m",
-            "nir_band": "B08_10m",
+            "index": spec.key,
+            "bands": spec.bands.iter().map(|b| b.kind).collect::<Vec<_>>(),
+            "resolution_m": spec.resolution,
             "sensor_profile": profile_label,
+            "scl_applied": scl_applied,
         }),
-        inputs: vec![
-            ProductInputRef {
-                product_id: red_product.product_id.clone(),
-                role: "red".to_string(),
-            },
-            ProductInputRef {
-                product_id: nir_product.product_id.clone(),
-                role: "nir".to_string(),
-            },
-        ],
+        inputs: spec
+            .bands
+            .iter()
+            .zip(&products)
+            .map(|(band, product)| ProductInputRef {
+                product_id: product.product_id.clone(),
+                role: band.role.key().to_string(),
+            })
+            .chain(scl_input)
+            .collect(),
         scope: ProductScope {
             farm_id: None,
             field_id: request.field_id.clone(),
             season_id: request.season_id.clone(),
             scene_id: Some(request.scene_id.clone()),
-            temporal_start: red_product
+            temporal_start: products[0]
                 .temporal_start
                 .clone()
                 .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string()),
-            temporal_end: red_product
+            temporal_end: products[0]
                 .temporal_end
                 .clone()
                 .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string()),
@@ -335,19 +590,19 @@ pub async fn derive_sen2cor_ndvi(
         source_id: Some(SEN2COR_SOURCE_ID.to_string()),
     };
 
-    let ndvi_dir = data_root.join("derived").join("sen2cor_ndvi");
-    std::fs::create_dir_all(&ndvi_dir).map_err(|source| Sen2CorDeriveError::Store {
-        what: "sen2cor ndvi directory",
+    let index_dir = data_root.join("derived").join("sen2cor_index");
+    std::fs::create_dir_all(&index_dir).map_err(|source| Sen2CorDeriveError::Store {
+        what: "sen2cor index directory",
         source,
     })?;
-    let ndvi_path = ndvi_dir.join(format!(
+    let index_path = index_dir.join(format!(
         "{}.tif",
         artifact_file_component(&draft.product_id())
     ));
     write_geotiff_f32(
-        &ndvi_path,
-        red.width,
-        red.height,
+        &index_path,
+        grid_width,
+        grid_height,
         &index.values,
         &GeoTiffTags {
             epsg: Some(epsg),
@@ -355,35 +610,48 @@ pub async fn derive_sen2cor_ndvi(
             nodata: Some(f64::from(INDEX_NODATA)),
         },
     )?;
-    let checksum = file_checksum(&ndvi_path, "sen2cor ndvi readback")?;
+    let checksum = file_checksum(&index_path, "sen2cor index readback")?;
     draft.artifact = Some(ProductArtifact {
         format: "tif".to_string(),
-        path: ndvi_path.to_string_lossy().to_string(),
+        path: index_path.to_string_lossy().to_string(),
         checksum_sha256: Some(checksum.clone()),
     });
     draft.evidence_digests.push(checksum);
-    draft.quality_summary = Some(serde_json::json!({
+    let mut quality = serde_json::json!({
         "valid_pixels": index.valid_pixels,
         "invalid_pixels": index.invalid_pixels,
         "reasons": index.reason_counts,
-        "red_fill_pixels": scaled_red.fill_pixel_count,
-        "nir_fill_pixels": scaled_nir.fill_pixel_count,
-    }));
+    });
+    quality
+        .as_object_mut()
+        .expect("quality is an object")
+        .extend(fill_counts);
+    draft.quality_summary = Some(quality);
 
     let actor = provenance::ActorIdentity::system("geo_hub:sen2cor_derive");
     let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
-    let ndvi_product_id =
+    let index_product_id =
         catalog::register_product_with_actor(pool, &draft, &actor, &created_at).await?;
 
-    Ok(Sen2CorNdviOutcome {
-        stac_item_href: format!("/api/stac/collections/ndvi/items/{ndvi_product_id}"),
-        tiles_href: format!("/api/catalog/products/{ndvi_product_id}/tiles/{{z}}/{{x}}/{{y}}.png"),
-        ndvi_product_id,
+    // Per-field time series (batch S-3): best-effort, never fails the derive.
+    if request.field_id.is_some() {
+        crate::field_timeseries::append_field_stats_best_effort(pool, &index_product_id).await;
+    }
+
+    Ok(Sen2CorIndexOutcome {
+        stac_item_href: format!(
+            "/api/stac/collections/{}/items/{index_product_id}",
+            spec.key
+        ),
+        tiles_href: format!("/api/catalog/products/{index_product_id}/tiles/{{z}}/{{x}}/{{y}}.png"),
+        index_product_id,
+        index: spec.key.to_string(),
         scene_id: request.scene_id.clone(),
         valid_pixels: index.valid_pixels,
         invalid_pixels: index.invalid_pixels,
         sensor_profile: profile_label.to_string(),
-        ndvi_artifact: ndvi_path,
+        scl_applied,
+        index_artifact: index_path,
     })
 }
 
@@ -440,6 +708,19 @@ mod tests {
             parse_tile_geocoding(&no_ulx, 10),
             Err(Sen2CorDeriveError::BadGeocoding { what: "ULX", .. })
         ));
+    }
+
+    #[test]
+    fn scl_clear_codes_are_pinned() {
+        // 0 nodata, 1 saturated, 2 cast shadow, 3 cloud shadow, 8/9 cloud,
+        // 10 cirrus -> rejected; 4 vegetation, 5 bare, 6 water,
+        // 7 unclassified, 11 snow -> kept; out-of-range rejected.
+        for rejected in [0u16, 1, 2, 3, 8, 9, 10, 12, 255] {
+            assert!(!scl_clear(rejected), "{rejected}");
+        }
+        for kept in [4u16, 5, 6, 7, 11] {
+            assert!(scl_clear(kept), "{kept}");
+        }
     }
 
     #[test]

@@ -16,3 +16,10 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 futures-lite = "2.3"
 shared = { path = "../shared" }
 sensor_overlay_engine = { path = "../sensor_overlay_engine" }
+
+[features]
+# Fast incremental linking for local development only. Enable with
+# `cargo run -p geo_viewer --features dev-fast-link`. Do NOT use for release
+# builds: it dynamically links Bevy, yielding a binary that is not relocatable
+# (it requires libbevy_dylib next to it). `just viewer` builds without it.
+dev-fast-link = ["bevy/dynamic_linking"]

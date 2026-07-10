@@ -63,6 +63,8 @@ pub enum LandCoverError {
     NoUsableSeries { skipped: usize },
     #[error("phenology computation failed: {0}")]
     Phenology(#[from] PhenologyError),
+    #[error("series {0:?} is not a known input population (supported: l2, composites)")]
+    UnsupportedSeries(String),
     #[error("product {product_id} kind {kind:?} is not {expected:?}")]
     WrongKind {
         product_id: String,
@@ -95,6 +97,7 @@ impl LandCoverError {
     pub fn is_client_error(&self) -> bool {
         match self {
             LandCoverError::BadWindow { .. }
+            | LandCoverError::UnsupportedSeries(_)
             | LandCoverError::NoSeries { .. }
             | LandCoverError::NoUsableSeries { .. }
             | LandCoverError::Phenology(_)
@@ -121,6 +124,16 @@ pub struct LandCoverDeriveRequest {
     pub min_observations: u32,
     #[serde(default = "default_threshold_fraction")]
     pub season_threshold_fraction: f32,
+    /// Input population (batch 33): `l2` (default) uses raw index L2
+    /// observations; `composites` uses `temporal_composite` L3 products of
+    /// the index instead — one cloud-gap-filled observation per composited
+    /// window, never mixed with raw scenes (mixing would double-count).
+    #[serde(default = "default_series")]
+    pub series: String,
+}
+
+fn default_series() -> String {
+    "l2".to_string()
 }
 
 fn default_min_observations() -> u32 {
@@ -165,14 +178,22 @@ async fn load_series(
     kind: &str,
     start: &str,
     end: &str,
+    composites: bool,
     reference: Option<&LoadedRaster>,
     skipped: &mut Vec<SkippedObservation>,
 ) -> Result<Vec<(RegisteredProduct, LoadedRaster)>, LandCoverError> {
+    // Raw L2 observations, or (batch 33) `temporal_composite` L3s of the
+    // index — one gap-filled observation per composited window.
+    let (filter_kind, level) = if composites {
+        ("temporal_composite", ProductLevel::L3)
+    } else {
+        (kind, ProductLevel::L2)
+    };
     let mut candidates = catalog::list_products(
         pool,
         &ProductFilter {
-            kind: Some(kind.to_string()),
-            level: Some(ProductLevel::L2),
+            kind: Some(filter_kind.to_string()),
+            level: Some(level),
             status: Some("registered".to_string()),
             temporal_start: Some(start.to_string()),
             temporal_end: Some(end.to_string()),
@@ -180,6 +201,13 @@ async fn load_series(
         },
     )
     .await?;
+    if composites {
+        // Only composites of THIS index (band_names is identity-bearing on
+        // the composite draft).
+        candidates.retain(|candidate| {
+            candidate.parameters.get("band_names") == Some(&serde_json::json!([kind]))
+        });
+    }
     // Deterministic date order; the earliest dated product anchors the grid.
     candidates.sort_by_key(|product| {
         (
@@ -242,12 +270,18 @@ pub async fn derive_landcover(
             end: request.end.clone(),
         });
     }
+    let composites = match request.series.trim().to_ascii_lowercase().as_str() {
+        "l2" => false,
+        "composites" => true,
+        other => return Err(LandCoverError::UnsupportedSeries(other.to_string())),
+    };
     let mut skipped = Vec::new();
     let ndvi_series = load_series(
         pool,
         "ndvi",
         &request.start,
         &request.end,
+        composites,
         None,
         &mut skipped,
     )
@@ -274,6 +308,7 @@ pub async fn derive_landcover(
         "mndwi",
         &request.start,
         &request.end,
+        composites,
         Some(reference),
         &mut skipped,
     )
@@ -337,6 +372,9 @@ pub async fn derive_landcover(
     let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
 
     let mut phenology_draft = phenology_l3_draft(&phenology, &scope);
+    if let Some(params) = phenology_draft.parameters.as_object_mut() {
+        params.insert("series".to_string(), serde_json::json!(request.series));
+    }
     let derived_dir = data_root.join("derived").join("landcover");
     std::fs::create_dir_all(&derived_dir).map_err(|source| LandCoverError::Store {
         what: "landcover directory",
@@ -372,6 +410,9 @@ pub async fn derive_landcover(
         landcover_inputs.push(product.product_id.clone());
     }
     let mut landcover_draft = landcover_l3_draft(&classification, landcover_inputs, &scope);
+    if let Some(params) = landcover_draft.parameters.as_object_mut() {
+        params.insert("series".to_string(), serde_json::json!(request.series));
+    }
     let landcover_path = derived_dir.join(format!(
         "{}.landcover.tif",
         artifact_file_component(&landcover_draft.product_id())

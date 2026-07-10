@@ -256,3 +256,129 @@ details.derive > summary {
   padding: 2px 12px;
   cursor: pointer;
 }
+
+/* Field time series panel (batch S-13) */
+
+#ts-details > summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #667085;
+}
+
+#ts-details .ts-row {
+  display: block;
+  margin: 6px 0;
+  color: #344054;
+}
+
+#ts-details .ts-row select,
+#ts-details .ts-row input[type="date"] {
+  width: 100%;
+  margin-top: 2px;
+  padding: 4px 6px;
+  border: 1px solid #cfd6de;
+  border-radius: 4px;
+  background: #fff;
+  font-size: 12px;
+}
+
+.ts-sources {
+  margin: 4px 0;
+  font-size: 12px;
+}
+
+#ts-chart .ts-svg {
+  width: 100%;
+  height: auto;
+  margin-top: 6px;
+  border: 1px solid #e2e6eb;
+  border-radius: 4px;
+  background: #fff;
+}
+
+.ts-svg .ts-grid {
+  stroke: #eef1f5;
+  stroke-width: 1;
+}
+
+.ts-svg .ts-axis {
+  font-size: 8px;
+  fill: #667085;
+}
+
+.ts-svg .ts-axis-y {
+  text-anchor: end;
+}
+
+.ts-svg .ts-axis-x {
+  text-anchor: middle;
+}
+
+.ts-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin-top: 4px;
+  font-size: 11px;
+  color: #344054;
+}
+
+.ts-legend-bullet {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 4px;
+}
+
+.ts-subhead {
+  margin-top: 8px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: #667085;
+}
+
+.ts-harm-line {
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 11px;
+  color: #344054;
+  margin-top: 2px;
+  word-break: break-all;
+}
+
+.ts-anomaly-badge {
+  display: inline-block;
+  margin-top: 4px;
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: #fee4e2;
+  color: #b42318;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.ts-year-table {
+  width: 100%;
+  margin-top: 4px;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.ts-year-table th {
+  text-align: left;
+  color: #667085;
+  font-weight: 600;
+  border-bottom: 1px solid #e2e6eb;
+  padding: 2px 4px;
+}
+
+.ts-year-table td {
+  padding: 2px 4px;
+  border-bottom: 1px solid #f0f2f5;
+  color: #344054;
+}

@@ -1,6 +1,92 @@
+# Resume — sat-farmer-run-1 (CURRENT, 2026-07-06)
+
+- Plan: `/Users/rajanpanneerselvam/.claude/plans/you-re-right-the-project-starry-boole.md`
+  (hash e1b595dd4972a5a0eda85068fc9712c749c32542f1f9afe09cb0c047292d014d).
+  21 features: S-01..S-14 (satellite engine) + F-B1..F-B7 (farmer portal).
+- Branch: `satellite-farmer-expansion` (from landsat-parity @ 04d748f).
+- Committed (12/21): wave1 S-01 7551ca2, S-02 3ef9964, F-B1 3dd5f00; wave2
+  S-06, S-03 0192c68, F-B2 928db88 (repaired foreign ec512a5 server.rs break);
+  wave3 S-04 8b57d76, S-07 998762c, F-B3 cf1184b (+ReportFormat::Pdf /
+  ReportVisibility::Grower enum fix); wave4 S-05 cf6cef3 (server.rs line was
+  misplaced at EOF by a staging patch — repaired in F-B4 b4e6151), F-B4
+  b4e6151, S-08 0ff43c2 (worker wired into serve(), disabled by default).
+- Committed (19/21): +wave3.. S-05 cf6cef3, F-B4 b4e6151, S-08 0ff43c2;
+  wave5 F-B5 8fb05e0, S-09 9c5a163, S-10 2c9506d; wave6 S-13 39e7096,
+  F-B6 2b3d8c6 (amended from f3543a3 to strip S-11's in-flight route lines),
+  S-11 406bf4f; wave7 F-B7 a47bf1d.
+- Wave 7 hit the Fable-5 token limit mid-flight: F-B7 was ~complete on disk
+  (field.js 900 lines + chart.js, node-valid, route-manifest test green) →
+  verified + committed a47bf1d on resume. S-12 left nothing; S-14 left only
+  a stray fixture (pc_modis_13q1_search.json). Both RE-DISPATCHED fresh on
+  Opus 4.8 (disjoint files: S-12 owns pipeline_worker/pipeline; S-14 owns
+  new modis.rs/routes).
+- COMPLETE (21/21): S-12 5d880f0, S-14 faad49c committed on resume; plus a
+  follow-up (ff fix) draining the pipeline_l3 composite-supersede test for
+  S-12's new fan-out. 24 commits total (04d748f..HEAD).
+- Verification all green: satellite suites (pipeline_jobs/worker/discover/l3/
+  l3_suite/backfill, field_timeseries x3, modis, pc_sign, landsat/satellite
+  derive), portal suites (auth/farms/reports/recommendations/alerts/
+  activities/static + workspace_static), pruned timeseries + consumers
+  (shared/timeseries/post_processor/fleet_health/soil_iot), and `just
+  gis-test` exit 0 (198-suite geo_hub gis + shared 323 + geo_viewer 60).
+  New source files rustfmt-clean.
+- LEFT UNCOMMITTED ON PURPOSE: a concurrent session's water-balance work
+  (water_balance_rasters.rs, water_balance_run.rs, post_processor water_balance,
+  fmt-only diffs across many routes files, landsat.rs). NOT mine — do not
+  commit or revert.
+- (superseded) earlier wave-5 line:
+- STAGING LESSON: do NOT use zero-context `git apply --cached` patches on
+  server.rs/lib.rs — they can land hunks at EOF (happened twice). Use
+  update-index with sed-constructed content, or commit the full file when no
+  foreign hunks remain.
+- WORKTREE CAUTION: another session has uncommitted water-balance work here
+  (water_balance_rasters.rs, post_processor water_balance, fmt-only diffs in
+  many routes files; one foreign hunk each in geo_hub/src/lib.rs, server.rs,
+  post_processor/src/lib.rs). Stage surgically; partial-stage mixed files via
+  `git diff -U0` filtered patches + `git apply --cached`. NEVER run bare
+  `cargo fmt -p geo_hub` — use `rustfmt --edition 2021 <files>`.
+- Next action: on wave-2 completion verify + partial-stage + commit serially,
+  update checkpoint, then wave 3 = S-4 (timeseries route) + S-7 (pipeline
+  worker) + F-B3 (report inbox/grower PDF). Then S-5/S-8/F-B4, S-9/F-B5,
+  S-10, S-11/F-B6, S-12/S-13/F-B7, S-14 last.
+
+---
+
 # Resume — field-intel-run-1
 
-## CURRENT: satellite intelligence pipeline (2026-07)
+## ACTIVE BRANCHES (2026-07-06)
+- landsat-parity (CURRENT): batches 38-40 DONE — 38 (5ecded5) spec-driven
+  Landsat derive + TM/ETM+ archive + ST_QA; 39 (372cb3f) water-body
+  seasonality (persistence classes + availability areas); 40 (b3deea0) ET
+  fraction via Ts-VI triangle + FAO-56 Ra (verified vs Example 8).
+  NEXT candidates: Hargreaves-Samani ETo + ETa mm/day (needs Tmin/Tmax
+  source); water-balance summary product; reprojection core (parked).
+- crop-type-classification: foundation done (b898192) — CropType /
+  WorldCerealSeason / EwocCode+legend / ClassLabel trait. Next: generalize
+  NearestCentroidModel over ClassLabel.
+- enhance-satellite-image-pipeline: batches 28-37 pushed, awaiting PR.
+
+## CURRENT: satellite pipeline ENHANCEMENTS (2026-07, branch enhance-satellite-image-pipeline)
+field-intelligence-pipeline was merged to main via PR #5 (26b084a); work
+continues on enhance-satellite-image-pipeline. Batch 30 (4dc8d1a): index surface complete — nbr (B8A+B12, 20 m) + ndwi
+(B03+B08, 10 m) spec rows; /browse scene-scoped 'derive sen2cor index'
+affordance on band_b* items. Batch 29 (da46205): spec-driven multi-index
+(ndvi/mndwi/ndmi), cross-resolution B11 replication, SCL native/replicated.
+Batch 28 (7b6e26e): SCL cloud masking.
+Batch 37 (ccfa9ea): drought watch SPI scale + web product-mode trigger.
+Batch 36 (5411288): drought_watch application (drought L3 rasters ->
+stress findings -> Track C warning alerts + irrigation proposals).
+ENHANCEMENT TRACK batches 28-35 committed (SCL masking 7b6e26e,
+multi-index sen2cor da46205, NBR/NDWI+browse 4dc8d1a, dNBR proof 263805e,
+compositing f26b796, composite-fed phenology 114b917, composite-fed drought
+climatology 1242b97, Landsat C2 local derive c60320c). Final gates green:
+geo_hub 38 suites, shared 323, post_processor 181, geo_viewer 60,
+acceptance 5, workspace check clean.
+NEXT: drought-watch surface complete (36+37). Remaining candidates on this
+branch are larger jumps: weather advisory (15) fusion for SPEI; or wrap the
+branch for PR. Ask the user before starting domain 15 (scope change).
+
+## MERGED HISTORY: satellite intelligence pipeline (2026-07)
 Active plan + per-batch ledger: `docs/design/satellite-intelligence-pipeline.md`
 (the ledger there is authoritative; batches 1-27 committed — SATELLITE BACKLOG COMPLETE). Last: batch 27 (322e8e1) WorldCover bootstrap masks: homogeneous_reference_mask + compare_landcover_within + build_training_samples_masked; validate.bootstrap_mask, ml.{bootstrap,max_samples_per_class}. Before: batch 26 (525ac84) /browse derive affordances (per-item forms -> drought/SPI/water-extent derive routes; multi-input derives stay API-only). Before: batch 25 (26f5f25) JRC prior gating: post_processor extract_water_extent_with_prior (occurrence >=75/<=5 informative pixels, <50% agreement -> RejectedOtsuFlip -> fixed fallback; prior in L3 lineage + params) + geo_hub POST /api/water-management/jrc/register (water_occurrence, jrc-gsw) + derive prior_product_id. Before: batch 24 (745cf66) JP2 decode + local Sen2Cor NDVI: raster_io read_jp2_gray (jpeg2k/openjp2 pure-Rust) + test_util write_jp2_gray reference-encoder fixtures; geo_hub sen2cor_derive POST /api/ingest/sen2cor/ndvi/derive (MTD_TL.xml geocoding, SensorProfile calibration, ndvi L2 with red/nir lineage). Before: batch 23 (9025ac1) LST/thermal path: post_processor/src/lst.rs pure engine + geo_hub/src/lst_rasters.rs POST /api/thermal/lst/derive (lst L2, Kelvin); lst->tci already mapped so rasters/derive scores TCI; drought_result_from_raster + derive_vhi_raster + POST /api/drought-management/vhi/derive blend VCI+TCI into VHI L3. Before: batch 22 (a730a44) HLS Fmask cloud masking; batch 21
 (25b5491) — Int16 raster support: raster_io RasterDtype::I16/RasterBand::I16

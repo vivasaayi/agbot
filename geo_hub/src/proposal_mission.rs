@@ -287,15 +287,15 @@ mod tests {
 
     #[test]
     fn proposed_proposal_cannot_be_drafted() {
-        let err = draft_mission_for_proposal(&proposal(ProposalStatus::Proposed, "scout"))
-            .unwrap_err();
+        let err =
+            draft_mission_for_proposal(&proposal(ProposalStatus::Proposed, "scout")).unwrap_err();
         assert!(matches!(err, MissionDraftError::NotAccepted { .. }));
     }
 
     #[test]
     fn rejected_proposal_cannot_be_drafted() {
-        let err = draft_mission_for_proposal(&proposal(ProposalStatus::Rejected, "scout"))
-            .unwrap_err();
+        let err =
+            draft_mission_for_proposal(&proposal(ProposalStatus::Rejected, "scout")).unwrap_err();
         assert!(matches!(err, MissionDraftError::NotAccepted { .. }));
     }
 

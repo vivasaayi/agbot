@@ -20,9 +20,96 @@ use tokio::fs;
 use crate::catalog;
 use crate::error::{AppError, AppResult};
 use crate::product_tiler::{
-    colormap_for_kind, encode_tile_png, load_tile_source, render_web_tile, TileError,
+    colormap_for_kind, encode_tile_png, load_tile_source, render_rgb_web_tile, render_web_tile,
+    RgbStretch, TileError,
 };
 use crate::state::AppState;
+
+/// Product kinds rendered as a true-color RGB composite of three bands rather
+/// than a single-band colormap.
+fn is_true_color_kind(kind: &str) -> bool {
+    matches!(kind, "rgb" | "truecolor" | "true_color")
+}
+
+/// A resolved true-color composite: the three band artifact paths plus an
+/// optional explicit stretch (auto-computed from the bands when absent).
+struct RgbComposite {
+    red: PathBuf,
+    green: PathBuf,
+    blue: PathBuf,
+    stretch: Option<RgbStretch>,
+}
+
+fn require_geotiff(product_id: &str, role: &str, path: &str) -> Result<(), AppError> {
+    let ok = std::path::Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("tif") || ext.eq_ignore_ascii_case("tiff"))
+        .unwrap_or(false);
+    if ok {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(format!(
+            "true-color product {product_id} {role} band is not a GeoTIFF: {path}"
+        )))
+    }
+}
+
+/// Parse the `bands`/`stretch` contract out of a true-color product's
+/// `parameters` JSON:
+/// `{ "bands": { "red": "<path>", "green": "<path>", "blue": "<path>" },
+///    "stretch": { "lo": [r,g,b], "hi": [r,g,b] } }` (stretch optional).
+fn parse_rgb_composite(
+    product_id: &str,
+    parameters: &serde_json::Value,
+) -> Result<RgbComposite, AppError> {
+    let bands = parameters
+        .get("bands")
+        .and_then(|b| b.as_object())
+        .ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "true-color product {product_id} has no `bands` object in parameters"
+            ))
+        })?;
+    let band_path = |role: &str| -> Result<PathBuf, AppError> {
+        let path = bands.get(role).and_then(|v| v.as_str()).ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "true-color product {product_id} is missing the `{role}` band path"
+            ))
+        })?;
+        require_geotiff(product_id, role, path)?;
+        Ok(PathBuf::from(path))
+    };
+    let red = band_path("red")?;
+    let green = band_path("green")?;
+    let blue = band_path("blue")?;
+
+    let stretch = parameters.get("stretch").and_then(|s| {
+        let lo = triple(s.get("lo")?)?;
+        let hi = triple(s.get("hi")?)?;
+        Some(RgbStretch::linear(lo, hi))
+    });
+
+    Ok(RgbComposite {
+        red,
+        green,
+        blue,
+        stretch,
+    })
+}
+
+/// A `[f32; 3]` from a JSON array of three numbers, or `None`.
+fn triple(value: &serde_json::Value) -> Option<[f32; 3]> {
+    let arr = value.as_array()?;
+    if arr.len() != 3 {
+        return None;
+    }
+    let mut out = [0.0f32; 3];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = arr[i].as_f64()? as f32;
+    }
+    Some(out)
+}
 
 impl From<TileError> for AppError {
     fn from(err: TileError) -> Self {
@@ -74,22 +161,32 @@ pub async fn catalog_product_web_tile(
         .await
         .map_err(|err| AppError::Anyhow(err.into()))?
         .ok_or(AppError::NotFound)?;
-    let artifact_path = product.path.as_deref().ok_or_else(|| {
-        AppError::BadRequest(format!(
-            "product {product_id} has no artifact to tile (levels without a stored raster cannot be rendered)"
-        ))
-    })?;
-    let is_geotiff = std::path::Path::new(artifact_path)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.eq_ignore_ascii_case("tif") || ext.eq_ignore_ascii_case("tiff"))
-        .unwrap_or(false);
-    if !is_geotiff {
-        return Err(AppError::BadRequest(format!(
-            "product {product_id} artifact is not a GeoTIFF (format {:?}); only GeoTIFF products are web-tileable",
-            product.format
-        )));
-    }
+
+    let true_color = is_true_color_kind(&product.kind);
+
+    // A single-band product tiles from its own GeoTIFF; a true-color composite
+    // resolves three band paths from its parameters instead.
+    let composite = if true_color {
+        Some(parse_rgb_composite(&product_id, &product.parameters)?)
+    } else {
+        let artifact_path = product.path.as_deref().ok_or_else(|| {
+            AppError::BadRequest(format!(
+                "product {product_id} has no artifact to tile (levels without a stored raster cannot be rendered)"
+            ))
+        })?;
+        let is_geotiff = std::path::Path::new(artifact_path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.eq_ignore_ascii_case("tif") || ext.eq_ignore_ascii_case("tiff"))
+            .unwrap_or(false);
+        if !is_geotiff {
+            return Err(AppError::BadRequest(format!(
+                "product {product_id} artifact is not a GeoTIFF (format {:?}); only GeoTIFF products are web-tileable",
+                product.format
+            )));
+        }
+        None
+    };
 
     let tile_path = state
         .config
@@ -105,11 +202,23 @@ pub async fn catalog_product_web_tile(
         .await
         .map_err(|err| AppError::Anyhow(err.into()))?
     {
-        let source_path = PathBuf::from(artifact_path);
         let kind = product.kind.clone();
+        let artifact_path = product.path.clone();
         let tile_bytes = tokio::task::spawn_blocking(move || -> Result<Vec<u8>, TileError> {
-            let source = load_tile_source(&source_path)?;
-            let tile = render_web_tile(&source, &colormap_for_kind(&kind), z, x, y)?;
+            let tile = if let Some(composite) = composite {
+                let red = load_tile_source(&composite.red)?;
+                let green = load_tile_source(&composite.green)?;
+                let blue = load_tile_source(&composite.blue)?;
+                let stretch = composite
+                    .stretch
+                    .unwrap_or_else(|| RgbStretch::from_sources(&red, &green, &blue));
+                render_rgb_web_tile(&red, &green, &blue, &stretch, z, x, y)?
+            } else {
+                let source = load_tile_source(&PathBuf::from(
+                    artifact_path.expect("single-band product path validated above"),
+                ))?;
+                render_web_tile(&source, &colormap_for_kind(&kind), z, x, y)?
+            };
             encode_tile_png(&tile)
         })
         .await

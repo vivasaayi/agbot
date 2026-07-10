@@ -67,6 +67,24 @@ async fn browse_serves_html_page() -> Result<()> {
     assert!(body.contains("integrity=\"sha384-"), "SRI pin missing");
     assert!(body.contains("/browse/app.js"));
     assert!(body.contains("/browse/style.css"));
+    // Field time series panel (batch S-13): collapsible panel with metric
+    // selector (defaulting to sat.ndvi.mean), date range, source toggles,
+    // merged overlay toggle, and the chart/harmonization/summary containers.
+    for marker in [
+        "id=\"field-timeseries-panel\"",
+        "id=\"ts-metric\"",
+        "sat.ndvi.mean",
+        "id=\"ts-start\"",
+        "id=\"ts-end\"",
+        "id=\"ts-sources\"",
+        "id=\"ts-merged\"",
+        "id=\"ts-load\"",
+        "id=\"ts-chart\"",
+        "id=\"ts-harmonization\"",
+        "id=\"ts-summary\"",
+    ] {
+        assert!(body.contains(marker), "index.html missing {marker}");
+    }
     Ok(())
 }
 
@@ -91,6 +109,8 @@ async fn browse_assets_have_correct_content_types() -> Result<()> {
         "/api/drought-management/rasters/derive",
         "/api/drought-management/spi/derive",
         "/api/water-management/extent/derive",
+        "/api/ingest/sen2cor/index/derive",
+        "/api/composites/derive",
     ] {
         assert!(
             body.contains(endpoint),
@@ -108,6 +128,30 @@ async fn browse_assets_have_correct_content_types() -> Result<()> {
         "window_months",
         "sar_vv",
         "thermal_lst",
+        "band_b",
+        "index_product_id",
+        "composite_product_id",
+        "COMPOSITABLE_KINDS",
+    ] {
+        assert!(app_js.contains(marker), "app.js missing {marker}");
+    }
+
+    // Field time series panel (batch S-13): the module hits the timeseries
+    // trio (query, metric discovery, per-year summary — the base route via
+    // template literal, so assert the shared /timeseries segment plus the
+    // subpaths) and renders the inline SVG chart with the merged-overlay,
+    // harmonization-report, and anomaly-badge affordances.
+    for marker in [
+        "/timeseries?",
+        "/timeseries/metrics",
+        "/timeseries/summary",
+        "sat.ndvi.mean",
+        "renderTsChart",
+        "tsTimeTicks",
+        "harmonization",
+        "per_year",
+        "is_anomalous",
+        "stroke-dasharray",
     ] {
         assert!(app_js.contains(marker), "app.js missing {marker}");
     }
@@ -117,5 +161,8 @@ async fn browse_assets_have_correct_content_types() -> Result<()> {
     assert!(content_type.starts_with("text/css"), "{content_type}");
     assert!(body.contains("#map"));
     assert!(body.contains(".derive-form"), "derive styles missing");
+    for marker in [".ts-svg", ".ts-legend", ".ts-anomaly-badge", ".ts-year-table"] {
+        assert!(body.contains(marker), "style.css missing {marker}");
+    }
     Ok(())
 }

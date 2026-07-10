@@ -153,6 +153,14 @@ const RAMP_DNBR: &[[u8; 3]] = &[
 const RAMP_THERMAL: &[[u8; 3]] = &[[49, 54, 149], [255, 255, 191], [165, 0, 38]];
 /// Binary water-mask colors: land tan, water blue.
 const RAMP_WATER_MASK: &[[u8; 3]] = &[[210, 180, 140], [24, 100, 190]];
+/// Seasonality classes 0..=3: never-water tan, ephemeral pale blue,
+/// seasonal medium blue, permanent dark blue.
+const RAMP_WATER_SEASONALITY: &[[u8; 3]] = &[
+    [210, 180, 140],
+    [158, 202, 225],
+    [66, 146, 198],
+    [8, 48, 107],
+];
 /// Categorical land-cover class colors, codes 1..=6: water blue, bare tan,
 /// annual crop yellow, tree/perennial dark green, grassland light green,
 /// unknown gray.
@@ -190,6 +198,13 @@ pub fn colormap_for_kind(kind: &str) -> Colormap {
                 categorical: false,
             }
         }
+        // Evaporative fraction 0..1: dry red -> yellow -> wet green
+        // (condition semantics: high = well-watered).
+        "et_fraction" => Colormap {
+            domain: (0.0, 1.0),
+            stops: RAMP_CONDITION,
+            categorical: false,
+        },
         // LST in Kelvin: cool blue -> pale yellow -> hot red over the
         // terrestrial 250-330 K range (matches the CLI thermal viz range).
         "lst" | "thermal_lst" => Colormap {
@@ -220,6 +235,12 @@ pub fn colormap_for_kind(kind: &str) -> Colormap {
         "water_extent" => Colormap {
             domain: (0.0, 1.0),
             stops: RAMP_WATER_MASK,
+            categorical: true,
+        },
+        // Persistence classes 0..=3 (never/ephemeral/seasonal/permanent).
+        "water_seasonality" => Colormap {
+            domain: (0.0, 3.0),
+            stops: RAMP_WATER_SEASONALITY,
             categorical: true,
         },
         // Tier-1 rule + tier-3 learned land-cover classes share the code
@@ -468,6 +489,167 @@ pub fn render_web_tile(
                     opaque_pixels += 1;
                 }
                 None => transparent("nodata_or_outside_grid", &mut transparent_reasons),
+            }
+        }
+    }
+
+    Ok(RenderedTile {
+        rgba,
+        opaque_pixels,
+        transparent_reasons,
+    })
+}
+
+// --- True-color RGB compositing ----------------------------------------------
+
+/// Per-channel linear contrast stretch mapping a raw band value to `0..=255`.
+/// Reflectance bands (e.g. Sentinel-2 L2A scaled 0..10000) are not directly
+/// displayable, so a true-color composite stretches each channel independently.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RgbStretch {
+    /// Value mapped to 0 per channel `[r, g, b]`.
+    pub lo: [f32; 3],
+    /// Value mapped to 255 per channel `[r, g, b]`.
+    pub hi: [f32; 3],
+}
+
+impl RgbStretch {
+    /// Explicit per-channel lo/hi.
+    pub fn linear(lo: [f32; 3], hi: [f32; 3]) -> Self {
+        Self { lo, hi }
+    }
+
+    /// A workable default for 12-bit surface-reflectance imagery scaled to
+    /// 0..10000 (Sentinel-2 L2A, HLS): 0..3000 renders vegetation, soil, and
+    /// water with usable contrast without per-scene statistics.
+    pub fn reflectance_default() -> Self {
+        Self {
+            lo: [0.0; 3],
+            hi: [3000.0; 3],
+        }
+    }
+
+    /// Min/max stretch computed from each source's finite, non-nodata values.
+    /// Falls back to [`reflectance_default`] for any channel with no valid
+    /// pixels or a degenerate (lo == hi) range.
+    pub fn from_sources(red: &TileSource, green: &TileSource, blue: &TileSource) -> Self {
+        let default = Self::reflectance_default();
+        let mut lo = default.lo;
+        let mut hi = default.hi;
+        for (channel, source) in [red, green, blue].into_iter().enumerate() {
+            if let Some((min, max)) = source.finite_value_range() {
+                if max > min {
+                    lo[channel] = min;
+                    hi[channel] = max;
+                }
+            }
+        }
+        Self { lo, hi }
+    }
+
+    fn channel(&self, index: usize, value: f32) -> u8 {
+        let (lo, hi) = (self.lo[index], self.hi[index]);
+        if hi <= lo {
+            return 0;
+        }
+        let t = ((value - lo) / (hi - lo)).clamp(0.0, 1.0);
+        (t * 255.0).round() as u8
+    }
+}
+
+impl TileSource {
+    /// Min/max of finite, non-nodata band values; `None` when the band is
+    /// entirely nodata/non-finite. Used to auto-scale a true-color composite.
+    pub fn finite_value_range(&self) -> Option<(f32, f32)> {
+        let mut range: Option<(f32, f32)> = None;
+        for &value in &self.values {
+            if !value.is_finite() {
+                continue;
+            }
+            if let Some(nodata) = self.nodata {
+                if value == nodata {
+                    continue;
+                }
+            }
+            range = Some(match range {
+                Some((min, max)) => (min.min(value), max.max(value)),
+                None => (value, value),
+            });
+        }
+        range
+    }
+}
+
+/// Render one Web Mercator tile as a true-color composite of three co-located
+/// single-band sources (red, green, blue). Each output pixel is projected
+/// Mercator -> WGS84 and nearest-sampled from every band independently; a
+/// pixel is opaque only where all three bands have valid data, so mismatched
+/// footprints degrade to transparency instead of false colour. The per-channel
+/// [`RgbStretch`] maps raw band values to 8-bit intensities.
+pub fn render_rgb_web_tile(
+    red: &TileSource,
+    green: &TileSource,
+    blue: &TileSource,
+    stretch: &RgbStretch,
+    z: u8,
+    x: u32,
+    y: u32,
+) -> Result<RenderedTile, TileError> {
+    let rect = tile_mercator_rect(z, x, y)?;
+    let mut rgba = vec![0u8; (TILE_SIZE * TILE_SIZE * 4) as usize];
+    let mut opaque_pixels = 0usize;
+    let mut transparent_reasons: BTreeMap<String, usize> = BTreeMap::new();
+    let transparent = |reason: &str, counts: &mut BTreeMap<String, usize>| {
+        *counts.entry(reason.to_string()).or_insert(0) += 1;
+    };
+
+    // Cheap rejection against the red band's envelope (bands are co-registered).
+    let (src_min_lat, src_min_lon, src_max_lat, src_max_lon) = red.wgs84_envelope();
+    let (tile_min_lat, tile_min_lon) = mercator_to_wgs84(rect.min_x, rect.min_y);
+    let (tile_max_lat, tile_max_lon) = mercator_to_wgs84(rect.max_x, rect.max_y);
+    if tile_max_lat < src_min_lat
+        || tile_min_lat > src_max_lat
+        || tile_max_lon < src_min_lon
+        || tile_min_lon > src_max_lon
+    {
+        transparent_reasons.insert("outside_grid".to_string(), (TILE_SIZE * TILE_SIZE) as usize);
+        return Ok(RenderedTile {
+            rgba,
+            opaque_pixels: 0,
+            transparent_reasons,
+        });
+    }
+
+    let bands = [red, green, blue];
+    let span_x = (rect.max_x - rect.min_x) / f64::from(TILE_SIZE);
+    let span_y = (rect.max_y - rect.min_y) / f64::from(TILE_SIZE);
+    for py in 0..TILE_SIZE {
+        let merc_y = rect.max_y - (f64::from(py) + 0.5) * span_y;
+        for px in 0..TILE_SIZE {
+            let merc_x = rect.min_x + (f64::from(px) + 0.5) * span_x;
+            let (lat, lon) = mercator_to_wgs84(merc_x, merc_y);
+            let offset = ((py * TILE_SIZE + px) * 4) as usize;
+
+            let mut channels = [0u8; 3];
+            let mut complete = true;
+            for (index, source) in bands.iter().enumerate() {
+                let sampled = source
+                    .grid_coords(lat, lon)
+                    .and_then(|(easting, northing)| source.sample_grid(easting, northing));
+                match sampled {
+                    Some(value) => channels[index] = stretch.channel(index, value),
+                    None => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            if complete {
+                rgba[offset..offset + 3].copy_from_slice(&channels);
+                rgba[offset + 3] = 255;
+                opaque_pixels += 1;
+            } else {
+                transparent("nodata_or_outside_grid", &mut transparent_reasons);
             }
         }
     }
@@ -732,6 +914,90 @@ mod tests {
         let (fx, fy) = tile_containing(48.0, 2.0, 8);
         let far = render_web_tile(&source, &colormap_for_kind("spi"), 8, fx, fy).unwrap();
         assert_eq!(far.opaque_pixels, 0);
+    }
+
+    fn uniform_geographic_band(value: f32, nodata: Option<f32>) -> TileSource {
+        // 4x4 EPSG:4326 grid over ~(76.0..76.2, 11.0..11.2), matching the SPI test.
+        TileSource::new(
+            4326,
+            [76.0, 0.05, 0.0, 11.2, 0.0, -0.05],
+            4,
+            4,
+            vec![value; 16],
+            nodata,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn rgb_stretch_maps_channels_linearly() {
+        let stretch = RgbStretch::linear([0.0; 3], [1000.0; 3]);
+        assert_eq!(stretch.channel(0, 0.0), 0);
+        assert_eq!(stretch.channel(1, 1000.0), 255);
+        assert_eq!(stretch.channel(2, 500.0), 128); // 0.5 * 255 rounds to 128
+        assert_eq!(stretch.channel(0, -50.0), 0); // clamped below
+        assert_eq!(stretch.channel(0, 5000.0), 255); // clamped above
+    }
+
+    #[test]
+    fn rgb_stretch_from_sources_uses_band_ranges() {
+        let mut red = uniform_geographic_band(100.0, None);
+        red.values[0] = 900.0; // widen red's range to 100..900
+        let green = uniform_geographic_band(200.0, None);
+        let blue = uniform_geographic_band(300.0, None);
+        let stretch = RgbStretch::from_sources(&red, &green, &blue);
+        assert_eq!(stretch.lo[0], 100.0);
+        assert_eq!(stretch.hi[0], 900.0);
+        // Uniform bands (degenerate range) fall back to the reflectance default.
+        let default = RgbStretch::reflectance_default();
+        assert_eq!(stretch.lo[1], default.lo[1]);
+        assert_eq!(stretch.hi[1], default.hi[1]);
+    }
+
+    #[test]
+    fn rgb_composite_paints_stretched_channels() {
+        let red = uniform_geographic_band(3000.0, None);
+        let green = uniform_geographic_band(1500.0, None);
+        let blue = uniform_geographic_band(0.0, None);
+        let stretch = RgbStretch::linear([0.0; 3], [3000.0; 3]);
+
+        let z = 12;
+        let (x, y) = tile_containing(11.1, 76.1, z);
+        let tile = render_rgb_web_tile(&red, &green, &blue, &stretch, z, x, y).unwrap();
+        assert!(tile.opaque_pixels > 0, "footprint must render opaque");
+        let first_opaque = tile
+            .rgba
+            .chunks_exact(4)
+            .find(|px| px[3] == 255)
+            .expect("an opaque pixel");
+        // red=3000 -> 255, green=1500 -> 128, blue=0 -> 0.
+        assert_eq!(&first_opaque[..3], &[255, 128, 0]);
+    }
+
+    #[test]
+    fn rgb_composite_is_transparent_where_any_band_is_nodata() {
+        // Blue band is entirely nodata -> every pixel must be transparent even
+        // though red and green have data (no false colour on partial coverage).
+        let red = uniform_geographic_band(3000.0, None);
+        let green = uniform_geographic_band(3000.0, None);
+        let blue = uniform_geographic_band(-9999.0, Some(-9999.0));
+        let stretch = RgbStretch::reflectance_default();
+
+        let z = 12;
+        let (x, y) = tile_containing(11.1, 76.1, z);
+        let tile = render_rgb_web_tile(&red, &green, &blue, &stretch, z, x, y).unwrap();
+        assert_eq!(tile.opaque_pixels, 0);
+    }
+
+    #[test]
+    fn rgb_composite_far_tile_is_fully_transparent() {
+        let red = uniform_geographic_band(3000.0, None);
+        let green = uniform_geographic_band(3000.0, None);
+        let blue = uniform_geographic_band(3000.0, None);
+        let stretch = RgbStretch::reflectance_default();
+        let (x, y) = tile_containing(48.0, 2.0, 8);
+        let tile = render_rgb_web_tile(&red, &green, &blue, &stretch, 8, x, y).unwrap();
+        assert_eq!(tile.opaque_pixels, 0);
     }
 
     #[test]

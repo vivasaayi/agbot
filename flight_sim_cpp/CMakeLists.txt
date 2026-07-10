@@ -8,6 +8,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_library(agbot_flight_sim_core
+    src/AssetPaths.cpp
     src/CoordinationPreview.cpp
     src/DeterministicRegression.cpp
     src/DeterministicRunner.cpp
@@ -58,7 +59,7 @@ endif()
 add_executable(agbot_flight_sim_headless
     src/headless_main.cpp
 )
-target_link_libraries(agbot_flight_sim_headless PRIVATE agbot_flight_sim_core)
+target_link_libraries(agbot_flight_sim_headless PRIVATE agbot_flight_sim_core agbot_config)
 
 add_executable(agbot_mission_bridge
     src/mission_bridge_main.cpp
@@ -70,6 +71,18 @@ add_executable(agbot_sim
 )
 target_link_libraries(agbot_sim PRIVATE agbot_flight_sim_core)
 set_target_properties(agbot_sim PROPERTIES OUTPUT_NAME agbot-sim)
+
+# Relocatable install layout. `cmake --install` places the binary under bin/
+# and its runtime assets under share/agbot_flight_sim/, which AssetPaths finds
+# via executable-relative lookup — so a copied/installed tree "just runs"
+# without AGBOT_FLIGHT_SIM_SOURCE_DIR. Running straight from the build tree
+# keeps using the compiled source-dir fallback (dev behaviour unchanged).
+include(GNUInstallDirs)
+install(TARGETS agbot_flight_sim_headless RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(DIRECTORY samples calibration
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/agbot_flight_sim)
+install(FILES config/flight_sim.toml
+    DESTINATION ${CMAKE_INSTALL_DATADIR}/agbot_flight_sim/config)
 
 enable_testing()
 add_executable(agbot_flight_sim_tests

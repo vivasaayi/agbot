@@ -38,6 +38,13 @@ pub struct SatelliteDeriveBody {
     pub aoi: [f64; 4],
     /// Index kind key, e.g. `ndvi`, `mndwi`, `ndmi`.
     pub index: String,
+    /// Optional field scope threaded into every registered product so the
+    /// per-field time series can query the catalog by field.
+    #[serde(default)]
+    pub field_id: Option<String>,
+    /// Optional season scope, alongside `field_id`.
+    #[serde(default)]
+    pub season_id: Option<String>,
 }
 
 pub struct SatelliteDeriveError {
@@ -131,7 +138,13 @@ pub async fn satellite_derive(
         }
     };
 
-    let request = DeriveRequest { item, aoi, index };
+    let request = DeriveRequest {
+        item,
+        aoi,
+        index,
+        field_id: body.field_id,
+        season_id: body.season_id,
+    };
     let default_resolver = UrlCogResolver;
     let resolver_ref: &dyn crate::satellite_derivation::CogStoreResolver = match &resolver {
         Some(Extension(SatelliteCogResolver(inner))) => inner.as_ref(),

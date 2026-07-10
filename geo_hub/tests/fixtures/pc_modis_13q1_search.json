@@ -1,0 +1,47 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "stac_version": "1.0.0",
+      "id": "MOD13Q1.A2026009.h21v08.061.2026026000000",
+      "collection": "modis-13Q1-061",
+      "bbox": [9.99, -0.01, 10.11, 0.11],
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [9.99, -0.01],
+            [10.11, -0.01],
+            [10.11, 0.11],
+            [9.99, 0.11],
+            [9.99, -0.01]
+          ]
+        ]
+      },
+      "properties": {
+        "datetime": "2026-01-09T00:00:00Z",
+        "start_datetime": "2026-01-09T00:00:00Z",
+        "end_datetime": "2026-01-24T23:59:59Z",
+        "platform": "terra",
+        "instruments": ["modis"]
+      },
+      "assets": {
+        "250m_16_days_NDVI": {
+          "href": "__NDVI_HREF__",
+          "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+          "title": "250m 16 days NDVI"
+        },
+        "250m_16_days_EVI": {
+          "href": "__EVI_HREF__",
+          "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+          "title": "250m 16 days EVI"
+        },
+        "hdf": {
+          "href": "https://example.test/MOD13Q1.A2026009.h21v08.061.hdf",
+          "type": "application/x-hdf"
+        }
+      }
+    }
+  ]
+}

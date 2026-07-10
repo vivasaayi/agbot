@@ -387,4 +387,3 @@ pub async fn apply_rollout_control_route(
         .map(Json)
         .map_err(fleet_health_error)
 }
-

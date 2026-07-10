@@ -128,4 +128,3 @@ pub async fn list_weather_fetch_failures(
             .collect(),
     ))
 }
-

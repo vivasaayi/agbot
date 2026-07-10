@@ -1,11 +1,15 @@
 // Leaflet map + product tile layers (Track B phase A3). Uses vendored Leaflet
 // (window.L, loaded by index.html). Product tile URLs come from api.js only.
 
-import { productTilesUrlTemplate } from "./api.js";
+import {
+  productTilesUrlTemplate,
+  catalogProductTilesUrlTemplate,
+} from "./api.js";
 
 let map = null;
 let compareMap = null;
 const productLayers = new Map(); // "sceneId::kind" -> L.TileLayer
+const catalogLayers = new Map(); // "productId" -> L.TileLayer
 
 function backdrop(target) {
   window.L.rectangle(
@@ -79,6 +83,38 @@ export function addProductLayer(sceneId, kind, opacity = 1.0) {
   });
   layer.addTo(map);
   productLayers.set(key, layer);
+}
+
+/** Add (or reveal) a catalog product tile layer (e.g. true-color RGB). */
+export function addCatalogProductLayer(productId, opacity = 1.0) {
+  if (!map) return;
+  if (catalogLayers.has(productId)) {
+    catalogLayers.get(productId).setOpacity(opacity);
+    return;
+  }
+  const layer = window.L.tileLayer(catalogProductTilesUrlTemplate(productId), {
+    opacity,
+    tileSize: 256,
+    minZoom: 0,
+    maxZoom: 22,
+    noWrap: true,
+  });
+  layer.addTo(map);
+  catalogLayers.set(productId, layer);
+}
+
+/** Remove a catalog product tile layer. */
+export function removeCatalogProductLayer(productId) {
+  const layer = catalogLayers.get(productId);
+  if (layer && map) {
+    map.removeLayer(layer);
+    catalogLayers.delete(productId);
+  }
+}
+
+/** True when the given catalog product layer is currently shown. */
+export function hasCatalogProductLayer(productId) {
+  return catalogLayers.has(productId);
 }
 
 /** Remove a scene product tile layer. */

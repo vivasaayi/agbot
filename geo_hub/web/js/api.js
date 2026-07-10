@@ -41,7 +41,73 @@ export const endpoints = {
   fieldProposals: "/api/fields/:field_id/proposals",
   proposalAccept: "/api/proposals/:proposal_id/accept",
   proposalReject: "/api/proposals/:proposal_id/reject",
+  catalogSources: "/api/catalog/sources",
+  ingestHealth: "/api/ingest/health",
+  pipelineJobs: "/api/pipeline/jobs",
+  fieldSubscriptions: "/api/fields/:field_id/subscriptions",
+  fieldBackfills: "/api/fields/:field_id/backfills",
+  fieldTimeseries: "/api/fields/:field_id/timeseries",
 };
+
+/**
+ * Leaflet XYZ tile-url template for a catalog product (e.g. a true-color RGB
+ * composite). Leaflet fills the `{z}/{x}/{y}` placeholders per tile request.
+ */
+export function catalogProductTilesUrlTemplate(productId) {
+  return `/api/catalog/products/${encodeURIComponent(productId)}/tiles/{z}/{x}/{y}.png`;
+}
+
+/** A field's multi-source metric time-series (requires `metric`). */
+export function fieldTimeseriesPath(fieldId, query) {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query ?? {})) {
+    if (value !== undefined && value !== null && value !== "") {
+      params.set(key, value);
+    }
+  }
+  const suffix = params.toString();
+  const base = `/api/fields/${encodeURIComponent(fieldId)}/timeseries`;
+  return suffix ? `${base}?${suffix}` : base;
+}
+
+/** Registered ingestion sources, optionally filtered (status, source_kind). */
+export function catalogSourcesPath(query) {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query ?? {})) {
+    if (value !== undefined && value !== null && value !== "") {
+      params.set(key, value);
+    }
+  }
+  const suffix = params.toString();
+  return suffix ? `/api/catalog/sources?${suffix}` : "/api/catalog/sources";
+}
+
+/** Scene-ingestion health summary (in-flight / succeeded / failed). */
+export function ingestHealthPath() {
+  return "/api/ingest/health";
+}
+
+/** Recent pipeline jobs, optionally filtered (field_id, status, limit). */
+export function pipelineJobsPath(query) {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(query ?? {})) {
+    if (value !== undefined && value !== null && value !== "") {
+      params.set(key, value);
+    }
+  }
+  const suffix = params.toString();
+  return suffix ? `/api/pipeline/jobs?${suffix}` : "/api/pipeline/jobs";
+}
+
+/** A field's dataset subscriptions. */
+export function fieldSubscriptionsPath(fieldId) {
+  return `/api/fields/${encodeURIComponent(fieldId)}/subscriptions`;
+}
+
+/** A field's backfill runs. */
+export function fieldBackfillsPath(fieldId) {
+  return `/api/fields/${encodeURIComponent(fieldId)}/backfills`;
+}
 
 /** A field's proposal queue. */
 export function fieldProposalsPath(fieldId) {
@@ -150,6 +216,10 @@ export function waterPriorityRunsPath() {
 /** Anomaly-detection application run trigger (POST zone index values). */
 export function anomalyRunsPath() {
   return "/api/applications/anomaly/runs";
+}
+
+export function droughtWatchRunsPath() {
+  return "/api/applications/drought-watch/runs";
 }
 
 /** Fields belonging to a farm. */

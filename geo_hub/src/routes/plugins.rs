@@ -153,4 +153,3 @@ pub async fn execute_plugin(
 
     Ok(Json(outcome))
 }
-

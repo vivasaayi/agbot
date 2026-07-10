@@ -364,4 +364,3 @@ pub async fn get_crop_closed_loop_proposal(
 
     Ok(Json(proposal))
 }
-

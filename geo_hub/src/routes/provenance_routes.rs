@@ -245,4 +245,3 @@ pub async fn get_provenance_audit_entry(
         .map(Json)
         .ok_or(AppError::NotFound)
 }
-

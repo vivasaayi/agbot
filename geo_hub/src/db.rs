@@ -1,21 +1,97 @@
 use crate::config::HubConfig;
 use anyhow::Result;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::{Pool, Row, Sqlite, SqlitePool};
+use std::str::FromStr;
+use std::time::Duration;
 use tracing::info;
 
 pub type DbPool = SqlitePool;
 
 pub async fn connect_pool(config: &HubConfig) -> Result<DbPool> {
-    let pool = SqlitePool::connect(&config.database_url).await?;
+    // WAL + a generous busy timeout so concurrent readers (API handlers) and
+    // the single pipeline writer do not fail fast on transient lock contention.
+    // Connect options apply to every connection the pool opens.
+    let options = SqliteConnectOptions::from_str(&config.database_url)?
+        .journal_mode(SqliteJournalMode::Wal)
+        .busy_timeout(Duration::from_millis(5000));
+    let pool = SqlitePool::connect_with(options).await?;
     apply_migrations(&pool).await?;
     Ok(pool)
 }
 
+/// The full baseline schema is version 1; add ordered `(version, sql)` steps to
+/// [`INCREMENTAL_MIGRATIONS`] for forward-only changes beyond it.
+const BASELINE_SCHEMA_VERSION: i64 = 1;
+
+/// Ordered incremental migrations applied after the baseline, each stamped into
+/// `PRAGMA user_version` on success and run exactly once (gated by version).
+/// Steps must be forward-only and ordered by ascending version.
+const INCREMENTAL_MIGRATIONS: &[(i64, &str)] = &[];
+
+/// The highest schema version this build knows how to reach.
+fn target_schema_version() -> i64 {
+    INCREMENTAL_MIGRATIONS
+        .iter()
+        .map(|(version, _)| *version)
+        .max()
+        .unwrap_or(BASELINE_SCHEMA_VERSION)
+        .max(BASELINE_SCHEMA_VERSION)
+}
+
+/// The database's recorded schema version (`PRAGMA user_version`, 0 on a fresh
+/// or pre-versioning database).
+pub async fn schema_version(pool: &Pool<Sqlite>) -> Result<i64> {
+    let row = sqlx::query("PRAGMA user_version").fetch_one(pool).await?;
+    Ok(row.get::<i64, _>(0))
+}
+
+async fn set_schema_version(pool: &Pool<Sqlite>, version: i64) -> Result<()> {
+    // PRAGMA does not accept bound parameters; `version` is an internal constant.
+    sqlx::query(&format!("PRAGMA user_version = {version};"))
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Bring the database schema up to [`target_schema_version`], recording progress
+/// in `PRAGMA user_version` so upgrades are ordered and idempotent.
+///
+/// A database at version 0 (fresh, or one created before versioning) runs the
+/// idempotent baseline DDL and is stamped to version 1; one already at >= 1
+/// skips the baseline entirely (a fast startup path). Incremental steps then
+/// run in order, each stamped on success, so a step never re-runs.
 async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
+    // Per-connection PRAGMA; runs on every startup regardless of version so it
+    // is not lost when the baseline is skipped.
     sqlx::query("PRAGMA foreign_keys = ON;")
         .execute(pool)
         .await?;
 
+    let current = schema_version(pool).await?;
+
+    if current < BASELINE_SCHEMA_VERSION {
+        apply_baseline_schema(pool).await?;
+        set_schema_version(pool, BASELINE_SCHEMA_VERSION).await?;
+    }
+
+    let mut version = schema_version(pool).await?;
+    for (step_version, sql) in INCREMENTAL_MIGRATIONS {
+        if *step_version > version {
+            sqlx::query(sql).execute(pool).await?;
+            set_schema_version(pool, *step_version).await?;
+            version = *step_version;
+            info!(version = *step_version, "applied schema migration");
+        }
+    }
+
+    let target = target_schema_version();
+    debug_assert_eq!(version, target, "migrations must reach the target version");
+    info!(schema_version = version, target, "database schema ready");
+    Ok(())
+}
+
+async fn apply_baseline_schema(pool: &Pool<Sqlite>) -> Result<()> {
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS farms (
@@ -3317,7 +3393,198 @@ async fn apply_migrations(pool: &Pool<Sqlite>) -> Result<()> {
     .execute(pool)
     .await?;
 
-    info!("database ready");
+    // Portal auth (farmer portal): admin-issued access codes and bearer
+    // sessions. Only sha256 hashes of codes/tokens are stored at rest.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS portal_access_codes (
+            code_id TEXT PRIMARY KEY,
+            code_hash TEXT NOT NULL UNIQUE,
+            account_id TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            label TEXT,
+            created_at TEXT NOT NULL,
+            expires_at TEXT,
+            revoked_at TEXT,
+            last_used_at TEXT
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS portal_sessions (
+            session_id TEXT PRIMARY KEY,
+            token_hash TEXT NOT NULL UNIQUE,
+            account_id TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            last_seen_at TEXT NOT NULL,
+            revoked_at TEXT
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_portal_sessions_account
+        ON portal_sessions(account_id);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Portal report inbox (batch F-B3): per-account read receipts for the
+    // report inbox. A row means the account has opened/acknowledged the report.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS portal_report_reads (
+            account_id TEXT NOT NULL,
+            report_id TEXT NOT NULL,
+            read_at TEXT NOT NULL,
+            PRIMARY KEY (account_id, report_id)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Farm activity log (batch F-B5): operations a portal caller records
+    // against an owned field (planting, irrigation, ...). `source`/`linked_ref`
+    // tie recommendation-driven entries back to their origin.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS field_activities (
+            activity_id TEXT PRIMARY KEY,
+            field_id TEXT NOT NULL,
+            org_id TEXT NOT NULL,
+            activity_type TEXT NOT NULL,
+            occurred_at TEXT NOT NULL,
+            note TEXT,
+            quantity REAL,
+            unit TEXT,
+            cost REAL,
+            geometry_json TEXT,
+            created_by TEXT NOT NULL,
+            source TEXT NOT NULL DEFAULT 'manual',
+            linked_ref TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_field_activities_field_time
+        ON field_activities(field_id, occurred_at);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Satellite pipeline (batch S-6): per-field dataset subscriptions and the
+    // durable job queue that drives discover -> derive -> L3 -> app runs.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS satellite_subscriptions (
+            subscription_id TEXT PRIMARY KEY,
+            field_id TEXT NOT NULL,
+            dataset TEXT NOT NULL,
+            indices_json TEXT NOT NULL,
+            cadence_hours INTEGER NOT NULL DEFAULT 24,
+            max_cloud_cover REAL NOT NULL DEFAULT 60.0,
+            lookback_days INTEGER NOT NULL DEFAULT 14,
+            status TEXT NOT NULL DEFAULT 'active',
+            last_checked_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(field_id, dataset)
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS pipeline_jobs (
+            job_id TEXT PRIMARY KEY,
+            job_key TEXT NOT NULL UNIQUE,
+            kind TEXT NOT NULL,
+            field_id TEXT,
+            dataset TEXT,
+            payload_json TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'queued',
+            priority INTEGER NOT NULL DEFAULT 0,
+            attempts INTEGER NOT NULL DEFAULT 0,
+            max_attempts INTEGER NOT NULL DEFAULT 3,
+            run_after TEXT NOT NULL,
+            backfill_id TEXT,
+            parent_job_id TEXT,
+            claimed_at TEXT,
+            started_at TEXT,
+            finished_at TEXT,
+            last_error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_pipeline_jobs_ready
+        ON pipeline_jobs(status, run_after, priority);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_pipeline_jobs_backfill
+        ON pipeline_jobs(backfill_id, status);
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Historical backfill runs (batch S-11): resumable 1982+ range walks
+    // that expand into chunked `backfill_enumerate` jobs. `cursor_json`
+    // maps each dataset to the next unprocessed chunk start date.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS backfill_runs (
+            backfill_id TEXT PRIMARY KEY,
+            field_id TEXT NOT NULL,
+            datasets_json TEXT NOT NULL,
+            indices_json TEXT NOT NULL,
+            start_date TEXT NOT NULL,
+            end_date TEXT NOT NULL,
+            max_cloud_cover REAL NOT NULL DEFAULT 70.0,
+            status TEXT NOT NULL DEFAULT 'running',
+            cursor_json TEXT,
+            scenes_discovered INTEGER NOT NULL DEFAULT 0,
+            jobs_enqueued INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    info!("baseline schema applied");
     Ok(())
 }
 

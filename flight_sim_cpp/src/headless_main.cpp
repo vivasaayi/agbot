@@ -1,6 +1,9 @@
 #include "agbot_flight_sim/DeterministicRunner.hpp"
 #include "agbot_flight_sim/MissionLoader.hpp"
 #include "agbot_flight_sim/SimulationOps.hpp"
+#include "agbot_flight_sim/AssetPaths.hpp"
+
+#include "agbot_config/Toml.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -22,10 +25,14 @@ using agbot::flight_sim::run_deterministic;
 
 namespace {
 
+// Default seed used when neither the CLI nor the settings file supplies one,
+// so the simulator runs deterministically with zero arguments.
+constexpr std::uint64_t kDefaultSeed = 1;
+
 struct Args {
     std::filesystem::path mission_path = default_sample_mission_path();
-    std::filesystem::path output_path = std::filesystem::path(AGBOT_FLIGHT_SIM_SOURCE_DIR) / "out" / "telemetry.jsonl";
-    std::optional<std::uint64_t> seed; // required: deterministic mode demands an explicit seed
+    std::filesystem::path output_path = agbot::flight_sim::sim_out_dir() / "telemetry.jsonl";
+    std::optional<std::uint64_t> seed; // resolved from settings file / default when absent
     double timestep_ms = 1000.0 / 60.0;
     double record_interval_s = 0.25;
     double max_time_s = 600.0;
@@ -65,8 +72,8 @@ std::pair<std::uint32_t, std::uint32_t> parse_u32_pair_csv(const std::string& te
 }
 
 [[noreturn]] void print_usage_and_exit(int code) {
-    std::cout << "Usage: agbot_flight_sim_headless --seed N [options]\n"
-              << "  --seed N             REQUIRED. Seed for deterministic run (refuses to start without it).\n"
+    std::cout << "Usage: agbot_flight_sim_headless [options]\n"
+              << "  --seed N             Seed for deterministic run (default from config/flight_sim.toml, else 1).\n"
               << "  --timestep-ms MS     Fixed timestep in milliseconds (default 16.667).\n"
               << "  --record-interval S  Telemetry sampling interval in seconds (default 0.25).\n"
               << "  --mission PATH       Mission JSON to fly (default: bundled sample).\n"
@@ -90,8 +97,44 @@ std::pair<std::uint32_t, std::uint32_t> parse_u32_pair_csv(const std::string& te
     std::exit(code);
 }
 
+// Apply defaults from the user-editable settings file (config/flight_sim.toml)
+// so a bare `agbot_flight_sim_headless` invocation runs with sensible, tunable
+// defaults. Missing file or fields fall back to the compiled defaults; a
+// malformed file is reported and ignored rather than fatal.
+void apply_settings_defaults(Args& args) {
+    args.seed = kDefaultSeed;
+
+    const std::filesystem::path settings_path =
+        agbot::flight_sim::sim_config_dir() / "flight_sim.toml";
+    std::error_code ec;
+    if (!std::filesystem::exists(settings_path, ec)) {
+        return;
+    }
+
+    const agbot::config::TomlParseResult parsed =
+        agbot::config::parse_toml_file(settings_path);
+    if (!parsed.ok) {
+        std::cerr << "warning: ignoring invalid settings file "
+                  << settings_path << ": " << parsed.error << "\n";
+        return;
+    }
+
+    // Accept keys either at the top level or under a [run] table.
+    const agbot::config::ParamTable* run =
+        agbot::config::find_table(parsed.root, "run");
+    const agbot::config::ParamTable& table = run != nullptr ? *run : parsed.root;
+
+    args.seed = static_cast<std::uint64_t>(agbot::config::integer_or(
+        table, "seed", static_cast<std::int64_t>(kDefaultSeed)));
+    args.timestep_ms = agbot::config::double_or(table, "timestep_ms", args.timestep_ms);
+    args.record_interval_s =
+        agbot::config::double_or(table, "record_interval_s", args.record_interval_s);
+    args.max_time_s = agbot::config::double_or(table, "max_time_s", args.max_time_s);
+}
+
 Args parse_args(int argc, char** argv) {
     Args args;
+    apply_settings_defaults(args);
     for (int index = 1; index < argc; ++index) {
         const std::string current = argv[index];
         if (current == "--mission" && index + 1 < argc) {
@@ -131,7 +174,8 @@ Args parse_args(int argc, char** argv) {
         }
     }
     if (!args.seed.has_value()) {
-        throw std::runtime_error("deterministic mode requires --seed");
+        // Should not happen: apply_settings_defaults always seeds a default.
+        args.seed = kDefaultSeed;
     }
     if (args.timestep_ms <= 0.0) {
         throw std::runtime_error("--timestep-ms must be positive");

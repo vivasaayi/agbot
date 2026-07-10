@@ -371,6 +371,93 @@
     .error {
       color: #c96a5f;
     }
+
+    /* Ingestion & sources oversight panel. */
+    .pipeline-heading {
+      margin: 0.8rem 0 0.3rem;
+      font-size: 0.82rem;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+    .pipeline-refresh {
+      color: var(--accent);
+      background: none;
+      border: 1px solid var(--panel-border);
+      border-radius: 3px;
+      padding: 0.15rem 0.5rem;
+      cursor: pointer;
+      font-size: 0.75rem;
+    }
+    .pipeline-metrics {
+      display: flex;
+      gap: 0.5rem;
+    }
+    .pipeline-metric {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      border: 1px solid var(--panel-border);
+      border-radius: 4px;
+      padding: 0.35rem 0.2rem;
+    }
+    .pipeline-metric-value {
+      font-size: 1.1rem;
+      font-weight: 600;
+    }
+    .pipeline-metric-label {
+      font-size: 0.68rem;
+      color: var(--text-dim);
+    }
+    .pipeline-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.74rem;
+      margin-top: 0.2rem;
+    }
+    .pipeline-table th,
+    .pipeline-table td {
+      text-align: left;
+      padding: 0.2rem 0.35rem;
+      border-bottom: 1px solid var(--panel-border);
+      vertical-align: top;
+    }
+    .pipeline-table th {
+      color: var(--text-dim);
+      font-weight: 600;
+    }
+    .tag-ok { color: #4f9d69; border-color: #4f9d69; }
+    .tag-error { color: #c96a5f; border-color: #c96a5f; }
+    .tag-info { color: #5f86c9; border-color: #5f86c9; }
+    .tag-warn { color: #c9a15f; border-color: #c9a15f; }
+
+    /* Per-level product browser (scene inspector). */
+    .level-label {
+      margin: 0.5rem 0 0.2rem;
+      font-size: 0.76rem;
+      color: var(--accent);
+    }
+    .level-product-list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+    }
+    .level-product-list li {
+      padding: 0.25rem 0;
+      border-bottom: 1px solid var(--panel-border);
+    }
+    .level-product-row {
+      font-size: 0.76rem;
+    }
+    .level-series {
+      color: var(--accent);
+      margin-top: 0.2rem;
+    }
+    .sparkline {
+      display: block;
+      max-width: 100%;
+    }
   </style>
 </head>
 <body>
@@ -404,6 +491,7 @@
         <span class="tab" data-tab="provenance">Provenance</span>
         <span class="tab" data-tab="alerts">Alerts</span>
         <span class="tab" data-tab="proposals">Proposals</span>
+        <span class="tab" data-tab="pipeline">Pipeline</span>
       </div>
       <div id="layers-panel"></div>
       <div id="annotations-panel"></div>
@@ -412,6 +500,7 @@
       <div id="alerts-panel"></div>
       <div id="proposals-panel"></div>
       <div id="provenance-panel"></div>
+      <div id="pipeline-panel"></div>
       <div id="scene-detail">
         <p class="status">Select a scene to inspect it.</p>
       </div>

@@ -1470,7 +1470,9 @@ fn usgs_band_l1_draft(
     band_file: &UsgsBandFile,
     acquired_at: &str,
 ) -> shared::product_graph::ProductRecordDraft {
-    use shared::product_graph::{ProductArtifact, ProductInputRef, ProductLevel, ProductRecordDraft, ProductScope};
+    use shared::product_graph::{
+        ProductArtifact, ProductInputRef, ProductLevel, ProductRecordDraft, ProductScope,
+    };
     let scene = &record.scene;
     ProductRecordDraft {
         level: ProductLevel::L1,
@@ -1529,11 +1531,10 @@ pub fn normalized_ingest_from_usgs_with_bands(
     use crate::ingest_contract::{IngestError, IngestScene, NormalizedIngest};
     let scene = &record.scene;
     let source_id = usgs_source_id(&scene.dataset_name);
-    let metadata_json =
-        serde_json::to_string(scene).map_err(|source| IngestError::Serialize {
-            what: "usgs scene summary",
-            source,
-        })?;
+    let metadata_json = serde_json::to_string(scene).map_err(|source| IngestError::Serialize {
+        what: "usgs scene summary",
+        source,
+    })?;
     let acquired_at = scene
         .acquired_at
         .clone()
@@ -1841,7 +1842,9 @@ mod tests {
                 browse_url: Some("https://example.test/browse.png".to_string()),
             },
             metadata_path: std::path::PathBuf::from(format!("/data/{scene_id}/metadata.json")),
-            downloaded_browse_path: std::path::PathBuf::from(format!("/data/{scene_id}/browse.png")),
+            downloaded_browse_path: std::path::PathBuf::from(format!(
+                "/data/{scene_id}/browse.png"
+            )),
             stored_at: "2026-06-02T00:00:00Z".to_string(),
         }
     }
@@ -1898,7 +1901,9 @@ mod tests {
         for l1 in &ingest.l1_products {
             assert_eq!(l1.level, shared::product_graph::ProductLevel::L1);
             assert!(
-                l1.inputs.iter().any(|i| i.product_id == l0_id && i.role == "raw_scene"),
+                l1.inputs
+                    .iter()
+                    .any(|i| i.product_id == l0_id && i.role == "raw_scene"),
                 "each L1 band lists the L0 raw-scene as input"
             );
         }

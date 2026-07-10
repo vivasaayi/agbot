@@ -10,7 +10,8 @@ use crate::state::AppState;
 use anyhow::Error;
 use axum::extract::{Path, Query, State};
 use axum::Json;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use sqlx::Row;
 
 /// Map a catalog registration error onto an HTTP error: graph-validation
 /// failures are client errors, everything else is a server error.
@@ -123,6 +124,73 @@ pub async fn list_catalog_products(
         .await
         .map_err(catalog_error)?;
     Ok(Json(products))
+}
+
+/// Query filter for `GET /api/catalog/sources`.
+#[derive(Debug, Default, Deserialize)]
+pub struct CatalogSourcesQuery {
+    pub status: Option<String>,
+    pub source_kind: Option<String>,
+}
+
+/// A registered ingestion source (read view over `catalog_sources`). This is
+/// the missing read side of the source registry — until now the table was
+/// write-only from the ingest contract.
+#[derive(Debug, Serialize)]
+pub struct CatalogSource {
+    pub source_id: String,
+    pub source_kind: String,
+    pub platform: Option<String>,
+    pub sensor: Option<String>,
+    pub status: String,
+    pub registered_at: String,
+    /// Parsed `config_json` if present and valid JSON, otherwise null.
+    pub config: Option<serde_json::Value>,
+}
+
+/// List registered ingestion sources, most-recently-registered first.
+/// Optional `status` and `source_kind` filters are ANDed.
+pub async fn list_catalog_sources(
+    State(state): State<AppState>,
+    Query(query): Query<CatalogSourcesQuery>,
+) -> AppResult<Json<Vec<CatalogSource>>> {
+    let status = normalize_optional_text(query.status);
+    let source_kind = normalize_optional_text(query.source_kind);
+
+    let rows = sqlx::query(
+        r#"
+        SELECT source_id, source_kind, platform, sensor, config_json, status, registered_at
+        FROM catalog_sources
+        WHERE (?1 IS NULL OR status = ?1)
+          AND (?2 IS NULL OR source_kind = ?2)
+        ORDER BY registered_at DESC, source_id ASC
+        "#,
+    )
+    .bind(&status)
+    .bind(&source_kind)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
+
+    let sources = rows
+        .iter()
+        .map(|row| {
+            let config = row
+                .get::<Option<String>, _>("config_json")
+                .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+            CatalogSource {
+                source_id: row.get("source_id"),
+                source_kind: row.get("source_kind"),
+                platform: row.get("platform"),
+                sensor: row.get("sensor"),
+                status: row.get("status"),
+                registered_at: row.get("registered_at"),
+                config,
+            }
+        })
+        .collect();
+
+    Ok(Json(sources))
 }
 
 /// Fetch a single catalog product by id.

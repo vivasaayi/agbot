@@ -20,6 +20,7 @@ use crate::provenance_store::{self, ProvenanceStoreError};
 use provenance::{lineage_record_for_product_draft, ActorIdentity};
 use shared::product_graph::{ProductLevel, ProductRecordDraft};
 use sqlx::Row;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use thiserror::Error;
 
@@ -44,6 +45,11 @@ pub enum CatalogError {
     InvalidLevel { product_id: String, value: String },
     #[error("failed to persist provenance lineage: {0}")]
     Lineage(#[from] ProvenanceStoreError),
+    #[error("failed to reclaim artifact file {path}: {source}")]
+    Io {
+        path: String,
+        source: std::io::Error,
+    },
     #[error(transparent)]
     Db(#[from] sqlx::Error),
 }
@@ -464,6 +470,105 @@ pub async fn supersede_product(
     Ok(())
 }
 
+/// Product status for one that failed the QA gate (an allowed value of the
+/// `catalog_products.status` CHECK constraint): present in the graph for
+/// audit/lineage but excluded from `status = 'registered'` queries (serving and
+/// downstream fan-out), so low-quality data does not propagate.
+pub const STATUS_FAILED_QA: &str = "failed_qa";
+
+/// QA-gate policy: the minimum acceptable product confidence. `0` accepts
+/// everything (gate disabled).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QaPolicy {
+    pub min_confidence: f64,
+}
+
+/// The QA gate's decision for a product.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QaVerdict {
+    Pass,
+    Quarantine { reason: String },
+}
+
+/// Evaluate a product's `confidence` against `policy`. An unknown confidence
+/// (`None`) passes — the gate rejects only a *measured* low score, never the
+/// absence of a measurement — as does any score at or above the minimum.
+pub fn qa_verdict(confidence: Option<f64>, policy: &QaPolicy) -> QaVerdict {
+    match confidence {
+        Some(score) if score < policy.min_confidence => QaVerdict::Quarantine {
+            reason: format!(
+                "confidence {score:.3} below minimum {:.3}",
+                policy.min_confidence
+            ),
+        },
+        _ => QaVerdict::Pass,
+    }
+}
+
+/// Mark a product as `failed_qa` so it is excluded from `registered` queries.
+pub async fn quarantine_product(pool: &DbPool, product_id: &str) -> Result<(), CatalogError> {
+    sqlx::query("UPDATE catalog_products SET status = ? WHERE product_id = ?")
+        .bind(STATUS_FAILED_QA)
+        .bind(product_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Delete a product's on-disk artifact to reclaim space (used after a product
+/// is superseded, so regenerated rasters don't accumulate unbounded).
+///
+/// Safety-guarded so it can never delete outside the managed data tree or a
+/// still-referenced file:
+/// - the product must have a non-empty artifact path;
+/// - the resolved path must live under `data_root`;
+/// - no other catalog product may still reference the same path (content-
+///   addressed products can share a file).
+///
+/// Returns the removed path, or `None` when nothing was eligible/present. A
+/// missing file is treated as already reclaimed (`Ok(None)`), not an error.
+pub async fn reclaim_product_artifact(
+    pool: &DbPool,
+    data_root: &Path,
+    product_id: &str,
+) -> Result<Option<PathBuf>, CatalogError> {
+    let Some(product) = get_product(pool, product_id).await? else {
+        return Ok(None);
+    };
+    let Some(path) = product.path.filter(|p| !p.is_empty()) else {
+        return Ok(None);
+    };
+    let path_buf = PathBuf::from(&path);
+
+    // Never touch a file outside the managed data tree. canonicalize also
+    // fails when the file is already gone -> treated as nothing to reclaim.
+    let under_root = match (path_buf.canonicalize(), data_root.canonicalize()) {
+        (Ok(resolved), Ok(root)) => resolved.starts_with(&root),
+        _ => false,
+    };
+    if !under_root {
+        return Ok(None);
+    }
+
+    // Never delete an artifact another product still points at.
+    let others: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM catalog_products WHERE path = ? AND product_id != ?",
+    )
+    .bind(&path)
+    .bind(product_id)
+    .fetch_one(pool)
+    .await?;
+    if others > 0 {
+        return Ok(None);
+    }
+
+    match std::fs::remove_file(&path_buf) {
+        Ok(()) => Ok(Some(path_buf)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CatalogError::Io { path, source }),
+    }
+}
+
 fn row_to_product(row: sqlx::sqlite::SqliteRow) -> Result<RegisteredProduct, CatalogError> {
     let product_id: String = row.get("product_id");
     let level_str: String = row.get("level");
@@ -625,4 +730,31 @@ pub async fn register_sidecar_dir(
         ));
     }
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qa_verdict_quarantines_only_a_measured_below_threshold_score() {
+        let policy = QaPolicy {
+            min_confidence: 0.5,
+        };
+        // Measured below threshold -> quarantine with a reason.
+        match qa_verdict(Some(0.4), &policy) {
+            QaVerdict::Quarantine { reason } => assert!(reason.contains("below minimum")),
+            other => panic!("expected quarantine, got {other:?}"),
+        }
+        // At or above threshold -> pass.
+        assert_eq!(qa_verdict(Some(0.5), &policy), QaVerdict::Pass);
+        assert_eq!(qa_verdict(Some(0.9), &policy), QaVerdict::Pass);
+        // Unknown confidence -> pass (the gate never rejects a missing measure).
+        assert_eq!(qa_verdict(None, &policy), QaVerdict::Pass);
+        // Disabled policy (0) accepts everything, including a 0 score.
+        let off = QaPolicy {
+            min_confidence: 0.0,
+        };
+        assert_eq!(qa_verdict(Some(0.0), &off), QaVerdict::Pass);
+    }
 }

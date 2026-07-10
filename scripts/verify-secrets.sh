@@ -23,6 +23,9 @@ is_managed_reference() {
     [[ "$value" == \$* ]] && return 0
     [[ "$value" == /run/secrets/* ]] && return 0
     [[ "$lower_value" == "null" ]] && return 0
+    # A sqlite file/memory URL carries no credentials (no `user:pass@` userinfo),
+    # so an appliance path like sqlite:///opt/agbot/db/geo_hub.db is not a secret.
+    [[ "$lower_value" == sqlite://* && "$value" != *@* ]] && return 0
     return 1
 }
 
