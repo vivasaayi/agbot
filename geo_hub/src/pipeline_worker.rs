@@ -300,8 +300,12 @@ pub fn spawn_pipeline_worker(
             return;
         }
         match pipeline::reset_orphaned_running_jobs(&ctx.pool).await {
-            Ok(0) => {}
-            Ok(reset) => tracing::info!("pipeline worker re-queued {reset} orphaned running jobs"),
+            Ok(recovery) if recovery.requeued == 0 && recovery.dead_lettered == 0 => {}
+            Ok(recovery) => tracing::info!(
+                requeued = recovery.requeued,
+                dead_lettered = recovery.dead_lettered,
+                "pipeline worker recovered orphaned running jobs"
+            ),
             Err(err) => {
                 tracing::error!("pipeline worker failed to reset orphaned running jobs: {err}");
             }

@@ -271,11 +271,51 @@ async fn orphaned_running_jobs_reset_to_queued() -> Result<()> {
     pipeline::claim_next_job(&pool, t0()).await?.unwrap();
     pipeline::claim_next_job(&pool, t0()).await?.unwrap();
 
-    let reset = pipeline::reset_orphaned_running_jobs(&pool).await?;
-    assert_eq!(reset, 2);
+    let recovery = pipeline::reset_orphaned_running_jobs(&pool).await?;
+    assert_eq!(recovery.requeued, 2);
+    assert_eq!(recovery.dead_lettered, 0);
 
     let jobs = pipeline::list_jobs(&pool, None).await?;
     assert!(jobs.iter().all(|job| job.status == JobStatus::Queued));
+    Ok(())
+}
+
+/// A job that keeps taking the worker down mid-run (poison pill) must not be
+/// re-queued forever: once its attempts reach the ceiling the orphan sweep
+/// dead-letters it, and a healthy sibling still recovers so the worker drains.
+#[tokio::test]
+async fn orphaned_job_with_exhausted_attempts_is_dead_lettered() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let pool = pool(&tmp).await?;
+
+    enqueue_discover(&pool, "field-poison", 0, t0()).await?;
+    enqueue_discover(&pool, "field-healthy", 0, t0()).await?;
+    let poison = pipeline::claim_next_job(&pool, t0()).await?.unwrap();
+    pipeline::claim_next_job(&pool, t0()).await?.unwrap();
+
+    // Simulate the poison job having crash-looped up to its attempt ceiling; a
+    // mid-run process death leaves it `running`.
+    sqlx::query("UPDATE pipeline_jobs SET attempts = max_attempts WHERE job_id = ?")
+        .bind(&poison.job_id)
+        .execute(&pool)
+        .await?;
+
+    let recovery = pipeline::reset_orphaned_running_jobs(&pool).await?;
+    assert_eq!(recovery.dead_lettered, 1, "poison job buried");
+    assert_eq!(recovery.requeued, 1, "healthy job re-queued");
+
+    let jobs = pipeline::list_jobs(&pool, None).await?;
+    let poison_row = jobs.iter().find(|job| job.job_id == poison.job_id).unwrap();
+    assert_eq!(poison_row.status, JobStatus::Dead);
+    assert!(poison_row
+        .last_error
+        .as_deref()
+        .unwrap()
+        .contains("attempts exhausted"));
+
+    // The worker keeps draining: the healthy job is claimable, the poison one is not.
+    let next = pipeline::claim_next_job(&pool, t0()).await?.unwrap();
+    assert_ne!(next.job_id, poison.job_id);
     Ok(())
 }
 

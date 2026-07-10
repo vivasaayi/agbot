@@ -533,15 +533,61 @@ pub async fn fail_job(
     Ok(())
 }
 
-/// Recover jobs left `running` by a crashed or killed worker (called on
-/// worker startup, before the poll loop). Returns how many were re-queued.
-pub async fn reset_orphaned_running_jobs(pool: &DbPool) -> Result<usize, PipelineError> {
-    let result = sqlx::query(
-        "UPDATE pipeline_jobs SET status = 'queued', claimed_at = NULL WHERE status = 'running'",
+/// Outcome of the startup orphan sweep.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct OrphanRecovery {
+    /// Orphaned running jobs put back on the queue for another attempt.
+    pub requeued: usize,
+    /// Orphaned running jobs buried because they had already exhausted their
+    /// attempts — a job that keeps taking the worker down mid-run is a poison
+    /// pill, not a transient failure.
+    pub dead_lettered: usize,
+}
+
+/// Recover jobs left `running` by a crashed or killed worker (called on worker
+/// startup, before the poll loop).
+///
+/// [`claim_next_job`] charges an attempt up front, so a job found `running`
+/// after a crash has already consumed one. This matters under
+/// `panic = "abort"` (the release profile): a handler panic takes the whole
+/// process down, the container restarts, and a naive re-queue would re-run the
+/// same poison job and crash again — an unbounded crash loop that starves every
+/// other job. So a job whose `attempts` have reached `max_attempts` is
+/// dead-lettered here instead of re-queued; the rest are re-queued for a normal
+/// retry, and the worker keeps draining.
+pub async fn reset_orphaned_running_jobs(pool: &DbPool) -> Result<OrphanRecovery, PipelineError> {
+    let now_ts = format_ts(Utc::now());
+
+    // Bury poison jobs first (they are still `running`), then re-queue the rest.
+    let dead = sqlx::query(
+        r#"
+        UPDATE pipeline_jobs
+        SET status = 'dead',
+            last_error = 'worker exited while running this job; attempts exhausted',
+            finished_at = ?, updated_at = ?
+        WHERE status = 'running' AND attempts >= max_attempts
+        "#,
     )
+    .bind(&now_ts)
+    .bind(&now_ts)
     .execute(pool)
     .await?;
-    Ok(result.rows_affected() as usize)
+
+    let requeued = sqlx::query(
+        r#"
+        UPDATE pipeline_jobs
+        SET status = 'queued', claimed_at = NULL, updated_at = ?
+        WHERE status = 'running'
+        "#,
+    )
+    .bind(&now_ts)
+    .execute(pool)
+    .await?;
+
+    Ok(OrphanRecovery {
+        requeued: requeued.rows_affected() as usize,
+        dead_lettered: dead.rows_affected() as usize,
+    })
 }
 
 /// List jobs, optionally filtered to one field, oldest first.
