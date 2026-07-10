@@ -161,6 +161,7 @@ async fn worker_ctx(poll_interval_ms: u64) -> Result<(TempDir, PipelineWorkerCon
             enabled: true,
             poll_interval_ms,
             provider_min_delay_ms: 0,
+            ..PipelineConfig::default()
         },
         ..HubConfig::default()
     };

@@ -245,7 +245,12 @@ pub async fn run_one_tick(ctx: &PipelineWorkerContext) -> Result<TickOutcome, Pi
             job.kind,
             JobKind::Derive | JobKind::Discover | JobKind::BackfillEnumerate
         );
-        let result = execute_job(ctx, &job).await;
+        let result = with_job_timeout(
+            Duration::from_secs(ctx.config.pipeline.job_timeout_secs),
+            &job.job_id,
+            execute_job(ctx, &job),
+        )
+        .await;
         match &result {
             JobRunResult::Succeeded => {
                 pipeline::complete_job(&ctx.pool, &job.job_id, Utc::now()).await?;
@@ -354,6 +359,31 @@ fn transient_failure(error: String) -> JobRunResult {
     JobRunResult::Failed {
         error,
         client_error: false,
+    }
+}
+
+/// Run a job's execution future under a wall-clock cap. A handler that hangs
+/// would otherwise wedge the serial worker forever; on timeout the job is
+/// failed **transiently** (retried with backoff, then dead-lettered), so the
+/// worker keeps draining. A zero `timeout` disables the cap.
+async fn with_job_timeout<F>(timeout: Duration, label: &str, fut: F) -> JobRunResult
+where
+    F: Future<Output = JobRunResult>,
+{
+    if timeout.is_zero() {
+        return fut.await;
+    }
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            let secs = timeout.as_secs();
+            tracing::warn!(
+                job_id = label,
+                timeout_secs = secs,
+                "pipeline job exceeded lease timeout"
+            );
+            transient_failure(format!("job exceeded {secs}s lease timeout"))
+        }
     }
 }
 
@@ -2178,6 +2208,45 @@ mod tests {
         let via_feature = aoi_bounds_from_geojson(&feature).unwrap();
         assert_eq!(via_feature.min_lon, bounds.min_lon);
         assert_eq!(via_feature.max_lat, bounds.max_lat);
+    }
+
+    #[tokio::test]
+    async fn job_timeout_fails_a_hung_job_transiently() {
+        // A 20ms cap over a future that would sleep far longer: the timeout
+        // fires almost immediately and the job fails transiently.
+        let hung = async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            JobRunResult::Succeeded
+        };
+        let result = with_job_timeout(Duration::from_millis(20), "hung-job", hung).await;
+        match result {
+            JobRunResult::Failed {
+                client_error,
+                error,
+            } => {
+                assert!(!client_error, "a timeout is transient (retryable)");
+                assert!(error.contains("lease timeout"), "{error}");
+            }
+            other => panic!("expected a timeout failure, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn job_timeout_passes_through_a_fast_job() {
+        let result = with_job_timeout(Duration::from_secs(30), "fast", async {
+            JobRunResult::Succeeded
+        })
+        .await;
+        assert_eq!(result, JobRunResult::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn job_timeout_zero_disables_the_cap() {
+        let result = with_job_timeout(Duration::ZERO, "uncapped", async {
+            JobRunResult::Succeeded
+        })
+        .await;
+        assert_eq!(result, JobRunResult::Succeeded);
     }
 
     #[test]

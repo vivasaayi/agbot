@@ -70,6 +70,11 @@ pub struct PipelineConfig {
     pub poll_interval_ms: u64,
     /// Minimum delay between successive upstream provider requests.
     pub provider_min_delay_ms: u64,
+    /// Hard wall-clock cap on a single job's execution. A handler that hangs
+    /// (e.g. an upstream read with no timeout of its own) would otherwise block
+    /// the serial worker forever; on timeout the job is failed transiently and
+    /// retried with backoff, so the worker keeps draining. `0` disables the cap.
+    pub job_timeout_secs: u64,
 }
 
 impl Default for PipelineConfig {
@@ -78,6 +83,9 @@ impl Default for PipelineConfig {
             enabled: false,
             poll_interval_ms: 1000,
             provider_min_delay_ms: 250,
+            // 30 minutes: far above any legitimate derive/composite, low enough
+            // to bound a wedged worker. Always on by default.
+            job_timeout_secs: 1800,
         }
     }
 }

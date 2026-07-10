@@ -25,6 +25,9 @@ services:
       # The image bakes absolute GEO_HUB__* defaults; override here only to
       # opt into the pipeline worker or point at a different runtime mode.
       GEO_HUB__PIPELINE__ENABLED: ${AGBOT_PIPELINE_ENABLED:-false}
+      # Hard cap on a single pipeline job's run time (seconds; 0 disables). A
+      # hung handler is failed transiently so the serial worker keeps draining.
+      GEO_HUB__PIPELINE__JOB_TIMEOUT_SECS: ${AGBOT_JOB_TIMEOUT_SECS:-1800}
       GEO_HUB__RUNTIME_MODE: ${AGBOT_RUNTIME_MODE:-local}
       # Admin access-code API bearer token. Empty → API disabled (fail-closed).
       GEO_HUB__SECURITY__ADMIN_TOKEN: ${AGBOT_ADMIN_TOKEN:-}

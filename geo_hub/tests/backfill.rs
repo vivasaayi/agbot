@@ -125,6 +125,7 @@ async fn hub_pool(tmp: &TempDir) -> Result<(Arc<HubConfig>, db::DbPool)> {
             enabled: true,
             poll_interval_ms: 1000,
             provider_min_delay_ms: 0,
+            ..PipelineConfig::default()
         },
         ..HubConfig::default()
     };
