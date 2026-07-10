@@ -262,6 +262,38 @@ async fn client_error_goes_dead() -> Result<()> {
 }
 
 #[tokio::test]
+async fn transient_failure_honors_upstream_retry_after() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let pool = pool(&tmp).await?;
+
+    enqueue_discover(&pool, "field-1", 0, t0()).await?;
+    let job = pipeline::claim_next_job(&pool, t0()).await?.unwrap();
+    assert_eq!(job.attempts, 1);
+
+    // A 429 with Retry-After of 45s (embedded by earth_search::upstream_error).
+    // Without honoring it, attempts=1 would back off 60*2^1 = 120s.
+    pipeline::fail_job(
+        &pool,
+        &job,
+        "item fetch failed: ... 429 Too Many Requests [retry-after=45]: slow down",
+        false,
+        t0(),
+    )
+    .await?;
+
+    // Not yet claimable one second before the honored delay...
+    assert!(
+        pipeline::claim_next_job(&pool, t0() + Duration::seconds(44))
+            .await?
+            .is_none()
+    );
+    // ...claimable exactly at +45s (proves 45, not the 120s exponential value).
+    let reclaimed = pipeline::claim_next_job(&pool, t0() + Duration::seconds(45)).await?;
+    assert_eq!(reclaimed.map(|j| j.job_id), Some(job.job_id));
+    Ok(())
+}
+
+#[tokio::test]
 async fn orphaned_running_jobs_reset_to_queued() -> Result<()> {
     let tmp = TempDir::new()?;
     let pool = pool(&tmp).await?;

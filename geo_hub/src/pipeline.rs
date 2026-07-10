@@ -23,6 +23,28 @@ use thiserror::Error;
 /// `BACKOFF_BASE_SECS * 2^attempts` seconds.
 const BACKOFF_BASE_SECS: i64 = 60;
 
+/// Upper bound on an honored `Retry-After` (1 hour) so a bogus or hostile
+/// header cannot park a job indefinitely.
+const MAX_RETRY_AFTER_SECS: i64 = 3600;
+
+/// Extract an explicit retry delay (whole seconds) that an upstream embedded in
+/// the error text as `retry-after=<secs>` (see `earth_search::upstream_error`),
+/// so the transient-failure path can honor a provider's `Retry-After` instead
+/// of blind exponential backoff.
+pub fn parse_retry_after_secs(error_msg: &str) -> Option<i64> {
+    const MARKER: &str = "retry-after=";
+    let start = error_msg.find(MARKER)? + MARKER.len();
+    let digits: String = error_msg[start..]
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    if digits.is_empty() {
+        None
+    } else {
+        digits.parse::<i64>().ok()
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum PipelineError {
     #[error("pipeline job {0} not found")]
@@ -497,8 +519,12 @@ pub async fn fail_job(
     let retryable = !is_client_error && job.attempts < job.max_attempts;
 
     let result = if retryable {
-        let backoff_secs = BACKOFF_BASE_SECS * 2_i64.pow(job.attempts.clamp(0, 30) as u32);
-        let run_after_ts = format_ts(now + Duration::seconds(backoff_secs));
+        // Honor an upstream `Retry-After` (embedded as `retry-after=<secs>`)
+        // when present; otherwise exponential backoff.
+        let delay_secs = parse_retry_after_secs(error_msg)
+            .map(|secs| secs.clamp(0, MAX_RETRY_AFTER_SECS))
+            .unwrap_or_else(|| BACKOFF_BASE_SECS * 2_i64.pow(job.attempts.clamp(0, 30) as u32));
+        let run_after_ts = format_ts(now + Duration::seconds(delay_secs));
         sqlx::query(
             r#"
             UPDATE pipeline_jobs
@@ -1031,5 +1057,20 @@ mod tests {
         assert_eq!(format_ts(at), "2026-06-01T00:00:00Z");
         let later = at + Duration::seconds(90);
         assert!(format_ts(later) > format_ts(at));
+    }
+
+    #[test]
+    fn parse_retry_after_reads_embedded_seconds() {
+        assert_eq!(
+            parse_retry_after_secs(
+                "item fetch failed: ... failed with 429 Too Many Requests [retry-after=45]: body"
+            ),
+            Some(45)
+        );
+        // No marker -> None (caller falls back to exponential backoff).
+        assert_eq!(parse_retry_after_secs("some other 429 error"), None);
+        // Non-numeric / empty after the marker -> None.
+        assert_eq!(parse_retry_after_secs("retry-after=soon"), None);
+        assert_eq!(parse_retry_after_secs("retry-after="), None);
     }
 }

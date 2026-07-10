@@ -164,6 +164,36 @@ fn http_client() -> Result<reqwest::Client> {
         .context("failed to build HTTP client")
 }
 
+/// The integer-seconds form of a `Retry-After` response header, if present.
+/// The HTTP-date form is ignored (callers fall back to normal backoff).
+fn retry_after_header_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+}
+
+/// Build an upstream-failure error. On `429 Too Many Requests` with a numeric
+/// `Retry-After`, the delay is embedded as `retry-after=<secs>` so the pipeline
+/// can honor it (see `pipeline::parse_retry_after_secs`) instead of blind
+/// exponential backoff.
+fn upstream_error(
+    context: &str,
+    status: reqwest::StatusCode,
+    retry_after: Option<u64>,
+    text: &str,
+) -> anyhow::Error {
+    match retry_after {
+        Some(secs) if status == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+            anyhow!("{context} failed with {status} [retry-after={secs}]: {text}")
+        }
+        _ => anyhow!("{context} failed with {status}: {text}"),
+    }
+}
+
 /// Search Earth Search for scenes around a point within a day window,
 /// filtered by max cloud cover, best (least cloudy) first.
 pub async fn search_items(
@@ -197,9 +227,13 @@ pub async fn search_items(
         .context("failed to call Earth Search STAC search")?;
     if !response.status().is_success() {
         let status = response.status();
+        let retry_after = retry_after_header_secs(response.headers());
         let text = response.text().await.unwrap_or_default();
-        return Err(anyhow!(
-            "Earth Search STAC search failed with {status}: {text}"
+        return Err(upstream_error(
+            "Earth Search STAC search",
+            status,
+            retry_after,
+            &text,
         ));
     }
     let text = response.text().await?;
@@ -289,9 +323,13 @@ pub async fn search_items_range(
         .context("failed to call Earth Search STAC search")?;
     if !response.status().is_success() {
         let status = response.status();
+        let retry_after = retry_after_header_secs(response.headers());
         let text = response.text().await.unwrap_or_default();
-        return Err(anyhow!(
-            "Earth Search STAC search failed with {status}: {text}"
+        return Err(upstream_error(
+            "Earth Search STAC search",
+            status,
+            retry_after,
+            &text,
         ));
     }
     let text = response.text().await?;
@@ -311,9 +349,13 @@ pub async fn fetch_item(collection: &str, item_id: &str) -> Result<EarthSearchIt
         .with_context(|| format!("failed to fetch Earth Search item {item_id}"))?;
     if !response.status().is_success() {
         let status = response.status();
+        let retry_after = retry_after_header_secs(response.headers());
         let text = response.text().await.unwrap_or_default();
-        return Err(anyhow!(
-            "Earth Search item fetch failed with {status}: {text}"
+        return Err(upstream_error(
+            "Earth Search item fetch",
+            status,
+            retry_after,
+            &text,
         ));
     }
     let text = response.text().await?;
@@ -329,6 +371,20 @@ mod tests {
 
     fn s2_item() -> EarthSearchItem {
         serde_json::from_str(S2_FIXTURE).expect("parse captured S2 item")
+    }
+
+    #[test]
+    fn upstream_error_embeds_retry_after_only_on_429() {
+        use reqwest::StatusCode;
+        // 429 with a numeric Retry-After -> embed the marker.
+        let rate_limited = upstream_error("ctx", StatusCode::TOO_MANY_REQUESTS, Some(45), "body");
+        assert!(rate_limited.to_string().contains("retry-after=45"));
+        // 429 without a usable Retry-After -> no marker.
+        let no_header = upstream_error("ctx", StatusCode::TOO_MANY_REQUESTS, None, "body");
+        assert!(!no_header.to_string().contains("retry-after="));
+        // A non-429 status never carries the marker, even if a value is passed.
+        let other = upstream_error("ctx", StatusCode::INTERNAL_SERVER_ERROR, Some(45), "body");
+        assert!(!other.to_string().contains("retry-after="));
     }
 
     #[test]
