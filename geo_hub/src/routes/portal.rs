@@ -132,6 +132,60 @@ impl FromRequestParts<AppState> for PortalIdentity {
     }
 }
 
+/// A portal identity when the request carries one, `None` when anonymous.
+///
+/// Used by the non-portal farm/field routes to close the cross-tenant leak
+/// without forcing a session in the unlocked (dev / single-user) mode: when a
+/// session **is** present the caller's org is authoritative and overrides any
+/// client-supplied `org_id`; when absent the legacy query-param scoping
+/// applies. A present-but-invalid token is still rejected with 401 rather than
+/// silently downgraded to anonymous.
+#[derive(Debug, Clone)]
+pub struct OptionalPortalIdentity(pub Option<PortalIdentity>);
+
+impl OptionalPortalIdentity {
+    /// The org filter to enforce: the principal's org when authenticated
+    /// (client input ignored), otherwise the caller-supplied `fallback`.
+    pub fn org_filter(&self, fallback: Option<String>) -> Option<String> {
+        match &self.0 {
+            Some(identity) => Some(identity.org_id.clone()),
+            None => fallback,
+        }
+    }
+
+    /// Whether an authenticated principal may act on a record owned by `owner`.
+    /// Anonymous callers (unlocked mode) are unrestricted; an authenticated
+    /// caller may only touch its own org's records.
+    pub fn owns(&self, owner: &str) -> bool {
+        match &self.0 {
+            Some(identity) => identity.org_id == owner,
+            None => true,
+        }
+    }
+
+    /// The principal's org id, if authenticated.
+    pub fn org_id(&self) -> Option<&str> {
+        self.0.as_ref().map(|identity| identity.org_id.as_str())
+    }
+}
+
+#[axum::async_trait]
+impl FromRequestParts<AppState> for OptionalPortalIdentity {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        match bearer_token(&parts.headers) {
+            None => Ok(OptionalPortalIdentity(None)),
+            Some(token) => Ok(OptionalPortalIdentity(Some(
+                resolve_portal_session(state, token).await?,
+            ))),
+        }
+    }
+}
+
 /// Proof that the caller presented the configured admin bearer token.
 ///
 /// The admin access-code API (mint / list / revoke) can forge a portal session
