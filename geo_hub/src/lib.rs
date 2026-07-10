@@ -3,6 +3,7 @@ pub mod alert_lifecycle;
 pub mod anomaly_run;
 pub mod applications;
 pub mod backfill;
+pub mod backup;
 pub mod bootstrap;
 pub mod catalog;
 pub mod composite_rasters;

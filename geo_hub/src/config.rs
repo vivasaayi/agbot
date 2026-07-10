@@ -258,19 +258,25 @@ impl HubConfig {
         Ok(())
     }
 
+    /// The on-disk path of a file-backed `sqlite://` database, or `None` for
+    /// in-memory databases and non-sqlite URLs. Strips any `?mode=rwc`-style
+    /// query suffix. Used by backup/restore and the parent-dir helper.
+    pub fn database_file_path(&self) -> Option<PathBuf> {
+        let rest = self.database_url.strip_prefix("sqlite://")?;
+        let path_part = rest.split('?').next().unwrap_or(rest);
+        if path_part.is_empty() || path_part == ":memory:" {
+            return None;
+        }
+        Some(PathBuf::from(path_part))
+    }
+
     /// For a `sqlite://` database URL backed by a file, return the parent
     /// directory of that file so it can be created ahead of connecting. This
     /// keeps a relocated appliance (e.g. `sqlite:///opt/agbot/db/geo_hub.db`)
     /// working even when the enclosing directory does not yet exist. Returns
     /// `None` for in-memory databases and non-sqlite URLs.
     fn sqlite_db_parent(&self) -> Option<PathBuf> {
-        let rest = self.database_url.strip_prefix("sqlite://")?;
-        // Strip any `?mode=rwc` style query suffix and in-memory markers.
-        let path_part = rest.split('?').next().unwrap_or(rest);
-        if path_part.is_empty() || path_part == ":memory:" {
-            return None;
-        }
-        Path::new(path_part)
+        self.database_file_path()?
             .parent()
             .filter(|parent| !parent.as_os_str().is_empty())
             .map(Path::to_path_buf)

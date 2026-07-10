@@ -38,6 +38,28 @@ State is persisted in two named Docker volumes so upgrades never lose data:
 - `geo_hub_db`   → `/opt/agbot/db`   (SQLite database)
 - `geo_hub_data` → `/opt/agbot/data` (ingested scenes / products)
 
+### Backup & restore
+
+The `geo_hub` binary can snapshot and restore its SQLite database. Backup uses
+`VACUUM INTO`, so it is a consistent snapshot safe to take while the server
+runs; restore replaces the live file and should be done with the server stopped.
+
+```sh
+# Snapshot into the mounted db volume (safe while running):
+docker compose -f docker-compose.prod.yml exec geo_hub \
+  geo_hub backup /opt/agbot/db/backup-$(date +%F).db
+
+# Restore from a snapshot (stop first, then start again):
+agbot down
+docker compose -f docker-compose.prod.yml run --rm geo_hub \
+  geo_hub restore /opt/agbot/db/backup-2026-07-10.db
+agbot up
+```
+
+Backup refuses to overwrite an existing destination; restore validates the
+SQLite header before clobbering the live database and clears stale `-wal` /
+`-shm` sidecars.
+
 ### Release channels
 
 | Channel  | Image tag | Source                                        |

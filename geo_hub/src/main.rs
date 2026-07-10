@@ -12,6 +12,28 @@ async fn main() -> anyhow::Result<()> {
         .ensure_data_dirs()
         .context("failed to create data directories")?;
 
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Database file management runs before opening a pool or bootstrapping:
+    // restore replaces the database file, and bootstrap would otherwise
+    // recreate/seed it first.
+    match args.as_slice() {
+        [cmd, dest] if cmd == "backup" => {
+            let path = geo_hub::backup::backup_database(&config, std::path::Path::new(dest))
+                .await
+                .context("backup failed")?;
+            println!("backup written to {}", path.display());
+            return Ok(());
+        }
+        [cmd, src] if cmd == "restore" => {
+            geo_hub::backup::restore_database(&config, std::path::Path::new(src))
+                .context("restore failed")?;
+            println!("restored database from {src}");
+            return Ok(());
+        }
+        _ => {}
+    }
+
     // Connect to database pool
     let pool = db::connect_pool(&config)
         .await
@@ -25,7 +47,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Subcommands: `geo_hub catalog register <dir>` walks product_record.json
     // sidecars and registers them; no args runs the server.
-    let args: Vec<String> = std::env::args().skip(1).collect();
     match args.as_slice() {
         [] => {
             info!(
@@ -79,7 +100,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         _ => {
-            bail!("usage: geo_hub [catalog register <dir> | sen2cor run <input.SAFE> [output_dir]]")
+            bail!("usage: geo_hub [catalog register <dir> | sen2cor run <input.SAFE> [output_dir] | backup <dest.db> | restore <src.db>]")
         }
     }
 }
