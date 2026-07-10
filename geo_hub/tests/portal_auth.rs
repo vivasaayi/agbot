@@ -470,3 +470,26 @@ async fn admin_api_is_disabled_when_no_token_configured() -> Result<()> {
     assert_eq!(status, StatusCode::FORBIDDEN);
     Ok(())
 }
+
+#[tokio::test]
+async fn rate_limit_returns_429_after_cap() -> Result<()> {
+    // Under `oneshot` there is no ConnectInfo, so every request shares the
+    // unspecified-address bucket: a cap of 2 lets two through, then 429s.
+    let app = test_app_with_security(SecurityConfig {
+        rate_limit_per_min: 2,
+        ..SecurityConfig::default()
+    })
+    .await?;
+
+    let (s1, _) = request(&app, "GET", "/health", None, None).await?;
+    let (s2, _) = request(&app, "GET", "/health", None, None).await?;
+    let (s3, _) = request(&app, "GET", "/health", None, None).await?;
+    assert_eq!(s1, StatusCode::OK);
+    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(
+        s3,
+        StatusCode::TOO_MANY_REQUESTS,
+        "third request over the cap must be 429"
+    );
+    Ok(())
+}

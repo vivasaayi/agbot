@@ -25,7 +25,7 @@ async fn ready_handler() -> &'static str {
 }
 
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
+    let router = Router::new()
         .nest_service(
             "/workspace",
             ServeDir::new(state.config.workspace_web_dir()),
@@ -1134,8 +1134,21 @@ pub fn build_router(state: AppState) -> Router {
             state.clone(),
             crate::security::require_session_mw,
         ))
-        .layer(DefaultBodyLimit::max(state.config.security.max_body_bytes))
-        .with_state(state)
+        .layer(DefaultBodyLimit::max(state.config.security.max_body_bytes));
+
+    // Optional per-IP rate limit, applied outermost so it sheds load before the
+    // auth gate and any database work. Off unless `rate_limit_per_min > 0`.
+    let router = if state.config.security.rate_limit_per_min > 0 {
+        let limiter = Arc::new(crate::security::RateLimiter::new(
+            state.config.security.rate_limit_per_min,
+            60,
+        ));
+        router.layer(from_fn_with_state(limiter, crate::security::rate_limit_mw))
+    } else {
+        router
+    };
+
+    router.with_state(state)
 }
 
 /// Start the geo_hub HTTP server using configuration and resources.

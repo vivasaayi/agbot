@@ -31,6 +31,9 @@ services:
       # Require a valid portal session on every /api/* route (anonymous → 401).
       # Off by default; turn on once the portal is exposed beyond a trusted LAN.
       GEO_HUB__SECURITY__REQUIRE_SESSION: ${AGBOT_REQUIRE_SESSION:-false}
+      # Per-client-IP request cap over a 60s window (0 disables). Requires the
+      # reverse proxy to forward the real client IP for meaningful buckets.
+      GEO_HUB__SECURITY__RATE_LIMIT_PER_MIN: ${AGBOT_RATE_LIMIT_PER_MIN:-0}
     volumes:
       - geo_hub_db:/opt/agbot/db
       - geo_hub_data:/opt/agbot/data

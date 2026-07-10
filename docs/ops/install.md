@@ -101,6 +101,40 @@ raster-tile requests do not send an Authorization header, so map tiles under
 an authenticating proxy if you enable the gate. Request bodies are capped at
 64 MiB (`GEO_HUB__SECURITY__MAX_BODY_BYTES`).
 
+### Rate limiting
+
+A coarse per-client-IP cap blunts login brute-force and runaway clients:
+
+```sh
+export AGBOT_RATE_LIMIT_PER_MIN=120   # GEO_HUB__SECURITY__RATE_LIMIT_PER_MIN
+agbot up
+```
+
+`0` (default) disables it. Over the cap → `429 Too Many Requests` with
+`Retry-After`. It buckets by the peer IP, so put the reverse proxy in
+`X-Forwarded-For`-preserving mode and terminate it close to the app; for
+anything finer than a single 60-second fixed window, rate-limit at the proxy.
+
+### TLS via a reverse proxy
+
+geo_hub serves plain HTTP and does not terminate TLS itself. In any exposed
+deployment, front it with a TLS-terminating reverse proxy (Caddy, nginx,
+Traefik) that:
+
+- terminates HTTPS and proxies to `http://127.0.0.1:8080`,
+- forwards the real client IP (`X-Forwarded-For`) so rate-limit buckets and
+  logs are meaningful,
+- optionally adds its own auth in front of the browse/workspace tile URLs that
+  the in-app session gate cannot cover (see the tile caveat above).
+
+Example Caddyfile:
+
+```
+agbot.example.com {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
 ## Mac role (desktop GUIs)
 
 Requires `just`, a Rust toolchain, and (for the sim) a C++/CMake toolchain.

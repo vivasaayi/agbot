@@ -108,6 +108,12 @@ pub struct SecurityConfig {
     /// Maximum accepted request body size in bytes. Requests larger than this
     /// are rejected with 413 before the handler runs.
     pub max_body_bytes: usize,
+    /// Per-client-IP request cap over a rolling 60-second window. `0` disables
+    /// rate limiting (the default). When exceeded, requests get 429 with a
+    /// `Retry-After` header. A single fixed window per IP — coarse, but enough
+    /// to blunt login brute-force and runaway clients; front with a reverse
+    /// proxy for anything finer.
+    pub rate_limit_per_min: u32,
 }
 
 impl Default for SecurityConfig {
@@ -116,6 +122,7 @@ impl Default for SecurityConfig {
             admin_token: None,
             require_session: false,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            rate_limit_per_min: 0,
         }
     }
 }
