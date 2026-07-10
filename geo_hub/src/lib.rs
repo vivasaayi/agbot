@@ -40,6 +40,7 @@ pub mod proposal_queue;
 pub mod provenance_store;
 pub mod routes;
 pub mod satellite_derivation;
+pub mod secrets;
 pub mod security;
 pub mod sen2cor;
 pub mod sen2cor_derive;

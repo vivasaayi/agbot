@@ -114,6 +114,21 @@ Treat the token as a secret (it is not baked into the image). Until a full
 operator-auth layer lands, keep the server behind a private network or a
 TLS-terminating reverse proxy.
 
+To keep the token out of the compose file and the process environment, point it
+at a reference instead of an inline value — resolved once at startup:
+
+- `file:/run/secrets/admin_token` (a Docker/systemd secret mount; a bare
+  `/run/secrets/...` path is also treated as a file),
+- `env:ADMIN_TOKEN` (read from another environment variable).
+
+```sh
+# Docker secret mount, resolved via file: reference:
+export AGBOT_ADMIN_TOKEN=file:/run/secrets/admin_token
+```
+
+A missing file or unset variable fails startup loudly rather than silently
+disabling the gate.
+
 ### Require a session on the API
 
 By default the `/api/*` surface is open (single-user / trusted-LAN loop). Once

@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -283,7 +283,24 @@ impl HubConfig {
             // Enable WAL mode for better concurrency
             config.database_url.push_str("?mode=rwc");
         }
+        config.resolve_secrets()?;
         Ok(config)
+    }
+
+    /// Resolve secret-bearing config fields through [`SecretResolver`] so a
+    /// value like `file:/run/secrets/admin_token` or `env:ADMIN_TOKEN` is
+    /// dereferenced once, at load, keeping the secret out of config and the
+    /// process environment listing. A misconfigured reference (missing file /
+    /// env var) fails startup loudly rather than silently disabling auth.
+    fn resolve_secrets(&mut self) -> Result<()> {
+        let resolver = crate::secrets::SecretResolver::new();
+        if let Some(raw) = self.security.admin_token.take() {
+            let resolved = resolver
+                .resolve(&raw)
+                .context("resolving security.admin_token")?;
+            self.security.admin_token = Some(resolved);
+        }
+        Ok(())
     }
 
     fn validate_required_file_fields(cfg: &config::Config) -> Result<()> {
@@ -512,6 +529,53 @@ log_format = "json"
         );
         let config = HubConfig::load_with_path(Some(&path)).unwrap();
         assert_eq!(config.observability.log_format, LogFormat::Json);
+    }
+
+    #[test]
+    fn hub_config_resolves_admin_token_from_a_file_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let secret_path = tmp.path().join("admin_token");
+        fs::write(&secret_path, "  resolved-admin-secret\n").unwrap();
+
+        let (_cfgtmp, path) = write_config(&format!(
+            r#"
+runtime_mode = "local"
+bind_address = "127.0.0.1:8787"
+database_url = "sqlite://geo_hub_test.db"
+data_root = "tmp/geo_hub"
+
+[landsat]
+source = "sample"
+
+[security]
+admin_token = "file:{}"
+"#,
+            secret_path.display()
+        ));
+
+        let config = HubConfig::load_with_path(Some(&path)).unwrap();
+        // The `file:` reference is dereferenced (and trimmed) at load.
+        assert_eq!(config.security.admin_token(), Some("resolved-admin-secret"));
+    }
+
+    #[test]
+    fn hub_config_fails_when_admin_token_file_is_missing() {
+        let (_tmp, path) = write_config(
+            r#"
+runtime_mode = "local"
+bind_address = "127.0.0.1:8787"
+database_url = "sqlite://geo_hub_test.db"
+data_root = "tmp/geo_hub"
+
+[landsat]
+source = "sample"
+
+[security]
+admin_token = "file:/no/such/secret/file"
+"#,
+        );
+        let err = HubConfig::load_with_path(Some(&path)).unwrap_err();
+        assert!(err.to_string().contains("admin_token"), "{err}");
     }
 
     #[test]
