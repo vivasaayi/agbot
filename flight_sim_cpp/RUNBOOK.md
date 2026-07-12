@@ -151,6 +151,17 @@ To inspect a faulted trace:
 flight_sim_cpp/build/agbot-sim diff flight_sim_cpp/out/baseline.jsonl flight_sim_cpp/out/faulted.jsonl
 ```
 
+For noisy or cross-build comparisons, use explicit tolerances and structured
+multi-diff output:
+
+```bash
+flight_sim_cpp/build/agbot-sim diff baseline.jsonl candidate.jsonl \
+  --abs-tol 0.001 --rel-tol 0.0001 --max-diffs 20 --json
+```
+
+Exit `0` means equivalent within tolerance, `1` means compatible traces differ,
+and `3` means their major contract versions are incompatible.
+
 ## Tile Cache
 
 Clear the map-tile cache when terrain or OSM fetch behavior is suspect:

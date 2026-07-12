@@ -184,7 +184,15 @@ flight_sim_cpp/build/agbot-sim diff flight_sim_cpp/out/telemetry.jsonl flight_si
 ```
 
 Identical traces exit 0 with `traces identical`. A divergence exits 1 and
-names the first differing step and telemetry field.
+names the first differing step and telemetry field. Use `--abs-tol` and
+`--rel-tol` for bounded numeric comparisons, `--max-diffs` to retain multiple
+differences, and `--json` for structured output. Incompatible major contract
+versions exit 3 instead of producing a misleading field comparison.
+
+```bash
+flight_sim_cpp/build/agbot-sim diff baseline.jsonl candidate.jsonl \
+  --abs-tol 0.001 --rel-tol 0.0001 --max-diffs 20 --json
+```
 
 ## Golden Regression
 

@@ -1932,6 +1932,67 @@ void test_trace_diff_reports_divergent_field() {
     assert(identical.identical);
 }
 
+void test_trace_diff_supports_tolerance_multi_diff_and_contract_checks() {
+    const std::string baseline =
+        "{\"contract_version\":\"1.0.0\",\"time_s\":1.000,\"mode\":\"flying\","
+        "\"position\":{\"x\":10.000,\"y\":20.000,\"z\":30.000},"
+        "\"velocity\":{\"x\":1.000,\"y\":2.000,\"z\":3.000}}\n";
+    const std::string slightly_different =
+        "{\"contract_version\":\"1.0.0\",\"time_s\":1.001,\"mode\":\"flying\","
+        "\"position\":{\"x\":10.005,\"y\":20.020,\"z\":30.000},"
+        "\"velocity\":{\"x\":1.000,\"y\":2.000,\"z\":3.000}}\n";
+
+    agbot::flight_sim::TraceDiffOptions tolerant;
+    tolerant.absolute_tolerance = 0.01;
+    tolerant.max_differences = 4;
+    const auto diff = agbot::flight_sim::diff_trace_text(baseline, slightly_different, tolerant);
+
+    assert(!diff.identical);
+    assert(diff.compatible);
+    assert(diff.differences.size() == 1);
+    assert(diff.differences[0].field_path == "position.y");
+    assert(diff.to_json().find("\"difference_count\":1") != std::string::npos);
+
+    const std::string many_differences =
+        "{\"contract_version\":\"1.0.0\",\"time_s\":1.000,\"mode\":\"flying\","
+        "\"position\":{\"x\":11.000,\"y\":22.000,\"z\":30.000},"
+        "\"velocity\":{\"x\":1.000,\"y\":2.000,\"z\":3.000}}\n";
+    const auto multi = agbot::flight_sim::diff_trace_text(baseline, many_differences, tolerant);
+    assert(multi.differences.size() == 2);
+    assert(multi.differences[0].field_path == "position.x");
+    assert(multi.differences[1].field_path == "position.y");
+
+    agbot::flight_sim::TraceDiffOptions bounded;
+    bounded.relative_tolerance = 0.1;
+    bounded.max_differences = 1;
+    const auto relative = agbot::flight_sim::diff_trace_text(baseline, many_differences, bounded);
+    assert(relative.identical);
+
+    bounded.relative_tolerance = 0.0;
+    const auto truncated = agbot::flight_sim::diff_trace_text(baseline, many_differences, bounded);
+    assert(truncated.difference_count == 2);
+    assert(truncated.differences.size() == 1);
+    assert(truncated.truncated);
+
+    const std::string incompatible =
+        "{\"contract_version\":\"2.0.0\",\"time_s\":1.000,\"mode\":\"flying\","
+        "\"position\":{\"x\":10.000,\"y\":20.000,\"z\":30.000},"
+        "\"velocity\":{\"x\":1.000,\"y\":2.000,\"z\":3.000}}\n";
+    const auto contract_diff = agbot::flight_sim::diff_trace_text(baseline, incompatible, tolerant);
+    assert(!contract_diff.compatible);
+    assert(contract_diff.code == "incompatible_contract_version");
+    assert(contract_diff.to_json().find("\"status\":\"incompatible_contract\"") != std::string::npos);
+
+    const std::string missing_contract =
+        "{\"time_s\":1.000,\"mode\":\"flying\","
+        "\"position\":{\"x\":10.000,\"y\":20.000,\"z\":30.000},"
+        "\"velocity\":{\"x\":1.000,\"y\":2.000,\"z\":3.000}}\n";
+    const auto missing_contract_diff =
+        agbot::flight_sim::diff_trace_text(baseline, missing_contract, tolerant);
+    assert(!missing_contract_diff.compatible);
+    assert(missing_contract_diff.right_value == "<missing>");
+}
+
 // Stories 02-01 / 02-02: golden-telemetry regression. The committed golden
 // trace pins physics + flight-controller behavior; any change to the step loop
 // or telemetry shape fails this test with a byte mismatch.
@@ -2262,6 +2323,7 @@ int main() {
     test_twin_contract_version_compatibility();
     test_canonical_runner_mission_and_telemetry_follow_twin_contract();
     test_trace_diff_reports_divergent_field();
+    test_trace_diff_supports_tolerance_multi_diff_and_contract_checks();
     test_deterministic_runner_matches_golden();
     test_fnv1a64_is_stable_and_distinct();
     test_simulation_health_reports_pass_and_seed_failure();

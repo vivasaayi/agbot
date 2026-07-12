@@ -5,6 +5,7 @@
 #include "agbot_flight_sim/MissionValidation.hpp"
 
 #include <cstdint>
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -56,11 +57,51 @@ std::string escape_json(std::string_view value) {
 
 void print_usage() {
     std::cout << "Usage:\n"
-              << "  agbot-sim diff <trace-a.jsonl> <trace-b.jsonl>\n"
+              << "  agbot-sim diff <trace-a.jsonl> <trace-b.jsonl> [--abs-tol N] [--rel-tol N] [--max-diffs N] [--json]\n"
               << "  agbot-sim regress [--golden-dir PATH]\n"
               << "  agbot-sim validate <mission.json> [--max-altitude M] [--geofence min_x,max_x,min_z,max_z]\n"
               << "  agbot-sim health --seed N --last-manifest PATH [--trace-dir PATH] [--cache-dir PATH] [--retention-keep N]\n"
               << "  agbot-sim cache clear [--cache-dir PATH]\n";
+}
+
+struct DiffArgs {
+    std::filesystem::path left_path;
+    std::filesystem::path right_path;
+    agbot::flight_sim::TraceDiffOptions options;
+    bool json = false;
+};
+
+DiffArgs parse_diff_args(int argc, char** argv) {
+    if (argc < 4) {
+        throw std::runtime_error("diff requires two trace paths");
+    }
+    DiffArgs args;
+    args.left_path = argv[2];
+    args.right_path = argv[3];
+    for (int index = 4; index < argc; ++index) {
+        const std::string current = argv[index];
+        if (current == "--abs-tol" && index + 1 < argc) {
+            args.options.absolute_tolerance = std::stod(argv[++index]);
+        } else if (current == "--rel-tol" && index + 1 < argc) {
+            args.options.relative_tolerance = std::stod(argv[++index]);
+        } else if (current == "--max-diffs" && index + 1 < argc) {
+            args.options.max_differences = static_cast<std::size_t>(std::stoull(argv[++index]));
+        } else if (current == "--json") {
+            args.json = true;
+        } else {
+            throw std::runtime_error("unknown diff argument: " + current);
+        }
+    }
+    if (!std::isfinite(args.options.absolute_tolerance)
+        || !std::isfinite(args.options.relative_tolerance)
+        || args.options.absolute_tolerance < 0.0
+        || args.options.relative_tolerance < 0.0) {
+        throw std::runtime_error("diff tolerances must be non-negative");
+    }
+    if (args.options.max_differences == 0) {
+        throw std::runtime_error("--max-diffs must be positive");
+    }
+    return args;
 }
 
 std::filesystem::path parse_regression_args(int argc, char** argv) {
@@ -200,15 +241,19 @@ int main(int argc, char** argv) {
                       << "\",\"removed_entries\":" << removed << "}\n";
             return 0;
         }
-        if (argc != 4 || std::string(argv[1]) != "diff") {
+        if (argc < 2 || std::string(argv[1]) != "diff") {
             print_usage();
             return 2;
         }
 
-        const std::string left = read_all(argv[2]);
-        const std::string right = read_all(argv[3]);
-        const auto diff = agbot::flight_sim::diff_trace_text(left, right);
-        std::cout << diff.message << "\n";
+        const DiffArgs args = parse_diff_args(argc, argv);
+        const std::string left = read_all(args.left_path);
+        const std::string right = read_all(args.right_path);
+        const auto diff = agbot::flight_sim::diff_trace_text(left, right, args.options);
+        std::cout << (args.json ? diff.to_json() : diff.message) << "\n";
+        if (!diff.compatible) {
+            return 3;
+        }
         return diff.identical ? 0 : 1;
     } catch (const std::exception& error) {
         std::cerr << "agbot-sim: " << error.what() << "\n";
