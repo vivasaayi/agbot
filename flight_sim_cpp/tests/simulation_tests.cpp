@@ -2191,6 +2191,35 @@ void test_deterministic_runner_records_time_limit_outcome() {
     assert(result.manifest.to_json().find("\"safety_violation\"") == std::string::npos);
 }
 
+void test_deterministic_runner_enforces_configured_safety_envelope() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    auto config = unit_run_config();
+    config.safety.max_altitude_m = 5.0;
+
+    const auto baseline = agbot::flight_sim::run_deterministic(mission, unit_run_config());
+    const auto result = agbot::flight_sim::run_deterministic(mission, config);
+
+    assert(!result.manifest.completed);
+    assert(result.manifest.termination_reason == "failsafe");
+    assert(result.manifest.safety_violation == "altitude_ceiling_violation");
+    assert(result.manifest.safety_config_json.find("\"max_altitude_m\":5.000") != std::string::npos);
+    assert(result.manifest.safety_config_hash != baseline.manifest.safety_config_hash);
+    assert(result.manifest.run_id != baseline.manifest.run_id);
+}
+
+void test_run_manifest_serializes_validation_evidence() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    auto result = agbot::flight_sim::run_deterministic(mission, unit_run_config());
+    const auto report = agbot::flight_sim::validate_mission(mission);
+    result.manifest.validation_report_json = report.to_json();
+    result.manifest.validation_report_hash =
+        agbot::flight_sim::sha256_hex(result.manifest.validation_report_json);
+
+    const std::string manifest = result.manifest.to_json();
+    assert(manifest.find("\"validation_report\":{") != std::string::npos);
+    assert(manifest.find("\"validation_report_hash\":\"") != std::string::npos);
+}
+
 void test_fault_injection_actuator_lag_slows_physical_response() {
     const auto mission = MissionLoader::load_from_text(kMissionJson);
     auto faulted_config = unit_run_config();
@@ -2333,6 +2362,8 @@ int main() {
     test_fault_injection_sensor_dropout_prunes_samples_and_records_event();
     test_fault_injection_low_battery_triggers_physical_failsafe();
     test_deterministic_runner_records_time_limit_outcome();
+    test_deterministic_runner_enforces_configured_safety_envelope();
+    test_run_manifest_serializes_validation_evidence();
     test_fault_injection_actuator_lag_slows_physical_response();
     test_fault_injection_bad_tile_marks_flat_fallback_in_manifest();
     test_fault_injection_rejects_fault_without_seed();

@@ -62,6 +62,21 @@ The default `simple` plant preserves existing golden traces. The `multirotor`
 plant uses the vehicle module's acceleration-limited, three-axis velocity
 response and records `plant_model` in the manifest and deterministic run ID.
 
+Every headless launch now writes a deterministic `<output>.validation.json`
+preflight report before physics starts. Use `--max-altitude M`,
+`--min-battery PCT`, and `--geofence min_x,max_x,min_z,max_z` to apply one
+safety envelope to both preflight and runtime enforcement. A blocked mission
+exits `4` without producing telemetry; successful manifests embed the report
+and its SHA-256 hash.
+
+```bash
+flight_sim_cpp/build/agbot_flight_sim_headless \
+  --seed 42 \
+  --max-altitude 40 \
+  --geofence -250,250,-250,250 \
+  --output flight_sim_cpp/out/preflighted.jsonl
+```
+
 Use explicit trace retention on a dedicated run directory:
 
 ```bash

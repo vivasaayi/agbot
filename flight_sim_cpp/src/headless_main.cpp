@@ -1,10 +1,13 @@
 #include "agbot_flight_sim/DeterministicRunner.hpp"
 #include "agbot_flight_sim/MissionLoader.hpp"
+#include "agbot_flight_sim/MissionValidation.hpp"
 #include "agbot_flight_sim/SimulationOps.hpp"
 #include "agbot_flight_sim/AssetPaths.hpp"
+#include "agbot_flight_sim/TwinContractV1.hpp"
 
 #include "agbot_config/Toml.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -37,6 +40,7 @@ struct Args {
     double record_interval_s = 0.25;
     double max_time_s = 600.0;
     agbot::flight_sim::PlantModel plant_model = agbot::flight_sim::PlantModel::Simple;
+    agbot::flight_sim::SafetyEnvelope safety;
     std::optional<std::size_t> trace_retention_keep;
     agbot::flight_sim::Vec3 steady_wind_mps;
     agbot::flight_sim::SensorCalibrationProfile sensor_profile = agbot::flight_sim::ideal_sensor_profile();
@@ -72,6 +76,22 @@ std::pair<std::uint32_t, std::uint32_t> parse_u32_pair_csv(const std::string& te
     return {horizontal, vertical};
 }
 
+std::array<double, 4> parse_geofence_csv(const std::string& text) {
+    std::array<double, 4> values {};
+    std::size_t start = 0;
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        const std::size_t end = text.find(',', start);
+        if ((index < values.size() - 1 && end == std::string::npos)
+            || (index == values.size() - 1 && end != std::string::npos)) {
+            throw std::runtime_error("--geofence must be formatted as min_x,max_x,min_z,max_z");
+        }
+        const std::size_t length = end == std::string::npos ? std::string::npos : end - start;
+        values[index] = std::stod(text.substr(start, length));
+        start = end == std::string::npos ? text.size() : end + 1;
+    }
+    return values;
+}
+
 [[noreturn]] void print_usage_and_exit(int code) {
     std::cout << "Usage: agbot_flight_sim_headless [options]\n"
               << "  --seed N             Seed for deterministic run (default from config/flight_sim.toml, else 1).\n"
@@ -82,6 +102,9 @@ std::pair<std::uint32_t, std::uint32_t> parse_u32_pair_csv(const std::string& te
               << "                       A <output>.manifest.json is written alongside it.\n"
               << "  --max-time S         Max mission seconds before giving up (default 600).\n"
               << "  --plant MODEL        Physics plant: simple or multirotor (default simple).\n"
+              << "  --max-altitude M     Preflight and runtime altitude ceiling in meters.\n"
+              << "  --min-battery PCT    Preflight and runtime battery abort threshold.\n"
+              << "  --geofence BOUNDS    Preflight and runtime min_x,max_x,min_z,max_z bounds.\n"
               << "  --wind-mps X,Y,Z     Steady wind vector in m/s applied to airborne ground track.\n"
               << "  --sensor-profile NAME\n"
               << "                       Sensor calibration/noise profile: ideal, cheap_gps_b2, rtk_gps_a1,\n"
@@ -155,6 +178,16 @@ Args parse_args(int argc, char** argv) {
             args.max_time_s = std::stod(argv[++index]);
         } else if (current == "--plant" && index + 1 < argc) {
             args.plant_model = agbot::flight_sim::plant_model_from_string(argv[++index]);
+        } else if (current == "--max-altitude" && index + 1 < argc) {
+            args.safety.max_altitude_m = std::stod(argv[++index]);
+        } else if (current == "--min-battery" && index + 1 < argc) {
+            args.safety.min_battery_percent = std::stod(argv[++index]);
+        } else if (current == "--geofence" && index + 1 < argc) {
+            const auto bounds = parse_geofence_csv(argv[++index]);
+            args.safety.min_x_m = bounds[0];
+            args.safety.max_x_m = bounds[1];
+            args.safety.min_z_m = bounds[2];
+            args.safety.max_z_m = bounds[3];
         } else if (current == "--wind-mps" && index + 1 < argc) {
             args.steady_wind_mps = parse_vec3_csv(argv[++index], "--wind-mps");
         } else if (current == "--sensor-profile" && index + 1 < argc) {
@@ -198,6 +231,15 @@ Args parse_args(int argc, char** argv) {
     if (args.lidar.range_noise_m < 0.0) {
         throw std::runtime_error("--lidar-range-noise must be non-negative");
     }
+    if (args.safety.max_altitude_m <= 0.0) {
+        throw std::runtime_error("--max-altitude must be positive");
+    }
+    if (args.safety.min_battery_percent < 0.0 || args.safety.min_battery_percent > 100.0) {
+        throw std::runtime_error("--min-battery must be between 0 and 100");
+    }
+    if (args.safety.min_x_m > args.safety.max_x_m || args.safety.min_z_m > args.safety.max_z_m) {
+        throw std::runtime_error("--geofence minimum bounds must not exceed maximum bounds");
+    }
     agbot::flight_sim::validate_fault_plan(args.faults);
     return args;
 }
@@ -221,18 +263,35 @@ int main(int argc, char** argv) {
 
         auto mission = MissionLoader::load_from_file(args.mission_path);
 
+        agbot::flight_sim::MissionValidationConfig validation_config;
+        validation_config.safety = args.safety;
+        const auto validation = agbot::flight_sim::validate_mission(mission, validation_config);
+        const std::filesystem::path validation_path =
+            std::filesystem::path(args.output_path).replace_extension(".validation.json");
+        write_file(validation_path, validation.to_json() + "\n");
+        if (validation.blocked) {
+            std::cout << "Mission: " << validation.mission_name << "\n"
+                      << "Preflight: blocked\n"
+                      << "Validation: " << validation_path << "\n";
+            return 4;
+        }
+
         RunConfig config;
         config.seed = *args.seed;
         config.plant_model = args.plant_model;
         config.timestep_s = args.timestep_ms / 1000.0;
         config.record_interval_s = args.record_interval_s;
         config.max_time_s = args.max_time_s;
+        config.safety = args.safety;
         config.steady_wind_mps = args.steady_wind_mps;
         config.sensor_profile = args.sensor_profile;
         config.lidar = args.lidar;
         config.faults = args.faults;
 
         RunResult result = run_deterministic(mission, config);
+        result.manifest.validation_report_json = validation.to_json();
+        result.manifest.validation_report_hash =
+            agbot::flight_sim::sha256_hex(result.manifest.validation_report_json);
 
         // Run header: log the determinism inputs on every run (story 02-31).
         std::cout << "agbot_flight_sim_headless"
@@ -269,6 +328,7 @@ int main(int argc, char** argv) {
                   << "Output hash: " << result.manifest.output_hash << "\n"
                   << "Telemetry: " << args.output_path << "\n"
                   << "LiDAR: " << (args.lidar.enabled ? lidar_path.string() : "disabled") << "\n"
+                  << "Validation: " << validation_path << "\n"
                   << "Manifest: " << manifest_path << "\n";
 
         if (result.manifest.completed) {

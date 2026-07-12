@@ -5,6 +5,7 @@
 #include "agbot_flight_sim/TelemetryRecorder.hpp"
 #include "agbot_flight_sim/TwinContractV1.hpp"
 
+#include <cmath>
 #include <cstdio>
 #include <iomanip>
 #include <random>
@@ -54,15 +55,56 @@ std::string weather_config_json(Vec3 steady_wind_mps) {
     return stream.str();
 }
 
-std::string default_safety_config_json() {
-    SimulationConfig config;
+std::string safety_config_json(const SafetyEnvelope& safety) {
     std::ostringstream stream;
     stream << std::fixed << std::setprecision(3)
-           << "{\"min_battery_percent\":" << config.min_battery_percent
-           << ",\"max_altitude_m\":\"unbounded\""
-           << ",\"geofence\":\"unbounded\""
-           << ",\"no_fly_zone_count\":" << config.safety.no_fly_zones.size()
-           << "}";
+           << "{\"min_battery_percent\":" << safety.min_battery_percent;
+    if (std::isfinite(safety.max_altitude_m)) {
+        stream << ",\"max_altitude_m\":" << safety.max_altitude_m;
+    } else {
+        stream << ",\"max_altitude_m\":\"unbounded\"";
+    }
+    const bool unbounded_geofence = !std::isfinite(safety.min_x_m)
+        && !std::isfinite(safety.max_x_m)
+        && !std::isfinite(safety.min_z_m)
+        && !std::isfinite(safety.max_z_m);
+    if (unbounded_geofence) {
+        stream << ",\"geofence\":\"unbounded\"";
+    } else {
+        const auto append_bound = [&](std::string_view name, double value, bool lower) {
+            stream << "\"" << name << "\":";
+            if (std::isfinite(value)) {
+                stream << value;
+            } else {
+                stream << "\"" << (lower ? "-unbounded" : "unbounded") << "\"";
+            }
+        };
+        stream << ",\"geofence\":{";
+        append_bound("min_x_m", safety.min_x_m, true);
+        stream << ',';
+        append_bound("max_x_m", safety.max_x_m, false);
+        stream << ',';
+        append_bound("min_z_m", safety.min_z_m, true);
+        stream << ',';
+        append_bound("max_z_m", safety.max_z_m, false);
+        stream << '}';
+    }
+    stream << ",\"no_fly_zone_count\":" << safety.no_fly_zones.size();
+    if (!safety.no_fly_zones.empty()) {
+        stream << ",\"no_fly_zones\":[";
+        for (std::size_t index = 0; index < safety.no_fly_zones.size(); ++index) {
+            if (index > 0) {
+                stream << ',';
+            }
+            const auto& zone = safety.no_fly_zones[index];
+            stream << "{\"id\":\"" << escape_json(zone.id) << "\""
+                   << ",\"x\":" << zone.center.x
+                   << ",\"z\":" << zone.center.z
+                   << ",\"radius_m\":" << zone.radius_m << "}";
+        }
+        stream << ']';
+    }
+    stream << "}";
     return stream.str();
 }
 
@@ -127,8 +169,12 @@ std::string RunManifest::to_json() const {
            << ",\"lidar_scan_count\":" << lidar_scan_count
            << ",\"lidar_output_hash\":\"" << escape_json(lidar_output_hash) << "\""
            << ",\"safety_config\":" << safety_config_json
-           << ",\"safety_config_hash\":\"" << escape_json(safety_config_hash) << "\""
-           << ",\"trace_retention_keep\":" << trace_retention_keep
+           << ",\"safety_config_hash\":\"" << escape_json(safety_config_hash) << "\"";
+    if (!validation_report_json.empty()) {
+        stream << ",\"validation_report\":" << validation_report_json
+               << ",\"validation_report_hash\":\"" << escape_json(validation_report_hash) << "\"";
+    }
+    stream << ",\"trace_retention_keep\":" << trace_retention_keep
            << ",\"trace_retention_deleted\":" << trace_retention_deleted_json
            << ",\"faults\":" << faults_json
            << ",\"faults_hash\":\"" << escape_json(faults_hash) << "\""
@@ -158,6 +204,8 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
 
     SimulationConfig simulation_config;
     simulation_config.plant_model = config.plant_model;
+    simulation_config.safety = config.safety;
+    simulation_config.min_battery_percent = config.safety.min_battery_percent;
     DroneSimulation simulation(mission, simulation_config);
 
     std::ostringstream trace;
@@ -228,6 +276,8 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
     manifest.sensor_config_hash = sha256_hex(manifest.sensor_config_json);
     manifest.lidar_config_json = lidar_config_json(config.lidar);
     manifest.lidar_config_hash = sha256_hex(manifest.lidar_config_json);
+    manifest.safety_config_json = safety_config_json(config.safety);
+    manifest.safety_config_hash = sha256_hex(manifest.safety_config_json);
     {
         std::ostringstream run_id_input;
         run_id_input << std::fixed << std::setprecision(9)
@@ -247,14 +297,16 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
         if (!manifest.plant_model.empty()) {
             run_id_input << "|" << manifest.plant_model;
         }
+        const std::string default_safety_hash = sha256_hex(safety_config_json(SafetyEnvelope {}));
+        if (manifest.safety_config_hash != default_safety_hash) {
+            run_id_input << "|" << manifest.safety_config_hash;
+        }
         manifest.run_id = sha256_hex(run_id_input.str());
     }
     manifest.step_count = step_count;
     manifest.sample_count = sample_count;
     manifest.lidar_scan_count = lidar_scan_count;
     manifest.prng_nonce = prng_nonce;
-    manifest.safety_config_json = default_safety_config_json();
-    manifest.safety_config_hash = sha256_hex(manifest.safety_config_json);
     manifest.fault_events_json = fault_events_to_json(fault_events);
     manifest.fault_events_hash = sha256_hex(manifest.fault_events_json);
     manifest.output_hash = sha256_hex(result.trace_jsonl);

@@ -36,6 +36,17 @@ runs include `termination_reason` (`failsafe` or `time_limit`); failsafe runs
 also include `safety_violation`. The headless process exits `0` for success,
 `2` for a time limit, and `3` for a safety failsafe.
 
+## Headless Preflight
+
+Every headless launch writes `<output>.validation.json` before simulation. The
+report records coverage, estimated duration, battery margin, terrain gaps, and
+blocking safety issues. Configure `--max-altitude`, `--min-battery`, and
+`--geofence min_x,max_x,min_z,max_z`; the same envelope is enforced by the
+runtime plant and recorded in `safety_config`.
+
+A blocked preflight exits `4` and does not create telemetry. Successful run
+manifests embed `validation_report` and `validation_report_hash`.
+
 ## Physics Plant
 
 Use `--plant multirotor` to run the mission through the shared multirotor

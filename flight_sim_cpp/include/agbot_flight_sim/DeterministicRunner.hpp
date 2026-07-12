@@ -38,6 +38,7 @@ struct RunConfig {
     double timestep_s = 1.0 / 60.0;
     double record_interval_s = 0.25;
     double max_time_s = 600.0;
+    SafetyEnvelope safety;
     Vec3 steady_wind_mps;
     SensorCalibrationProfile sensor_profile = ideal_sensor_profile();
     LidarRaycastConfig lidar;
@@ -74,6 +75,8 @@ struct RunManifest {
     std::string lidar_output_hash;
     std::string safety_config_json = "{}";
     std::string safety_config_hash;
+    std::string validation_report_json;
+    std::string validation_report_hash;
     std::size_t trace_retention_keep = 0;
     std::string trace_retention_deleted_json = "[]";
     std::string faults_json = "[]";
