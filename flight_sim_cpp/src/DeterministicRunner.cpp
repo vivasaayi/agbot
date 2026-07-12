@@ -109,8 +109,11 @@ std::string RunManifest::to_json() const {
            << ",\"timestep_s\":" << timestep_s
            << ",\"record_interval_s\":" << record_interval_s
            << ",\"mission_name\":\"" << escape_json(mission_name) << "\""
-           << ",\"mission_hash\":\"" << escape_json(mission_hash) << "\""
-           << ",\"step_count\":" << step_count
+           << ",\"mission_hash\":\"" << escape_json(mission_hash) << "\"";
+    if (!plant_model.empty()) {
+        stream << ",\"plant_model\":\"" << escape_json(plant_model) << "\"";
+    }
+    stream << ",\"step_count\":" << step_count
            << ",\"sample_count\":" << sample_count
            << ",\"prng_nonce\":" << prng_nonce
            << ",\"terrain_tiles\":" << terrain_tiles_json
@@ -148,7 +151,9 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
     std::mt19937_64 prng(config.seed);
     const std::uint64_t prng_nonce = prng();
 
-    DroneSimulation simulation(mission);
+    SimulationConfig simulation_config;
+    simulation_config.plant_model = config.plant_model;
+    DroneSimulation simulation(mission, simulation_config);
 
     std::ostringstream trace;
     std::ostringstream lidar_trace;
@@ -175,7 +180,10 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
 
     while (!simulation.is_complete() && simulation.state().mission_time_s < config.max_time_s) {
         append_fault_events_for_step(config.faults, step_count, fault_events);
+        simulation.inject_battery_drop(battery_drop_for_step(config.faults, step_count));
+        simulation.set_actuator_response_factor(actuator_response_for_step(config.faults, step_count));
         simulation.set_wind(config.steady_wind_mps + wind_fault_for_step(config.faults, step_count));
+        simulation.set_guidance_state(apply_observation_faults(simulation.state(), config.faults, step_count));
         if (simulation.state().mission_time_s >= next_record_s) {
             record(simulation.state(), step_count);
             next_record_s += config.record_interval_s;
@@ -200,6 +208,9 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
     manifest.record_interval_s = config.record_interval_s;
     manifest.mission_name = mission.name;
     manifest.mission_hash = sha256_hex(mission_to_json(mission));
+    if (config.plant_model != PlantModel::Simple) {
+        manifest.plant_model = to_string(config.plant_model);
+    }
     manifest.faults_json = config.faults.to_json();
     manifest.faults_hash = sha256_hex(manifest.faults_json);
     manifest.terrain_tiles_json = merge_json_arrays(
@@ -228,6 +239,9 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
                      << manifest.weather_config_hash << "|"
                      << manifest.sensor_config_hash << "|"
                      << manifest.lidar_config_hash;
+        if (!manifest.plant_model.empty()) {
+            run_id_input << "|" << manifest.plant_model;
+        }
         manifest.run_id = sha256_hex(run_id_input.str());
     }
     manifest.step_count = step_count;

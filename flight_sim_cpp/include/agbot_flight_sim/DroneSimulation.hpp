@@ -4,11 +4,22 @@
 #include "agbot_flight_sim/SafetyRules.hpp"
 
 #include <cstddef>
+#include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
+namespace agbot::vehicles {
+class MultirotorModel;
+}
+
 namespace agbot::flight_sim {
+
+enum class PlantModel {
+    Simple,
+    Multirotor,
+};
 
 enum class DroneMode {
     Idle,
@@ -73,6 +84,7 @@ struct SimulationEvent {
 };
 
 struct SimulationConfig {
+    PlantModel plant_model = PlantModel::Simple;
     double min_battery_percent = 12.0;
     double idle_battery_drain_percent_per_s = 0.001;
     double flight_battery_drain_percent_per_s = 0.012;
@@ -88,12 +100,21 @@ struct SimulationConfig {
 class DroneSimulation {
 public:
     explicit DroneSimulation(Mission mission, SimulationConfig config = {});
+    ~DroneSimulation();
+    DroneSimulation(DroneSimulation&&) noexcept;
+    DroneSimulation& operator=(DroneSimulation&&) noexcept;
+    DroneSimulation(const DroneSimulation&) = delete;
+    DroneSimulation& operator=(const DroneSimulation&) = delete;
 
     void reset();
     void step(double dt_s);
     void replace_mission(Mission mission);
     void set_control_mode(ControlMode mode);
     void set_manual_input(ManualControlInput input);
+    void set_guidance_state(std::optional<DroneState> state);
+    void clear_guidance_state();
+    void inject_battery_drop(double percent);
+    void set_actuator_response_factor(double factor);
     void set_wind(Vec3 wind_mps);
     void request_emergency_abort();
     void arm();
@@ -130,6 +151,9 @@ private:
     DroneState state_;
     ManualControlInput manual_input_;
     Vec3 wind_mps_;
+    std::optional<DroneState> guidance_state_;
+    double actuator_response_factor_ = 1.0;
+    std::unique_ptr<agbot::vehicles::MultirotorModel> multirotor_model_;
     bool emergency_abort_requested_ = false;
     std::optional<SafetyViolation> last_safety_violation_;
     std::vector<SimulationEvent> event_log_;
@@ -138,5 +162,7 @@ private:
 [[nodiscard]] const char* to_string(DroneMode mode);
 [[nodiscard]] const char* to_string(ControlMode mode);
 [[nodiscard]] const char* to_string(SimulationEventType type);
+[[nodiscard]] const char* to_string(PlantModel model);
+[[nodiscard]] PlantModel plant_model_from_string(std::string_view value);
 
 } // namespace agbot::flight_sim

@@ -22,3 +22,7 @@ record_interval_s = 0.25
 
 # Maximum simulated mission seconds before giving up.
 max_time_s = 600.0
+
+# Physics plant. "simple" preserves legacy golden traces; "multirotor" uses
+# the shared vehicle model and its native acceleration limits.
+plant_model = "simple"

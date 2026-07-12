@@ -36,7 +36,7 @@ flight_sim_cpp/out/telemetry.manifest.json
 ```
 
 Every run logs `sim`, `contract`, `seed`, `timestep_ms`, and a deterministic
-`run_id`. The same mission, seed, timestep, record interval, max time,
+`run_id`. The same mission, seed, plant, timestep, record interval, max time,
 simulator version, and contract schema produce the same `run_id`.
 
 Use a custom mission:
@@ -47,6 +47,20 @@ flight_sim_cpp/build/agbot_flight_sim_headless \
   --mission flight_sim_cpp/samples/sample_field_loop.json \
   --output flight_sim_cpp/out/sample.jsonl
 ```
+
+Select the shared multirotor vehicle model as the physical plant:
+
+```bash
+flight_sim_cpp/build/agbot_flight_sim_headless \
+  --seed 42 \
+  --plant multirotor \
+  --mission flight_sim_cpp/samples/sample_field_loop.json \
+  --output flight_sim_cpp/out/multirotor.jsonl
+```
+
+The default `simple` plant preserves existing golden traces. The `multirotor`
+plant uses the vehicle module's acceleration-limited, three-axis velocity
+response and records `plant_model` in the manifest and deterministic run ID.
 
 Use explicit trace retention on a dedicated run directory:
 

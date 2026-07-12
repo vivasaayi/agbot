@@ -36,6 +36,7 @@ struct Args {
     double timestep_ms = 1000.0 / 60.0;
     double record_interval_s = 0.25;
     double max_time_s = 600.0;
+    agbot::flight_sim::PlantModel plant_model = agbot::flight_sim::PlantModel::Simple;
     std::optional<std::size_t> trace_retention_keep;
     agbot::flight_sim::Vec3 steady_wind_mps;
     agbot::flight_sim::SensorCalibrationProfile sensor_profile = agbot::flight_sim::ideal_sensor_profile();
@@ -80,6 +81,7 @@ std::pair<std::uint32_t, std::uint32_t> parse_u32_pair_csv(const std::string& te
               << "  --output PATH        Telemetry JSONL output (default: out/telemetry.jsonl).\n"
               << "                       A <output>.manifest.json is written alongside it.\n"
               << "  --max-time S         Max mission seconds before giving up (default 600).\n"
+              << "  --plant MODEL        Physics plant: simple or multirotor (default simple).\n"
               << "  --wind-mps X,Y,Z     Steady wind vector in m/s applied to airborne ground track.\n"
               << "  --sensor-profile NAME\n"
               << "                       Sensor calibration/noise profile: ideal, cheap_gps_b2, rtk_gps_a1,\n"
@@ -130,6 +132,8 @@ void apply_settings_defaults(Args& args) {
     args.record_interval_s =
         agbot::config::double_or(table, "record_interval_s", args.record_interval_s);
     args.max_time_s = agbot::config::double_or(table, "max_time_s", args.max_time_s);
+    args.plant_model = agbot::flight_sim::plant_model_from_string(
+        agbot::config::string_or(table, "plant_model", to_string(args.plant_model)));
 }
 
 Args parse_args(int argc, char** argv) {
@@ -149,6 +153,8 @@ Args parse_args(int argc, char** argv) {
             args.record_interval_s = std::stod(argv[++index]);
         } else if (current == "--max-time" && index + 1 < argc) {
             args.max_time_s = std::stod(argv[++index]);
+        } else if (current == "--plant" && index + 1 < argc) {
+            args.plant_model = agbot::flight_sim::plant_model_from_string(argv[++index]);
         } else if (current == "--wind-mps" && index + 1 < argc) {
             args.steady_wind_mps = parse_vec3_csv(argv[++index], "--wind-mps");
         } else if (current == "--sensor-profile" && index + 1 < argc) {
@@ -217,6 +223,7 @@ int main(int argc, char** argv) {
 
         RunConfig config;
         config.seed = *args.seed;
+        config.plant_model = args.plant_model;
         config.timestep_s = args.timestep_ms / 1000.0;
         config.record_interval_s = args.record_interval_s;
         config.max_time_s = args.max_time_s;

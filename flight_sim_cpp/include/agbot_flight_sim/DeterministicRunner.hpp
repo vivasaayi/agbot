@@ -30,10 +30,11 @@ inline constexpr char kTwinContractVersion[] = "1.0.0";
 [[nodiscard]] std::uint64_t fnv1a64(std::string_view bytes);
 [[nodiscard]] std::string to_hex(std::uint64_t value);
 
-/// Configuration for a single deterministic run. A run is fully reproducible
-/// from (mission, seed, timestep) alone: no wall-clock, no unseeded RNG.
+/// Configuration for a single deterministic run. Every physical, sensor, and
+/// fault input is explicit: no wall-clock and no unseeded RNG.
 struct RunConfig {
     std::uint64_t seed = 0;
+    PlantModel plant_model = PlantModel::Simple;
     double timestep_s = 1.0 / 60.0;
     double record_interval_s = 0.25;
     double max_time_s = 600.0;
@@ -55,6 +56,7 @@ struct RunManifest {
     double record_interval_s = 0.0;
     std::string mission_name;
     std::string mission_hash;     // SHA-256 hash of the canonical mission JSON
+    std::string plant_model;      // omitted for the backward-compatible simple plant
     std::uint64_t step_count = 0; // fixed-timestep steps executed
     std::uint64_t sample_count = 0;
     std::uint64_t prng_nonce = 0; // first draw from the seeded PRNG; proves the

@@ -1,5 +1,7 @@
 #include "agbot_flight_sim/DroneSimulation.hpp"
 
+#include "agbot_vehicles/MultirotorModel.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -51,8 +53,15 @@ DroneSimulation::DroneSimulation(Mission mission, SimulationConfig config)
     if (mission_.waypoints.empty()) {
         throw std::runtime_error("DroneSimulation requires a mission with waypoints");
     }
+    if (config_.plant_model == PlantModel::Multirotor) {
+        multirotor_model_ = std::make_unique<agbot::vehicles::MultirotorModel>();
+    }
     reset();
 }
+
+DroneSimulation::~DroneSimulation() = default;
+DroneSimulation::DroneSimulation(DroneSimulation&&) noexcept = default;
+DroneSimulation& DroneSimulation::operator=(DroneSimulation&&) noexcept = default;
 
 void DroneSimulation::reset() {
     state_ = {};
@@ -60,6 +69,12 @@ void DroneSimulation::reset() {
     state_.mode = DroneMode::Idle;
     state_.control_mode = ControlMode::Autopilot;
     manual_input_ = {};
+    guidance_state_.reset();
+    actuator_response_factor_ = 1.0;
+    if (multirotor_model_) {
+        multirotor_model_->clear_velocity_setpoint();
+        multirotor_model_->set_response_factor(1.0);
+    }
     emergency_abort_requested_ = false;
     last_safety_violation_.reset();
     event_log_.clear();
@@ -97,6 +112,22 @@ void DroneSimulation::set_manual_input(ManualControlInput input) {
     input.pitch = clamp_axis(input.pitch);
     input.roll = clamp_axis(input.roll);
     manual_input_ = input;
+}
+
+void DroneSimulation::set_guidance_state(std::optional<DroneState> state) {
+    guidance_state_ = std::move(state);
+}
+
+void DroneSimulation::clear_guidance_state() {
+    guidance_state_.reset();
+}
+
+void DroneSimulation::inject_battery_drop(double percent) {
+    state_.battery_percent = std::max(0.0, state_.battery_percent - std::max(0.0, percent));
+}
+
+void DroneSimulation::set_actuator_response_factor(double factor) {
+    actuator_response_factor_ = std::clamp(factor, 0.0, 1.0);
 }
 
 void DroneSimulation::set_wind(Vec3 wind_mps) {
@@ -223,7 +254,8 @@ void DroneSimulation::step_autopilot(double dt_s) {
         state_.mode = mode_for_waypoint(*waypoint);
     }
 
-    const Vec3 to_target = waypoint->position - state_.position;
+    const DroneState& guidance_state = guidance_state_.has_value() ? *guidance_state_ : state_;
+    const Vec3 to_target = waypoint->position - guidance_state.position;
     const double distance = to_target.length();
     const double acceptance = std::max(0.1, mission_.acceptance_radius_m);
 
@@ -305,15 +337,34 @@ void DroneSimulation::step_manual(double dt_s) {
 }
 
 void DroneSimulation::move_towards_velocity(Vec3 desired_velocity, double dt_s) {
-    const Vec3 delta = desired_velocity - state_.velocity;
-    state_.velocity += clamp_vector_delta(delta, config_.max_acceleration_mps2 * dt_s);
+    if (multirotor_model_) {
+        agbot::vehicles::EntityState plant_state;
+        plant_state.position = state_.position;
+        plant_state.velocity = state_.velocity;
+        plant_state.yaw_rad = state_.yaw_rad;
+        plant_state.pitch_rad = state_.pitch_rad;
+        plant_state.roll_rad = state_.roll_rad;
+        plant_state.time_s = state_.mission_time_s;
 
-    Vec3 ground_velocity = state_.velocity;
-    if (state_.position.y > 0.05 || desired_velocity.y > 0.0) {
-        ground_velocity += wind_mps_;
+        multirotor_model_->set_velocity_setpoint(desired_velocity);
+        multirotor_model_->set_response_factor(actuator_response_factor_);
+        const auto next = multirotor_model_->step(plant_state, {}, dt_s);
+        state_.position = next.position;
+        state_.velocity = next.velocity;
+        state_.yaw_rad = next.yaw_rad;
+        state_.pitch_rad = next.pitch_rad;
+        state_.roll_rad = next.roll_rad;
+    } else {
+        const Vec3 delta = desired_velocity - state_.velocity;
+        state_.velocity += clamp_vector_delta(
+            delta,
+            config_.max_acceleration_mps2 * actuator_response_factor_ * dt_s);
+        state_.position += state_.velocity * dt_s;
     }
 
-    state_.position += ground_velocity * dt_s;
+    if (state_.position.y > 0.05 || desired_velocity.y > 0.0) {
+        state_.position += wind_mps_ * dt_s;
+    }
 
     if (state_.position.y < 0.0) {
         state_.position.y = 0.0;
@@ -418,6 +469,26 @@ const char* to_string(DroneMode mode) {
             return "failsafe";
     }
     return "unknown";
+}
+
+const char* to_string(PlantModel model) {
+    switch (model) {
+        case PlantModel::Simple:
+            return "simple";
+        case PlantModel::Multirotor:
+            return "multirotor";
+    }
+    return "unknown";
+}
+
+PlantModel plant_model_from_string(std::string_view value) {
+    if (value == "simple") {
+        return PlantModel::Simple;
+    }
+    if (value == "multirotor") {
+        return PlantModel::Multirotor;
+    }
+    throw std::invalid_argument("unknown plant model: " + std::string(value));
 }
 
 const char* to_string(ControlMode mode) {

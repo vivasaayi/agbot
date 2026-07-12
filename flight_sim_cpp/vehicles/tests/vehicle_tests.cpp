@@ -164,6 +164,12 @@ void test_multirotor_velocity_control() {
     expect(std::abs(state.velocity.z - 2.0) < 1e-6 && std::abs(state.velocity.x) < 1e-6,
            "multirotor follows direct velocity setpoint");
     expect(model.kind() == VehicleKind::Multirotor, "multirotor reports its kind");
+
+    model.set_velocity_setpoint({0.0, -1.0, 0.0});
+    const double altitude_before_descent = state.position.y;
+    state = model.step(state, {0.0, 0.0}, 0.5);
+    expect(state.position.y < altitude_before_descent,
+           "multirotor direct velocity setpoint controls vertical motion");
 }
 
 void test_registry_creation() {

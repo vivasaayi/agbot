@@ -125,6 +125,7 @@ add_subdirectory(config)
 add_subdirectory(terrain_engine)
 add_subdirectory(worldgen)
 add_subdirectory(vehicles)
+target_link_libraries(agbot_flight_sim_core PRIVATE agbot_vehicles)
 add_subdirectory(nav)
 add_subdirectory(render)
 

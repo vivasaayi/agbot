@@ -396,6 +396,26 @@ void test_steady_wind_disturbs_ground_track() {
     assert(windy.state().position.x > calm.state().position.x + 0.1);
 }
 
+void test_guidance_state_changes_autopilot_control_solution() {
+    auto baseline_mission = MissionLoader::load_from_text(kMissionJson);
+    DroneSimulation baseline(std::move(baseline_mission));
+    baseline.step(0.5);
+
+    auto biased_mission = MissionLoader::load_from_text(kMissionJson);
+    DroneSimulation biased(std::move(biased_mission));
+    agbot::flight_sim::DroneState observed = biased.state();
+    observed.position.x = 10.0;
+    biased.set_guidance_state(observed);
+    biased.step(0.5);
+
+    assert(biased.state().position.x < baseline.state().position.x - 0.1);
+    assert(biased.state().position.y > 0.0);
+
+    biased.clear_guidance_state();
+    biased.step(0.5);
+    assert(biased.state().mode != DroneMode::Failsafe);
+}
+
 void test_mission_round_trip() {
     auto mission = MissionLoader::load_from_text(kMissionJson);
     const std::string json = agbot::flight_sim::mission_to_json(mission);
@@ -1476,6 +1496,23 @@ void test_deterministic_runner_is_byte_identical() {
     assert(a.manifest.completed);
 }
 
+void test_deterministic_runner_supports_multirotor_plant() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    auto config = unit_run_config();
+    config.plant_model = agbot::flight_sim::PlantModel::Multirotor;
+
+    const auto baseline = agbot::flight_sim::run_deterministic(mission, unit_run_config());
+    const auto a = agbot::flight_sim::run_deterministic(mission, config);
+    const auto b = agbot::flight_sim::run_deterministic(mission, config);
+
+    assert(a.manifest.completed);
+    assert(a.trace_jsonl == b.trace_jsonl);
+    assert(a.manifest.to_json() == b.manifest.to_json());
+    assert(a.trace_jsonl != baseline.trace_jsonl);
+    assert(a.manifest.to_json().find("\"plant_model\":\"multirotor\"") != std::string::npos);
+    assert(baseline.manifest.to_json().find("\"plant_model\"") == std::string::npos);
+}
+
 void test_golden_regression_matches_committed_reference_missions() {
     const auto cases = agbot::flight_sim::load_golden_regression_cases();
     const auto report = agbot::flight_sim::run_golden_regression_suite(cases);
@@ -2027,6 +2064,7 @@ void test_fault_injection_gps_drift_is_seeded_and_reproducible() {
     assert(a.trace_jsonl == b.trace_jsonl);
     assert(a.manifest.to_json() == b.manifest.to_json());
     assert(a.trace_jsonl != baseline.trace_jsonl);
+    assert(a.manifest.step_count != baseline.manifest.step_count);
     assert(a.manifest.faults_json.find("\"class\":\"gps_drift\"") != std::string::npos);
     assert(a.manifest.fault_events_json.find("\"class\":\"gps_drift\"") != std::string::npos);
 
@@ -2054,6 +2092,45 @@ void test_fault_injection_sensor_dropout_prunes_samples_and_records_event() {
     assert(faulted.manifest.sample_count < baseline.manifest.sample_count);
     assert(faulted.manifest.faults_json.find("\"class\":\"sensor_dropout\"") != std::string::npos);
     assert(faulted.manifest.fault_events_json.find("\"class\":\"sensor_dropout\"") != std::string::npos);
+}
+
+void test_fault_injection_low_battery_triggers_physical_failsafe() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    auto faulted_config = unit_run_config();
+    faulted_config.faults.faults.push_back({
+        agbot::flight_sim::FaultClass::LowBattery,
+        4321,
+        0,
+        std::nullopt,
+        95.0,
+        "battery",
+    });
+
+    const auto baseline = agbot::flight_sim::run_deterministic(mission, unit_run_config());
+    const auto faulted = agbot::flight_sim::run_deterministic(mission, faulted_config);
+
+    assert(faulted.manifest.step_count < baseline.manifest.step_count);
+    assert(faulted.trace_jsonl.find("\"mode\":\"failsafe\"") != std::string::npos);
+    assert(faulted.trace_jsonl.find("\"battery_percent\":5.000") != std::string::npos);
+}
+
+void test_fault_injection_actuator_lag_slows_physical_response() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    auto faulted_config = unit_run_config();
+    faulted_config.faults.faults.push_back({
+        agbot::flight_sim::FaultClass::ActuatorLag,
+        9876,
+        0,
+        std::nullopt,
+        0.8,
+        "motors",
+    });
+
+    const auto baseline = agbot::flight_sim::run_deterministic(mission, unit_run_config());
+    const auto faulted = agbot::flight_sim::run_deterministic(mission, faulted_config);
+
+    assert(faulted.manifest.step_count > baseline.manifest.step_count);
+    assert(faulted.manifest.fault_events_json.find("\"class\":\"actuator_lag\"") != std::string::npos);
 }
 
 void test_fault_injection_bad_tile_marks_flat_fallback_in_manifest() {
@@ -2112,6 +2189,7 @@ int main() {
     test_simulation_emergency_event_suppresses_normal_events();
     test_manual_controls_move_drone();
     test_steady_wind_disturbs_ground_track();
+    test_guidance_state_changes_autopilot_control_solution();
     test_mission_round_trip();
     test_twin_backend_executes_shared_command_and_returns_telemetry();
     test_twin_backend_unavailable_fails_closed_without_telemetry();
@@ -2149,6 +2227,7 @@ int main() {
     test_multispectral_capture_emits_georeferenced_bands_round_trip();
     test_multispectral_capture_reports_no_coverage_outside_terrain();
     test_deterministic_runner_is_byte_identical();
+    test_deterministic_runner_supports_multirotor_plant();
     test_golden_regression_matches_committed_reference_missions();
     test_golden_regression_names_divergent_field();
     test_golden_regression_rejects_incompatible_contract_version();
@@ -2174,6 +2253,8 @@ int main() {
     test_tile_cache_clear_removes_entries_but_keeps_directory();
     test_fault_injection_gps_drift_is_seeded_and_reproducible();
     test_fault_injection_sensor_dropout_prunes_samples_and_records_event();
+    test_fault_injection_low_battery_triggers_physical_failsafe();
+    test_fault_injection_actuator_lag_slows_physical_response();
     test_fault_injection_bad_tile_marks_flat_fallback_in_manifest();
     test_fault_injection_rejects_fault_without_seed();
     std::cout << "agbot_flight_sim_tests passed\n";

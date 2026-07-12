@@ -53,6 +53,8 @@ void validate_fault_plan(const FaultInjectionPlan& plan);
 [[nodiscard]] bool is_fault_active(const FaultSpec& fault, std::uint64_t step);
 [[nodiscard]] bool sensor_stream_suppressed(const FaultInjectionPlan& plan, std::uint64_t step);
 [[nodiscard]] Vec3 wind_fault_for_step(const FaultInjectionPlan& plan, std::uint64_t step);
+[[nodiscard]] double battery_drop_for_step(const FaultInjectionPlan& plan, std::uint64_t step);
+[[nodiscard]] double actuator_response_for_step(const FaultInjectionPlan& plan, std::uint64_t step);
 [[nodiscard]] DroneState apply_observation_faults(
     const DroneState& state,
     const FaultInjectionPlan& plan,
