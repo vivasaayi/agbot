@@ -134,9 +134,14 @@ std::string RunManifest::to_json() const {
            << ",\"faults_hash\":\"" << escape_json(faults_hash) << "\""
            << ",\"fault_events\":" << fault_events_json
            << ",\"fault_events_hash\":\"" << escape_json(fault_events_hash) << "\""
-           << ",\"output_hash\":\"" << escape_json(output_hash) << "\""
-           << ",\"completed\":" << (completed ? "true" : "false")
-           << "}";
+           << ",\"output_hash\":\"" << escape_json(output_hash) << "\"";
+    if (!termination_reason.empty()) {
+        stream << ",\"termination_reason\":\"" << escape_json(termination_reason) << "\"";
+    }
+    if (!safety_violation.empty()) {
+        stream << ",\"safety_violation\":\"" << escape_json(safety_violation) << "\"";
+    }
+    stream << ",\"completed\":" << (completed ? "true" : "false") << "}";
     return stream.str();
 }
 
@@ -254,7 +259,17 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
     manifest.fault_events_hash = sha256_hex(manifest.fault_events_json);
     manifest.output_hash = sha256_hex(result.trace_jsonl);
     manifest.lidar_output_hash = sha256_hex(result.lidar_scans_jsonl);
-    manifest.completed = simulation.is_complete();
+    manifest.completed = simulation.state().mode == DroneMode::Completed;
+    if (!manifest.completed) {
+        if (simulation.state().mode == DroneMode::Failsafe) {
+            manifest.termination_reason = "failsafe";
+            if (simulation.last_safety_violation().has_value()) {
+                manifest.safety_violation = to_string(simulation.last_safety_violation()->code);
+            }
+        } else {
+            manifest.termination_reason = "time_limit";
+        }
+    }
 
     return result;
 }

@@ -2110,8 +2110,24 @@ void test_fault_injection_low_battery_triggers_physical_failsafe() {
     const auto faulted = agbot::flight_sim::run_deterministic(mission, faulted_config);
 
     assert(faulted.manifest.step_count < baseline.manifest.step_count);
+    assert(!faulted.manifest.completed);
     assert(faulted.trace_jsonl.find("\"mode\":\"failsafe\"") != std::string::npos);
     assert(faulted.trace_jsonl.find("\"battery_percent\":5.000") != std::string::npos);
+    const std::string manifest = faulted.manifest.to_json();
+    assert(manifest.find("\"termination_reason\":\"failsafe\"") != std::string::npos);
+    assert(manifest.find("\"safety_violation\":\"low_battery_abort\"") != std::string::npos);
+}
+
+void test_deterministic_runner_records_time_limit_outcome() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    auto config = unit_run_config();
+    config.max_time_s = config.timestep_s * 2.0;
+
+    const auto result = agbot::flight_sim::run_deterministic(mission, config);
+
+    assert(!result.manifest.completed);
+    assert(result.manifest.to_json().find("\"termination_reason\":\"time_limit\"") != std::string::npos);
+    assert(result.manifest.to_json().find("\"safety_violation\"") == std::string::npos);
 }
 
 void test_fault_injection_actuator_lag_slows_physical_response() {
@@ -2254,6 +2270,7 @@ int main() {
     test_fault_injection_gps_drift_is_seeded_and_reproducible();
     test_fault_injection_sensor_dropout_prunes_samples_and_records_event();
     test_fault_injection_low_battery_triggers_physical_failsafe();
+    test_deterministic_runner_records_time_limit_outcome();
     test_fault_injection_actuator_lag_slows_physical_response();
     test_fault_injection_bad_tile_marks_flat_fallback_in_manifest();
     test_fault_injection_rejects_fault_without_seed();

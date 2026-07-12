@@ -81,7 +81,9 @@ struct RunManifest {
     std::string fault_events_json = "[]";
     std::string fault_events_hash;
     std::string output_hash;      // SHA-256 hash of the emitted JSONL trace
-    bool completed = false;
+    std::string termination_reason; // populated for unsuccessful runs
+    std::string safety_violation;   // populated when a safety rule caused termination
+    bool completed = false;         // true only when all mission waypoints completed
 
     [[nodiscard]] std::string to_json() const;
 };

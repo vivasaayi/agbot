@@ -31,6 +31,11 @@ Every headless run prints the simulator version, contract version, seed, timeste
 
 The sibling manifest records the same `run_id`, input hashes, output hash, PRNG nonce, and retention evidence.
 
+`completed=true` means every mission waypoint finished successfully. Unsuccessful
+runs include `termination_reason` (`failsafe` or `time_limit`); failsafe runs
+also include `safety_violation`. The headless process exits `0` for success,
+`2` for a time limit, and `3` for a safety failsafe.
+
 ## Physics Plant
 
 Use `--plant multirotor` to run the mission through the shared multirotor

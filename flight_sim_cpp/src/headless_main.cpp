@@ -261,6 +261,9 @@ int main(int argc, char** argv) {
 
         std::cout << "Mission: " << result.manifest.mission_name << "\n"
                   << "Completed: " << (result.manifest.completed ? "yes" : "no") << "\n"
+                  << "Outcome: " << (result.manifest.completed
+                      ? "completed"
+                      : result.manifest.termination_reason) << "\n"
                   << "Samples: " << result.manifest.sample_count << "\n"
                   << "LiDAR scans: " << result.manifest.lidar_scan_count << "\n"
                   << "Output hash: " << result.manifest.output_hash << "\n"
@@ -268,7 +271,10 @@ int main(int argc, char** argv) {
                   << "LiDAR: " << (args.lidar.enabled ? lidar_path.string() : "disabled") << "\n"
                   << "Manifest: " << manifest_path << "\n";
 
-        return result.manifest.completed ? 0 : 2;
+        if (result.manifest.completed) {
+            return 0;
+        }
+        return result.manifest.termination_reason == "failsafe" ? 3 : 2;
     } catch (const std::exception& error) {
         std::cerr << "agbot_flight_sim_headless: " << error.what() << "\n";
         return 1;
