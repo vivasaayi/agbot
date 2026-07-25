@@ -9,6 +9,7 @@
 #include "agbot_flight_sim/MissionPreview.hpp"
 #include "agbot_flight_sim/TelemetryRecorder.hpp"
 #include "agbot_flight_sim/TelemetryReplay.hpp"
+#include "agbot_render/WorldPackage.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -120,6 +121,16 @@ std::filesystem::path mission_path_from_argv(int argc, char** argv) {
         }
     }
     return default_sample_mission_path();
+}
+
+std::filesystem::path terrain_package_path_from_argv(int argc, char** argv) {
+    for (int index = 1; index < argc; ++index) {
+        const std::string current = argv[index];
+        if (current == "--terrain-package" && index + 1 < argc) {
+            return argv[index + 1];
+        }
+    }
+    return {};
 }
 
 NSString* ns_string(const std::filesystem::path& path) {
@@ -564,6 +575,7 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     double terrain3d_drag_start_yaw_;
     double terrain3d_drag_start_pitch_;
     std::filesystem::path mission_path_;
+    std::filesystem::path terrain_package_path_;
     std::filesystem::path replay_path_;
     std::filesystem::path recording_path_;
     std::string status_message_;
@@ -572,13 +584,17 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     std::string globe_map_status_;
 }
 
-- (instancetype)initWithFrame:(NSRect)frame missionPath:(NSString*)missionPath;
+- (instancetype)initWithFrame:(NSRect)frame
+                  missionPath:(NSString*)missionPath
+           terrainPackagePath:(NSString*)terrainPackagePath;
 
 @end
 
 @implementation FlightSimOpenGLView
 
-- (instancetype)initWithFrame:(NSRect)frame missionPath:(NSString*)missionPath {
+- (instancetype)initWithFrame:(NSRect)frame
+                  missionPath:(NSString*)missionPath
+           terrainPackagePath:(NSString*)terrainPackagePath {
     NSOpenGLPixelFormatAttribute attributes[] = {
         NSOpenGLPFAAccelerated,
         NSOpenGLPFADoubleBuffer,
@@ -662,6 +678,8 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
 
         try {
             mission_path_ = std::filesystem::path([missionPath UTF8String]);
+            terrain_package_path_ =
+                std::filesystem::path([terrainPackagePath UTF8String]);
             simulation_ = std::make_unique<DroneSimulation>(MissionLoader::load_from_file(mission_path_));
         } catch (const std::exception& error) {
             std::cerr << "Unable to load mission: " << error.what() << "\n";
@@ -670,6 +688,9 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
         }
         [self fitMissionCamera];
         [self setupOverlayControls];
+        if (!terrain_package_path_.empty()) {
+            [self loadRealWorldTerrainForMission];
+        }
         [self startNewRecording];
         [self updatePanelText];
 
@@ -1028,6 +1049,39 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     }
 
     const GeoCoordinate origin = *simulation_->mission().home_geo;
+    if (!terrain_package_path_.empty()) {
+        const auto loaded =
+            agbot::render::load_world_terrain(terrain_package_path_, origin);
+        if (!loaded.ok()) {
+            terrain_mesh_ = {};
+            terrain_status_ = "L3 package invalid";
+            [self setStatusMessage:
+                ("Terrain package rejected: " + *loaded.error)];
+            return;
+        }
+        if (!agbot::flight_sim::terrain_covers_mission(
+                loaded.terrain, simulation_->mission())) {
+            terrain_mesh_ = {};
+            terrain_status_ = "L3 package out of coverage";
+            [self setStatusMessage:
+                "Terrain package does not cover this mission"];
+            return;
+        }
+
+        terrain_mesh_ = loaded.terrain.mesh;
+        std::ostringstream status;
+        status << "L3 " << loaded.terrain.elevation_state
+               << " " << loaded.terrain.resolution << "x"
+               << loaded.terrain.resolution
+               << " " << loaded.terrain.vertical_datum
+               << " " << std::fixed << std::setprecision(0)
+               << terrain_mesh_.min_elevation_m << "-"
+               << terrain_mesh_.max_elevation_m << "m";
+        terrain_status_ = status.str();
+        [self setStatusMessage:"L3 terrain package loaded"];
+        return;
+    }
+
     const double radius_m = radius_m_for_area_km2(real_world_area_km2_);
     const GeoBounds bounds = GeoBounds::from_center(origin, radius_m);
     int zoom = zoom_for_radius_m(radius_m);
@@ -3069,18 +3123,22 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
 @interface FlightSimAppDelegate : NSObject <NSApplicationDelegate> {
     NSWindow* window_;
     std::filesystem::path mission_path_;
+    std::filesystem::path terrain_package_path_;
 }
 
-- (instancetype)initWithMissionPath:(std::filesystem::path)missionPath;
+- (instancetype)initWithMissionPath:(std::filesystem::path)missionPath
+                 terrainPackagePath:(std::filesystem::path)terrainPackagePath;
 
 @end
 
 @implementation FlightSimAppDelegate
 
-- (instancetype)initWithMissionPath:(std::filesystem::path)missionPath {
+- (instancetype)initWithMissionPath:(std::filesystem::path)missionPath
+                 terrainPackagePath:(std::filesystem::path)terrainPackagePath {
     self = [super init];
     if (self) {
         mission_path_ = std::move(missionPath);
+        terrain_package_path_ = std::move(terrainPackagePath);
     }
     return self;
 }
@@ -3099,7 +3157,8 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
 
     [window_ setTitle:@"AgBot FlightSim"];
     FlightSimOpenGLView* view = [[FlightSimOpenGLView alloc] initWithFrame:frame
-                                                               missionPath:ns_string(mission_path_)];
+                                                               missionPath:ns_string(mission_path_)
+                                                        terrainPackagePath:ns_string(terrain_package_path_)];
     [window_ setContentView:view];
     [window_ makeFirstResponder:view];
     [view release];
@@ -3119,6 +3178,8 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
 int main(int argc, char** argv) {
     @autoreleasepool {
         const std::filesystem::path mission_path = mission_path_from_argv(argc, argv);
+        const std::filesystem::path terrain_package_path =
+            terrain_package_path_from_argv(argc, argv);
 
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
@@ -3136,7 +3197,9 @@ int main(int argc, char** argv) {
         [appMenu addItem:quitItem];
         [appMenuItem setSubmenu:appMenu];
 
-        FlightSimAppDelegate* delegate = [[FlightSimAppDelegate alloc] initWithMissionPath:mission_path];
+        FlightSimAppDelegate* delegate =
+            [[FlightSimAppDelegate alloc] initWithMissionPath:mission_path
+                                          terrainPackagePath:terrain_package_path];
         [NSApp setDelegate:delegate];
         [NSApp run];
         [delegate release];

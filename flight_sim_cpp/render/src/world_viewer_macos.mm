@@ -1,7 +1,8 @@
 // agbot_world_viewer — macOS Cocoa app hosting the modern OpenGL 4.1 Core renderer.
 //
 // Usage:
-//   agbot_world_viewer [scene.agbscn]   windowed viewer (demo scene if no file)
+//   agbot_world_viewer [world.agbworld|scene.agbscn]
+//                                      windowed viewer (demo scene if no file)
 //   agbot_world_viewer --self-check     offscreen render sanity check, exits 0/1
 
 #import <Cocoa/Cocoa.h>
@@ -14,6 +15,7 @@
 #include "agbot_render/DemoScene.hpp"
 #include "agbot_render/GlRenderer.hpp"
 #include "agbot_render/SceneFile.hpp"
+#include "agbot_render/WorldPackage.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -30,12 +32,28 @@ namespace {
 
 agbot::render::RenderScene load_scene_or_demo(int argc, const char** argv) {
     if (argc > 1 && argv[1][0] != '-') {
-        const std::filesystem::path path = argv[1];
-        agbot::render::SceneFileResult result = agbot::render::read_scene_file(path);
+        const std::filesystem::path requested_path = argv[1];
+        std::filesystem::path scene_path = requested_path;
+        if (requested_path.extension() == ".agbworld") {
+            const auto package = agbot::render::read_world_package(requested_path);
+            if (!package.ok()) {
+                std::fprintf(stderr, "[agbot_world_viewer] %s — falling back to demo scene\n",
+                             package.error->c_str());
+                return agbot::render::build_demo_scene();
+            }
+            scene_path = package.package.scene_path;
+            std::printf("[agbot_world_viewer] resolved world package: %s "
+                        "(world_hash=%llu, elevation=%s, datum=%s)\n",
+                        requested_path.string().c_str(),
+                        static_cast<unsigned long long>(package.package.world_hash),
+                        package.package.elevation_state.c_str(),
+                        package.package.vertical_datum.c_str());
+        }
+        agbot::render::SceneFileResult result = agbot::render::read_scene_file(scene_path);
         if (result.ok()) {
             std::printf("[agbot_world_viewer] loaded scene file: %s "
                         "(%zu meshes, %zu textured meshes, %zu markers)\n",
-                        path.string().c_str(), result.scene.static_meshes.size(),
+                        scene_path.string().c_str(), result.scene.static_meshes.size(),
                         result.scene.textured_meshes.size(), result.scene.markers.size());
             return result.scene;
         }

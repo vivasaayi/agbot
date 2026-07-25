@@ -93,6 +93,10 @@ async fn register_then_get_round_trips_core_fields() -> Result<()> {
     assert_eq!(got.scene_id.as_deref(), Some("scene-1"));
     assert_eq!(got.source_id.as_deref(), Some("landsat-9"));
     assert_eq!(got.confidence, Some(0.9));
+    assert_eq!(
+        got.quality_summary,
+        Some(serde_json::json!({ "cloud_fraction": 0.02 }))
+    );
     assert_eq!(got.status, "registered");
     assert_eq!(got.parameters_hash, draft.parameters_hash());
     assert_eq!(got.bbox, Some([0.0, 0.0, 1.0, 1.0]));

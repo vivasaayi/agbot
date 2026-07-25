@@ -160,6 +160,21 @@ struct TerrainMesh {
     bool has_elevation = false;
 };
 
+// Datum-referenced terrain prepared for a simulator-local mission frame. The
+// mesh Y values are absolute elevations; drone state Y remains altitude above
+// local ground (AGL) and is converted only at terrain-aware sensor/rendering
+// boundaries.
+struct RuntimeTerrain {
+    TerrainMesh mesh;
+    GeoBounds bounds;
+    std::uint64_t world_hash = 0;
+    std::string source_id;
+    std::string vertical_datum;
+    std::string elevation_state;
+    int resolution = 0;
+    std::size_t nodata_cells = 0;
+};
+
 [[nodiscard]] double radius_m_for_area_km2(double area_km2);
 [[nodiscard]] TileCoordinate tile_for_geo(const GeoCoordinate& coordinate, int zoom);
 [[nodiscard]] int zoom_for_radius_m(double radius_m);
@@ -210,7 +225,17 @@ struct TerrainMesh {
     double depth_m,
     double vertical_scale = 1.0);
 
+[[nodiscard]] std::optional<int> terrain_grid_resolution(
+    const TerrainMesh& terrain);
+[[nodiscard]] std::optional<double> terrain_height_at(
+    const TerrainMesh& terrain,
+    double x,
+    double z);
+[[nodiscard]] bool terrain_covers_mission(
+    const RuntimeTerrain& terrain,
+    const Mission& mission);
 [[nodiscard]] std::string terrain_tiles_json(const ElevationComposite& composite);
+[[nodiscard]] std::string terrain_tiles_json(const RuntimeTerrain& terrain);
 [[nodiscard]] std::string map_texture_tiles_json(const MapTextureComposite& composite);
 [[nodiscard]] std::string terrain_tiles_json_for_mission_fallback(
     const Mission& mission,

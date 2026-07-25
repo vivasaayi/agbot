@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -43,6 +44,7 @@ struct RunConfig {
     SensorCalibrationProfile sensor_profile = ideal_sensor_profile();
     LidarRaycastConfig lidar;
     FaultInjectionPlan faults;
+    std::optional<RuntimeTerrain> terrain;
 };
 
 /// Per-run scenario manifest (story 02-28, minimal first slice). Records the

@@ -17,6 +17,21 @@ import {
 } from "../map.js";
 
 const TRUE_COLOR_KINDS = new Set(["rgb", "truecolor", "true_color"]);
+const GEOTIFF_FORMATS = new Set(["tif", "tiff", "geotiff", "cog"]);
+
+// Every stored GeoTIFF can use the global catalog tile endpoint. True-color
+// composites are also tileable even though their three band paths live in
+// product parameters instead of a single artifact path.
+function isTileableRasterProduct(product) {
+  if (TRUE_COLOR_KINDS.has(product?.kind)) return true;
+  const format = String(product?.format ?? "").toLowerCase();
+  const path = String(product?.path ?? "").toLowerCase();
+  return (
+    GEOTIFF_FORMATS.has(format) ||
+    path.endsWith(".tif") ||
+    path.endsWith(".tiff")
+  );
+}
 
 function asItems(page) {
   if (Array.isArray(page)) return page;
@@ -217,15 +232,16 @@ async function renderLevelBrowser(inspector, sceneId) {
       }
       li.appendChild(line);
 
-      // True-color composites: toggle the RGB tile layer on the map.
-      if (TRUE_COLOR_KINDS.has(product.kind)) {
+      // All catalog GeoTIFFs (including elevation DSM/DTM products) render
+      // through the global XYZ tile path and can be toggled on the GIS map.
+      if (level !== "l0" && isTileableRasterProduct(product)) {
         const toggle = document.createElement("button");
         toggle.type = "button";
         toggle.className = "pipeline-refresh";
         const sync = () => {
           toggle.textContent = hasCatalogProductLayer(product.product_id)
-            ? "Hide true-color"
-            : "Show true-color";
+            ? "Hide layer"
+            : "Show layer";
         };
         toggle.addEventListener("click", () => {
           if (hasCatalogProductLayer(product.product_id)) {

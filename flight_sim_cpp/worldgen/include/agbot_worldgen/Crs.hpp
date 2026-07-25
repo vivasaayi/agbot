@@ -30,7 +30,10 @@ enum class VerticalDatum {
     None,             // source carries no z
     Navd88,           // NAVD88 orthometric
     Navd88Geoid18,    // NAVD88 realised via GEOID18 (NOAA republished LiDAR)
-    Ellipsoidal,      // NAD83 ellipsoidal height
+    Egm96,            // EGM96 orthometric height (SRTM/NASADEM/AW3D30)
+    Egm2008,          // EGM2008 orthometric height (Copernicus DEM)
+    Ellipsoidal,      // generic/NAD83 ellipsoidal height
+    Wgs84Ellipsoidal, // WGS84 ellipsoidal height (TanDEM-X)
 };
 
 [[nodiscard]] VerticalDatum vertical_datum_from_name(const std::string& name);

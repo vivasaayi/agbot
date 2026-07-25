@@ -2,6 +2,7 @@
 // scene file round-trip, and demo scene sanity. No GL context required.
 
 #include "agbot_flight_sim/WeatherPreset.hpp"
+#include "agbot_flight_sim/GeoTerrain.hpp"
 #include "agbot_render/Atmosphere.hpp"
 #include "agbot_render/Camera.hpp"
 #include "agbot_render/DemoScene.hpp"
@@ -9,6 +10,7 @@
 #include "agbot_render/OffscreenRenderer.hpp"
 #include "agbot_render/RenderScene.hpp"
 #include "agbot_render/SceneFile.hpp"
+#include "agbot_render/WorldPackage.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -450,6 +452,158 @@ void test_scene_file_bad_magic() {
     std::filesystem::remove(path);
 }
 
+void test_world_package_resolves_scene_payload() {
+    const std::filesystem::path directory =
+        std::filesystem::temp_directory_path() / "agbot_render_world_package";
+    std::filesystem::create_directories(directory);
+    const std::filesystem::path scene_path = directory / "terrain.agbscn";
+    const std::filesystem::path manifest_path = directory / "terrain.agbworld";
+    const auto write_error =
+        agbot::render::write_scene_file(scene_path, make_reference_scene());
+    check(!write_error.has_value(), "world package scene fixture writes");
+    {
+        std::ofstream manifest(manifest_path, std::ios::binary | std::ios::trunc);
+        manifest
+            << R"({"world_hash":4242,"crs_policy":{"horizontal":"EPSG:4326",)"
+            << R"("vertical_datum":"EGM2008"},"tiles":[{"scene_path":"terrain.agbscn",)"
+            << R"("elevation_state":"authoritative"}]})";
+    }
+
+    const auto package = agbot::render::read_world_package(manifest_path);
+    check(package.ok(), "world package manifest resolves");
+    if (package.ok()) {
+        check(package.package.scene_path == std::filesystem::weakly_canonical(scene_path),
+              "world package resolves sibling scene path");
+        check(package.package.world_hash == 4242, "world package retains world hash");
+        check(package.package.vertical_datum == "EGM2008",
+              "world package retains vertical datum");
+        check(package.package.elevation_state == "authoritative",
+              "world package retains elevation state");
+        check(agbot::render::read_scene_file(package.package.scene_path).ok(),
+              "resolved world package scene is consumable");
+    }
+
+    {
+        std::ofstream manifest(manifest_path, std::ios::binary | std::ios::trunc);
+        manifest
+            << R"({"world_hash":1,"tiles":[{"scene_path":"../escape.agbscn",)"
+            << R"("elevation_state":"missing"}]})";
+    }
+    const auto escaping = agbot::render::read_world_package(manifest_path);
+    check(!escaping.ok() &&
+              escaping.error->find("escapes_package") != std::string::npos,
+          "world package rejects a traversing scene path");
+
+    const std::filesystem::path outside_scene =
+        std::filesystem::temp_directory_path() / "agbot_render_world_package_escape.agbscn";
+    const std::filesystem::path linked_scene = directory / "linked.agbscn";
+    const auto outside_error =
+        agbot::render::write_scene_file(outside_scene, make_reference_scene());
+    check(!outside_error.has_value(), "world package symlink escape fixture writes");
+    std::error_code symlink_error;
+    std::filesystem::create_symlink(outside_scene, linked_scene, symlink_error);
+    if (!symlink_error) {
+        std::ofstream manifest(manifest_path, std::ios::binary | std::ios::trunc);
+        manifest
+            << R"({"world_hash":1,"tiles":[{"scene_path":"linked.agbscn",)"
+            << R"("elevation_state":"authoritative"}]})";
+        manifest.close();
+        const auto symlink_escape = agbot::render::read_world_package(manifest_path);
+        check(!symlink_escape.ok() &&
+                  symlink_escape.error->find("escapes_package") != std::string::npos,
+              "world package rejects a symlinked scene outside the package");
+    }
+
+    std::filesystem::remove_all(directory);
+    std::filesystem::remove(outside_scene);
+}
+
+void test_world_package_loads_runtime_terrain_in_mission_frame() {
+    const std::filesystem::path directory =
+        std::filesystem::temp_directory_path() / "agbot_render_runtime_terrain";
+    std::filesystem::create_directories(directory);
+    const std::filesystem::path scene_path = directory / "terrain.agbscn";
+    const std::filesystem::path manifest_path = directory / "terrain.agbworld";
+
+    RenderMesh terrain_mesh;
+    terrain_mesh.vertices = {
+        {-50.0F, 100.0F, 50.0F, 0.0F, 1.0F, 0.0F, 0.2F, 0.7F, 0.2F, 1.0F},
+        {50.0F, 110.0F, 50.0F, 0.0F, 1.0F, 0.0F, 0.2F, 0.7F, 0.2F, 1.0F},
+        {-50.0F, 120.0F, -50.0F, 0.0F, 1.0F, 0.0F, 0.2F, 0.7F, 0.2F, 1.0F},
+        {50.0F, 130.0F, -50.0F, 0.0F, 1.0F, 0.0F, 0.2F, 0.7F, 0.2F, 1.0F},
+    };
+    terrain_mesh.indices = {0, 2, 1, 1, 2, 3};
+    RenderScene scene;
+    scene.static_meshes.push_back(terrain_mesh);
+    const auto write_error = agbot::render::write_scene_file(scene_path, scene);
+    check(!write_error.has_value(), "runtime terrain scene fixture writes");
+
+    {
+        std::ofstream manifest(manifest_path, std::ios::binary | std::ios::trunc);
+        manifest
+            << R"({"world_hash":4242,)"
+            << R"("aoi":{"min_lat":40.0,"min_lon":-76.0,"max_lat":40.001,"max_lon":-75.999},)"
+            << R"("crs_policy":{"horizontal":"EPSG:4326","vertical_datum":"EGM2008",)"
+            << R"("runtime_frame":"local_enu_m"},)"
+            << R"("sources":[{"source_id":"catalog:dem"}],)"
+            << R"("tiles":[{"scene_path":"terrain.agbscn","elevation_state":"authoritative"}],)"
+            << R"("quality":{"terrain_cell_count":4,"terrain_nodata_cells":0}})";
+    }
+
+    const agbot::flight_sim::GeoCoordinate runtime_origin {
+        40.0005,
+        -75.9995,
+        0.0,
+    };
+    const auto loaded =
+        agbot::render::load_world_terrain(manifest_path, runtime_origin);
+    check(loaded.ok(), "world package loads a runtime terrain mesh");
+    if (loaded.ok()) {
+        check(loaded.terrain.mesh.vertices.size() == 4,
+              "runtime terrain retains grid vertices");
+        check(loaded.terrain.mesh.indices.size() == 6,
+              "runtime terrain retains grid indices");
+        check(loaded.terrain.resolution == 2,
+              "runtime terrain derives square-grid resolution");
+        check(loaded.terrain.world_hash == 4242,
+              "runtime terrain retains package hash");
+        check(loaded.terrain.source_id == "catalog:dem",
+              "runtime terrain retains DEM provenance");
+        check(loaded.terrain.vertical_datum == "EGM2008",
+              "runtime terrain retains the vertical datum");
+        const auto center_height =
+            agbot::flight_sim::terrain_height_at(loaded.terrain.mesh, 0.0, 0.0);
+        check(center_height.has_value() &&
+                  std::fabs(*center_height - 115.0) < 0.01,
+              "runtime terrain samples datum-referenced elevation");
+        const auto north_west_height =
+            agbot::flight_sim::terrain_height_at(
+                loaded.terrain.mesh, -50.0, 50.0);
+        check(north_west_height.has_value() &&
+                  std::fabs(*north_west_height - 100.0) < 0.01,
+              "runtime terrain preserves north-to-south raster orientation");
+    }
+
+    {
+        std::ofstream manifest(manifest_path, std::ios::binary | std::ios::trunc);
+        manifest
+            << R"({"world_hash":4242,)"
+            << R"("aoi":{"min_lat":40.0,"min_lon":-76.0,"max_lat":40.001,"max_lon":-75.999},)"
+            << R"("crs_policy":{"horizontal":"EPSG:4326","vertical_datum":"EGM2008",)"
+            << R"("runtime_frame":"local_enu_m"},)"
+            << R"("sources":[{"source_id":"catalog:dem"}],)"
+            << R"("tiles":[{"scene_path":"terrain.agbscn","elevation_state":"authoritative"}],)"
+            << R"("quality":{"terrain_cell_count":4,"terrain_nodata_cells":1}})";
+    }
+    const auto nodata =
+        agbot::render::load_world_terrain(manifest_path, runtime_origin);
+    check(!nodata.ok() &&
+              nodata.error->find("contains_nodata") != std::string::npos,
+          "runtime terrain rejects silent zero-filled nodata cells");
+
+    std::filesystem::remove_all(directory);
+}
+
 // ---------------------------------------------------------------------------
 // Demo scene sanity
 // ---------------------------------------------------------------------------
@@ -769,6 +923,8 @@ int main() {
     test_scene_file_v2_textured_round_trip();
     test_scene_file_v1_compat();
     test_scene_file_bad_magic();
+    test_world_package_resolves_scene_payload();
+    test_world_package_loads_runtime_terrain_in_mission_frame();
     test_demo_scene();
     test_value_noise();
     test_offscreen_rasterizer();

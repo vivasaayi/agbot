@@ -10,6 +10,7 @@ add_library(agbot_render
     src/DemoScene.cpp
     src/OffscreenRenderer.cpp
     src/SceneFile.cpp
+    src/WorldPackage.cpp
 )
 
 target_include_directories(agbot_render
@@ -18,7 +19,10 @@ target_include_directories(agbot_render
 )
 
 target_compile_features(agbot_render PUBLIC cxx_std_20)
-target_link_libraries(agbot_render PUBLIC agbot_config agbot_flight_sim_core)
+target_link_libraries(agbot_render
+    PUBLIC agbot_config agbot_flight_sim_core
+    PRIVATE agbot_third_party
+)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(agbot_render PRIVATE -Wall -Wextra -Wpedantic)

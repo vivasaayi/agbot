@@ -27,6 +27,66 @@ ctest --test-dir flight_sim_cpp/build --output-on-failure
 flight_sim_cpp/build/agbot_flight_sim_headless --seed 42
 ```
 
+## Compile and view catalog terrain
+
+`geo_hub` invokes the terrain-only compiler when
+`POST /api/terrain/derive` is called. It can also be run directly:
+
+```bash
+flight_sim_cpp/build/worldgen/agbot_terrain_compile \
+  --dem /absolute/path/to/elevation-f32-4326.tif \
+  --output-dir flight_sim_cpp/out/terrain/example \
+  --name terrain \
+  --min-lat 40.70 --min-lon -74.02 \
+  --max-lat 40.72 --max-lon -74.00 \
+  --resolution 256 --target-gsd-m 30 \
+  --vertical-datum EGM2008
+```
+
+The compiler emits `terrain.agbworld`, `terrain.agbscn`, and
+`terrain.validation.json`. On macOS the world viewer consumes the L3 manifest
+directly and resolves its scene payload:
+
+```bash
+flight_sim_cpp/build/render/agbot_world_viewer \
+  flight_sim_cpp/out/terrain/example/terrain.agbworld
+```
+
+Terrain-only worlds retain the DEM byte hash, CRS, vertical datum, validation
+metrics, and explicit `authoritative`, `fallback`, `masked_water`, or `missing`
+elevation state. They do not fabricate a building source.
+
+Use the same L3 package in a georeferenced deterministic flight:
+
+```bash
+flight_sim_cpp/build/agbot_flight_sim_headless \
+  --seed 42 \
+  --mission /path/to/mission.json \
+  --terrain-package flight_sim_cpp/out/terrain/example/terrain.agbworld \
+  --output flight_sim_cpp/out/l3-flight.jsonl
+```
+
+The package AOI must cover the mission home and every waypoint. The simulator
+keeps waypoint and telemetry altitude in meters above local ground (AGL), while
+the L3 mesh retains datum-referenced elevation. At the LiDAR boundary, AGL is
+combined with sampled ground elevation so point clouds and sensor positions
+occupy the package's vertical datum. Package hash, DEM source, vertical datum,
+coverage, resolution, nodata count, and elevation range are recorded in
+`terrain_tiles` and therefore influence the deterministic `run_id`.
+
+The interactive macOS simulator accepts the same handoff and renders the
+vehicle above the package terrain:
+
+```bash
+flight_sim_cpp/build/agbot_flight_sim_viewer \
+  --mission /path/to/mission.json \
+  --terrain-package flight_sim_cpp/out/terrain/example/terrain.agbworld
+```
+
+An explicitly supplied package fails closed when it is invalid or outside the
+mission footprint; the simulator does not silently replace it with network or
+flat terrain.
+
 The headless runner requires an explicit seed and writes telemetry plus a
 manifest to:
 
@@ -139,10 +199,10 @@ flight_sim_cpp/build/agbot_flight_sim_headless \
   --output flight_sim_cpp/out/lidar.jsonl
 ```
 
-Use `--disable-lidar` when only the telemetry trace is needed. The first slice
-raycasts against the simulator terrain heightfield or a flat fallback terrain
-mesh derived from the mission footprint, so output remains reproducible without
-hardware or network access.
+Use `--disable-lidar` when only the telemetry trace is needed. Raycasts use an
+explicit L3 terrain package when supplied, or a flat fallback mesh derived from
+the mission footprint, so output remains reproducible without hardware or
+network access.
 
 Inject a seeded fault:
 

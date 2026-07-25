@@ -215,7 +215,9 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
     std::uint64_t lidar_scan_count = 0;
     double next_record_s = 0.0;
     std::vector<FaultEvent> fault_events;
-    const TerrainMesh lidar_terrain = build_lidar_flat_terrain_for_mission(mission);
+    const TerrainMesh lidar_terrain = config.terrain.has_value()
+        ? config.terrain->mesh
+        : build_lidar_flat_terrain_for_mission(mission);
 
     const auto record = [&](const DroneState& state, std::uint64_t step) {
         if (sensor_stream_suppressed(config.faults, step)) {
@@ -225,7 +227,17 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
         trace << format_telemetry_sample(observed) << "\n";
         ++sample_count;
         if (config.lidar.enabled) {
-            const LidarScan scan = raycast_lidar_scan(observed, lidar_terrain, config.lidar, config.seed, step);
+            DroneState lidar_state = observed;
+            if (config.terrain.has_value()) {
+                if (const auto ground_elevation = terrain_height_at(
+                        lidar_terrain,
+                        observed.position.x,
+                        observed.position.z)) {
+                    lidar_state.position.y += *ground_elevation;
+                }
+            }
+            const LidarScan scan = raycast_lidar_scan(
+                lidar_state, lidar_terrain, config.lidar, config.seed, step);
             lidar_trace << scan.to_json() << "\n";
             ++lidar_scan_count;
         }
@@ -266,9 +278,11 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
     }
     manifest.faults_json = config.faults.to_json();
     manifest.faults_hash = sha256_hex(manifest.faults_json);
+    const std::string terrain_evidence = config.terrain.has_value()
+        ? terrain_tiles_json(*config.terrain)
+        : terrain_tiles_json_for_mission_fallback(mission, 96);
     manifest.terrain_tiles_json = merge_json_arrays(
-        terrain_tiles_json_for_mission_fallback(mission, 96),
-        terrain_tiles_json_for_faults(config.faults));
+        terrain_evidence, terrain_tiles_json_for_faults(config.faults));
     manifest.terrain_tiles_hash = sha256_hex(manifest.terrain_tiles_json);
     manifest.weather_config_json = weather_config_json(config.steady_wind_mps);
     manifest.weather_config_hash = sha256_hex(manifest.weather_config_json);

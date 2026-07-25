@@ -6,6 +6,7 @@
 #include "agbot_flight_sim/TwinContractV1.hpp"
 
 #include "agbot_config/Toml.hpp"
+#include "agbot_render/WorldPackage.hpp"
 
 #include <array>
 #include <cstddef>
@@ -34,6 +35,7 @@ constexpr std::uint64_t kDefaultSeed = 1;
 
 struct Args {
     std::filesystem::path mission_path = default_sample_mission_path();
+    std::optional<std::filesystem::path> terrain_package_path;
     std::filesystem::path output_path = agbot::flight_sim::sim_out_dir() / "telemetry.jsonl";
     std::optional<std::uint64_t> seed; // resolved from settings file / default when absent
     double timestep_ms = 1000.0 / 60.0;
@@ -98,6 +100,8 @@ std::array<double, 4> parse_geofence_csv(const std::string& text) {
               << "  --timestep-ms MS     Fixed timestep in milliseconds (default 16.667).\n"
               << "  --record-interval S  Telemetry sampling interval in seconds (default 0.25).\n"
               << "  --mission PATH       Mission JSON to fly (default: bundled sample).\n"
+              << "  --terrain-package PATH\n"
+              << "                       L3 .agbworld terrain package used by LiDAR and run evidence.\n"
               << "  --output PATH        Telemetry JSONL output (default: out/telemetry.jsonl).\n"
               << "                       A <output>.manifest.json is written alongside it.\n"
               << "  --max-time S         Max mission seconds before giving up (default 600).\n"
@@ -166,6 +170,8 @@ Args parse_args(int argc, char** argv) {
         const std::string current = argv[index];
         if (current == "--mission" && index + 1 < argc) {
             args.mission_path = argv[++index];
+        } else if (current == "--terrain-package" && index + 1 < argc) {
+            args.terrain_package_path = std::filesystem::path(argv[++index]);
         } else if (current == "--output" && index + 1 < argc) {
             args.output_path = argv[++index];
         } else if (current == "--seed" && index + 1 < argc) {
@@ -287,6 +293,24 @@ int main(int argc, char** argv) {
         config.sensor_profile = args.sensor_profile;
         config.lidar = args.lidar;
         config.faults = args.faults;
+        if (args.terrain_package_path.has_value()) {
+            if (!mission.home_geo.has_value()) {
+                throw std::runtime_error(
+                    "--terrain-package requires a georeferenced mission");
+            }
+            const auto terrain = agbot::render::load_world_terrain(
+                *args.terrain_package_path, *mission.home_geo);
+            if (!terrain.ok()) {
+                throw std::runtime_error(
+                    "Unable to load terrain package: " + *terrain.error);
+            }
+            if (!agbot::flight_sim::terrain_covers_mission(
+                    terrain.terrain, mission)) {
+                throw std::runtime_error(
+                    "Terrain package does not cover the mission home and waypoints");
+            }
+            config.terrain = terrain.terrain;
+        }
 
         RunResult result = run_deterministic(mission, config);
         result.manifest.validation_report_json = validation.to_json();

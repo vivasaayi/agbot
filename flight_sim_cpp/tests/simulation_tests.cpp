@@ -1652,6 +1652,57 @@ void test_run_manifest_records_geodetic_terrain_fallback_evidence() {
     assert(json.find("\"terrain_tiles\":[{") != std::string::npos);
 }
 
+void test_runtime_terrain_is_manifested_and_drives_lidar() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    const auto flat_mesh =
+        agbot::flight_sim::build_lidar_flat_terrain_for_mission(mission, 8, 40.0);
+
+    agbot::flight_sim::RuntimeTerrain runtime_terrain;
+    runtime_terrain.mesh = flat_mesh;
+    for (auto& vertex : runtime_terrain.mesh.vertices) {
+        vertex.position.y += 125.0;
+    }
+    runtime_terrain.mesh.min_elevation_m = 125.0F;
+    runtime_terrain.mesh.max_elevation_m = 125.0F;
+    runtime_terrain.mesh.has_elevation = true;
+    runtime_terrain.bounds = {40.0, -76.0, 40.001, -75.999};
+    runtime_terrain.world_hash = 4242;
+    runtime_terrain.source_id = "catalog:dem";
+    runtime_terrain.vertical_datum = "EGM2008";
+    runtime_terrain.elevation_state = "authoritative";
+    runtime_terrain.resolution = 8;
+
+    auto terrain_config = unit_run_config();
+    terrain_config.terrain = runtime_terrain;
+    const auto with_terrain =
+        agbot::flight_sim::run_deterministic(mission, terrain_config);
+    const auto repeated =
+        agbot::flight_sim::run_deterministic(mission, terrain_config);
+    const auto flat =
+        agbot::flight_sim::run_deterministic(mission, unit_run_config());
+
+    assert(with_terrain.trace_jsonl == flat.trace_jsonl);
+    assert(with_terrain.lidar_scans_jsonl != flat.lidar_scans_jsonl);
+    assert(with_terrain.manifest.output_hash == flat.manifest.output_hash);
+    assert(with_terrain.manifest.run_id != flat.manifest.run_id);
+    assert(with_terrain.manifest.lidar_output_hash !=
+           flat.manifest.lidar_output_hash);
+    assert(with_terrain.lidar_scans_jsonl == repeated.lidar_scans_jsonl);
+    assert(with_terrain.manifest.to_json() == repeated.manifest.to_json());
+    assert(with_terrain.manifest.terrain_tiles_json.find("\"world_hash\":4242") !=
+           std::string::npos);
+    assert(with_terrain.manifest.terrain_tiles_json.find("\"source_id\":\"catalog:dem\"") !=
+           std::string::npos);
+    assert(with_terrain.manifest.terrain_tiles_json.find("\"vertical_datum\":\"EGM2008\"") !=
+           std::string::npos);
+    assert(with_terrain.manifest.terrain_tiles_json.find("\"state\":\"authoritative\"") !=
+           std::string::npos);
+    assert(with_terrain.manifest.terrain_tiles_json.find("flat_fallback") ==
+           std::string::npos);
+    assert(with_terrain.manifest.terrain_tiles_hash ==
+           agbot::flight_sim::sha256_hex(with_terrain.manifest.terrain_tiles_json));
+}
+
 void test_zero_wind_keeps_deterministic_trace_identical() {
     const auto mission = MissionLoader::load_from_text(kMissionJson);
     auto zero_wind = unit_run_config();
@@ -2342,6 +2393,7 @@ int main() {
     test_deterministic_runner_emits_capture_shaped_lidar_jsonl();
     test_run_manifest_records_contract_and_hashes();
     test_run_manifest_records_geodetic_terrain_fallback_evidence();
+    test_runtime_terrain_is_manifested_and_drives_lidar();
     test_zero_wind_keeps_deterministic_trace_identical();
     test_steady_wind_is_reproducible_and_manifested();
     test_zero_noise_sensor_profile_is_exact();
