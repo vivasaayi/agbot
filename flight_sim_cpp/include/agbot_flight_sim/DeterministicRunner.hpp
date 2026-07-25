@@ -16,7 +16,7 @@ namespace agbot::flight_sim {
 
 /// Version of the simulator's binary/behavior. Bump on any change that can
 /// alter telemetry output so golden fixtures and manifests stay attributable.
-inline constexpr char kSimulatorVersion[] = "0.1.0";
+inline constexpr char kSimulatorVersion[] = "0.2.0";
 
 /// Version of the twin wire contract (commands, telemetry, trace, manifest).
 /// This is the seed of TwinContractV1 (story 02-24): any breaking change to the

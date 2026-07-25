@@ -231,6 +231,10 @@ struct RuntimeTerrain {
     const TerrainMesh& terrain,
     double x,
     double z);
+[[nodiscard]] std::optional<double> terrain_slope_degrees_at(
+    const TerrainMesh& terrain,
+    double x,
+    double z);
 [[nodiscard]] bool terrain_covers_mission(
     const RuntimeTerrain& terrain,
     const Mission& mission);

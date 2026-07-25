@@ -60,6 +60,49 @@ MissionValidationIssue issue_for_violation(const SafetyViolation& violation) {
     };
 }
 
+std::optional<Vec3> safety_position_for_waypoint(
+    const Mission& mission,
+    const Waypoint& waypoint,
+    const std::optional<TerrainMesh>& terrain,
+    const std::optional<double>& home_ground_elevation_m) {
+    if (!terrain.has_value()) {
+        if (mission.altitude_reference ==
+            AltitudeReference::MeanSeaLevel) {
+            return std::nullopt;
+        }
+        return waypoint.position;
+    }
+
+    const auto ground_elevation = terrain_height_at(
+        *terrain, waypoint.position.x, waypoint.position.z);
+    if (!ground_elevation.has_value() ||
+        !home_ground_elevation_m.has_value()) {
+        return std::nullopt;
+    }
+
+    Vec3 safety_position = waypoint.position;
+    if (waypoint.action == WaypointAction::Land) {
+        safety_position.y = 0.0;
+    } else {
+        switch (mission.altitude_reference) {
+            case AltitudeReference::AboveGroundLevel:
+                safety_position.y = waypoint.position.y;
+                break;
+            case AltitudeReference::RelativeHome:
+                safety_position.y =
+                    waypoint.position.y -
+                    (*ground_elevation -
+                     *home_ground_elevation_m);
+                break;
+            case AltitudeReference::MeanSeaLevel:
+                safety_position.y =
+                    waypoint.position.y - *ground_elevation;
+                break;
+        }
+    }
+    return safety_position;
+}
+
 } // namespace
 
 std::string MissionValidationReport::to_json() const {
@@ -103,7 +146,10 @@ MissionValidationReport validate_mission(
     report.battery_margin_percent =
         100.0 - report.estimated_battery_used_percent - config.safety.min_battery_percent;
 
-    if (const auto bounds = terrain_bounds_for_mission(mission)) {
+    if (config.terrain.has_value()) {
+        report.terrain_policy = "runtime_terrain";
+        report.terrain_gap_count = 0;
+    } else if (const auto bounds = terrain_bounds_for_mission(mission)) {
         const auto tiles = terrain_tiles_for_bounds_limited(*bounds, bounds->width_m());
         report.terrain_gap_count = tiles.size();
         report.terrain_policy = report.terrain_gap_count == 0 ? "available" : "runnable_with_gaps";
@@ -119,10 +165,42 @@ MissionValidationReport validate_mission(
         report.terrain_policy = "not_georeferenced";
     }
 
+    std::optional<double> home_ground_elevation_m;
+    if (config.terrain.has_value()) {
+        home_ground_elevation_m = terrain_height_at(
+            *config.terrain, mission.home.x, mission.home.z);
+        if (!home_ground_elevation_m.has_value()) {
+            report.issues.push_back({
+                "terrain_unavailable",
+                "blocker",
+                0,
+                "runtime terrain does not cover the mission home",
+            });
+            report.blocked = true;
+        }
+    }
+
     for (std::size_t index = 0; index < mission.waypoints.size(); ++index) {
         const Waypoint& waypoint = mission.waypoints[index];
+        const auto safety_position = safety_position_for_waypoint(
+            mission,
+            waypoint,
+            config.terrain,
+            home_ground_elevation_m);
+        if (!safety_position.has_value()) {
+            report.issues.push_back({
+                "terrain_unavailable",
+                "blocker",
+                index,
+                config.terrain.has_value()
+                    ? "runtime terrain does not cover the waypoint"
+                    : "MSL altitude validation requires runtime terrain",
+            });
+            report.blocked = true;
+            continue;
+        }
         const SafetySample sample{
-            waypoint.position,
+            *safety_position,
             100.0 - report.estimated_battery_used_percent,
             index,
             false,

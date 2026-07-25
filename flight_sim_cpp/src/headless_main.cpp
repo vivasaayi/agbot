@@ -268,9 +268,32 @@ int main(int argc, char** argv) {
         const Args args = parse_args(argc, argv);
 
         auto mission = MissionLoader::load_from_file(args.mission_path);
+        std::optional<agbot::flight_sim::RuntimeTerrain>
+            runtime_terrain;
+        if (args.terrain_package_path.has_value()) {
+            if (!mission.home_geo.has_value()) {
+                throw std::runtime_error(
+                    "--terrain-package requires a georeferenced mission");
+            }
+            const auto terrain = agbot::render::load_world_terrain(
+                *args.terrain_package_path, *mission.home_geo);
+            if (!terrain.ok()) {
+                throw std::runtime_error(
+                    "Unable to load terrain package: " + *terrain.error);
+            }
+            if (!agbot::flight_sim::terrain_covers_mission(
+                    terrain.terrain, mission)) {
+                throw std::runtime_error(
+                    "Terrain package does not cover the mission home and waypoints");
+            }
+            runtime_terrain = terrain.terrain;
+        }
 
         agbot::flight_sim::MissionValidationConfig validation_config;
         validation_config.safety = args.safety;
+        if (runtime_terrain.has_value()) {
+            validation_config.terrain = runtime_terrain->mesh;
+        }
         const auto validation = agbot::flight_sim::validate_mission(mission, validation_config);
         const std::filesystem::path validation_path =
             std::filesystem::path(args.output_path).replace_extension(".validation.json");
@@ -293,23 +316,8 @@ int main(int argc, char** argv) {
         config.sensor_profile = args.sensor_profile;
         config.lidar = args.lidar;
         config.faults = args.faults;
-        if (args.terrain_package_path.has_value()) {
-            if (!mission.home_geo.has_value()) {
-                throw std::runtime_error(
-                    "--terrain-package requires a georeferenced mission");
-            }
-            const auto terrain = agbot::render::load_world_terrain(
-                *args.terrain_package_path, *mission.home_geo);
-            if (!terrain.ok()) {
-                throw std::runtime_error(
-                    "Unable to load terrain package: " + *terrain.error);
-            }
-            if (!agbot::flight_sim::terrain_covers_mission(
-                    terrain.terrain, mission)) {
-                throw std::runtime_error(
-                    "Terrain package does not cover the mission home and waypoints");
-            }
-            config.terrain = terrain.terrain;
+        if (runtime_terrain.has_value()) {
+            config.terrain = *runtime_terrain;
         }
 
         RunResult result = run_deterministic(mission, config);

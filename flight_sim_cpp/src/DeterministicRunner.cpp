@@ -206,6 +206,9 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
     simulation_config.plant_model = config.plant_model;
     simulation_config.safety = config.safety;
     simulation_config.min_battery_percent = config.safety.min_battery_percent;
+    if (config.terrain.has_value()) {
+        simulation_config.terrain = config.terrain->mesh;
+    }
     DroneSimulation simulation(mission, simulation_config);
 
     std::ostringstream trace;
@@ -229,12 +232,8 @@ RunResult run_deterministic(const Mission& mission, const RunConfig& config) {
         if (config.lidar.enabled) {
             DroneState lidar_state = observed;
             if (config.terrain.has_value()) {
-                if (const auto ground_elevation = terrain_height_at(
-                        lidar_terrain,
-                        observed.position.x,
-                        observed.position.z)) {
-                    lidar_state.position.y += *ground_elevation;
-                }
+                lidar_state.position.y =
+                    simulation.world_elevation_m(observed.position);
             }
             const LidarScan scan = raycast_lidar_scan(
                 lidar_state, lidar_terrain, config.lidar, config.seed, step);

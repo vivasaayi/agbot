@@ -66,13 +66,30 @@ flight_sim_cpp/build/agbot_flight_sim_headless \
   --output flight_sim_cpp/out/l3-flight.jsonl
 ```
 
-The package AOI must cover the mission home and every waypoint. The simulator
-keeps waypoint and telemetry altitude in meters above local ground (AGL), while
-the L3 mesh retains datum-referenced elevation. At the LiDAR boundary, AGL is
-combined with sampled ground elevation so point clouds and sensor positions
-occupy the package's vertical datum. Package hash, DEM source, vertical datum,
-coverage, resolution, nodata count, and elevation range are recorded in
-`terrain_tiles` and therefore influence the deterministic `run_id`.
+The package AOI must cover the mission home and every waypoint. Aircraft state
+and telemetry use the mission's local ENU frame; state `position.y` is relative
+to the terrain elevation at home. The simulator samples terrain during
+guidance, safety evaluation, collision detection, and landing. LiDAR positions
+are converted into the package's vertical datum. Package hash, DEM source,
+vertical datum, coverage, resolution, nodata count, and elevation range are
+recorded in `terrain_tiles` and therefore influence the deterministic `run_id`.
+
+Mission JSON can declare one vertical command convention:
+
+```json
+{
+  "altitude_reference": "agl"
+}
+```
+
+Supported values are `agl` (the default), `relative_home`, and `msl`. AGL
+waypoints are resolved above the sampled ground at each waypoint;
+`relative_home` preserves a constant vertical offset from home; and MSL values
+are interpreted directly in the L3 vertical datum. Landing commands always
+settle onto the sampled terrain surface; landing zones steeper than 15 degrees
+fail with `unsafe_landing_slope`. The safety altitude ceiling is evaluated in
+AGL, while an unexpected terrain intersection terminates the run with
+`terrain_collision`.
 
 The interactive macOS simulator accepts the same handoff and renders the
 vehicle above the package terrain:

@@ -36,6 +36,12 @@ const char* to_string(SafetyViolationCode code) {
             return "low_battery_abort";
         case SafetyViolationCode::EmergencyAbort:
             return "emergency_abort";
+        case SafetyViolationCode::TerrainCollision:
+            return "terrain_collision";
+        case SafetyViolationCode::TerrainUnavailable:
+            return "terrain_unavailable";
+        case SafetyViolationCode::UnsafeLandingSlope:
+            return "unsafe_landing_slope";
     }
     return "unknown_safety_violation";
 }

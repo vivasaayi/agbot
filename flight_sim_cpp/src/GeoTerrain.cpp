@@ -763,6 +763,58 @@ std::optional<double> terrain_height_at(const TerrainMesh& terrain, double x, do
     return top * (1.0 - tz) + bottom * tz;
 }
 
+std::optional<double> terrain_slope_degrees_at(
+    const TerrainMesh& terrain,
+    double x,
+    double z) {
+    const auto resolution = terrain_grid_resolution(terrain);
+    if (!resolution.has_value()) {
+        return std::nullopt;
+    }
+
+    const Vec3& first = terrain.vertices.front().position;
+    const Vec3& x_edge =
+        terrain.vertices[static_cast<std::size_t>(*resolution - 1)].position;
+    const Vec3& z_edge =
+        terrain.vertices[
+            static_cast<std::size_t>((*resolution - 1) * *resolution)].position;
+    const double min_x = std::min(first.x, x_edge.x);
+    const double max_x = std::max(first.x, x_edge.x);
+    const double min_z = std::min(first.z, z_edge.z);
+    const double max_z = std::max(first.z, z_edge.z);
+    if (x < min_x || x > max_x || z < min_z || z > max_z) {
+        return std::nullopt;
+    }
+
+    const double cell_x =
+        (max_x - min_x) / static_cast<double>(*resolution - 1);
+    const double cell_z =
+        (max_z - min_z) / static_cast<double>(*resolution - 1);
+    const double left_x = std::max(min_x, x - cell_x);
+    const double right_x = std::min(max_x, x + cell_x);
+    const double low_z = std::max(min_z, z - cell_z);
+    const double high_z = std::min(max_z, z + cell_z);
+    if (right_x <= left_x || high_z <= low_z) {
+        return std::nullopt;
+    }
+
+    const auto left = terrain_height_at(terrain, left_x, z);
+    const auto right = terrain_height_at(terrain, right_x, z);
+    const auto low = terrain_height_at(terrain, x, low_z);
+    const auto high = terrain_height_at(terrain, x, high_z);
+    if (!left.has_value() || !right.has_value() ||
+        !low.has_value() || !high.has_value()) {
+        return std::nullopt;
+    }
+
+    const double gradient_x = (*right - *left) / (right_x - left_x);
+    const double gradient_z = (*high - *low) / (high_z - low_z);
+    constexpr double kRadiansToDegrees =
+        180.0 / 3.14159265358979323846;
+    return std::atan(std::hypot(gradient_x, gradient_z)) *
+        kRadiansToDegrees;
+}
+
 bool terrain_covers_mission(const RuntimeTerrain& terrain, const Mission& mission) {
     if (!mission.home_geo.has_value() || terrain.mesh.vertices.empty()) {
         return false;

@@ -50,6 +50,7 @@ using agbot::flight_sim::SimulationEventType;
 using agbot::flight_sim::TileCoordinate;
 using agbot::flight_sim::TelemetryRecorder;
 using agbot::flight_sim::TelemetryReplay;
+using agbot::flight_sim::WaypointAction;
 using agbot::flight_sim::HudUiState;
 using agbot::flight_sim::hud_telemetry_from_state;
 
@@ -166,6 +167,8 @@ void test_loads_mission() {
     const auto mission = MissionLoader::load_from_text(kMissionJson);
     assert(mission.name == "Unit Test Mission");
     assert(mission.waypoints.size() == 4);
+    assert(mission.altitude_reference ==
+           agbot::flight_sim::AltitudeReference::AboveGroundLevel);
     assert(std::abs(mission.cruise_speed_mps - 10.0) < 1e-9);
     assert(std::abs(mission.acceptance_radius_m - 0.5) < 1e-9);
 }
@@ -418,10 +421,16 @@ void test_guidance_state_changes_autopilot_control_solution() {
 
 void test_mission_round_trip() {
     auto mission = MissionLoader::load_from_text(kMissionJson);
+    mission.altitude_reference =
+        agbot::flight_sim::AltitudeReference::MeanSeaLevel;
     const std::string json = agbot::flight_sim::mission_to_json(mission);
+    assert(json.find("\"altitude_reference\": \"msl\"") !=
+           std::string::npos);
     const auto reloaded = MissionLoader::load_from_text(json);
     assert(reloaded.name == mission.name);
     assert(reloaded.waypoints.size() == mission.waypoints.size());
+    assert(reloaded.altitude_reference ==
+           agbot::flight_sim::AltitudeReference::MeanSeaLevel);
 }
 
 void test_twin_backend_executes_shared_command_and_returns_telemetry() {
@@ -1254,6 +1263,237 @@ void test_builds_terrain_mesh_from_heightmap() {
     assert(std::abs(mesh.vertices[4].normal.length() - 1.0) < 0.001);
 }
 
+agbot::flight_sim::TerrainMesh terrain_from_x_profile(
+    const std::vector<float>& x_heights,
+    float base_elevation_m = 0.0F) {
+    const int resolution = static_cast<int>(x_heights.size());
+    std::vector<float> heightmap;
+    heightmap.reserve(
+        static_cast<std::size_t>(resolution * resolution));
+    for (int z = 0; z < resolution; ++z) {
+        heightmap.insert(
+            heightmap.end(), x_heights.begin(), x_heights.end());
+    }
+    auto mesh = agbot::flight_sim::build_terrain_mesh(
+        heightmap, resolution, 40.0, 40.0);
+    for (auto& vertex : mesh.vertices) {
+        vertex.position.y += base_elevation_m;
+    }
+    mesh.min_elevation_m += base_elevation_m;
+    mesh.max_elevation_m += base_elevation_m;
+    mesh.has_elevation = true;
+    return mesh;
+}
+
+void test_altitude_references_resolve_against_physical_terrain() {
+    agbot::flight_sim::Mission mission;
+    mission.home = {-20.0, 0.0, 0.0};
+    mission.waypoints.push_back(
+        {"terrain_target", {20.0, 10.0, 0.0}});
+
+    agbot::flight_sim::SimulationConfig config;
+    config.terrain = terrain_from_x_profile(
+        {0.0F, 2.5F, 5.0F, 7.5F, 10.0F}, 100.0F);
+
+    mission.altitude_reference =
+        agbot::flight_sim::AltitudeReference::AboveGroundLevel;
+    DroneSimulation agl_simulation(mission, config);
+    assert(std::abs(
+        agl_simulation.resolved_waypoint_position(
+            mission.waypoints.front()).y - 20.0) < 0.001);
+
+    mission.altitude_reference =
+        agbot::flight_sim::AltitudeReference::RelativeHome;
+    DroneSimulation relative_simulation(mission, config);
+    assert(std::abs(
+        relative_simulation.resolved_waypoint_position(
+            mission.waypoints.front()).y - 10.0) < 0.001);
+
+    mission.altitude_reference =
+        agbot::flight_sim::AltitudeReference::MeanSeaLevel;
+    mission.waypoints.front().position.y = 115.0;
+    DroneSimulation msl_simulation(mission, config);
+    assert(std::abs(
+        msl_simulation.resolved_waypoint_position(
+            mission.waypoints.front()).y - 15.0) < 0.001);
+    assert(std::abs(msl_simulation.world_elevation_m({20.0, 15.0, 0.0}) -
+                    115.0) < 0.001);
+}
+
+void test_preflight_applies_altitude_ceiling_to_agl() {
+    agbot::flight_sim::Mission mission;
+    mission.name = "Terrain-aware preflight";
+    mission.home = {-20.0, 0.0, 0.0};
+    mission.altitude_reference =
+        agbot::flight_sim::AltitudeReference::RelativeHome;
+    mission.waypoints.push_back(
+        {"slope_clearance", {20.0, 15.0, 0.0}});
+
+    agbot::flight_sim::MissionValidationConfig config;
+    config.safety.max_altitude_m = 6.0;
+    config.terrain = terrain_from_x_profile(
+        {0.0F, 2.5F, 5.0F, 7.5F, 10.0F}, 100.0F);
+    const auto relative_report =
+        agbot::flight_sim::validate_mission(mission, config);
+    assert(!relative_report.blocked);
+    assert(relative_report.terrain_policy == "runtime_terrain");
+
+    mission.altitude_reference =
+        agbot::flight_sim::AltitudeReference::MeanSeaLevel;
+    mission.waypoints.front().position.y = 115.0;
+    const auto msl_report =
+        agbot::flight_sim::validate_mission(mission, config);
+    assert(!msl_report.blocked);
+
+    config.terrain.reset();
+    const auto missing_terrain =
+        agbot::flight_sim::validate_mission(mission, config);
+    assert(missing_terrain.blocked);
+    assert(missing_terrain.to_json().find(
+               "MSL altitude validation requires runtime terrain") !=
+           std::string::npos);
+}
+
+void test_terrain_ridge_causes_deterministic_collision() {
+    agbot::flight_sim::Mission mission;
+    mission.name = "Ridge collision";
+    mission.home = {-20.0, 0.0, 0.0};
+    mission.altitude_reference =
+        agbot::flight_sim::AltitudeReference::RelativeHome;
+    mission.cruise_speed_mps = 8.0;
+    mission.acceptance_radius_m = 0.25;
+    mission.waypoints = {
+        {"takeoff", {-20.0, 10.0, 0.0},
+         std::nullopt, WaypointAction::Takeoff},
+        {"cross_ridge", {20.0, 10.0, 0.0},
+         std::nullopt, WaypointAction::FlyThrough},
+    };
+
+    agbot::flight_sim::SimulationConfig config;
+    config.terrain =
+        terrain_from_x_profile({0.0F, 2.0F, 20.0F, 2.0F, 0.0F});
+    DroneSimulation simulation(mission, config);
+    for (int step = 0; step < 60 * 30 && !simulation.is_complete();
+         ++step) {
+        simulation.step(1.0 / 60.0);
+    }
+
+    assert(simulation.state().mode == DroneMode::Failsafe);
+    assert(simulation.last_safety_violation().has_value());
+    assert(simulation.last_safety_violation()->code ==
+           agbot::flight_sim::SafetyViolationCode::TerrainCollision);
+    assert(simulation.altitude_agl_m().has_value());
+    assert(std::abs(*simulation.altitude_agl_m()) < 0.01);
+}
+
+void test_landing_uses_sloped_terrain_surface() {
+    agbot::flight_sim::Mission mission;
+    mission.name = "Slope landing";
+    mission.home = {-20.0, 0.0, 0.0};
+    mission.altitude_reference =
+        agbot::flight_sim::AltitudeReference::RelativeHome;
+    mission.cruise_speed_mps = 6.0;
+    mission.acceptance_radius_m = 0.2;
+    mission.waypoints = {
+        {"takeoff", {-20.0, 15.0, 0.0},
+         std::nullopt, WaypointAction::Takeoff},
+        {"cross_slope", {20.0, 15.0, 0.0},
+         std::nullopt, WaypointAction::FlyThrough},
+        {"land_on_slope", {20.0, 0.0, 0.0},
+         std::nullopt, WaypointAction::Land},
+    };
+
+    agbot::flight_sim::SimulationConfig config;
+    config.terrain = terrain_from_x_profile(
+        {0.0F, 2.5F, 5.0F, 7.5F, 10.0F}, 100.0F);
+    DroneSimulation simulation(mission, config);
+    for (int step = 0; step < 60 * 45 && !simulation.is_complete();
+         ++step) {
+        simulation.step(1.0 / 60.0);
+    }
+
+    assert(simulation.state().mode == DroneMode::Completed);
+    assert(!simulation.last_safety_violation().has_value());
+    assert(std::abs(simulation.state().position.y - 10.0) < 0.01);
+    assert(simulation.altitude_agl_m().has_value());
+    assert(std::abs(*simulation.altitude_agl_m()) < 0.01);
+    assert(std::abs(
+        simulation.world_elevation_m(simulation.state().position) -
+        110.0) < 0.01);
+}
+
+void test_landing_rejects_unsafe_terrain_slope() {
+    agbot::flight_sim::Mission mission;
+    mission.name = "Unsafe slope landing";
+    mission.home = {-20.0, 0.0, 0.0};
+    mission.altitude_reference =
+        agbot::flight_sim::AltitudeReference::RelativeHome;
+    mission.cruise_speed_mps = 8.0;
+    mission.acceptance_radius_m = 0.25;
+    mission.waypoints = {
+        {"takeoff", {-20.0, 50.0, 0.0},
+         std::nullopt, WaypointAction::Takeoff},
+        {"approach", {20.0, 50.0, 0.0},
+         std::nullopt, WaypointAction::FlyThrough},
+        {"land", {20.0, 0.0, 0.0},
+         std::nullopt, WaypointAction::Land},
+    };
+
+    agbot::flight_sim::SimulationConfig config;
+    config.max_landing_slope_deg = 15.0;
+    config.terrain = terrain_from_x_profile(
+        {0.0F, 7.5F, 15.0F, 22.5F, 30.0F}, 100.0F);
+    DroneSimulation simulation(mission, config);
+    for (int step = 0; step < 60 * 45 && !simulation.is_complete();
+         ++step) {
+        simulation.step(1.0 / 60.0);
+    }
+
+    assert(simulation.state().mode == DroneMode::Failsafe);
+    assert(simulation.last_safety_violation().has_value());
+    assert(simulation.last_safety_violation()->code ==
+           agbot::flight_sim::SafetyViolationCode::UnsafeLandingSlope);
+}
+
+void test_manual_descent_rejects_unsafe_terrain_slope() {
+    agbot::flight_sim::Mission mission;
+    mission.name = "Unsafe manual descent";
+    mission.home = {0.0, 0.0, 0.0};
+    mission.waypoints.push_back(
+        {"hold", {0.0, 20.0, 0.0},
+         std::nullopt, WaypointAction::Loiter});
+
+    agbot::flight_sim::SimulationConfig config;
+    config.max_landing_slope_deg = 15.0;
+    config.terrain = terrain_from_x_profile(
+        {0.0F, 7.5F, 15.0F, 22.5F, 30.0F}, 100.0F);
+    DroneSimulation simulation(mission, config);
+    simulation.set_control_mode(
+        agbot::flight_sim::ControlMode::Manual);
+    simulation.set_manual_input({
+        0.0, 0.0, 0.0, 0.0, true, false, true});
+
+    for (int step = 0; step < 60 * 10; ++step) {
+        simulation.step(1.0 / 60.0);
+        if (simulation.altitude_agl_m().value_or(0.0) >= 3.0) {
+            break;
+        }
+    }
+    assert(simulation.altitude_agl_m().value_or(0.0) >= 3.0);
+
+    simulation.set_manual_input({
+        -1.0, 0.0, 0.0, 0.0, false, false, false});
+    for (int step = 0; step < 60 * 10 && !simulation.is_complete();
+         ++step) {
+        simulation.step(1.0 / 60.0);
+    }
+
+    assert(simulation.state().mode == DroneMode::Failsafe);
+    assert(simulation.last_safety_violation().has_value());
+    assert(simulation.last_safety_violation()->code ==
+           agbot::flight_sim::SafetyViolationCode::UnsafeLandingSlope);
+}
+
 void test_lidar_raycast_ranges_match_flat_terrain_cloud_tolerance() {
     const std::vector<float> heightmap(9, 0.0f);
     const auto terrain = agbot::flight_sim::build_terrain_mesh(heightmap, 3, 40.0, 40.0);
@@ -1701,6 +1941,46 @@ void test_runtime_terrain_is_manifested_and_drives_lidar() {
            std::string::npos);
     assert(with_terrain.manifest.terrain_tiles_hash ==
            agbot::flight_sim::sha256_hex(with_terrain.manifest.terrain_tiles_json));
+}
+
+void test_deterministic_runner_reports_terrain_collision() {
+    agbot::flight_sim::Mission mission;
+    mission.name = "Headless ridge collision";
+    mission.home = {-20.0, 0.0, 0.0};
+    mission.altitude_reference =
+        agbot::flight_sim::AltitudeReference::RelativeHome;
+    mission.cruise_speed_mps = 8.0;
+    mission.acceptance_radius_m = 0.25;
+    mission.waypoints = {
+        {"takeoff", {-20.0, 10.0, 0.0},
+         std::nullopt, WaypointAction::Takeoff},
+        {"cross_ridge", {20.0, 10.0, 0.0},
+         std::nullopt, WaypointAction::FlyThrough},
+    };
+
+    agbot::flight_sim::RuntimeTerrain runtime_terrain;
+    runtime_terrain.mesh =
+        terrain_from_x_profile({0.0F, 2.0F, 20.0F, 2.0F, 0.0F});
+    runtime_terrain.bounds = {40.0, -76.0, 40.001, -75.999};
+    runtime_terrain.world_hash = 9001;
+    runtime_terrain.source_id = "ridge-dem";
+    runtime_terrain.vertical_datum = "EGM2008";
+    runtime_terrain.elevation_state = "authoritative";
+    runtime_terrain.resolution = 5;
+
+    auto config = unit_run_config();
+    config.max_time_s = 30.0;
+    config.terrain = runtime_terrain;
+    const auto result =
+        agbot::flight_sim::run_deterministic(mission, config);
+    const auto repeated =
+        agbot::flight_sim::run_deterministic(mission, config);
+
+    assert(!result.manifest.completed);
+    assert(result.manifest.termination_reason == "failsafe");
+    assert(result.manifest.safety_violation == "terrain_collision");
+    assert(result.trace_jsonl == repeated.trace_jsonl);
+    assert(result.manifest.to_json() == repeated.manifest.to_json());
 }
 
 void test_zero_wind_keeps_deterministic_trace_identical() {
@@ -2377,6 +2657,12 @@ int main() {
     test_telemetry_video_stream_sends_decodable_aligned_frames_to_collector();
     test_telemetry_video_stream_buffers_when_collector_unreachable();
     test_builds_terrain_mesh_from_heightmap();
+    test_altitude_references_resolve_against_physical_terrain();
+    test_preflight_applies_altitude_ceiling_to_agl();
+    test_terrain_ridge_causes_deterministic_collision();
+    test_landing_uses_sloped_terrain_surface();
+    test_landing_rejects_unsafe_terrain_slope();
+    test_manual_descent_rejects_unsafe_terrain_slope();
     test_lidar_raycast_ranges_match_flat_terrain_cloud_tolerance();
     test_lidar_raycast_seeded_cloud_json_is_reproducible();
     test_lidar_raycast_empty_scene_returns_empty_capture_scan();
@@ -2394,6 +2680,7 @@ int main() {
     test_run_manifest_records_contract_and_hashes();
     test_run_manifest_records_geodetic_terrain_fallback_evidence();
     test_runtime_terrain_is_manifested_and_drives_lidar();
+    test_deterministic_runner_reports_terrain_collision();
     test_zero_wind_keeps_deterministic_trace_identical();
     test_steady_wind_is_reproducible_and_manifested();
     test_zero_noise_sensor_profile_is_exact();

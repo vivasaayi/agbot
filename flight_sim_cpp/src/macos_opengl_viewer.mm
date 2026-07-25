@@ -1039,6 +1039,9 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
 
 - (void)clearTerrain {
     terrain_mesh_ = {};
+    if (simulation_) {
+        simulation_->set_terrain(std::nullopt);
+    }
     terrain_status_ = "Terrain off";
 }
 
@@ -1053,7 +1056,7 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
         const auto loaded =
             agbot::render::load_world_terrain(terrain_package_path_, origin);
         if (!loaded.ok()) {
-            terrain_mesh_ = {};
+            [self clearTerrain];
             terrain_status_ = "L3 package invalid";
             [self setStatusMessage:
                 ("Terrain package rejected: " + *loaded.error)];
@@ -1061,7 +1064,7 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
         }
         if (!agbot::flight_sim::terrain_covers_mission(
                 loaded.terrain, simulation_->mission())) {
-            terrain_mesh_ = {};
+            [self clearTerrain];
             terrain_status_ = "L3 package out of coverage";
             [self setStatusMessage:
                 "Terrain package does not cover this mission"];
@@ -1069,6 +1072,7 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
         }
 
         terrain_mesh_ = loaded.terrain.mesh;
+        simulation_->set_terrain(terrain_mesh_);
         std::ostringstream status;
         status << "L3 " << loaded.terrain.elevation_state
                << " " << loaded.terrain.resolution << "x"
@@ -1119,6 +1123,7 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
         kTerrainResolution,
         requested_tiles);
     terrain_mesh_ = build_terrain_mesh(composite.heightmap, kTerrainResolution, bounds.width_m(), bounds.height_m(), 1.0);
+    simulation_->set_terrain(terrain_mesh_);
 
     std::ostringstream status;
     status << "Terrain z" << zoom << " " << elevation_tiles.size() << "/" << requested_tiles.size();
@@ -1268,7 +1273,12 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
 
     const DroneState& state = [self displayState];
     const ControlMode display_control_mode = replay_mode_ ? ControlMode::Replay : simulation_->control_mode();
-    const HudTelemetry hud = hud_telemetry_from_state(state, display_control_mode);
+    HudTelemetry hud =
+        hud_telemetry_from_state(state, display_control_mode);
+    if (const auto altitude_agl =
+            simulation_->altitude_agl_m(state.position)) {
+        hud.altitude_m = *altitude_agl;
+    }
     const std::size_t waypoint_count = simulation_->mission().waypoints.size();
     const std::size_t waypoint_index = std::min(state.target_waypoint_index + 1, waypoint_count);
     const MissionPreviewOverlay preview = build_mission_preview_overlay(simulation_->mission());
@@ -1917,9 +1927,12 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
 }
 
 - (Vec3)renderPositionForFlightPosition:(Vec3)position {
+    const double elevation = simulation_
+        ? simulation_->world_elevation_m(position)
+        : position.y;
     return Vec3(
         position.x,
-        position.y + [self terrainHeightAtX:position.x z:position.z],
+        elevation,
         position.z
     );
 }
@@ -2061,10 +2074,14 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
         return;
     }
 
-    const double elevation_span = std::max(
-        1.0,
-        static_cast<double>(terrain_mesh_.max_elevation_m - terrain_mesh_.min_elevation_m)
-    );
+    double min_vertex_y = terrain_mesh_.vertices.front().position.y;
+    double max_vertex_y = min_vertex_y;
+    for (const auto& vertex : terrain_mesh_.vertices) {
+        min_vertex_y = std::min(min_vertex_y, vertex.position.y);
+        max_vertex_y = std::max(max_vertex_y, vertex.position.y);
+    }
+    const double elevation_span =
+        std::max(1.0, max_vertex_y - min_vertex_y);
 
     glLineWidth(1.0f);
     glBegin(GL_TRIANGLES);
@@ -2073,7 +2090,10 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
             continue;
         }
         const auto& vertex = terrain_mesh_.vertices[index];
-        const double normalized_height = std::clamp(vertex.position.y / elevation_span, 0.0, 1.0);
+        const double normalized_height = std::clamp(
+            (vertex.position.y - min_vertex_y) / elevation_span,
+            0.0,
+            1.0);
         const double r = 0.16 + normalized_height * 0.54;
         const double g = 0.30 + normalized_height * 0.38;
         const double b = 0.22 + normalized_height * 0.18;
@@ -2172,7 +2192,13 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     glEnd();
 
     set_color(0.1, 0.9, 1.0, 0.75);
-    draw_circle(position.x, position.z, std::max(5.0, state.position.y * 0.2));
+    const double altitude_agl =
+        simulation_->altitude_agl_m(state.position)
+            .value_or(state.position.y);
+    draw_circle(
+        position.x,
+        position.z,
+        std::max(5.0, altitude_agl * 0.2));
 }
 
 - (Vec3)terrain3DTarget {
@@ -2291,10 +2317,14 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
         return;
     }
 
-    const double elevation_span = std::max(
-        1.0,
-        static_cast<double>(terrain_mesh_.max_elevation_m - terrain_mesh_.min_elevation_m)
-    );
+    double min_vertex_y = terrain_mesh_.vertices.front().position.y;
+    double max_vertex_y = min_vertex_y;
+    for (const auto& vertex : terrain_mesh_.vertices) {
+        min_vertex_y = std::min(min_vertex_y, vertex.position.y);
+        max_vertex_y = std::max(max_vertex_y, vertex.position.y);
+    }
+    const double elevation_span =
+        std::max(1.0, max_vertex_y - min_vertex_y);
 
     glBegin(GL_TRIANGLES);
     for (const std::uint32_t index : terrain_mesh_.indices) {
@@ -2302,7 +2332,10 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
             continue;
         }
         const auto& vertex = terrain_mesh_.vertices[index];
-        const double normalized_height = std::clamp(vertex.position.y / elevation_span, 0.0, 1.0);
+        const double normalized_height = std::clamp(
+            (vertex.position.y - min_vertex_y) / elevation_span,
+            0.0,
+            1.0);
         const double light = std::clamp(
             vertex.normal.x * -0.25 + vertex.normal.y * 0.78 + vertex.normal.z * 0.30,
             0.38,
@@ -2330,7 +2363,11 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
         glLineWidth(2.5f);
         glBegin(GL_LINE_STRIP);
         for (const Vec3& boundary_point : preview.boundary_local) {
-            const Vec3 point = [self renderPositionForFlightPosition:Vec3(boundary_point.x, 0.0, boundary_point.z)];
+            const Vec3 point(
+                boundary_point.x,
+                [self terrainHeightAtX:boundary_point.x
+                                    z:boundary_point.z],
+                boundary_point.z);
             glVertex3d(point.x, point.y + 0.8, point.z);
         }
         glEnd();
@@ -2342,7 +2379,14 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     const Vec3 home = [self renderPositionForFlightPosition:mission.home];
     glVertex3d(home.x, home.y + 0.5, home.z);
     for (const Waypoint& waypoint : mission.waypoints) {
-        const Vec3 point = [self renderPositionForFlightPosition:waypoint.position];
+        Vec3 local_point = waypoint.position;
+        try {
+            local_point =
+                simulation_->resolved_waypoint_position(waypoint);
+        } catch (const std::exception&) {
+        }
+        const Vec3 point =
+            [self renderPositionForFlightPosition:local_point];
         glVertex3d(point.x, point.y, point.z);
     }
     glEnd();
@@ -2353,7 +2397,14 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     glVertex3d(home.x, home.y + 0.5, home.z);
     for (const Waypoint& waypoint : mission.waypoints) {
         color_for_action(waypoint.action);
-        const Vec3 point = [self renderPositionForFlightPosition:waypoint.position];
+        Vec3 local_point = waypoint.position;
+        try {
+            local_point =
+                simulation_->resolved_waypoint_position(waypoint);
+        } catch (const std::exception&) {
+        }
+        const Vec3 point =
+            [self renderPositionForFlightPosition:local_point];
         glVertex3d(point.x, point.y, point.z);
     }
     glEnd();
@@ -2637,7 +2688,12 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     const double height = bounds.size.height;
     const DroneState& state = [self displayState];
     const ControlMode display_control_mode = replay_mode_ ? ControlMode::Replay : simulation_->control_mode();
-    const HudTelemetry hud = hud_telemetry_from_state(state, display_control_mode);
+    HudTelemetry hud =
+        hud_telemetry_from_state(state, display_control_mode);
+    if (const auto altitude_agl =
+            simulation_->altitude_agl_m(state.position)) {
+        hud.altitude_m = *altitude_agl;
+    }
 
     glMatrixMode(GL_PROJECTION);
     glPushMatrix();

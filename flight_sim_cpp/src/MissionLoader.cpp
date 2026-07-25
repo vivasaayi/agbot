@@ -380,6 +380,40 @@ WaypointAction waypoint_action_from_string(const std::string& value) {
     return WaypointAction::FlyThrough;
 }
 
+const char* to_string(AltitudeReference reference) {
+    switch (reference) {
+        case AltitudeReference::AboveGroundLevel:
+            return "agl";
+        case AltitudeReference::RelativeHome:
+            return "relative_home";
+        case AltitudeReference::MeanSeaLevel:
+            return "msl";
+    }
+    return "agl";
+}
+
+AltitudeReference altitude_reference_from_string(const std::string& value) {
+    std::string lower = value;
+    std::transform(
+        lower.begin(),
+        lower.end(),
+        lower.begin(),
+        [](unsigned char c) {
+            return static_cast<char>(std::tolower(c));
+        });
+    if (lower == "agl" || lower == "above_ground_level") {
+        return AltitudeReference::AboveGroundLevel;
+    }
+    if (lower == "relative_home" || lower == "home") {
+        return AltitudeReference::RelativeHome;
+    }
+    if (lower == "msl" || lower == "mean_sea_level") {
+        return AltitudeReference::MeanSeaLevel;
+    }
+    throw std::invalid_argument(
+        "Unsupported altitude_reference: " + value);
+}
+
 Mission MissionLoader::load_from_file(const std::filesystem::path& path) {
     return load_from_text(read_all(path));
 }
@@ -387,6 +421,8 @@ Mission MissionLoader::load_from_file(const std::filesystem::path& path) {
 Mission MissionLoader::load_from_text(const std::string& text) {
     Mission mission;
     mission.name = string_for_key(text, "name", mission.name);
+    mission.altitude_reference = altitude_reference_from_string(
+        string_for_key(text, "altitude_reference", "agl"));
 
     auto home_object = optional_object_for_key(text, "home");
     if (!home_object) {
@@ -452,6 +488,11 @@ std::string mission_to_json(const Mission& mission) {
     output << "    \"y\": " << mission.home.y << ",\n";
     output << "    \"z\": " << mission.home.z << "\n";
     output << "  },\n";
+    if (mission.altitude_reference !=
+        AltitudeReference::AboveGroundLevel) {
+        output << "  \"altitude_reference\": \""
+               << to_string(mission.altitude_reference) << "\",\n";
+    }
     output << "  \"cruise_speed_mps\": " << mission.cruise_speed_mps << ",\n";
     output << "  \"acceptance_radius_m\": " << mission.acceptance_radius_m << ",\n";
     if (mission.field_boundary) {
