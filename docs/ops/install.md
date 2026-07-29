@@ -24,12 +24,12 @@ Overrides: `AGBOT_HOME`, `AGBOT_REPO`, `AGBOT_REF`, `BIN_DIR`.
 Requires Docker with the Compose plugin.
 
 ```sh
-agbot up                 # pull the latest appliance image and start it
+agbot up                 # pull the channel image by digest and start it
 open http://localhost:8080/portal   # farmer PWA
 
 agbot status             # container + /health status
 agbot logs               # follow logs
-agbot upgrade            # re-pull the newest image and restart (keeps data)
+agbot upgrade            # re-pull, health-check, and roll back on failure
 agbot down               # stop (named volumes retained)
 ```
 
@@ -82,7 +82,10 @@ agbot channel edge       # follow pre-releases
 agbot upgrade --channel stable   # one-off upgrade on a specific channel
 ```
 
-The image ref and port are configurable:
+The image ref and port are configurable. `agbot up` and `agbot upgrade` resolve
+the selected mutable channel tag to an immutable digest before starting Compose;
+an upgrade waits for `/health` and restores the prior running image if the new
+one does not become healthy.
 
 ```sh
 agbot config                          # show current settings
@@ -131,12 +134,12 @@ disabling the gate.
 
 ### Require a session on the API
 
-By default the `/api/*` surface is open (single-user / trusted-LAN loop). Once
-the portal is reachable beyond a network you control, require a valid portal
-session on every API call:
+The appliance requires a valid portal session on `/api/*` by default. For an
+isolated, trusted-LAN development deployment only, it may be explicitly
+disabled:
 
 ```sh
-export AGBOT_REQUIRE_SESSION=true   # GEO_HUB__SECURITY__REQUIRE_SESSION
+export AGBOT_REQUIRE_SESSION=false  # GEO_HUB__SECURITY__REQUIRE_SESSION
 agbot up
 ```
 
@@ -150,14 +153,16 @@ an authenticating proxy if you enable the gate. Request bodies are capped at
 
 ### Rate limiting
 
-A coarse per-client-IP cap blunts login brute-force and runaway clients:
+A coarse per-client-IP cap of 120 requests per minute is enabled by default to
+blunt login brute-force and runaway clients. Override it only when the network
+boundary provides an equivalent control:
 
 ```sh
 export AGBOT_RATE_LIMIT_PER_MIN=120   # GEO_HUB__SECURITY__RATE_LIMIT_PER_MIN
 agbot up
 ```
 
-`0` (default) disables it. Over the cap → `429 Too Many Requests` with
+`0` disables it. Over the cap → `429 Too Many Requests` with
 `Retry-After`. It buckets by the peer IP, so put the reverse proxy in
 `X-Forwarded-For`-preserving mode and terminate it close to the app; for
 anything finer than a single 60-second fixed window, rate-limit at the proxy.
@@ -222,11 +227,14 @@ shipped through CI (which is Linux-only).
 
 ## The release loop
 
-1. Merge to `main` → GitHub Actions builds and pushes the geo_hub image and cuts
-   a **dated pre-release** (`vYYYY.MM.DD-<sha>`, `:edge`).
+1. Merge to `main` → GitHub Actions passes Rust, dependency-security, GIS, C++
+   simulator, ARM, appliance vulnerability-scan, and smoke gates, then signs
+   and publishes the geo_hub image plus SBOM and build provenance as a **dated
+   pre-release** (`vYYYY.MM.DD-<sha>`, `:edge`).
 2. Promote with a semver tag (`git tag v1.2.3 && git push --tags`) or a manual
    `workflow_dispatch` → `:latest` + a full GitHub release.
-3. On the server, `agbot upgrade` pulls the new image and restarts, preserving
-   the data volumes.
+3. On the server, `agbot upgrade` resolves the new channel to its image digest,
+   waits for health, and rolls back automatically if the new appliance fails;
+   named data volumes are preserved.
 4. On a Mac, `agbot viewer` / `agbot sim` build the native apps against the
    server.

@@ -29,14 +29,22 @@ concurrency:
 
 permissions:
   contents: write
+  id-token: write
   packages: write
 
 jobs:
+  verify:
+    name: Required delivery gates
+    uses: ./.github/workflows/ci.yml
+
   release:
     name: Build & publish geo_hub appliance
     runs-on: ubuntu-latest
+    needs: verify
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Validate appliance Dockerfile contract
         run: bash scripts/verify-appliance-build.sh
@@ -44,14 +52,25 @@ jobs:
       - name: Resolve release version and channel
         id: version
         shell: bash
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
           sha="${GITHUB_SHA::7}"
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            version="${{ inputs.version }}"
+            if [ "$GITHUB_REF_NAME" != "main" ]; then
+              echo "Manual stable releases must run from main, not $GITHUB_REF_NAME" >&2
+              exit 1
+            fi
+            version="$INPUT_VERSION"
             channel="stable"
             prerelease="false"
           elif [ "${{ github.ref_type }}" = "tag" ]; then
+            git fetch --quiet origin main
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+              echo "Stable release tag must point to a commit reachable from main" >&2
+              exit 1
+            fi
             version="${GITHUB_REF_NAME}"
             channel="stable"
             prerelease="false"
@@ -59,6 +78,10 @@ jobs:
             version="v$(date -u +%Y.%m.%d)-${sha}"
             channel="edge"
             prerelease="true"
+          fi
+          if [ "$channel" = "stable" ] && ! [[ "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "Stable release version must be a semver tag such as v1.2.3: $version" >&2
+            exit 1
           fi
           # Normalise the image tag (strip a leading refs/ just in case).
           image_tag="${version#v}"
@@ -121,6 +144,17 @@ jobs:
             org.opencontainers.image.version=${{ steps.version.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          provenance: mode=max
+          sbom: true
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign published appliance digest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cosign sign --yes "${{ steps.tags.outputs.base }}@${{ steps.build.outputs.digest }}"
 
       - name: Write build manifest
         shell: bash
@@ -163,3 +197,10 @@ jobs:
             ```
 
             Digest: `${{ steps.build.outputs.digest }}`
+
+            Verify signature:
+            ```
+            cosign verify ${{ steps.tags.outputs.base }}@${{ steps.build.outputs.digest }} \
+              --certificate-identity-regexp='https://github.com/${{ github.repository }}/.github/workflows/release.yml@.*' \
+              --certificate-oidc-issuer='https://token.actions.githubusercontent.com'
+            ```

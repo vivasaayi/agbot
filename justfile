@@ -59,7 +59,7 @@ build:
 # Build release version
 build-release:
     @echo "🔨 Building release version..."
-    cargo build --release
+    cargo build --locked --release
 
 # Build the standalone C++ flight simulator
 flight-sim-build:
@@ -174,7 +174,7 @@ docker:
 # Cross-compile for ARM64 (Jetson)
 arm64:
     @echo "🔧 Cross-compiling for ARM64..."
-    cross build --target aarch64-unknown-linux-gnu --release
+    cross build --locked --target aarch64-unknown-linux-gnu --release
 
 # Smoke-check ARM64 artifacts under cross/QEMU
 arm64-smoke: arm64
@@ -192,7 +192,7 @@ arm64-ci: arm64 arm64-smoke arm64-package
 # Cross-compile for ARM (Raspberry Pi)
 arm:
     @echo "🔧 Cross-compiling for ARM..."
-    cross build --target armv7-unknown-linux-gnueabihf --release
+    cross build --locked --target armv7-unknown-linux-gnueabihf --release
 
 # Smoke-check ARMv7 artifacts under cross/QEMU
 arm-smoke: arm
