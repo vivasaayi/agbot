@@ -30,8 +30,8 @@ use geo_hub::modis::{ingest_modis_ndvi_with_resolver, MODIS_13Q1_COLLECTION};
 use geo_hub::pc_sign::{PcSasTokenCache, SasHttpStore};
 use geo_hub::satellite_derivation::{CogStoreResolver, DerivationError, UrlCogResolver};
 use geo_hub::state::AppState;
-use raster_io::object_store::{path::Path as ObjectPath, ObjectStore};
 use geo_hub::{db, server, HubConfig};
+use raster_io::object_store::{path::Path as ObjectPath, ObjectStore};
 use raster_io::test_util::{build_tiled_geotiff, FixtureSpec, Pixels};
 use serde_json::json;
 use tempfile::TempDir;
@@ -211,11 +211,7 @@ impl CogStoreResolver for LocalSasResolver {
             href: href.to_string(),
             message: err.to_string(),
         })?;
-        let base = format!(
-            "{}://{}",
-            url.scheme(),
-            url.host_str().unwrap_or_default()
-        );
+        let base = format!("{}://{}", url.scheme(), url.host_str().unwrap_or_default());
         let base = match url.port() {
             Some(port) => format!("{base}:{port}"),
             None => base,
@@ -223,16 +219,18 @@ impl CogStoreResolver for LocalSasResolver {
         if base != self.blob_base {
             return UrlCogResolver.resolve(href);
         }
-        let location = ObjectPath::from_url_path(url.path().trim_start_matches('/'))
-            .map_err(|err| DerivationError::Resolve {
-                href: href.to_string(),
-                message: err.to_string(),
+        let location =
+            ObjectPath::from_url_path(url.path().trim_start_matches('/')).map_err(|err| {
+                DerivationError::Resolve {
+                    href: href.to_string(),
+                    message: err.to_string(),
+                }
             })?;
         let store = SasHttpStore::new(&self.blob_base, self.cache.clone(), MODIS_13Q1_COLLECTION)
             .map_err(|err| DerivationError::Resolve {
-                href: href.to_string(),
-                message: err.to_string(),
-            })?;
+            href: href.to_string(),
+            message: err.to_string(),
+        })?;
         Ok((Arc::new(store), location.to_string()))
     }
 }

@@ -1146,7 +1146,7 @@ fn rule_matches_candidate(rule: &AlertRule, candidate: &AlertCandidateRecord) ->
         && rule
             .subject_ref
             .as_deref()
-            .map_or(true, |subject_ref| subject_ref == candidate.subject_ref)
+            .is_none_or(|subject_ref| subject_ref == candidate.subject_ref)
 }
 
 pub fn normalize_fired_alert_record(
@@ -1200,21 +1200,22 @@ pub fn filter_alert_history(
             query
                 .source_domain
                 .as_deref()
-                .map_or(true, |source_domain| source_domain == record.source_domain)
-                && query.field_id.as_deref().map_or(true, |field_id| {
-                    record.field_id.as_deref() == Some(field_id)
-                })
+                .is_none_or(|source_domain| source_domain == record.source_domain)
+                && query
+                    .field_id
+                    .as_deref()
+                    .is_none_or(|field_id| record.field_id.as_deref() == Some(field_id))
                 && query
                     .severity
-                    .map_or(true, |severity| severity == record.severity)
+                    .is_none_or(|severity| severity == record.severity)
                 && query
                     .start
                     .as_deref()
-                    .map_or(true, |start| record.fired_at.as_str() >= start)
+                    .is_none_or(|start| record.fired_at.as_str() >= start)
                 && query
                     .end
                     .as_deref()
-                    .map_or(true, |end| record.fired_at.as_str() <= end)
+                    .is_none_or(|end| record.fired_at.as_str() <= end)
         })
         .cloned()
         .collect::<Vec<_>>();
@@ -2286,14 +2287,14 @@ fn alert_bypasses_dedup_suppression(alert: &FiredAlertRecord) -> bool {
 fn routing_rule_matches_alert(rule: &AlertRoutingRule, alert: &FiredAlertRecord) -> bool {
     rule.source_domain
         .as_deref()
-        .map_or(true, |source_domain| source_domain == alert.source_domain)
+        .is_none_or(|source_domain| source_domain == alert.source_domain)
         && rule
             .field_id
             .as_deref()
-            .map_or(true, |field_id| alert.field_id.as_deref() == Some(field_id))
+            .is_none_or(|field_id| alert.field_id.as_deref() == Some(field_id))
         && rule
             .severity
-            .map_or(true, |severity| severity == alert.severity)
+            .is_none_or(|severity| severity == alert.severity)
 }
 
 fn routing_decision(

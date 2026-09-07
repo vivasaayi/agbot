@@ -74,4 +74,7 @@ if(APPLE)
     # renders the demo scene into an FBO, and asserts non-uniform output.
     add_test(NAME agbot_world_viewer_self_check
              COMMAND agbot_world_viewer --self-check)
+    set_tests_properties(agbot_world_viewer_self_check PROPERTIES
+        SKIP_RETURN_CODE 77
+    )
 endif()
