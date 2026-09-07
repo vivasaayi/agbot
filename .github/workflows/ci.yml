@@ -151,7 +151,7 @@ jobs:
         bash scripts/verify-appliance-build.sh
       
     - name: Build appliance image
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@v7
       with:
         context: .
         target: runtime-appliance

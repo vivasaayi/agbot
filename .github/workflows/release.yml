@@ -130,7 +130,7 @@ jobs:
 
       - name: Build and push appliance image
         id: build
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v7
         with:
           context: .
           target: runtime-appliance
