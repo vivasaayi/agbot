@@ -107,7 +107,7 @@ name = "alerting"
 version = "0.1.0"
 dependencies = [
  "serde",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1829,7 +1829,7 @@ dependencies = [
  "chrono",
  "serde",
  "serde_json",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -1986,7 +1986,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "shared",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -2145,7 +2145,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shared",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -2307,7 +2307,7 @@ dependencies = [
  "serde_json",
  "shared",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "uuid",
@@ -2710,7 +2710,7 @@ dependencies = [
  "chrono",
  "serde",
  "shared",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "timeseries",
 ]
 
@@ -3040,7 +3040,7 @@ dependencies = [
  "soil_iot",
  "sqlx",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "timeseries",
  "tokio",
  "tokio-util",
@@ -3364,7 +3364,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shared",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-tungstenite 0.21.0",
  "tower 0.4.13",
@@ -3984,7 +3984,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "shared",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "uuid",
@@ -4057,7 +4057,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shared",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -4350,7 +4350,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "shared",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "uuid",
@@ -4607,7 +4607,7 @@ dependencies = [
  "serde_json",
  "serialport",
  "shared",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-serial",
  "tokio-tungstenite 0.21.0",
@@ -4658,7 +4658,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shared",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-tungstenite 0.21.0",
  "tracing",
@@ -5536,7 +5536,7 @@ dependencies = [
  "serde",
  "serde_json",
  "shared",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -5802,7 +5802,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "shared",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -6133,7 +6133,7 @@ dependencies = [
  "serde_json",
  "shared",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "timeseries",
  "tokio",
  "tracing",
@@ -6221,7 +6221,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "shared",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -6504,7 +6504,7 @@ dependencies = [
  "openjp2",
  "shared",
  "tempfile",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tiff 0.11.3",
  "tokio",
  "url",
@@ -7135,7 +7135,7 @@ dependencies = [
  "serde_json",
  "serialport",
  "shared",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-serial",
  "tokio-util",
@@ -7350,7 +7350,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -7521,7 +7521,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "timeseries",
 ]
 
@@ -8123,7 +8123,7 @@ name = "timeseries"
 version = "0.1.0"
 dependencies = [
  "serde",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
