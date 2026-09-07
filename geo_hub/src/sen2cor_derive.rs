@@ -345,7 +345,7 @@ async fn band_product(
     scene_id: &str,
     kind: &str,
 ) -> Result<RegisteredProduct, Sen2CorDeriveError> {
-    let mut products = catalog::list_products(
+    let products = catalog::list_products(
         pool,
         &ProductFilter {
             scene_id: Some(scene_id.to_string()),
@@ -357,7 +357,8 @@ async fn band_product(
     )
     .await?;
     products
-        .pop()
+        .into_iter()
+        .next()
         .ok_or_else(|| Sen2CorDeriveError::BandNotFound {
             scene_id: scene_id.to_string(),
             kind: kind.to_string(),

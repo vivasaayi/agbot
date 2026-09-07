@@ -91,7 +91,32 @@ async fn register_band_sized_for(
     width: u32,
     height: u32,
 ) -> Result<String> {
-    let path = tmp.path().join(format!("{scene_id}_{kind}.tif"));
+    register_band_sized_for_variant(
+        ctx,
+        tmp,
+        scene_id,
+        kind,
+        dn,
+        width,
+        height,
+        "original",
+        "2026-07-05T00:00:00Z",
+    )
+    .await
+}
+
+async fn register_band_sized_for_variant(
+    ctx: &Ctx,
+    tmp: &TempDir,
+    scene_id: &str,
+    kind: &str,
+    dn: Vec<u16>,
+    width: u32,
+    height: u32,
+    variant: &str,
+    created_at: &str,
+) -> Result<String> {
+    let path = tmp.path().join(format!("{scene_id}_{kind}_{variant}.tif"));
     write_geotiff_u16(
         &path,
         width,
@@ -108,7 +133,7 @@ async fn register_band_sized_for(
         kind: kind.to_string(),
         algorithm_id: "usgs.landsat.surface_reflectance".to_string(),
         algorithm_version: "1.0.0".to_string(),
-        parameters: json!({ "scene_id": scene_id, "band": kind }),
+        parameters: json!({ "scene_id": scene_id, "band": kind, "variant": variant }),
         inputs: Vec::new(),
         scope: ProductScope {
             farm_id: None,
@@ -132,7 +157,7 @@ async fn register_band_sized_for(
         evidence_digests: Vec::new(),
         source_id: Some("usgs-landsat".to_string()),
     };
-    Ok(catalog::register_product(&ctx.pool, &draft, "2026-07-05T00:00:00Z").await?)
+    Ok(catalog::register_product(&ctx.pool, &draft, created_at).await?)
 }
 
 async fn send(
@@ -263,6 +288,53 @@ async fn landsat_bands_derive_qa_masked_ndvi_and_lst() -> Result<()> {
     .await?;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn landsat_derivation_uses_the_newest_registered_band_revision() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = ctx(&tmp).await?;
+
+    let old_red = register_band(&ctx, &tmp, "band_sr_b4", vec![14545; 4]).await?;
+    let new_red = register_band_sized_for_variant(
+        &ctx,
+        &tmp,
+        SCENE_ID,
+        "band_sr_b4",
+        vec![29091; 4],
+        2,
+        2,
+        "corrected",
+        "2026-07-06T00:00:00Z",
+    )
+    .await?;
+    register_band(&ctx, &tmp, "band_sr_b5", vec![29091; 4]).await?;
+
+    let (status, outcome) = send(
+        &ctx.app,
+        "POST",
+        "/api/ingest/landsat/derive",
+        Some(json!({ "scene_id": SCENE_ID, "product": "ndvi" })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{outcome}");
+    let product = catalog::get_product(&ctx.pool, outcome["product_id"].as_str().unwrap())
+        .await?
+        .unwrap();
+    let edges = catalog::trace_inputs(&ctx.pool, &product.product_id).await?;
+    assert!(edges
+        .iter()
+        .any(|edge| edge.role == "red" && edge.input_product_id == new_red));
+    assert!(!edges
+        .iter()
+        .any(|edge| edge.role == "red" && edge.input_product_id == old_red));
+    let mut reader = GeoTiffReader::open(product.path.as_deref().unwrap())?;
+    assert!(reader
+        .read_band()?
+        .to_f32()
+        .iter()
+        .all(|value| value.abs() < 1e-3));
     Ok(())
 }
 

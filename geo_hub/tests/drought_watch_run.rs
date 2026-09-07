@@ -70,6 +70,29 @@ async fn register_product(
     parameters: serde_json::Value,
     values: Vec<f32>,
 ) -> Result<String> {
+    register_product_scoped(
+        pool,
+        tmp,
+        name,
+        kind,
+        parameters,
+        values,
+        ProductLevel::L3,
+        "field-1",
+    )
+    .await
+}
+
+async fn register_product_scoped(
+    pool: &db::DbPool,
+    tmp: &TempDir,
+    name: &str,
+    kind: &str,
+    parameters: serde_json::Value,
+    values: Vec<f32>,
+    level: ProductLevel,
+    field_id: &str,
+) -> Result<String> {
     let path = tmp.path().join(format!("{name}.tif"));
     write_geotiff_f32(
         &path,
@@ -85,7 +108,7 @@ async fn register_product(
     let mut parameters = parameters;
     parameters["fixture"] = json!(name);
     let draft = ProductRecordDraft {
-        level: ProductLevel::L3,
+        level,
         kind: kind.to_string(),
         algorithm_id: format!("{kind}.fixture"),
         algorithm_version: "1.0.0".to_string(),
@@ -93,7 +116,7 @@ async fn register_product(
         inputs: Vec::new(),
         scope: ProductScope {
             farm_id: None,
-            field_id: Some("field-1".to_string()),
+            field_id: Some(field_id.to_string()),
             season_id: Some("2026-kharif".to_string()),
             scene_id: None,
             temporal_start: "2026-06-01T00:00:00Z".to_string(),
@@ -236,5 +259,58 @@ async fn drought_rasters_become_findings_and_fire_an_alert() -> Result<()> {
     )
     .await?;
     assert_ne!(status, StatusCode::OK, "{body}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn drought_watch_rejects_wrong_field_and_non_l3_inputs() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let (app, pool) = ctx(&tmp).await?;
+
+    let other_field = register_product_scoped(
+        &pool,
+        &tmp,
+        "other_field_vci",
+        "drought_index",
+        json!({ "index_kind": "vci" }),
+        vec![5.0; 4],
+        ProductLevel::L3,
+        "field-2",
+    )
+    .await?;
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/api/applications/drought-watch/runs",
+        Some(json!({ "field_id": "field-1", "product_ids": [other_field] })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("not requested field field-1"));
+
+    let l2 = register_product_scoped(
+        &pool,
+        &tmp,
+        "l2_vci",
+        "drought_index",
+        json!({ "index_kind": "vci" }),
+        vec![5.0; 4],
+        ProductLevel::L2,
+        "field-1",
+    )
+    .await?;
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/api/applications/drought-watch/runs",
+        Some(json!({ "field_id": "field-1", "product_ids": [l2] })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.to_string().contains("requires L3"));
+
+    let (status, findings) = send(&app, "GET", "/api/fields/field-1/findings", None).await?;
+    assert_eq!(status, StatusCode::OK, "{findings}");
+    assert!(findings.as_array().unwrap().is_empty());
     Ok(())
 }
