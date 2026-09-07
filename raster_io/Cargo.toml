@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 shared = { path = "../shared" }
 thiserror = { workspace = true }
-tiff = "0.10"
+tiff = "0.11"
 
 # JPEG 2000 band decode (Sentinel-2 L2A / Sen2Cor output). Pure-Rust
 # `openjp2` backend (source port of the reference OpenJPEG) — no C
