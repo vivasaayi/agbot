@@ -3,7 +3,7 @@
 #
 #   Server role (headless Linux box):
 #     agbot up                    pull + run the geo_hub appliance
-#     agbot upgrade [--channel C] re-pull the image, migrate, restart (keeps data)
+#     agbot upgrade [--channel C] pull a digest, restart, health-check, rollback
 #     agbot down                  stop the appliance
 #     agbot status                container + /health status
 #     agbot logs [args...]        follow appliance logs
@@ -73,6 +73,14 @@ resolved_image() {
     printf '%s:%s' "$AGBOT_IMAGE_REPO" "$_tag"
 }
 
+active_image() {
+    if [ -n "${AGBOT_IMAGE_RESOLVED:-}" ]; then
+        printf '%s' "$AGBOT_IMAGE_RESOLVED"
+    else
+        resolved_image
+    fi
+}
+
 # --- docker helpers --------------------------------------------------------
 need_docker() {
     command -v docker >/dev/null 2>&1 || die "docker is required but not installed"
@@ -81,14 +89,47 @@ need_docker() {
 compose() {
     # Prefer the compose plugin; fall back to docker-compose.
     if docker compose version >/dev/null 2>&1; then
-        AGBOT_IMAGE="$(resolved_image)" AGBOT_PORT="$AGBOT_PORT" \
+        AGBOT_IMAGE="$(active_image)" AGBOT_PORT="$AGBOT_PORT" \
             docker compose -f "$COMPOSE_FILE" "$@"
     elif command -v docker-compose >/dev/null 2>&1; then
-        AGBOT_IMAGE="$(resolved_image)" AGBOT_PORT="$AGBOT_PORT" \
+        AGBOT_IMAGE="$(active_image)" AGBOT_PORT="$AGBOT_PORT" \
             docker-compose -f "$COMPOSE_FILE" "$@"
     else
         die "neither 'docker compose' nor 'docker-compose' is available"
     fi
+}
+
+pin_pulled_image() {
+    image_ref="$(resolved_image)"
+    image_digest="$(docker image inspect \
+        --format '{{index .RepoDigests 0}}' "$image_ref" 2>/dev/null || true)"
+    [ -n "$image_digest" ] && [ "$image_digest" != "<no value>" ] \
+        || die "could not resolve immutable digest for $image_ref"
+    AGBOT_IMAGE_RESOLVED="$image_digest"
+    log "resolved $image_ref to $AGBOT_IMAGE_RESOLVED"
+}
+
+running_image() {
+    container_image_id="$(docker inspect --format '{{.Image}}' agbot-geo-hub 2>/dev/null || true)"
+    [ -n "$container_image_id" ] || return 0
+    docker image inspect --format '{{index .RepoDigests 0}}' \
+        "$container_image_id" 2>/dev/null || printf '%s' "$container_image_id"
+}
+
+wait_for_health() {
+    health_url="http://127.0.0.1:$AGBOT_PORT/health"
+    attempt=1
+    while [ "$attempt" -le 30 ]; do
+        if command -v curl >/dev/null 2>&1 && \
+            curl -fsS "$health_url" >/dev/null 2>&1; then
+            log "health OK at $health_url"
+            return 0
+        fi
+        sleep 1
+        attempt=$((attempt + 1))
+    done
+    warn "health check did not recover at $health_url"
+    return 1
 }
 
 # --- server commands -------------------------------------------------------
@@ -97,19 +138,36 @@ cmd_up() {
     [ -f "$COMPOSE_FILE" ] || die "compose file not found: $COMPOSE_FILE"
     log "pulling $(resolved_image)"
     compose pull
+    pin_pulled_image
     log "starting geo_hub appliance on port $AGBOT_PORT"
     compose up -d
-    cmd_status || true
+    wait_for_health
 }
 
 cmd_upgrade() {
     need_docker
+    previous_image="$(running_image)"
     log "upgrading to newest $AGBOT_CHANNEL image: $(resolved_image)"
     compose pull
+    pin_pulled_image
     # Recreate only the service; named volumes (db/data) are preserved.
     compose up -d
-    log "upgrade complete; data volumes preserved"
-    cmd_status || true
+    if wait_for_health; then
+        log "upgrade complete; data volumes preserved"
+        return 0
+    fi
+
+    if [ -n "$previous_image" ]; then
+        warn "upgrade failed health checks; rolling back to $previous_image"
+        AGBOT_IMAGE_RESOLVED="$previous_image"
+        compose up -d
+        if wait_for_health; then
+            warn "rollback completed; the new digest was not promoted"
+        else
+            die "rollback failed health checks; inspect logs with 'agbot logs'"
+        fi
+    fi
+    die "upgrade failed health checks; the previous appliance remains active"
 }
 
 cmd_down() {
@@ -121,12 +179,7 @@ cmd_down() {
 cmd_status() {
     need_docker
     compose ps || true
-    _url="http://127.0.0.1:$AGBOT_PORT/health"
-    if command -v curl >/dev/null 2>&1 && curl -fsS "$_url" >/dev/null 2>&1; then
-        log "health OK at $_url"
-    else
-        warn "health check not responding at $_url (may still be starting)"
-    fi
+    wait_for_health
 }
 
 cmd_logs() {

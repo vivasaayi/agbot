@@ -236,3 +236,18 @@ fn only_api_js_contains_backend_url_literals() {
         );
     }
 }
+
+#[test]
+fn catalog_panel_can_toggle_any_tileable_raster_product() -> Result<()> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let catalog_js = std::fs::read_to_string(manifest_dir.join("web/js/panels/catalog.js"))?;
+    assert!(
+        catalog_js.contains("isTileableRasterProduct"),
+        "catalog panel must detect GeoTIFF-backed products"
+    );
+    assert!(
+        catalog_js.contains("Show layer"),
+        "catalog panel must expose a generic GIS layer toggle"
+    );
+    Ok(())
+}

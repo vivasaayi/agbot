@@ -139,6 +139,9 @@ struct WorldCompileSpec {
     std::string terrain_version;
     std::string terrain_license;
     std::string terrain_vertical_datum;
+    // Hash of the DEM bytes supplied by the caller. When zero, the compiler
+    // retains the legacy config hash for inline/synthetic terrain sources.
+    std::uint64_t terrain_content_hash = 0;
     // True when the terrain base layer is an authoritative DEM (e.g. USGS 3DEP)
     // rather than a fallback source. Drives the tile ElevationState.
     bool terrain_authoritative = false;
@@ -146,7 +149,11 @@ struct WorldCompileSpec {
     bool water_mask = false;
     float sea_level_m = 0.5f;   // NAVD88 threshold for water candidacy
 
-    std::string buildings_path;                         // required GeoJSON
+    // GeoJSON remains required by default for compatibility with the complete
+    // world compiler. Catalog DEM derivation explicitly opts into a
+    // terrain-only package, without inventing a building source or provenance.
+    bool allow_terrain_only = false;
+    std::string buildings_path;
     agbot::config::ParamTable building_params;
     std::string buildings_source_id = "buildings";
     std::string buildings_uri;

@@ -128,6 +128,16 @@ VerticalDatum vertical_datum_from_name(const std::string& name) {
     if (n == "navd88_geoid18" || n == "navd88-geoid18" || n == "geoid18") {
         return VerticalDatum::Navd88Geoid18;
     }
+    if (n == "egm96" || n == "egm-96") {
+        return VerticalDatum::Egm96;
+    }
+    if (n == "egm2008" || n == "egm-2008") {
+        return VerticalDatum::Egm2008;
+    }
+    if (n == "wgs84 ellipsoid" || n == "wgs84_ellipsoid" ||
+        n == "wgs84-ellipsoid" || n == "wgs84 ellipsoidal") {
+        return VerticalDatum::Wgs84Ellipsoidal;
+    }
     if (n == "ellipsoidal" || n == "nad83" || n == "ellipsoid") {
         return VerticalDatum::Ellipsoidal;
     }
@@ -140,7 +150,10 @@ const char* to_string(VerticalDatum datum) {
         case VerticalDatum::None: return "none";
         case VerticalDatum::Navd88: return "NAVD88";
         case VerticalDatum::Navd88Geoid18: return "NAVD88_GEOID18";
+        case VerticalDatum::Egm96: return "EGM96";
+        case VerticalDatum::Egm2008: return "EGM2008";
         case VerticalDatum::Ellipsoidal: return "ellipsoidal";
+        case VerticalDatum::Wgs84Ellipsoidal: return "WGS84 ellipsoid";
     }
     return "unknown";
 }
@@ -156,7 +169,13 @@ bool vertical_datums_compatible(VerticalDatum a, VerticalDatum b) {
     const auto navd88_family = [](VerticalDatum d) {
         return d == VerticalDatum::Navd88 || d == VerticalDatum::Navd88Geoid18;
     };
-    return navd88_family(a) && navd88_family(b);
+    if (navd88_family(a) && navd88_family(b)) {
+        return true;
+    }
+    const auto ellipsoidal_family = [](VerticalDatum d) {
+        return d == VerticalDatum::Ellipsoidal || d == VerticalDatum::Wgs84Ellipsoidal;
+    };
+    return ellipsoidal_family(a) && ellipsoidal_family(b);
 }
 
 GeoCoordinate wgs84_from_state_plane_li_ft(double easting_ft, double northing_ft) {

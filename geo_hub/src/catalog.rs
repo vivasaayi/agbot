@@ -81,6 +81,7 @@ pub struct RegisteredProduct {
     pub quality_mask_product_id: Option<String>,
     pub confidence: Option<f64>,
     pub confidence_method: Option<String>,
+    pub quality_summary: Option<serde_json::Value>,
     pub status: String,
     pub superseded_by: Option<String>,
     pub provenance_id: Option<String>,
@@ -582,6 +583,15 @@ fn row_to_product(row: sqlx::sqlite::SqliteRow) -> Result<RegisteredProduct, Cat
             what: "parameters",
             source,
         })?;
+    let quality_summary = row
+        .get::<Option<String>, _>("quality_summary_json")
+        .map(|json| {
+            serde_json::from_str(&json).map_err(|source| CatalogError::Deserialize {
+                what: "quality_summary",
+                source,
+            })
+        })
+        .transpose()?;
 
     let bbox = match (
         row.get::<Option<f64>, _>("bbox_min_x"),
@@ -617,6 +627,7 @@ fn row_to_product(row: sqlx::sqlite::SqliteRow) -> Result<RegisteredProduct, Cat
         quality_mask_product_id: row.get("quality_mask_product_id"),
         confidence: row.get("confidence"),
         confidence_method: row.get("confidence_method"),
+        quality_summary,
         status: row.get("status"),
         superseded_by: row.get("superseded_by"),
         provenance_id: row.get("provenance_id"),

@@ -21,6 +21,46 @@ Useful environment overrides:
 - `GEO_HUB__BIND_ADDRESS=127.0.0.1:8080`
 - `GEO_HUB__DATA_ROOT=/absolute/path/to/data/geo_hub`
 - `GEO_HUB__DATABASE_URL=sqlite://geo_hub.db?mode=rwc`
+- `GEO_HUB__TERRAIN__COMPILER_PATH=/absolute/path/to/agbot_terrain_compile`
+
+## Elevation to simulator terrain
+
+Provider DEM/DSM files enter the same catalog and GIS path as satellite
+imagery. List the supported source profiles and ingest a server-local
+GeoTIFF/COG:
+
+```bash
+curl "http://127.0.0.1:8080/api/ingest/elevation/sources"
+
+curl -X POST "http://127.0.0.1:8080/api/ingest/elevation" \
+  -H "content-type: application/json" \
+  -d '{
+    "profile_id": "copernicus_dem_glo30",
+    "scene_id": "cop-dem-example",
+    "artifact_path": "/absolute/path/to/cop-dem.tif",
+    "acquired_at": "2026-07-01T00:00:00Z"
+  }'
+```
+
+The ingest response contains the L1 elevation product ID and GIS tile URL.
+After building `flight_sim_cpp`, derive the traceable L3 simulator package:
+
+```bash
+curl -X POST "http://127.0.0.1:8080/api/terrain/derive" \
+  -H "content-type: application/json" \
+  -d '{
+    "elevation_product_id": "<L1 product ID>",
+    "resolution": 256,
+    "target_gsd_m": 30,
+    "expected_vertical_datum": "EGM2008",
+    "seed": 7
+  }'
+```
+
+The result is a cataloged `sim_terrain_package` backed by `.agbworld`,
+`.agbscn`, and validation artifacts. The first bridge accepts EPSG:4326
+elevation only and rejects missing, changed, or datum-mismatched source
+evidence.
 
 ## File-backed contract for quick local testing
 

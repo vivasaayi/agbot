@@ -125,8 +125,14 @@ add_subdirectory(config)
 add_subdirectory(terrain_engine)
 add_subdirectory(worldgen)
 add_subdirectory(vehicles)
+target_link_libraries(agbot_flight_sim_core PRIVATE agbot_vehicles)
 add_subdirectory(nav)
 add_subdirectory(render)
+
+target_link_libraries(agbot_flight_sim_headless PRIVATE agbot_render)
+if(APPLE)
+    target_link_libraries(agbot_flight_sim_viewer PRIVATE agbot_render)
+endif()
 
 add_executable(agbot_world_demo demo/world_demo_main.cpp)
 # agbot_worldgen PUBLIC-links agbot_terrain + agbot_render (the world compiler

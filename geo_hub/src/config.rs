@@ -187,6 +187,22 @@ pub struct StorageConfig {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
+pub struct TerrainConfig {
+    /// Path to the deterministic `flight_sim_cpp` terrain compiler. Relative
+    /// paths resolve against the current directory or Cargo workspace root.
+    pub compiler_path: PathBuf,
+}
+
+impl Default for TerrainConfig {
+    fn default() -> Self {
+        Self {
+            compiler_path: PathBuf::from("flight_sim_cpp/build/worldgen/agbot_terrain_compile"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct BootstrapConfig {
     /// When true, a fresh server (no marketplace accounts yet) is seeded with a
     /// default org + account + portal access code so the farmer PWA works
@@ -234,6 +250,7 @@ pub struct HubConfig {
     pub bootstrap: BootstrapConfig,
     pub security: SecurityConfig,
     pub storage: StorageConfig,
+    pub terrain: TerrainConfig,
     pub observability: ObservabilityConfig,
 }
 
@@ -250,6 +267,7 @@ impl Default for HubConfig {
             bootstrap: BootstrapConfig::default(),
             security: SecurityConfig::default(),
             storage: StorageConfig::default(),
+            terrain: TerrainConfig::default(),
             observability: ObservabilityConfig::default(),
         }
     }
@@ -364,6 +382,17 @@ impl HubConfig {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let workspace_root = manifest_dir.parent().unwrap_or(manifest_dir);
         workspace_root.join(&self.workspace_web_root)
+    }
+
+    /// Resolve the configured C++ terrain compiler with the same relocatable
+    /// workspace behavior as static web assets.
+    pub fn terrain_compiler_path(&self) -> PathBuf {
+        if self.terrain.compiler_path.is_absolute() || self.terrain.compiler_path.exists() {
+            return self.terrain.compiler_path.clone();
+        }
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let workspace_root = manifest_dir.parent().unwrap_or(manifest_dir);
+        workspace_root.join(&self.terrain.compiler_path)
     }
 }
 

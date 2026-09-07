@@ -1,9 +1,11 @@
 #pragma once
 
+#include "agbot_flight_sim/GeoTerrain.hpp"
 #include "agbot_flight_sim/Mission.hpp"
 #include "agbot_flight_sim/SafetyRules.hpp"
 
 #include <cstddef>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -21,6 +23,7 @@ struct MissionValidationConfig {
     double flight_battery_drain_percent_per_s = 0.012;
     double idle_battery_drain_percent_per_s = 0.001;
     int terrain_resolution = 96;
+    std::optional<TerrainMesh> terrain;
 };
 
 struct MissionValidationReport {

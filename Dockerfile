@@ -15,7 +15,7 @@ WORKDIR /app
 
 # Copy source and build the runtime binaries.
 COPY . .
-RUN cargo build --release \
+RUN cargo build --locked --release \
     --bin mission_control \
     --bin sensor_collector \
     --bin imagery_processor \

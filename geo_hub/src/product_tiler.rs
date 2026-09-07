@@ -138,6 +138,16 @@ const RAMP_CONDITION: &[[u8; 3]] = &[[215, 48, 39], [254, 224, 139], [26, 152, 8
 const RAMP_DIVERGING_DRY_WET: &[[u8; 3]] = &[[178, 24, 43], [247, 247, 247], [33, 102, 172]];
 /// White -> blue: precipitation accumulations (mm).
 const RAMP_PRECIP: &[[u8; 3]] = &[[247, 251, 255], [8, 69, 148]];
+/// Bathymetric blue -> lowland green -> upland tan -> mountain brown ->
+/// snow: elevation in meters. This fixed hypsometric ramp makes source DEMs
+/// immediately distinguishable from spectral-index layers.
+const RAMP_ELEVATION: &[[u8; 3]] = &[
+    [35, 95, 145],
+    [61, 135, 75],
+    [205, 188, 118],
+    [132, 92, 62],
+    [245, 245, 245],
+];
 /// Black -> white fallback for unknown kinds.
 const RAMP_GRAY: &[[u8; 3]] = &[[0, 0, 0], [255, 255, 255]];
 /// Green -> white -> yellow -> red -> purple: dNBR burn severity
@@ -222,6 +232,14 @@ pub fn colormap_for_kind(kind: &str) -> Colormap {
         "precipitation" => Colormap {
             domain: (0.0, 500.0),
             stops: RAMP_PRECIP,
+            categorical: false,
+        },
+        // Global and local terrain products. The below-sea-level lower bound
+        // keeps coastal depressions visible; 5,000 m covers nearly all
+        // agricultural and routine flight-planning terrain.
+        "elevation" | "elevation_dtm" | "elevation_dsm" | "dem" | "dtm" | "dsm" => Colormap {
+            domain: (-500.0, 5_000.0),
+            stops: RAMP_ELEVATION,
             categorical: false,
         },
         // dNBR: diverging over the Key & Benson class range (-0.5 regrowth

@@ -118,6 +118,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/metrics", get(metrics_handler))
         .route("/api/ingest/health", get(routes::get_ingest_health))
         .route(
+            "/api/ingest/elevation/sources",
+            get(routes::list_elevation_sources),
+        )
+        .route("/api/ingest/elevation", post(routes::ingest_elevation))
+        .route("/api/terrain/derive", post(routes::derive_sim_terrain))
+        .route(
             "/api/ingest/drone-session",
             post(routes::ingest_drone_session),
         )

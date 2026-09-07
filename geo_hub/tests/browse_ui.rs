@@ -161,7 +161,12 @@ async fn browse_assets_have_correct_content_types() -> Result<()> {
     assert!(content_type.starts_with("text/css"), "{content_type}");
     assert!(body.contains("#map"));
     assert!(body.contains(".derive-form"), "derive styles missing");
-    for marker in [".ts-svg", ".ts-legend", ".ts-anomaly-badge", ".ts-year-table"] {
+    for marker in [
+        ".ts-svg",
+        ".ts-legend",
+        ".ts-anomaly-badge",
+        ".ts-year-table",
+    ] {
         assert!(body.contains(marker), "style.css missing {marker}");
     }
     Ok(())

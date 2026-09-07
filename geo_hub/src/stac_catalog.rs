@@ -935,6 +935,7 @@ mod tests {
             quality_mask_product_id: None,
             confidence: None,
             confidence_method: None,
+            quality_summary: None,
             status: "registered".to_string(),
             superseded_by: None,
             provenance_id: None,

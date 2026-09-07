@@ -16,6 +16,9 @@ enum class SafetyViolationCode {
     NoFlyZoneViolation,
     LowBatteryAbort,
     EmergencyAbort,
+    TerrainCollision,
+    TerrainUnavailable,
+    UnsafeLandingSlope,
 };
 
 struct CircularNoFlyZone {

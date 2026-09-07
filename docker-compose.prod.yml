@@ -1,7 +1,7 @@
 # Production deployment for the geo_hub appliance (farmer portal + web
 # workspace/browse + APIs + satellite ingestion). SQLite-backed, single
-# service, no Postgres. Driven by the `agbot` CLI, which resolves the image
-# tag for the selected channel and writes the .env consumed here.
+# service, no Postgres. Driven by the `agbot` CLI, which resolves the selected
+# channel tag to an immutable digest and passes it to Compose at runtime.
 #
 #   AGBOT_IMAGE        full image ref, e.g. ghcr.io/vivasaayi/geo-hub:latest
 #   AGBOT_PORT         host port to expose the portal on (default 8080)
@@ -35,11 +35,12 @@ services:
       # Admin access-code API bearer token. Empty → API disabled (fail-closed).
       GEO_HUB__SECURITY__ADMIN_TOKEN: ${AGBOT_ADMIN_TOKEN:-}
       # Require a valid portal session on every /api/* route (anonymous → 401).
-      # Off by default; turn on once the portal is exposed beyond a trusted LAN.
-      GEO_HUB__SECURITY__REQUIRE_SESSION: ${AGBOT_REQUIRE_SESSION:-false}
-      # Per-client-IP request cap over a 60s window (0 disables). Requires the
-      # reverse proxy to forward the real client IP for meaningful buckets.
-      GEO_HUB__SECURITY__RATE_LIMIT_PER_MIN: ${AGBOT_RATE_LIMIT_PER_MIN:-0}
+      # Public-safe default; trusted LAN deployments may explicitly opt out.
+      GEO_HUB__SECURITY__REQUIRE_SESSION: ${AGBOT_REQUIRE_SESSION:-true}
+      # Per-client-IP request cap over a 60s window. Requires the reverse proxy
+      # to forward the real client IP for meaningful buckets; set 0 only on a
+      # deliberately trusted network.
+      GEO_HUB__SECURITY__RATE_LIMIT_PER_MIN: ${AGBOT_RATE_LIMIT_PER_MIN:-120}
       # Delete a product's artifact as it is superseded so regenerated rasters
       # don't fill the data volume. On by default for the appliance.
       GEO_HUB__STORAGE__DELETE_SUPERSEDED_ARTIFACTS: ${AGBOT_DELETE_SUPERSEDED:-true}

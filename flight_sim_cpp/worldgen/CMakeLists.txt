@@ -86,6 +86,14 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
 endif()
 add_test(NAME agbot_worldgen_tests COMMAND agbot_worldgen_tests)
 
+add_executable(agbot_terrain_compile src/terrain_compile_main.cpp)
+target_link_libraries(agbot_terrain_compile PRIVATE agbot_worldgen)
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(agbot_terrain_compile PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+install(TARGETS agbot_terrain_compile RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+add_test(NAME agbot_terrain_compile_help COMMAND agbot_terrain_compile --help)
+
 # Segmentation-lane tests: polygonization, tiling, classical indices, and the
 # (compile-gated) ONNX semantic segmentation extractor.
 add_executable(agbot_worldgen_seg_tests tests/segmentation_tests.cpp)

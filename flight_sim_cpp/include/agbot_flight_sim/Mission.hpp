@@ -22,6 +22,12 @@ enum class WaypointAction {
     ReturnHome,
 };
 
+enum class AltitudeReference {
+    AboveGroundLevel,
+    RelativeHome,
+    MeanSeaLevel,
+};
+
 struct Waypoint {
     std::string name;
     Vec3 position;
@@ -40,6 +46,8 @@ struct Mission {
     std::string name = "Untitled Flight";
     Vec3 home;
     std::optional<GeoCoordinate> home_geo;
+    AltitudeReference altitude_reference =
+        AltitudeReference::AboveGroundLevel;
     double cruise_speed_mps = 8.0;
     double acceptance_radius_m = 2.0;
     std::optional<FieldBoundary> field_boundary;
@@ -51,6 +59,9 @@ struct Mission {
 
 [[nodiscard]] const char* to_string(WaypointAction action);
 [[nodiscard]] WaypointAction waypoint_action_from_string(const std::string& value);
+[[nodiscard]] const char* to_string(AltitudeReference reference);
+[[nodiscard]] AltitudeReference altitude_reference_from_string(
+    const std::string& value);
 [[nodiscard]] std::string mission_to_json(const Mission& mission);
 
 } // namespace agbot::flight_sim
