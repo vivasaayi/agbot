@@ -67,6 +67,18 @@ async fn register_ndvi(
     values: Vec<f32>,
     transform: [f64; 6],
 ) -> Result<String> {
+    register_ndvi_scoped(ctx, tmp, stamp, values, transform, "field-1", "2026-kharif").await
+}
+
+async fn register_ndvi_scoped(
+    ctx: &Ctx,
+    tmp: &TempDir,
+    stamp: &str,
+    values: Vec<f32>,
+    transform: [f64; 6],
+    field_id: &str,
+    season_id: &str,
+) -> Result<String> {
     let path = tmp.path().join(format!("ndvi_{stamp}.tif"));
     write_geotiff_f32(
         &path,
@@ -88,8 +100,8 @@ async fn register_ndvi(
         inputs: Vec::new(),
         scope: ProductScope {
             farm_id: None,
-            field_id: None,
-            season_id: None,
+            field_id: Some(field_id.to_string()),
+            season_id: Some(season_id.to_string()),
             scene_id: Some(format!("scene-{stamp}")),
             temporal_start: format!("{stamp}T10:30:00Z"),
             temporal_end: format!("{stamp}T10:30:00Z"),
@@ -276,6 +288,87 @@ async fn june_window_composites_to_the_per_pixel_median_with_lineage() -> Result
     Ok(())
 }
 
+#[tokio::test]
+async fn composite_only_uses_products_from_the_requested_field_and_season() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = ctx(&tmp).await?;
+
+    let first = register_ndvi_scoped(
+        &ctx,
+        &tmp,
+        "2026-06-01",
+        vec![0.2; 4],
+        TRANSFORM,
+        "field-1",
+        "2026-kharif",
+    )
+    .await?;
+    let second = register_ndvi_scoped(
+        &ctx,
+        &tmp,
+        "2026-06-11",
+        vec![0.4; 4],
+        TRANSFORM,
+        "field-1",
+        "2026-kharif",
+    )
+    .await?;
+    let other_field = register_ndvi_scoped(
+        &ctx,
+        &tmp,
+        "2026-06-15",
+        vec![0.9; 4],
+        TRANSFORM,
+        "field-2",
+        "2026-kharif",
+    )
+    .await?;
+    let other_season = register_ndvi_scoped(
+        &ctx,
+        &tmp,
+        "2026-06-20",
+        vec![0.8; 4],
+        TRANSFORM,
+        "field-1",
+        "2025-rabi",
+    )
+    .await?;
+
+    let (status, outcome) = send(
+        &ctx.app,
+        "POST",
+        "/api/composites/derive",
+        Some(json!({
+            "kind": "ndvi",
+            "start": "2026-06-01",
+            "end": "2026-06-30",
+            "field_id": "field-1",
+            "season_id": "2026-kharif",
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{outcome}");
+    let used: Vec<&str> = outcome["observations_used"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap())
+        .collect();
+    assert_eq!(used, vec![first.as_str(), second.as_str()]);
+    assert!(!used.contains(&other_field.as_str()));
+    assert!(!used.contains(&other_season.as_str()));
+
+    let product =
+        catalog::get_product(&ctx.pool, outcome["composite_product_id"].as_str().unwrap())
+            .await?
+            .unwrap();
+    assert_eq!(product.field_id.as_deref(), Some("field-1"));
+    assert_eq!(product.season_id.as_deref(), Some("2026-kharif"));
+    let mut reader = GeoTiffReader::open(product.path.as_deref().unwrap())?;
+    assert!((reader.read_band()?.to_f32()[0] - 0.3).abs() < 1e-6);
+    Ok(())
+}
+
 /// Batch 33: monthly composites feed phenology directly. Six cloudy raw
 /// NDVI scenes (two per month, June-August) composite into three monthly
 /// medians, and /api/landcover/derive with series="composites" builds its
@@ -411,12 +504,14 @@ async fn yearly_composites_feed_the_drought_climatology() -> Result<()> {
     let mut composite_ids = Vec::new();
     for (year, value) in [(2024, 0.2f32), (2025, 0.6), (2026, 0.4)] {
         for day in ["05", "20"] {
-            register_ndvi(
+            register_ndvi_scoped(
                 &ctx,
                 &tmp,
                 &format!("{year}-06-{day}"),
                 vec![value; 4],
                 TRANSFORM,
+                "field-1",
+                &format!("{year}-kharif"),
             )
             .await?;
         }

@@ -288,7 +288,7 @@ async fn find_band(
     kinds: &'static [&'static str],
 ) -> Result<Option<RegisteredProduct>, LandsatDeriveError> {
     for kind in kinds {
-        let mut products = catalog::list_products(
+        let products = catalog::list_products(
             pool,
             &ProductFilter {
                 scene_id: Some(scene_id.to_string()),
@@ -299,7 +299,7 @@ async fn find_band(
             },
         )
         .await?;
-        if let Some(product) = products.pop() {
+        if let Some(product) = products.into_iter().next() {
             return Ok(Some(product));
         }
     }

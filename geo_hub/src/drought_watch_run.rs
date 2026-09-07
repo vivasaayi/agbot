@@ -16,6 +16,7 @@ use post_processor::drought_watch_app::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use shared::product_graph::ProductLevel;
 use shared::schemas::RecommendationPriority;
 
 use crate::applications::{
@@ -64,6 +65,19 @@ pub async fn run(
                     "kind {} (drought_watch consumes drought_index/spi L3s)",
                     product.kind
                 ),
+            });
+        }
+        if product.level != ProductLevel::L3 {
+            return Err(ApplicationError::InputNotL3 {
+                product_id: product_id.clone(),
+                level: product.level.as_str().to_string(),
+            });
+        }
+        if product.field_id.as_deref() != Some(request.field_id.as_str()) {
+            return Err(ApplicationError::InputFieldMismatch {
+                product_id: product_id.clone(),
+                requested_field_id: request.field_id.clone(),
+                actual_field_id: product.field_id.clone(),
             });
         }
         let path = geotiff_artifact_path(&product)

@@ -241,9 +241,10 @@ use uuid::Uuid;
 fn application_error(err: crate::applications::ApplicationError) -> AppError {
     use crate::applications::ApplicationError;
     match err {
-        ApplicationError::InputNotFound(_) | ApplicationError::InputNotL2OrL3 { .. } => {
-            AppError::BadRequest(err.to_string())
-        }
+        ApplicationError::InputNotFound(_)
+        | ApplicationError::InputNotL2OrL3 { .. }
+        | ApplicationError::InputNotL3 { .. }
+        | ApplicationError::InputFieldMismatch { .. } => AppError::BadRequest(err.to_string()),
         other => AppError::Anyhow(Error::new(other)),
     }
 }

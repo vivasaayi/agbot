@@ -74,6 +74,14 @@ pub enum ApplicationError {
     InputNotFound(String),
     #[error("input product {product_id} is level {level}; applications only consume L2/L3")]
     InputNotL2OrL3 { product_id: String, level: String },
+    #[error("input product {product_id} is level {level}; this application requires L3")]
+    InputNotL3 { product_id: String, level: String },
+    #[error("input product {product_id} belongs to field {actual_field_id:?}, not requested field {requested_field_id}")]
+    InputFieldMismatch {
+        product_id: String,
+        requested_field_id: String,
+        actual_field_id: Option<String>,
+    },
     #[error("failed to serialize {what}: {source}")]
     Serialize {
         what: &'static str,

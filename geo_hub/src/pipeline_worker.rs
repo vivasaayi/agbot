@@ -1860,6 +1860,8 @@ fn application_failure(err: ApplicationError) -> JobRunResult {
         err,
         ApplicationError::InputNotFound(_)
             | ApplicationError::InputNotL2OrL3 { .. }
+            | ApplicationError::InputNotL3 { .. }
+            | ApplicationError::InputFieldMismatch { .. }
             | ApplicationError::Serialize { .. }
     );
     JobRunResult::Failed {
