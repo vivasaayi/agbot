@@ -18,7 +18,7 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
     - uses: dtolnay/rust-toolchain@stable
     - uses: Swatinem/rust-cache@v2
 
@@ -45,7 +45,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
     - uses: dtolnay/rust-toolchain@stable
     - uses: Swatinem/rust-cache@v2
 
@@ -63,7 +63,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Audit Rust dependency advisories
       uses: rustsec/audit-check@v2.0.0
@@ -73,7 +73,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
 
     - name: Configure and build canonical C++ simulator
       run: |
@@ -88,7 +88,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: test
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
     - uses: dtolnay/rust-toolchain@stable
     - uses: Swatinem/rust-cache@v2
     
@@ -109,7 +109,7 @@ jobs:
             just_recipe: arm
             artifact_name: agbot-armv7-raspberry-pi
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
     - uses: dtolnay/rust-toolchain@stable
     - uses: Swatinem/rust-cache@v2
     - uses: docker/setup-qemu-action@v3
@@ -129,7 +129,7 @@ jobs:
       run: scripts/package-arm-artifacts.sh ${{ matrix.target }}
 
     - name: Upload target artifacts
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: ${{ matrix.artifact_name }}
         path: dist/arm/${{ matrix.target }}/agbot-${{ matrix.target }}.tar.gz
@@ -140,10 +140,10 @@ jobs:
     runs-on: ubuntu-latest
     needs: [test, gis, security, flight-sim]
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
     
     - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v3
+      uses: docker/setup-buildx-action@v4
 
     - name: Validate Dockerfile pins and manifest
       run: |
@@ -151,7 +151,7 @@ jobs:
         bash scripts/verify-appliance-build.sh
       
     - name: Build appliance image
-      uses: docker/build-push-action@v5
+      uses: docker/build-push-action@v7
       with:
         context: .
         target: runtime-appliance
