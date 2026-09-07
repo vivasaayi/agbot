@@ -61,7 +61,7 @@ prost = "0.12"
 
 # Math/Linear algebra
 nalgebra = { version = "0.32", features = ["serde-serialize"] }
-ndarray = "0.15"
+ndarray = "0.17"
 
 # Image processing
 image = { version = "0.24", features = ["png", "jpeg"] }
