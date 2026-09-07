@@ -1,27 +1,106 @@
+use crate::pipeline_worker::{
+    spawn_pipeline_worker, EarthSearchItemFetcher, PipelineWorkerContext,
+};
+use crate::satellite_derivation::UrlCogResolver;
 use crate::{config::HubConfig, routes, state::AppState};
 use anyhow::Result;
 use axum::{
-    routing::{delete, get, post, put},
+    extract::{DefaultBodyLimit, State},
+    http::{header, HeaderValue, StatusCode},
+    middleware::from_fn_with_state,
+    response::{IntoResponse, Response},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tower_http::services::ServeDir;
 use tracing::{info, warn};
 
+/// Liveness probe: the process is up and serving. Deliberately dependency-free
+/// so it never flaps on a transient database hiccup (that is `/ready`'s job).
 async fn health_handler() -> &'static str {
     "ok"
 }
 
-async fn ready_handler() -> &'static str {
-    "ready"
+/// Readiness probe: the process can serve real traffic, which for geo_hub means
+/// the SQLite pool answers a trivial query. Returns 200 `ready` or 503 with a
+/// reason so orchestrators / the appliance healthcheck can gate traffic.
+async fn ready_handler(State(state): State<AppState>) -> Response {
+    match sqlx::query("SELECT 1").execute(&state.pool).await {
+        Ok(_) => (StatusCode::OK, "ready").into_response(),
+        Err(err) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("not ready: database unavailable: {err}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Prometheus text-exposition metrics: process liveness plus pipeline queue
+/// depth by status (the highest-signal ops gauge — a growing `dead`/`failed`
+/// count or `queued` backlog is what alerting watches). No metrics registry is
+/// pulled in; the gauges are read live from the queue table on scrape.
+async fn metrics_handler(State(state): State<AppState>) -> Response {
+    use std::fmt::Write as _;
+
+    let mut body = String::from(
+        "# HELP geo_hub_up 1 when the process is serving.\n\
+         # TYPE geo_hub_up gauge\n\
+         geo_hub_up 1\n",
+    );
+
+    // Emit every known status (0 when absent) so a gauge never silently drops
+    // off a dashboard between scrapes.
+    let mut counts: std::collections::BTreeMap<&str, i64> = [
+        ("queued", 0),
+        ("running", 0),
+        ("succeeded", 0),
+        ("failed", 0),
+        ("dead", 0),
+    ]
+    .into_iter()
+    .collect();
+    if let Ok(rows) = sqlx::query_as::<_, (String, i64)>(
+        "SELECT status, COUNT(*) FROM pipeline_jobs GROUP BY status",
+    )
+    .fetch_all(&state.pool)
+    .await
+    {
+        for (status, n) in rows {
+            if let Some(slot) = counts.get_mut(status.as_str()) {
+                *slot = n;
+            }
+        }
+    }
+    body.push_str(
+        "# HELP geo_hub_pipeline_jobs Pipeline jobs by status.\n\
+         # TYPE geo_hub_pipeline_jobs gauge\n",
+    );
+    for (status, n) in &counts {
+        let _ = writeln!(body, "geo_hub_pipeline_jobs{{status=\"{status}\"}} {n}");
+    }
+
+    (
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("text/plain; version=0.0.4"),
+        )],
+        body,
+    )
+        .into_response()
 }
 
 pub fn build_router(state: AppState) -> Router {
-    Router::new()
+    let router = Router::new()
         .nest_service(
             "/workspace",
             ServeDir::new(state.config.workspace_web_dir()),
+        )
+        .nest_service(
+            "/portal",
+            ServeDir::new(state.config.workspace_web_dir().join("portal")),
         )
         .route("/", get(routes::mobile_app))
         .route("/app", get(routes::mobile_app))
@@ -35,7 +114,15 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/mobile/analyze", post(routes::mobile_analyze))
         .route("/health", get(health_handler))
         .route("/ready", get(ready_handler))
+        .route("/readyz", get(ready_handler))
+        .route("/metrics", get(metrics_handler))
         .route("/api/ingest/health", get(routes::get_ingest_health))
+        .route(
+            "/api/ingest/elevation/sources",
+            get(routes::list_elevation_sources),
+        )
+        .route("/api/ingest/elevation", post(routes::ingest_elevation))
+        .route("/api/terrain/derive", post(routes::derive_sim_terrain))
         .route(
             "/api/ingest/drone-session",
             post(routes::ingest_drone_session),
@@ -53,6 +140,7 @@ pub fn build_router(state: AppState) -> Router {
             "/api/ingest/landsat/derive",
             post(routes::derive_landsat_product_route),
         )
+        .route("/api/catalog/sources", get(routes::list_catalog_sources))
         .route(
             "/api/catalog/products",
             get(routes::list_catalog_products).post(routes::register_catalog_product),
@@ -66,6 +154,22 @@ pub fn build_router(state: AppState) -> Router {
             get(routes::catalog_product_web_tile),
         )
         .route("/api/satellite/derive", post(routes::satellite_derive))
+        .route(
+            "/api/fields/:field_id/modis/ingest",
+            post(routes::ingest_field_modis),
+        )
+        .route(
+            "/api/fields/:field_id/timeseries",
+            get(routes::get_field_timeseries),
+        )
+        .route(
+            "/api/fields/:field_id/timeseries/metrics",
+            get(routes::get_field_timeseries_metrics),
+        )
+        .route(
+            "/api/fields/:field_id/timeseries/summary",
+            get(routes::get_field_timeseries_summary),
+        )
         .route("/api/stac", get(routes::stac_landing_page))
         .route("/api/stac/conformance", get(routes::stac_conformance))
         .route("/api/stac/collections", get(routes::stac_list_collections))
@@ -112,6 +216,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/applications/drought-watch/runs",
             post(routes::run_drought_watch_app),
+        )
+        .route(
+            "/api/applications/water-balance-watch/runs",
+            post(routes::run_water_balance_watch_app),
         )
         .route(
             "/api/fields/:field_id/alert-evaluation",
@@ -415,6 +523,10 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/thermal/lst/derive", post(routes::derive_lst_route))
         .route(
+            "/api/water-management/et/derive",
+            post(routes::derive_et_fraction_route),
+        )
+        .route(
             "/api/composites/derive",
             post(routes::derive_composite_route),
         )
@@ -431,6 +543,14 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/water-management/sentinel1/register",
             post(routes::register_sentinel1_route),
+        )
+        .route(
+            "/api/water-management/balance/derive",
+            post(routes::derive_water_balance_route),
+        )
+        .route(
+            "/api/water-management/seasonality/derive",
+            post(routes::derive_water_seasonality_route),
         )
         .route(
             "/api/water-management/extent/derive",
@@ -481,6 +601,57 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/portal/marketplace-entry",
             get(routes::get_marketplace_portal_entry),
+        )
+        .route("/api/portal/login", post(routes::portal_login))
+        .route("/api/portal/logout", post(routes::portal_logout))
+        .route("/api/portal/me", get(routes::portal_me))
+        .route("/api/portal/farms", get(routes::portal_list_farms))
+        .route("/api/portal/fields", get(routes::portal_list_fields))
+        .route(
+            "/api/portal/fields/:field_id/overview",
+            get(routes::portal_field_overview),
+        )
+        .route("/api/portal/reports", get(routes::portal_list_reports))
+        .route(
+            "/api/portal/reports/:report_id/read",
+            post(routes::portal_mark_report_read),
+        )
+        .route(
+            "/api/portal/reports/:report_id/download",
+            get(routes::portal_download_report),
+        )
+        .route(
+            "/api/portal/fields/:field_id/grower-report",
+            post(routes::portal_generate_grower_report),
+        )
+        .route(
+            "/api/portal/recommendations/:recommendation_id/status",
+            put(routes::portal_update_recommendation_status),
+        )
+        .route(
+            "/api/portal/fields/:field_id/activities",
+            get(routes::portal_list_activities).post(routes::portal_create_activity),
+        )
+        .route(
+            "/api/portal/fields/:field_id/activities/summary",
+            get(routes::portal_field_activity_summary),
+        )
+        .route(
+            "/api/portal/activities/:activity_id",
+            put(routes::portal_update_activity).delete(routes::portal_delete_activity),
+        )
+        .route("/api/portal/alerts", get(routes::portal_list_alerts))
+        .route(
+            "/api/portal/notifications/summary",
+            get(routes::portal_notifications_summary),
+        )
+        .route(
+            "/api/admin/portal/access-codes",
+            get(routes::list_portal_access_codes).post(routes::issue_portal_access_code),
+        )
+        .route(
+            "/api/admin/portal/access-codes/:code_id/revoke",
+            post(routes::revoke_portal_access_code),
         )
         .route(
             "/api/marketplace/listings",
@@ -996,7 +1167,64 @@ pub fn build_router(state: AppState) -> Router {
             "/api/scenes/:scene_id/products/:kind/tiles/:z/:x/:y.png",
             get(routes::stream_product_tile),
         )
-        .with_state(state)
+        // Satellite pipeline (batch S-8): subscriptions, manual trigger,
+        // job queue inspection and retry.
+        .route(
+            "/api/fields/:field_id/subscriptions",
+            get(routes::list_field_subscriptions).post(routes::upsert_field_subscription),
+        )
+        .route(
+            "/api/subscriptions/:subscription_id",
+            patch(routes::patch_subscription_status),
+        )
+        // Historical backfill (batch S-11): resumable 1982+ range walks.
+        .route(
+            "/api/fields/:field_id/backfill",
+            post(routes::start_field_backfill),
+        )
+        .route(
+            "/api/fields/:field_id/backfills",
+            get(routes::list_field_backfills),
+        )
+        .route("/api/backfills/:backfill_id", get(routes::get_backfill))
+        .route(
+            "/api/backfills/:backfill_id/pause",
+            post(routes::pause_backfill),
+        )
+        .route(
+            "/api/backfills/:backfill_id/resume",
+            post(routes::resume_backfill),
+        )
+        .route("/api/pipeline/run", post(routes::run_pipeline_now))
+        .route("/api/pipeline/jobs", get(routes::list_pipeline_jobs))
+        .route("/api/pipeline/jobs/:job_id", get(routes::get_pipeline_job))
+        .route(
+            "/api/pipeline/jobs/:job_id/retry",
+            post(routes::retry_pipeline_job),
+        )
+        // Global request-security layers. The require-session gate is a no-op
+        // unless `security.require_session` is set; the body limit always
+        // applies. `from_fn_with_state` bakes in the state, so these wrap the
+        // fully-stated router.
+        .layer(from_fn_with_state(
+            state.clone(),
+            crate::security::require_session_mw,
+        ))
+        .layer(DefaultBodyLimit::max(state.config.security.max_body_bytes));
+
+    // Optional per-IP rate limit, applied outermost so it sheds load before the
+    // auth gate and any database work. Off unless `rate_limit_per_min > 0`.
+    let router = if state.config.security.rate_limit_per_min > 0 {
+        let limiter = Arc::new(crate::security::RateLimiter::new(
+            state.config.security.rate_limit_per_min,
+            60,
+        ));
+        router.layer(from_fn_with_state(limiter, crate::security::rate_limit_mw))
+    } else {
+        router
+    };
+
+    router.with_state(state)
 }
 
 /// Start the geo_hub HTTP server using configuration and resources.
@@ -1011,6 +1239,23 @@ pub async fn serve(config: HubConfig, pool: crate::db::DbPool) -> Result<()> {
 
     let router = build_router(state);
 
+    // Satellite pipeline worker (batch S-8): a serial background loop that
+    // drains the job queue and runs the subscription cadence pass. Off by
+    // default (`[pipeline] enabled = false`), so tests/CI are unaffected.
+    let (worker_shutdown_tx, worker_shutdown_rx) = watch::channel(false);
+    let worker_handle = if shared_config.pipeline.enabled {
+        info!("satellite pipeline worker enabled");
+        let worker_ctx = PipelineWorkerContext {
+            pool: pool.clone(),
+            config: Arc::clone(&shared_config),
+            cog_resolver: Arc::new(UrlCogResolver),
+            item_fetcher: Arc::new(EarthSearchItemFetcher),
+        };
+        Some(spawn_pipeline_worker(worker_ctx, worker_shutdown_rx))
+    } else {
+        None
+    };
+
     let listener = TcpListener::bind(addr).await?;
     info!(%addr, "geo_hub listening");
 
@@ -1020,6 +1265,15 @@ pub async fn serve(config: HubConfig, pool: crate::db::DbPool) -> Result<()> {
     )
     .with_graceful_shutdown(shutdown_signal())
     .await?;
+
+    // The HTTP server drained after the shutdown signal; flip the worker's
+    // watch channel and wait for the loop to exit before returning.
+    let _ = worker_shutdown_tx.send(true);
+    if let Some(handle) = worker_handle {
+        if let Err(err) = handle.await {
+            warn!(%err, "pipeline worker task join failed");
+        }
+    }
 
     Ok(())
 }

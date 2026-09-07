@@ -97,4 +97,3 @@ pub async fn list_copilot_turns(
         .collect::<AppResult<Vec<_>>>()
         .map(Json)
 }
-

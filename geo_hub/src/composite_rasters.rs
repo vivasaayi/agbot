@@ -149,6 +149,8 @@ pub async fn derive_composite(
             kind: Some(request.kind.clone()),
             level: Some(ProductLevel::L2),
             status: Some("registered".to_string()),
+            field_id: Some(request.field_id.clone()),
+            season_id: Some(request.season_id.clone()),
             temporal_start: Some(format!("{start}T00:00:00Z")),
             temporal_end: Some(format!("{end}T23:59:59Z")),
             ..ProductFilter::default()

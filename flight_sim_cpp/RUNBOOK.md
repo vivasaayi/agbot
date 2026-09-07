@@ -27,9 +27,39 @@ If `prng_seeded` is `fail`, rerun the simulator with an explicit `--seed N`. Hea
 
 ## Deterministic Run Header
 
-Every headless run prints the simulator version, contract version, seed, timestep, and deterministic `run_id`. The same mission, seed, timestep, record interval, max time, simulator version, and contract schema produce the same `run_id`.
+Every headless run prints the simulator version, contract version, seed, timestep, and deterministic `run_id`. The same mission, seed, plant, timestep, record interval, max time, simulator version, and contract schema produce the same `run_id`.
 
 The sibling manifest records the same `run_id`, input hashes, output hash, PRNG nonce, and retention evidence.
+
+`completed=true` means every mission waypoint finished successfully. Unsuccessful
+runs include `termination_reason` (`failsafe` or `time_limit`); failsafe runs
+also include `safety_violation`. The headless process exits `0` for success,
+`2` for a time limit, and `3` for a safety failsafe.
+
+## Headless Preflight
+
+Every headless launch writes `<output>.validation.json` before simulation. The
+report records coverage, estimated duration, battery margin, terrain gaps, and
+blocking safety issues. Configure `--max-altitude`, `--min-battery`, and
+`--geofence min_x,max_x,min_z,max_z`; the same envelope is enforced by the
+runtime plant and recorded in `safety_config`.
+
+A blocked preflight exits `4` and does not create telemetry. Successful run
+manifests embed `validation_report` and `validation_report_hash`.
+
+## Physics Plant
+
+Use `--plant multirotor` to run the mission through the shared multirotor
+vehicle model. The default is `simple`, which preserves committed golden
+traces. Non-default plant selection is recorded in the manifest and run ID.
+
+```bash
+flight_sim_cpp/build/agbot_flight_sim_headless \
+  --seed 42 \
+  --plant multirotor \
+  --mission flight_sim_cpp/samples/sample_field_loop.json \
+  --output flight_sim_cpp/out/multirotor.jsonl
+```
 
 ## Wind Field
 
@@ -131,6 +161,17 @@ To inspect a faulted trace:
 ```bash
 flight_sim_cpp/build/agbot-sim diff flight_sim_cpp/out/baseline.jsonl flight_sim_cpp/out/faulted.jsonl
 ```
+
+For noisy or cross-build comparisons, use explicit tolerances and structured
+multi-diff output:
+
+```bash
+flight_sim_cpp/build/agbot-sim diff baseline.jsonl candidate.jsonl \
+  --abs-tol 0.001 --rel-tol 0.0001 --max-diffs 20 --json
+```
+
+Exit `0` means equivalent within tolerance, `1` means compatible traces differ,
+and `3` means their major contract versions are incompatible.
 
 ## Tile Cache
 

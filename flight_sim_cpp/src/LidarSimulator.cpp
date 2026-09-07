@@ -112,51 +112,6 @@ std::string deterministic_uuid(std::uint64_t seed, std::uint64_t step) {
     return output.str();
 }
 
-std::optional<int> terrain_resolution(const TerrainMesh& terrain) {
-    const double root = std::sqrt(static_cast<double>(terrain.vertices.size()));
-    const int resolution = static_cast<int>(std::llround(root));
-    if (resolution < 2 || static_cast<std::size_t>(resolution * resolution) != terrain.vertices.size()) {
-        return std::nullopt;
-    }
-    return resolution;
-}
-
-std::optional<double> terrain_height_at(const TerrainMesh& terrain, double x, double z) {
-    const auto resolution = terrain_resolution(terrain);
-    if (!resolution.has_value()) {
-        return std::nullopt;
-    }
-
-    const Vec3& first = terrain.vertices.front().position;
-    const Vec3& last = terrain.vertices.back().position;
-    const double min_x = std::min(first.x, last.x);
-    const double max_x = std::max(first.x, last.x);
-    const double min_z = std::min(first.z, last.z);
-    const double max_z = std::max(first.z, last.z);
-    if (max_x <= min_x || max_z <= min_z || x < min_x || x > max_x || z < min_z || z > max_z) {
-        return std::nullopt;
-    }
-
-    const double u = (x - min_x) / (max_x - min_x);
-    const double v = (z - min_z) / (max_z - min_z);
-    const double fx = u * static_cast<double>(*resolution - 1);
-    const double fz = v * static_cast<double>(*resolution - 1);
-    const int x0 = static_cast<int>(std::floor(fx));
-    const int z0 = static_cast<int>(std::floor(fz));
-    const int x1 = std::min(x0 + 1, *resolution - 1);
-    const int z1 = std::min(z0 + 1, *resolution - 1);
-    const double tx = fx - static_cast<double>(x0);
-    const double tz = fz - static_cast<double>(z0);
-
-    const auto at = [&terrain, resolution](int grid_x, int grid_z) {
-        return terrain.vertices[static_cast<std::size_t>(grid_z * *resolution + grid_x)].position.y;
-    };
-
-    const double top = at(x0, z0) * (1.0 - tx) + at(x1, z0) * tx;
-    const double bottom = at(x0, z1) * (1.0 - tx) + at(x1, z1) * tx;
-    return top * (1.0 - tz) + bottom * tz;
-}
-
 struct RayHit {
     Vec3 position;
     double range_m = 0.0;
@@ -292,7 +247,7 @@ LidarScan raycast_lidar_scan(
         scan.status = "disabled";
         return scan;
     }
-    if (!terrain_resolution(terrain).has_value()) {
+    if (!terrain_grid_resolution(terrain).has_value()) {
         scan.status = "empty_scene";
         return scan;
     }

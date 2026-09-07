@@ -124,9 +124,7 @@ pub async fn write_lidar_product_sidecar(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        LidarObservationCounts, LidarOccupancyGridEvidence, LidarProductOutputHash,
-    };
+    use crate::{LidarObservationCounts, LidarOccupancyGridEvidence, LidarProductOutputHash};
     use shared::schemas::RasterSpatialRef;
     use uuid::Uuid;
 

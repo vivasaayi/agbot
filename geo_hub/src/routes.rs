@@ -241,9 +241,10 @@ use uuid::Uuid;
 fn application_error(err: crate::applications::ApplicationError) -> AppError {
     use crate::applications::ApplicationError;
     match err {
-        ApplicationError::InputNotFound(_) | ApplicationError::InputNotL2OrL3 { .. } => {
-            AppError::BadRequest(err.to_string())
-        }
+        ApplicationError::InputNotFound(_)
+        | ApplicationError::InputNotL2OrL3 { .. }
+        | ApplicationError::InputNotL3 { .. }
+        | ApplicationError::InputFieldMismatch { .. } => AppError::BadRequest(err.to_string()),
         other => AppError::Anyhow(Error::new(other)),
     }
 }
@@ -299,6 +300,7 @@ fn farm_field_list_page<T>(
 mod alert_rules;
 mod alerts;
 mod applications;
+mod backfill_routes;
 mod browse;
 mod catalog;
 mod change_detection_routes;
@@ -311,6 +313,7 @@ mod crop_intelligence_routes;
 mod drought_raster_routes;
 mod farms_fields;
 mod field_io;
+mod field_timeseries_routes;
 mod fleet;
 mod fleet_health_routes;
 mod ingestion;
@@ -318,8 +321,11 @@ mod landcover_routes;
 mod lst_routes;
 mod marketplace;
 mod mobile;
+mod modis_routes;
 mod orthomosaic_routes;
+mod pipeline_routes;
 mod plugins;
+mod portal;
 mod product_tiles;
 mod proposals;
 mod provenance_routes;
@@ -334,6 +340,7 @@ mod workspace;
 pub use alert_rules::*;
 pub use alerts::*;
 pub use applications::*;
+pub use backfill_routes::*;
 pub use browse::*;
 pub use catalog::*;
 pub use change_detection_routes::*;
@@ -346,6 +353,7 @@ pub use crop_intelligence_routes::*;
 pub use drought_raster_routes::*;
 pub use farms_fields::*;
 pub use field_io::*;
+pub use field_timeseries_routes::*;
 pub use fleet::*;
 pub use fleet_health_routes::*;
 pub use ingestion::*;
@@ -353,8 +361,11 @@ pub use landcover_routes::*;
 pub use lst_routes::*;
 pub use marketplace::*;
 pub use mobile::*;
+pub use modis_routes::*;
 pub use orthomosaic_routes::*;
+pub use pipeline_routes::*;
 pub use plugins::*;
+pub use portal::*;
 pub use product_tiles::*;
 pub use proposals::*;
 pub use provenance_routes::*;
@@ -12323,12 +12334,14 @@ fn parse_recommendation_status(value: String) -> AppResult<RecommendationStatus>
 fn report_format_str(format: ReportFormat) -> &'static str {
     match format {
         ReportFormat::Html => "html",
+        ReportFormat::Pdf => "pdf",
     }
 }
 
 fn parse_report_format(value: String) -> AppResult<ReportFormat> {
     match value.as_str() {
         "html" => Ok(ReportFormat::Html),
+        "pdf" => Ok(ReportFormat::Pdf),
         _ => Err(AppError::Anyhow(anyhow::anyhow!(
             "invalid report format {}",
             value
@@ -12340,6 +12353,7 @@ fn report_visibility_str(visibility: ReportVisibility) -> &'static str {
     match visibility {
         ReportVisibility::Org => "org",
         ReportVisibility::Shared => "shared",
+        ReportVisibility::Grower => "grower",
     }
 }
 
@@ -12347,6 +12361,7 @@ fn parse_report_visibility(value: String) -> AppResult<ReportVisibility> {
     match value.as_str() {
         "org" => Ok(ReportVisibility::Org),
         "shared" => Ok(ReportVisibility::Shared),
+        "grower" => Ok(ReportVisibility::Grower),
         _ => Err(AppError::BadRequest(format!(
             "invalid report visibility {}",
             value

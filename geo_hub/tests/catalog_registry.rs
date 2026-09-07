@@ -93,6 +93,10 @@ async fn register_then_get_round_trips_core_fields() -> Result<()> {
     assert_eq!(got.scene_id.as_deref(), Some("scene-1"));
     assert_eq!(got.source_id.as_deref(), Some("landsat-9"));
     assert_eq!(got.confidence, Some(0.9));
+    assert_eq!(
+        got.quality_summary,
+        Some(serde_json::json!({ "cloud_fraction": 0.02 }))
+    );
     assert_eq!(got.status, "registered");
     assert_eq!(got.parameters_hash, draft.parameters_hash());
     assert_eq!(got.bbox, Some([0.0, 0.0, 1.0, 1.0]));
@@ -328,5 +332,35 @@ async fn supersede_marks_old_product_and_links_successor() -> Result<()> {
     let old = catalog::get_product(&pool, &old_id).await?.expect("old");
     assert_eq!(old.status, "superseded");
     assert_eq!(old.superseded_by.as_deref(), Some(new_id.as_str()));
+    Ok(())
+}
+
+#[tokio::test]
+async fn quarantined_product_is_excluded_from_registered_queries() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let pool = pool(&tmp).await?;
+
+    let id =
+        catalog::register_product(&pool, &index_draft("ndvi", "scene-1", "field-1", 1), T0).await?;
+
+    let registered_filter = || ProductFilter {
+        status: Some("registered".to_string()),
+        ..ProductFilter::default()
+    };
+
+    // Present as registered before the gate acts.
+    let before = catalog::list_products(&pool, &registered_filter()).await?;
+    assert!(before.iter().any(|p| p.product_id == id));
+
+    catalog::quarantine_product(&pool, &id).await?;
+    let got = catalog::get_product(&pool, &id).await?.expect("product");
+    assert_eq!(got.status, "failed_qa");
+
+    // Now excluded from `registered` queries (serving + downstream fan-out).
+    let after = catalog::list_products(&pool, &registered_filter()).await?;
+    assert!(
+        !after.iter().any(|p| p.product_id == id),
+        "quarantined product must not appear as registered"
+    );
     Ok(())
 }

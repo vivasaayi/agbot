@@ -1,0 +1,328 @@
+/* AGBot Farm portal — mobile-first, dark-on-light, large touch targets. */
+
+:root {
+  --green: #2e7d32;
+  --green-dark: #1b5e20;
+  --green-soft: #e8f2e8;
+  --bg: #f4f7f4;
+  --surface: #ffffff;
+  --ink: #1d241d;
+  --muted: #5c6b5c;
+  --border: #d7e0d7;
+  --error: #b3261e;
+  --severity-critical: #c62828;
+  --severity-high: #ef6c00;
+  --severity-medium: #f9a825;
+  --severity-low: #2e7d32;
+  --severity-none: #78909c;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+    sans-serif;
+  font-size: 16px;
+  line-height: 1.45;
+}
+
+/* --- Header ---------------------------------------------------------- */
+
+.app-header {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  padding-top: calc(0.75rem + env(safe-area-inset-top));
+  background: var(--green);
+  color: #fff;
+}
+
+.app-title {
+  font-size: 1.15rem;
+  font-weight: 700;
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.header-button {
+  min-height: 44px;
+  padding: 0.4rem 0.8rem;
+  border: 1px solid rgba(255, 255, 255, 0.6);
+  border-radius: 8px;
+  background: transparent;
+  color: #fff;
+  font-size: 0.9rem;
+  cursor: pointer;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: #fff;
+  color: var(--green-dark);
+  font-weight: 700;
+  font-size: 0.85rem;
+  text-decoration: none;
+}
+
+/* --- Offline banner --------------------------------------------------- */
+
+.offline-banner {
+  padding: 0.5rem 1rem;
+  background: #fff3cd;
+  color: #6b5300;
+  font-size: 0.9rem;
+  text-align: center;
+}
+
+/* --- Layout ------------------------------------------------------------ */
+
+.view-container {
+  max-width: 640px;
+  margin: 0 auto;
+  padding: 1rem;
+  padding-bottom: calc(4.5rem + env(safe-area-inset-bottom));
+}
+
+.view h2 {
+  margin: 0.25rem 0 0.75rem;
+  font-size: 1.35rem;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.error-text {
+  color: var(--error);
+  font-size: 0.95rem;
+}
+
+.back-link {
+  display: inline-block;
+  min-height: 44px;
+  color: var(--green-dark);
+  text-decoration: none;
+  font-weight: 600;
+}
+
+/* --- Tab bar ------------------------------------------------------------ */
+
+.tab-bar {
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  z-index: 10;
+  display: flex;
+  border-top: 1px solid var(--border);
+  background: var(--surface);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+
+.tab {
+  flex: 1;
+  min-height: 52px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.tab.active {
+  color: var(--green-dark);
+  border-top: 3px solid var(--green);
+  margin-top: -1px;
+}
+
+/* --- Forms --------------------------------------------------------------- */
+
+label {
+  display: block;
+  margin: 0.75rem 0 0.25rem;
+  font-weight: 600;
+}
+
+input,
+select {
+  width: 100%;
+  min-height: 48px;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  color: var(--ink);
+  font-size: 1rem;
+}
+
+input:focus,
+select:focus {
+  outline: 2px solid var(--green);
+  outline-offset: 1px;
+}
+
+.primary-button {
+  width: 100%;
+  min-height: 48px;
+  margin-top: 1rem;
+  border: none;
+  border-radius: 10px;
+  background: var(--green);
+  color: #fff;
+  font-size: 1rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.primary-button:disabled {
+  opacity: 0.6;
+}
+
+/* --- Cards ---------------------------------------------------------------- */
+
+.card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.field-card,
+.report-row {
+  display: block;
+  padding: 0.85rem 1rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  color: inherit;
+  text-decoration: none;
+}
+
+.field-card:active,
+.report-row:active {
+  background: var(--green-soft);
+}
+
+.field-card-top,
+.report-row-top {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.field-name,
+.report-title {
+  font-weight: 700;
+}
+
+.field-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  justify-content: flex-end;
+}
+
+.field-card-meta,
+.report-row-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-top: 0.35rem;
+  font-size: 0.9rem;
+}
+
+/* --- Pills / severity ------------------------------------------------------ */
+
+.pill {
+  display: inline-block;
+  padding: 0.1rem 0.55rem;
+  border-radius: 999px;
+  color: #fff;
+  font-size: 0.75rem;
+  font-weight: 700;
+  text-transform: capitalize;
+  white-space: nowrap;
+}
+
+.severity-critical {
+  background: var(--severity-critical);
+}
+
+.severity-high {
+  background: var(--severity-high);
+}
+
+.severity-medium {
+  background: var(--severity-medium);
+  color: #3d3000;
+}
+
+.severity-low {
+  background: var(--severity-low);
+}
+
+.severity-none {
+  background: var(--severity-none);
+}
+
+.pill-recs {
+  background: var(--green-dark);
+}
+
+.pill-alerts {
+  background: var(--severity-high);
+}
+
+/* --- Reports ---------------------------------------------------------------- */
+
+.report-row.unread .report-title {
+  font-weight: 800;
+}
+
+.report-row.unread {
+  border-left: 4px solid var(--green);
+}
+
+.generate-report {
+  margin-top: 1.5rem;
+  padding: 1rem;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+}
+
+.generate-report h3 {
+  margin: 0 0 0.25rem;
+  font-size: 1.05rem;
+}
+
+/* --- Wider screens ----------------------------------------------------------- */
+
+@media (min-width: 720px) {
+  .view-container {
+    padding-top: 1.5rem;
+  }
+}

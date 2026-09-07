@@ -79,8 +79,7 @@ pub struct GovernedDispatchAdvisory {
 /// Derive the operator-facing advisory for a proposal's dispatch chain. Pure and
 /// deterministic; presents state only.
 pub fn build_dispatch_advisory(input: &ProposalDispatchInput) -> GovernedDispatchAdvisory {
-    let (stage, requires_distinct_operator, dispatch_authorized, summary) =
-        classify(input);
+    let (stage, requires_distinct_operator, dispatch_authorized, summary) = classify(input);
 
     GovernedDispatchAdvisory {
         advisory_id: format!("dispatch-advisory:{}", input.proposal_id),
@@ -95,9 +94,7 @@ pub fn build_dispatch_advisory(input: &ProposalDispatchInput) -> GovernedDispatc
     }
 }
 
-fn classify(
-    input: &ProposalDispatchInput,
-) -> (DispatchAdvisoryStage, bool, bool, &'static str) {
+fn classify(input: &ProposalDispatchInput) -> (DispatchAdvisoryStage, bool, bool, &'static str) {
     match input.proposal_status.as_str() {
         "rejected" => (
             DispatchAdvisoryStage::Rejected,

@@ -203,4 +203,3 @@ pub async fn link_field_to_farm(
     field.updated_at = updated_at;
     Ok(Json(field))
 }
-

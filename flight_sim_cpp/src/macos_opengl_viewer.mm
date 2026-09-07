@@ -9,6 +9,7 @@
 #include "agbot_flight_sim/MissionPreview.hpp"
 #include "agbot_flight_sim/TelemetryRecorder.hpp"
 #include "agbot_flight_sim/TelemetryReplay.hpp"
+#include "agbot_render/WorldPackage.hpp"
 
 #include <chrono>
 #include <cmath>
@@ -120,6 +121,16 @@ std::filesystem::path mission_path_from_argv(int argc, char** argv) {
         }
     }
     return default_sample_mission_path();
+}
+
+std::filesystem::path terrain_package_path_from_argv(int argc, char** argv) {
+    for (int index = 1; index < argc; ++index) {
+        const std::string current = argv[index];
+        if (current == "--terrain-package" && index + 1 < argc) {
+            return argv[index + 1];
+        }
+    }
+    return {};
 }
 
 NSString* ns_string(const std::filesystem::path& path) {
@@ -564,6 +575,7 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     double terrain3d_drag_start_yaw_;
     double terrain3d_drag_start_pitch_;
     std::filesystem::path mission_path_;
+    std::filesystem::path terrain_package_path_;
     std::filesystem::path replay_path_;
     std::filesystem::path recording_path_;
     std::string status_message_;
@@ -572,13 +584,17 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     std::string globe_map_status_;
 }
 
-- (instancetype)initWithFrame:(NSRect)frame missionPath:(NSString*)missionPath;
+- (instancetype)initWithFrame:(NSRect)frame
+                  missionPath:(NSString*)missionPath
+           terrainPackagePath:(NSString*)terrainPackagePath;
 
 @end
 
 @implementation FlightSimOpenGLView
 
-- (instancetype)initWithFrame:(NSRect)frame missionPath:(NSString*)missionPath {
+- (instancetype)initWithFrame:(NSRect)frame
+                  missionPath:(NSString*)missionPath
+           terrainPackagePath:(NSString*)terrainPackagePath {
     NSOpenGLPixelFormatAttribute attributes[] = {
         NSOpenGLPFAAccelerated,
         NSOpenGLPFADoubleBuffer,
@@ -662,6 +678,8 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
 
         try {
             mission_path_ = std::filesystem::path([missionPath UTF8String]);
+            terrain_package_path_ =
+                std::filesystem::path([terrainPackagePath UTF8String]);
             simulation_ = std::make_unique<DroneSimulation>(MissionLoader::load_from_file(mission_path_));
         } catch (const std::exception& error) {
             std::cerr << "Unable to load mission: " << error.what() << "\n";
@@ -670,6 +688,9 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
         }
         [self fitMissionCamera];
         [self setupOverlayControls];
+        if (!terrain_package_path_.empty()) {
+            [self loadRealWorldTerrainForMission];
+        }
         [self startNewRecording];
         [self updatePanelText];
 
@@ -1018,6 +1039,9 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
 
 - (void)clearTerrain {
     terrain_mesh_ = {};
+    if (simulation_) {
+        simulation_->set_terrain(std::nullopt);
+    }
     terrain_status_ = "Terrain off";
 }
 
@@ -1028,6 +1052,40 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     }
 
     const GeoCoordinate origin = *simulation_->mission().home_geo;
+    if (!terrain_package_path_.empty()) {
+        const auto loaded =
+            agbot::render::load_world_terrain(terrain_package_path_, origin);
+        if (!loaded.ok()) {
+            [self clearTerrain];
+            terrain_status_ = "L3 package invalid";
+            [self setStatusMessage:
+                ("Terrain package rejected: " + *loaded.error)];
+            return;
+        }
+        if (!agbot::flight_sim::terrain_covers_mission(
+                loaded.terrain, simulation_->mission())) {
+            [self clearTerrain];
+            terrain_status_ = "L3 package out of coverage";
+            [self setStatusMessage:
+                "Terrain package does not cover this mission"];
+            return;
+        }
+
+        terrain_mesh_ = loaded.terrain.mesh;
+        simulation_->set_terrain(terrain_mesh_);
+        std::ostringstream status;
+        status << "L3 " << loaded.terrain.elevation_state
+               << " " << loaded.terrain.resolution << "x"
+               << loaded.terrain.resolution
+               << " " << loaded.terrain.vertical_datum
+               << " " << std::fixed << std::setprecision(0)
+               << terrain_mesh_.min_elevation_m << "-"
+               << terrain_mesh_.max_elevation_m << "m";
+        terrain_status_ = status.str();
+        [self setStatusMessage:"L3 terrain package loaded"];
+        return;
+    }
+
     const double radius_m = radius_m_for_area_km2(real_world_area_km2_);
     const GeoBounds bounds = GeoBounds::from_center(origin, radius_m);
     int zoom = zoom_for_radius_m(radius_m);
@@ -1065,6 +1123,7 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
         kTerrainResolution,
         requested_tiles);
     terrain_mesh_ = build_terrain_mesh(composite.heightmap, kTerrainResolution, bounds.width_m(), bounds.height_m(), 1.0);
+    simulation_->set_terrain(terrain_mesh_);
 
     std::ostringstream status;
     status << "Terrain z" << zoom << " " << elevation_tiles.size() << "/" << requested_tiles.size();
@@ -1214,7 +1273,12 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
 
     const DroneState& state = [self displayState];
     const ControlMode display_control_mode = replay_mode_ ? ControlMode::Replay : simulation_->control_mode();
-    const HudTelemetry hud = hud_telemetry_from_state(state, display_control_mode);
+    HudTelemetry hud =
+        hud_telemetry_from_state(state, display_control_mode);
+    if (const auto altitude_agl =
+            simulation_->altitude_agl_m(state.position)) {
+        hud.altitude_m = *altitude_agl;
+    }
     const std::size_t waypoint_count = simulation_->mission().waypoints.size();
     const std::size_t waypoint_index = std::min(state.target_waypoint_index + 1, waypoint_count);
     const MissionPreviewOverlay preview = build_mission_preview_overlay(simulation_->mission());
@@ -1863,9 +1927,12 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
 }
 
 - (Vec3)renderPositionForFlightPosition:(Vec3)position {
+    const double elevation = simulation_
+        ? simulation_->world_elevation_m(position)
+        : position.y;
     return Vec3(
         position.x,
-        position.y + [self terrainHeightAtX:position.x z:position.z],
+        elevation,
         position.z
     );
 }
@@ -2007,10 +2074,14 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
         return;
     }
 
-    const double elevation_span = std::max(
-        1.0,
-        static_cast<double>(terrain_mesh_.max_elevation_m - terrain_mesh_.min_elevation_m)
-    );
+    double min_vertex_y = terrain_mesh_.vertices.front().position.y;
+    double max_vertex_y = min_vertex_y;
+    for (const auto& vertex : terrain_mesh_.vertices) {
+        min_vertex_y = std::min(min_vertex_y, vertex.position.y);
+        max_vertex_y = std::max(max_vertex_y, vertex.position.y);
+    }
+    const double elevation_span =
+        std::max(1.0, max_vertex_y - min_vertex_y);
 
     glLineWidth(1.0f);
     glBegin(GL_TRIANGLES);
@@ -2019,7 +2090,10 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
             continue;
         }
         const auto& vertex = terrain_mesh_.vertices[index];
-        const double normalized_height = std::clamp(vertex.position.y / elevation_span, 0.0, 1.0);
+        const double normalized_height = std::clamp(
+            (vertex.position.y - min_vertex_y) / elevation_span,
+            0.0,
+            1.0);
         const double r = 0.16 + normalized_height * 0.54;
         const double g = 0.30 + normalized_height * 0.38;
         const double b = 0.22 + normalized_height * 0.18;
@@ -2118,7 +2192,13 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     glEnd();
 
     set_color(0.1, 0.9, 1.0, 0.75);
-    draw_circle(position.x, position.z, std::max(5.0, state.position.y * 0.2));
+    const double altitude_agl =
+        simulation_->altitude_agl_m(state.position)
+            .value_or(state.position.y);
+    draw_circle(
+        position.x,
+        position.z,
+        std::max(5.0, altitude_agl * 0.2));
 }
 
 - (Vec3)terrain3DTarget {
@@ -2237,10 +2317,14 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
         return;
     }
 
-    const double elevation_span = std::max(
-        1.0,
-        static_cast<double>(terrain_mesh_.max_elevation_m - terrain_mesh_.min_elevation_m)
-    );
+    double min_vertex_y = terrain_mesh_.vertices.front().position.y;
+    double max_vertex_y = min_vertex_y;
+    for (const auto& vertex : terrain_mesh_.vertices) {
+        min_vertex_y = std::min(min_vertex_y, vertex.position.y);
+        max_vertex_y = std::max(max_vertex_y, vertex.position.y);
+    }
+    const double elevation_span =
+        std::max(1.0, max_vertex_y - min_vertex_y);
 
     glBegin(GL_TRIANGLES);
     for (const std::uint32_t index : terrain_mesh_.indices) {
@@ -2248,7 +2332,10 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
             continue;
         }
         const auto& vertex = terrain_mesh_.vertices[index];
-        const double normalized_height = std::clamp(vertex.position.y / elevation_span, 0.0, 1.0);
+        const double normalized_height = std::clamp(
+            (vertex.position.y - min_vertex_y) / elevation_span,
+            0.0,
+            1.0);
         const double light = std::clamp(
             vertex.normal.x * -0.25 + vertex.normal.y * 0.78 + vertex.normal.z * 0.30,
             0.38,
@@ -2276,7 +2363,11 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
         glLineWidth(2.5f);
         glBegin(GL_LINE_STRIP);
         for (const Vec3& boundary_point : preview.boundary_local) {
-            const Vec3 point = [self renderPositionForFlightPosition:Vec3(boundary_point.x, 0.0, boundary_point.z)];
+            const Vec3 point(
+                boundary_point.x,
+                [self terrainHeightAtX:boundary_point.x
+                                    z:boundary_point.z],
+                boundary_point.z);
             glVertex3d(point.x, point.y + 0.8, point.z);
         }
         glEnd();
@@ -2288,7 +2379,14 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     const Vec3 home = [self renderPositionForFlightPosition:mission.home];
     glVertex3d(home.x, home.y + 0.5, home.z);
     for (const Waypoint& waypoint : mission.waypoints) {
-        const Vec3 point = [self renderPositionForFlightPosition:waypoint.position];
+        Vec3 local_point = waypoint.position;
+        try {
+            local_point =
+                simulation_->resolved_waypoint_position(waypoint);
+        } catch (const std::exception&) {
+        }
+        const Vec3 point =
+            [self renderPositionForFlightPosition:local_point];
         glVertex3d(point.x, point.y, point.z);
     }
     glEnd();
@@ -2299,7 +2397,14 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     glVertex3d(home.x, home.y + 0.5, home.z);
     for (const Waypoint& waypoint : mission.waypoints) {
         color_for_action(waypoint.action);
-        const Vec3 point = [self renderPositionForFlightPosition:waypoint.position];
+        Vec3 local_point = waypoint.position;
+        try {
+            local_point =
+                simulation_->resolved_waypoint_position(waypoint);
+        } catch (const std::exception&) {
+        }
+        const Vec3 point =
+            [self renderPositionForFlightPosition:local_point];
         glVertex3d(point.x, point.y, point.z);
     }
     glEnd();
@@ -2583,7 +2688,12 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
     const double height = bounds.size.height;
     const DroneState& state = [self displayState];
     const ControlMode display_control_mode = replay_mode_ ? ControlMode::Replay : simulation_->control_mode();
-    const HudTelemetry hud = hud_telemetry_from_state(state, display_control_mode);
+    HudTelemetry hud =
+        hud_telemetry_from_state(state, display_control_mode);
+    if (const auto altitude_agl =
+            simulation_->altitude_agl_m(state.position)) {
+        hud.altitude_m = *altitude_agl;
+    }
 
     glMatrixMode(GL_PROJECTION);
     glPushMatrix();
@@ -3069,18 +3179,22 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
 @interface FlightSimAppDelegate : NSObject <NSApplicationDelegate> {
     NSWindow* window_;
     std::filesystem::path mission_path_;
+    std::filesystem::path terrain_package_path_;
 }
 
-- (instancetype)initWithMissionPath:(std::filesystem::path)missionPath;
+- (instancetype)initWithMissionPath:(std::filesystem::path)missionPath
+                 terrainPackagePath:(std::filesystem::path)terrainPackagePath;
 
 @end
 
 @implementation FlightSimAppDelegate
 
-- (instancetype)initWithMissionPath:(std::filesystem::path)missionPath {
+- (instancetype)initWithMissionPath:(std::filesystem::path)missionPath
+                 terrainPackagePath:(std::filesystem::path)terrainPackagePath {
     self = [super init];
     if (self) {
         mission_path_ = std::move(missionPath);
+        terrain_package_path_ = std::move(terrainPackagePath);
     }
     return self;
 }
@@ -3099,7 +3213,8 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
 
     [window_ setTitle:@"AgBot FlightSim"];
     FlightSimOpenGLView* view = [[FlightSimOpenGLView alloc] initWithFrame:frame
-                                                               missionPath:ns_string(mission_path_)];
+                                                               missionPath:ns_string(mission_path_)
+                                                        terrainPackagePath:ns_string(terrain_package_path_)];
     [window_ setContentView:view];
     [window_ makeFirstResponder:view];
     [view release];
@@ -3119,6 +3234,8 @@ void apply_look_at(Vec3 eye, Vec3 center, Vec3 up) {
 int main(int argc, char** argv) {
     @autoreleasepool {
         const std::filesystem::path mission_path = mission_path_from_argv(argc, argv);
+        const std::filesystem::path terrain_package_path =
+            terrain_package_path_from_argv(argc, argv);
 
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
@@ -3136,7 +3253,9 @@ int main(int argc, char** argv) {
         [appMenu addItem:quitItem];
         [appMenuItem setSubmenu:appMenu];
 
-        FlightSimAppDelegate* delegate = [[FlightSimAppDelegate alloc] initWithMissionPath:mission_path];
+        FlightSimAppDelegate* delegate =
+            [[FlightSimAppDelegate alloc] initWithMissionPath:mission_path
+                                          terrainPackagePath:terrain_package_path];
         [NSApp setDelegate:delegate];
         [NSApp run];
         [delegate release];

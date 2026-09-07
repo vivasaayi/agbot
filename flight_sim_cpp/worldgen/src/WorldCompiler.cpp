@@ -506,23 +506,34 @@ WorldCompileResult compile_world(const WorldCompileSpec& spec) {
     const fs::GeoBounds aoi = terrain.fused.elevation.bounds;
     result.origin = aoi.center();
 
-    // 2. Buildings (required) ------------------------------------------------
-    if (spec.buildings_path.empty() || !std::filesystem::exists(spec.buildings_path)) {
-        result.error_code = "buildings_file_missing";
-        result.error_detail = spec.buildings_path;
-        return result;
+    // 2. Buildings (optional) ------------------------------------------------
+    ExtractionResult buildings;
+    bool have_buildings = false;
+    if (spec.buildings_path.empty()) {
+        if (!spec.allow_terrain_only) {
+            result.error_code = "buildings_file_missing";
+            result.error_detail = spec.buildings_path;
+            return result;
+        }
+    } else {
+        if (!std::filesystem::exists(spec.buildings_path)) {
+            result.error_code = "buildings_file_missing";
+            result.error_detail = spec.buildings_path;
+            return result;
+        }
+        cfg::ParamTable building_params = spec.building_params;
+        building_params["path"] = cfg::ParamValue(spec.buildings_path);
+        building_params["source_crs"] = cfg::ParamValue(spec.buildings_source_crs);
+        const VectorImportExtractor building_extractor;
+        buildings = building_extractor.extract({aoi, building_params});
+        if (!buildings.ok) {
+            result.error_code = "building_extraction_failed:" + buildings.error_code;
+            result.error_detail = buildings.error_detail;
+            return result;
+        }
+        result.buildings = buildings.features;
+        have_buildings = true;
     }
-    cfg::ParamTable building_params = spec.building_params;
-    building_params["path"] = cfg::ParamValue(spec.buildings_path);
-    building_params["source_crs"] = cfg::ParamValue(spec.buildings_source_crs);
-    const VectorImportExtractor building_extractor;
-    const ExtractionResult buildings = building_extractor.extract({aoi, building_params});
-    if (!buildings.ok) {
-        result.error_code = "building_extraction_failed:" + buildings.error_code;
-        result.error_detail = buildings.error_detail;
-        return result;
-    }
-    result.buildings = buildings.features;
 
     // Datum discipline: when the buildings contribute base elevations, their
     // vertical datum must be compatible with the terrain's. Reject silent
@@ -709,19 +720,23 @@ WorldCompileResult compile_world(const WorldCompileSpec& spec) {
     terrain_source.crs = "EPSG:4326";
     terrain_source.vertical_datum =
         terrain_datum == VerticalDatum::Unknown ? "" : to_string(terrain_datum);
-    terrain_source.content_hash = fold_str(kFnvOffset, spec.terrain_config_toml);
+    terrain_source.content_hash = spec.terrain_content_hash != 0
+        ? spec.terrain_content_hash
+        : fold_str(kFnvOffset, spec.terrain_config_toml);
     manifest.sources.push_back(terrain_source);
 
-    SourceSnapshot building_source;
-    building_source.source_id = spec.buildings_source_id;
-    building_source.uri = spec.buildings_uri;
-    building_source.version = spec.buildings_version;
-    building_source.license = spec.buildings_license;
-    building_source.crs = epsg_for(horizontal_crs_from_epsg(spec.buildings_source_crs));
-    building_source.vertical_datum =
-        building_datum == VerticalDatum::Unknown ? "" : to_string(building_datum);
-    building_source.content_hash = hash_file_bytes(spec.buildings_path);
-    manifest.sources.push_back(building_source);
+    if (have_buildings) {
+        SourceSnapshot building_source;
+        building_source.source_id = spec.buildings_source_id;
+        building_source.uri = spec.buildings_uri;
+        building_source.version = spec.buildings_version;
+        building_source.license = spec.buildings_license;
+        building_source.crs = epsg_for(horizontal_crs_from_epsg(spec.buildings_source_crs));
+        building_source.vertical_datum =
+            building_datum == VerticalDatum::Unknown ? "" : to_string(building_datum);
+        building_source.content_hash = hash_file_bytes(spec.buildings_path);
+        manifest.sources.push_back(building_source);
+    }
 
     if (have_roads) {
         SourceSnapshot road_source;
@@ -773,8 +788,10 @@ WorldCompileResult compile_world(const WorldCompileSpec& spec) {
                  city_mesh_vertex_hash(result.city));
     tile.provenance.push_back({WorldLayerKind::Terrain, spec.terrain_source_id,
                                terrain.fused.source_algorithm, terrain.param_hash});
-    tile.provenance.push_back({WorldLayerKind::Buildings, spec.buildings_source_id,
-                               buildings.algorithm_id, buildings.params_hash});
+    if (have_buildings) {
+        tile.provenance.push_back({WorldLayerKind::Buildings, spec.buildings_source_id,
+                                   buildings.algorithm_id, buildings.params_hash});
+    }
     if (have_dsm) {
         tile.provenance.push_back(
             {WorldLayerKind::Dsm, spec.dsm_source_id, "dsm_residual", 0});

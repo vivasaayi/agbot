@@ -356,6 +356,3 @@ pub async fn list_drought_indices(
         .collect::<AppResult<Vec<_>>>()
         .map(Json)
 }
-
-
-

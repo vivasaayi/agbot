@@ -29,6 +29,7 @@ public:
 
     void set_velocity_setpoint(const Vec3& velocity_mps) { velocity_setpoint_ = velocity_mps; }
     void clear_velocity_setpoint() { velocity_setpoint_.reset(); }
+    void set_response_factor(double factor);
     [[nodiscard]] double hold_altitude_m() const { return hold_altitude_m_; }
 
 private:
@@ -37,6 +38,7 @@ private:
     VehicleLimits limits_ = {12.0, 6.0, 6.0, 1.4, 1.4, 0.0};
     double hold_altitude_m_ = 5.0;
     double altitude_gain_per_s_ = 1.0;
+    double response_factor_ = 1.0;
     std::optional<Vec3> velocity_setpoint_;
 };
 

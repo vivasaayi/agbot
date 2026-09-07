@@ -517,6 +517,15 @@ void test_datum_discipline() {
     namespace wg = agbot::worldgen;
     using wg::VerticalDatum;
 
+    expect(wg::vertical_datum_from_name("EGM96") == VerticalDatum::Egm96,
+           "EGM96 satellite datum is recognized");
+    expect(wg::vertical_datum_from_name("EGM2008") == VerticalDatum::Egm2008,
+           "EGM2008 satellite datum is recognized");
+    expect(wg::vertical_datum_from_name("WGS84 ellipsoid") ==
+               VerticalDatum::Wgs84Ellipsoidal,
+           "WGS84 ellipsoid satellite datum is recognized");
+    expect(!wg::vertical_datums_compatible(VerticalDatum::Egm96, VerticalDatum::Egm2008),
+           "different geoid realizations require an explicit transform");
     expect(wg::vertical_datums_compatible(VerticalDatum::Navd88, VerticalDatum::Navd88Geoid18),
            "NAVD88 family is self-compatible");
     expect(!wg::vertical_datums_compatible(VerticalDatum::Navd88, VerticalDatum::Ellipsoidal),
@@ -663,6 +672,63 @@ void test_elevation_state_authoritative() {
     expect(world.manifest.to_json().find("\"elevation_state\": \"authoritative\"") !=
                std::string::npos,
            "manifest serializes the authoritative elevation state");
+}
+
+void test_terrain_only_world_compile() {
+    namespace wg = agbot::worldgen;
+    const std::string dem_fixture =
+        std::string(WORLDGEN_SOURCE_DIR) + "/../terrain_engine/tests/fixtures/dem_128.tif";
+    if (!std::filesystem::exists(dem_fixture)) {
+        std::cout << "SKIP terrain-only world compile (DEM fixture absent)\n";
+        return;
+    }
+    const std::string terrain_toml =
+        "[pipeline]\n"
+        "target_gsd_m = 30.0\n"
+        "resolution = 16\n"
+        "aoi = { min_lat = 40.706, min_lon = -74.014, max_lat = 40.714, max_lon = -74.006 }\n"
+        "[[layer]]\n"
+        "algorithm = \"dem_fusion\"\n"
+        "weight = 1.0\n"
+        "  [layer.params]\n"
+        "  source = \"geotiff\"\n"
+        "  path = \"" + dem_fixture + "\"\n"
+        "  resample = \"bilinear\"\n"
+        "[fusion]\n"
+        "method = \"dem_locked\"\n"
+        "[validation]\n"
+        "enabled = true\n"
+        "reference_layer = 0\n";
+
+    wg::WorldCompileSpec spec;
+    spec.terrain_config_toml = terrain_toml;
+    spec.terrain_authoritative = true;
+    spec.terrain_vertical_datum = "EGM2008";
+    spec.terrain_content_hash = wg::hash_file_bytes(dem_fixture);
+    spec.allow_terrain_only = true;
+
+    const auto world = wg::compile_world(spec);
+    expect(world.ok, "terrain-only world compiles without a buildings fixture");
+    if (!world.ok) {
+        std::cout << "  error: " << world.error_code << " — " << world.error_detail << "\n";
+        return;
+    }
+    expect(world.buildings.empty() && world.manifest.quality.building_count == 0,
+           "terrain-only world has no fabricated buildings");
+    expect(world.manifest.sources.size() == 1,
+           "terrain-only manifest records only its DEM source");
+    expect(world.manifest.sources.front().content_hash == spec.terrain_content_hash,
+           "terrain source content hash is the DEM byte hash");
+    expect(world.manifest.crs_policy.vertical_datum == "EGM2008",
+           "terrain-only manifest retains EGM2008");
+    expect(world.manifest.tiles.front().provenance.size() == 1,
+           "terrain-only tile has only terrain provenance");
+
+    spec.allow_terrain_only = false;
+    const auto missing_buildings = wg::compile_world(spec);
+    expect(!missing_buildings.ok &&
+               missing_buildings.error_code == "buildings_file_missing",
+           "terrain-only compilation requires explicit opt-in");
 }
 
 void test_gate3_building_quality() {
@@ -892,6 +958,7 @@ int main() {
     test_datum_discipline();
     test_2263_ingest();
     test_elevation_state_authoritative();
+    test_terrain_only_world_compile();
     test_gate3_building_quality();
     test_dsm_residual_measured_heights();
     test_dsm_residual_compiler_wiring();

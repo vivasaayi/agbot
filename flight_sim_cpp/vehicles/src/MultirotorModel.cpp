@@ -55,6 +55,10 @@ EntityState MultirotorModel::step(const EntityState& state, const Actuation& inp
     return next;
 }
 
+void MultirotorModel::set_response_factor(double factor) {
+    response_factor_ = clamp(factor, 0.0, 1.0);
+}
+
 void MultirotorModel::substep(EntityState& state, const Actuation& input, double dt_s) {
     // Yaw-rate command.
     const double yaw_rate = clamp(input.steer_rad, -limits_.max_steer_rate_radps,
@@ -70,6 +74,7 @@ void MultirotorModel::substep(EntityState& state, const Actuation& input, double
             desired.x *= scale;
             desired.z *= scale;
         }
+        desired.y = clamp(desired.y, -limits_.max_speed_mps, limits_.max_speed_mps);
     } else {
         const double forward_speed =
             clamp(input.throttle, -1.0, 1.0) * limits_.max_speed_mps;
@@ -78,12 +83,16 @@ void MultirotorModel::substep(EntityState& state, const Actuation& input, double
             0.0,
             forward_speed * std::sin(state.yaw_rad),
         };
+        // Altitude hold applies to throttle/yaw control. A direct world-frame
+        // velocity setpoint owns all three axes, including climb and descent.
+        desired.y = clamp((hold_altitude_m_ - state.position.y) * altitude_gain_per_s_,
+                          -limits_.max_speed_mps, limits_.max_speed_mps);
     }
-    // Altitude hold: proportional climb toward the hold altitude.
-    desired.y = clamp((hold_altitude_m_ - state.position.y) * altitude_gain_per_s_,
-                      -limits_.max_speed_mps, limits_.max_speed_mps);
 
-    state.velocity = move_towards(state.velocity, desired, limits_.max_accel_mps2 * dt_s);
+    state.velocity = move_towards(
+        state.velocity,
+        desired,
+        limits_.max_accel_mps2 * response_factor_ * dt_s);
     state.position += state.velocity * dt_s;
     state.time_s += dt_s;
 }

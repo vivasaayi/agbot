@@ -9,6 +9,7 @@ import { renderFindingsPanel } from "./panels/findings.js";
 import { renderAlertsPanel } from "./panels/alerts.js";
 import { renderProposalsPanel } from "./panels/proposals.js";
 import { renderProvenancePanel } from "./panels/provenance.js";
+import { renderPipelinePanel } from "./panels/pipeline.js";
 import { setupCompare } from "./panels/compare.js";
 import { initMap } from "./map.js";
 
@@ -36,6 +37,11 @@ function bootstrap() {
   // The provenance inspector is a standing tool (trace any artifact id).
   renderProvenancePanel(document.getElementById("provenance-panel"));
 
+  // The ingestion & sources oversight dashboard is also a standing tool; it
+  // refreshes globally and drills into the selected scene's field on demand.
+  const pipeline = document.getElementById("pipeline-panel");
+  renderPipelinePanel(pipeline);
+
   initCatalogPanel(tree, (sceneId, fieldId) => {
     renderSceneDetail(detail, sceneId);
     renderLayersPanel(layers, sceneId);
@@ -44,6 +50,9 @@ function bootstrap() {
     renderFindingsPanel(findings, sceneId);
     renderAlertsPanel(alerts, sceneId);
     renderProposalsPanel(proposals, fieldId);
+    if (pipeline.__setField) {
+      pipeline.__setField(fieldId);
+    }
   });
 }
 

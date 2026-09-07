@@ -1,0 +1,28 @@
+# AGBot flight simulator — default settings (user-editable).
+#
+# These values seed a zero-argument `agbot_flight_sim_headless` run. Every key
+# can still be overridden per-invocation with the matching CLI flag. Delete a
+# key to fall back to the compiled default. A malformed file is reported and
+# ignored (the sim still runs with compiled defaults).
+#
+# Asset/output locations are resolved relative to the binary; override with
+# environment variables if you relocate them:
+#   AGBOT_FLIGHT_SIM_HOME  root holding samples/ + calibration/ + config/
+#   AGBOT_FLIGHT_SIM_OUT   writable directory for telemetry/caches (out/)
+
+[run]
+# Deterministic RNG seed. Same seed + same mission => identical telemetry.
+seed = 1
+
+# Fixed integration timestep in milliseconds (default ~60 Hz).
+timestep_ms = 16.667
+
+# Telemetry sampling interval in seconds.
+record_interval_s = 0.25
+
+# Maximum simulated mission seconds before giving up.
+max_time_s = 600.0
+
+# Physics plant. "simple" preserves legacy golden traces; "multirotor" uses
+# the shared vehicle model and its native acceleration limits.
+plant_model = "simple"

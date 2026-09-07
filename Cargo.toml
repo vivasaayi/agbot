@@ -39,7 +39,7 @@ thiserror = "1.0"
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -107,7 +107,11 @@ csv = "1.3"
 polars = { version = "0.35", features = ["lazy"] }
 
 # 3D Visualization & Game Engine
-bevy = { version = "0.14", features = ["dynamic_linking"] }
+# NOTE: `dynamic_linking` is intentionally NOT enabled here. It speeds up
+# incremental dev linking but produces a non-portable binary that needs
+# libbevy_dylib alongside it. geo_viewer exposes it as an opt-in
+# `dev-fast-link` feature; release builds stay self-contained.
+bevy = { version = "0.14" }
 bevy_egui = "0.28"
 
 [profile.release]

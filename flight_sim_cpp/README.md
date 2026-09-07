@@ -27,6 +27,83 @@ ctest --test-dir flight_sim_cpp/build --output-on-failure
 flight_sim_cpp/build/agbot_flight_sim_headless --seed 42
 ```
 
+## Compile and view catalog terrain
+
+`geo_hub` invokes the terrain-only compiler when
+`POST /api/terrain/derive` is called. It can also be run directly:
+
+```bash
+flight_sim_cpp/build/worldgen/agbot_terrain_compile \
+  --dem /absolute/path/to/elevation-f32-4326.tif \
+  --output-dir flight_sim_cpp/out/terrain/example \
+  --name terrain \
+  --min-lat 40.70 --min-lon -74.02 \
+  --max-lat 40.72 --max-lon -74.00 \
+  --resolution 256 --target-gsd-m 30 \
+  --vertical-datum EGM2008
+```
+
+The compiler emits `terrain.agbworld`, `terrain.agbscn`, and
+`terrain.validation.json`. On macOS the world viewer consumes the L3 manifest
+directly and resolves its scene payload:
+
+```bash
+flight_sim_cpp/build/render/agbot_world_viewer \
+  flight_sim_cpp/out/terrain/example/terrain.agbworld
+```
+
+Terrain-only worlds retain the DEM byte hash, CRS, vertical datum, validation
+metrics, and explicit `authoritative`, `fallback`, `masked_water`, or `missing`
+elevation state. They do not fabricate a building source.
+
+Use the same L3 package in a georeferenced deterministic flight:
+
+```bash
+flight_sim_cpp/build/agbot_flight_sim_headless \
+  --seed 42 \
+  --mission /path/to/mission.json \
+  --terrain-package flight_sim_cpp/out/terrain/example/terrain.agbworld \
+  --output flight_sim_cpp/out/l3-flight.jsonl
+```
+
+The package AOI must cover the mission home and every waypoint. Aircraft state
+and telemetry use the mission's local ENU frame; state `position.y` is relative
+to the terrain elevation at home. The simulator samples terrain during
+guidance, safety evaluation, collision detection, and landing. LiDAR positions
+are converted into the package's vertical datum. Package hash, DEM source,
+vertical datum, coverage, resolution, nodata count, and elevation range are
+recorded in `terrain_tiles` and therefore influence the deterministic `run_id`.
+
+Mission JSON can declare one vertical command convention:
+
+```json
+{
+  "altitude_reference": "agl"
+}
+```
+
+Supported values are `agl` (the default), `relative_home`, and `msl`. AGL
+waypoints are resolved above the sampled ground at each waypoint;
+`relative_home` preserves a constant vertical offset from home; and MSL values
+are interpreted directly in the L3 vertical datum. Landing commands always
+settle onto the sampled terrain surface; landing zones steeper than 15 degrees
+fail with `unsafe_landing_slope`. The safety altitude ceiling is evaluated in
+AGL, while an unexpected terrain intersection terminates the run with
+`terrain_collision`.
+
+The interactive macOS simulator accepts the same handoff and renders the
+vehicle above the package terrain:
+
+```bash
+flight_sim_cpp/build/agbot_flight_sim_viewer \
+  --mission /path/to/mission.json \
+  --terrain-package flight_sim_cpp/out/terrain/example/terrain.agbworld
+```
+
+An explicitly supplied package fails closed when it is invalid or outside the
+mission footprint; the simulator does not silently replace it with network or
+flat terrain.
+
 The headless runner requires an explicit seed and writes telemetry plus a
 manifest to:
 
@@ -36,7 +113,7 @@ flight_sim_cpp/out/telemetry.manifest.json
 ```
 
 Every run logs `sim`, `contract`, `seed`, `timestep_ms`, and a deterministic
-`run_id`. The same mission, seed, timestep, record interval, max time,
+`run_id`. The same mission, seed, plant, timestep, record interval, max time,
 simulator version, and contract schema produce the same `run_id`.
 
 Use a custom mission:
@@ -46,6 +123,35 @@ flight_sim_cpp/build/agbot_flight_sim_headless \
   --seed 42 \
   --mission flight_sim_cpp/samples/sample_field_loop.json \
   --output flight_sim_cpp/out/sample.jsonl
+```
+
+Select the shared multirotor vehicle model as the physical plant:
+
+```bash
+flight_sim_cpp/build/agbot_flight_sim_headless \
+  --seed 42 \
+  --plant multirotor \
+  --mission flight_sim_cpp/samples/sample_field_loop.json \
+  --output flight_sim_cpp/out/multirotor.jsonl
+```
+
+The default `simple` plant preserves existing golden traces. The `multirotor`
+plant uses the vehicle module's acceleration-limited, three-axis velocity
+response and records `plant_model` in the manifest and deterministic run ID.
+
+Every headless launch now writes a deterministic `<output>.validation.json`
+preflight report before physics starts. Use `--max-altitude M`,
+`--min-battery PCT`, and `--geofence min_x,max_x,min_z,max_z` to apply one
+safety envelope to both preflight and runtime enforcement. A blocked mission
+exits `4` without producing telemetry; successful manifests embed the report
+and its SHA-256 hash.
+
+```bash
+flight_sim_cpp/build/agbot_flight_sim_headless \
+  --seed 42 \
+  --max-altitude 40 \
+  --geofence -250,250,-250,250 \
+  --output flight_sim_cpp/out/preflighted.jsonl
 ```
 
 Use explicit trace retention on a dedicated run directory:
@@ -110,10 +216,10 @@ flight_sim_cpp/build/agbot_flight_sim_headless \
   --output flight_sim_cpp/out/lidar.jsonl
 ```
 
-Use `--disable-lidar` when only the telemetry trace is needed. The first slice
-raycasts against the simulator terrain heightfield or a flat fallback terrain
-mesh derived from the mission footprint, so output remains reproducible without
-hardware or network access.
+Use `--disable-lidar` when only the telemetry trace is needed. Raycasts use an
+explicit L3 terrain package when supplied, or a flat fallback mesh derived from
+the mission footprint, so output remains reproducible without hardware or
+network access.
 
 Inject a seeded fault:
 
@@ -170,7 +276,15 @@ flight_sim_cpp/build/agbot-sim diff flight_sim_cpp/out/telemetry.jsonl flight_si
 ```
 
 Identical traces exit 0 with `traces identical`. A divergence exits 1 and
-names the first differing step and telemetry field.
+names the first differing step and telemetry field. Use `--abs-tol` and
+`--rel-tol` for bounded numeric comparisons, `--max-diffs` to retain multiple
+differences, and `--json` for structured output. Incompatible major contract
+versions exit 3 instead of producing a misleading field comparison.
+
+```bash
+flight_sim_cpp/build/agbot-sim diff baseline.jsonl candidate.jsonl \
+  --abs-tol 0.001 --rel-tol 0.0001 --max-diffs 20 --json
+```
 
 ## Golden Regression
 

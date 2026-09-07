@@ -10,6 +10,22 @@ use crate::state::AppState;
 use axum::extract::{Path, Query, State};
 use axum::Json;
 
+/// Load a farm by id and enforce that an authenticated caller owns it. A
+/// missing farm — or one owned by a different org — reads as 404 so existence
+/// is not leaked across tenants. Anonymous callers (unlocked mode) are
+/// unrestricted.
+async fn load_owned_farm(
+    state: &AppState,
+    identity: &OptionalPortalIdentity,
+    farm_id: &str,
+) -> AppResult<FarmRecord> {
+    let farm = load_farm(state, farm_id).await?.ok_or(AppError::NotFound)?;
+    if !identity.owns(&farm.owner) {
+        return Err(AppError::NotFound);
+    }
+    Ok(farm)
+}
+
 pub async fn import_fields_geojson(
     State(state): State<AppState>,
     Json(payload): Json<GeoJson>,
@@ -75,10 +91,11 @@ async fn upsert_fields(state: &AppState, fields: &[FieldRecord]) -> AppResult<Ve
 }
 
 pub async fn list_farms(
+    identity: OptionalPortalIdentity,
     Query(query): Query<FarmFieldApiListQuery>,
     State(state): State<AppState>,
 ) -> AppResult<Json<FarmFieldListPage<FarmRecord>>> {
-    let org_filter = query.org_filter();
+    let org_filter = identity.org_filter(query.org_filter());
     let list_query = query.list_query();
     let (status, page, page_size, limit, offset) = farm_field_page_window(&list_query);
 
@@ -123,10 +140,17 @@ pub async fn list_farms(
 }
 
 pub async fn create_farm(
+    identity: OptionalPortalIdentity,
     State(state): State<AppState>,
     Json(request): Json<CreateFarmRequest>,
 ) -> AppResult<Json<FarmRecord>> {
-    let farm = build_farm_record(request)?;
+    let mut farm = build_farm_record(request)?;
+    // An authenticated caller can only create farms in its own org; the
+    // request-supplied owner/org_id is ignored.
+    if let Some(org_id) = identity.org_id() {
+        farm.owner = org_id.to_string();
+        farm.org_id = org_id.to_string();
+    }
 
     sqlx::query(
         r#"
@@ -149,23 +173,21 @@ pub async fn create_farm(
 }
 
 pub async fn get_farm(
+    identity: OptionalPortalIdentity,
     Path(farm_id): Path<String>,
     State(state): State<AppState>,
 ) -> AppResult<Json<FarmRecord>> {
-    let farm = load_farm(&state, &farm_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let farm = load_owned_farm(&state, &identity, &farm_id).await?;
     Ok(Json(farm))
 }
 
 pub async fn update_farm(
+    identity: OptionalPortalIdentity,
     Path(farm_id): Path<String>,
     State(state): State<AppState>,
     Json(request): Json<UpdateFarmRequest>,
 ) -> AppResult<Json<FarmRecord>> {
-    let mut farm = load_farm(&state, &farm_id)
-        .await?
-        .ok_or(AppError::NotFound)?;
+    let mut farm = load_owned_farm(&state, &identity, &farm_id).await?;
     farm.name = normalize_farm_name(request.name)?;
     farm.notes = normalize_optional_text(request.notes);
     farm.updated_at = current_record_timestamp();
@@ -189,12 +211,12 @@ pub async fn update_farm(
 }
 
 pub async fn delete_farm(
+    identity: OptionalPortalIdentity,
     Path(farm_id): Path<String>,
     State(state): State<AppState>,
 ) -> AppResult<StatusCode> {
-    if load_farm(&state, &farm_id).await?.is_none() {
-        return Err(AppError::NotFound);
-    }
+    // Ownership-checked load; a cross-org farm reads as 404.
+    load_owned_farm(&state, &identity, &farm_id).await?;
 
     let updated_at = current_record_timestamp();
     sqlx::query("UPDATE fields SET farm_id = NULL, updated_at = ?2 WHERE farm_id = ?1")
@@ -213,15 +235,14 @@ pub async fn delete_farm(
 }
 
 pub async fn list_farm_fields(
+    identity: OptionalPortalIdentity,
     Path(farm_id): Path<String>,
     Query(query): Query<FarmFieldApiListQuery>,
     State(state): State<AppState>,
 ) -> AppResult<Json<FarmFieldListPage<FieldRecord>>> {
-    if load_farm(&state, &farm_id).await?.is_none() {
-        return Err(AppError::NotFound);
-    }
+    load_owned_farm(&state, &identity, &farm_id).await?;
 
-    let org_filter = query.org_filter();
+    let org_filter = identity.org_filter(query.org_filter());
     let list_query = query.list_query();
     let (status, page, page_size, limit, offset) = farm_field_page_window(&list_query);
     let total_count: i64 = sqlx::query_scalar(
@@ -267,12 +288,11 @@ pub async fn list_farm_fields(
 }
 
 pub async fn list_farm_field_history(
+    identity: OptionalPortalIdentity,
     Path(farm_id): Path<String>,
     State(state): State<AppState>,
 ) -> AppResult<Json<Vec<FieldSeasonGroup>>> {
-    if load_farm(&state, &farm_id).await?.is_none() {
-        return Err(AppError::NotFound);
-    }
+    load_owned_farm(&state, &identity, &farm_id).await?;
 
     let rows = sqlx::query(
         r#"
@@ -296,10 +316,11 @@ pub async fn list_farm_field_history(
 }
 
 pub async fn list_fields(
+    identity: OptionalPortalIdentity,
     Query(query): Query<FarmFieldApiListQuery>,
     State(state): State<AppState>,
 ) -> AppResult<Json<FarmFieldListPage<FieldRecord>>> {
-    let org_filter = query.org_filter();
+    let org_filter = identity.org_filter(query.org_filter());
     let list_query = query.list_query();
     let (status, page, page_size, limit, offset) = farm_field_page_window(&list_query);
     let total_count: i64 = sqlx::query_scalar(
@@ -343,10 +364,11 @@ pub async fn list_fields(
 }
 
 pub async fn list_field_boundaries(
+    identity: OptionalPortalIdentity,
     Query(query): Query<FarmFieldApiListQuery>,
     State(state): State<AppState>,
 ) -> AppResult<Json<FarmFieldListPage<FieldBoundaryRecord>>> {
-    let org_filter = query.org_filter();
+    let org_filter = identity.org_filter(query.org_filter());
     let list_query = query.list_query();
     let (status, page, page_size, limit, offset) = farm_field_page_window(&list_query);
     let total_count: i64 = sqlx::query_scalar(
@@ -389,16 +411,23 @@ pub async fn list_field_boundaries(
     )))
 }
 
-pub async fn export_fields_geojson(State(state): State<AppState>) -> AppResult<Json<GeoJson>> {
+pub async fn export_fields_geojson(
+    identity: OptionalPortalIdentity,
+    State(state): State<AppState>,
+) -> AppResult<Json<GeoJson>> {
+    // Authenticated callers export only their own org's fields; anonymous
+    // (unlocked mode) exports all active fields as before.
+    let org_filter = identity.org_id().map(str::to_string);
     let rows = sqlx::query(
         r#"
         SELECT field_id, farm_id, owner, name, crop, season, notes, boundary_json, status,
                created_at, COALESCE(NULLIF(updated_at, ''), created_at) AS updated_at
         FROM fields
-        WHERE status = 'active'
+        WHERE status = 'active' AND (?1 IS NULL OR owner = ?1)
         ORDER BY name ASC, field_id ASC
         "#,
     )
+    .bind(&org_filter)
     .fetch_all(&state.pool)
     .await
     .map_err(Error::from)?;
@@ -410,4 +439,3 @@ pub async fn export_fields_geojson(State(state): State<AppState>) -> AppResult<J
 
     Ok(Json(geojson_from_fields(fields)))
 }
-

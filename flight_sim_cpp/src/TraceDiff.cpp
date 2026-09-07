@@ -1,6 +1,8 @@
 #include "agbot_flight_sim/TraceDiff.hpp"
+#include "agbot_flight_sim/TwinContractV1.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -135,49 +137,190 @@ const std::vector<std::string>& telemetry_fields() {
     return fields;
 }
 
-TraceDiffResult make_difference(
-    std::size_t step_index,
-    std::string field_path,
-    std::string left_value,
-    std::string right_value) {
+std::string escape_json(std::string_view value) {
+    std::ostringstream output;
+    for (const char c : value) {
+        switch (c) {
+            case '"': output << "\\\""; break;
+            case '\\': output << "\\\\"; break;
+            case '\n': output << "\\n"; break;
+            case '\r': output << "\\r"; break;
+            case '\t': output << "\\t"; break;
+            default: output << c; break;
+        }
+    }
+    return output.str();
+}
+
+std::optional<double> parse_number(std::string_view value) {
+    try {
+        const std::string owned(value);
+        std::size_t parsed = 0;
+        const double number = std::stod(owned, &parsed);
+        if (parsed != owned.size() || !std::isfinite(number)) {
+            return std::nullopt;
+        }
+        return number;
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+
+bool values_equal(
+    std::string_view left,
+    std::string_view right,
+    const TraceDiffOptions& options) {
+    if (left == right) {
+        return true;
+    }
+    const auto left_number = parse_number(left);
+    const auto right_number = parse_number(right);
+    if (!left_number || !right_number) {
+        return false;
+    }
+    const double difference = std::abs(*left_number - *right_number);
+    const double scale = std::max(std::abs(*left_number), std::abs(*right_number));
+    return difference <= options.absolute_tolerance + options.relative_tolerance * scale;
+}
+
+void append_difference(
+    TraceDiffResult& result,
+    TraceDifference difference,
+    std::size_t max_differences) {
+    ++result.difference_count;
+    if (result.differences.size() < max_differences) {
+        result.differences.push_back(std::move(difference));
+    } else {
+        result.truncated = true;
+    }
+}
+
+void finalize_result(TraceDiffResult& result) {
+    if (result.difference_count == 0) {
+        return;
+    }
+    result.identical = false;
+    if (result.code == "identical") {
+        result.code = "different";
+    }
+    const TraceDifference& first = result.differences.front();
+    result.step_index = first.step_index;
+    result.field_path = first.field_path;
+    result.left_value = first.left_value;
+    result.right_value = first.right_value;
+
     std::ostringstream message;
-    message << "trace divergence at step " << step_index << " field " << field_path
-            << ": left=" << left_value << " right=" << right_value;
-    return {false, step_index, std::move(field_path), std::move(left_value), std::move(right_value), message.str()};
+    if (!result.compatible) {
+        message << "incompatible contract versions: left=" << first.left_value
+                << " right=" << first.right_value;
+    } else if (result.difference_count == 1) {
+        message << "trace divergence at step " << first.step_index << " field " << first.field_path
+                << ": left=" << first.left_value << " right=" << first.right_value;
+    } else {
+        message << result.difference_count << " trace differences; first at step "
+                << first.step_index << " field " << first.field_path;
+    }
+    result.message = message.str();
 }
 
 } // namespace
 
-TraceDiffResult diff_trace_text(std::string_view left, std::string_view right) {
+std::string TraceDiffResult::to_json() const {
+    std::ostringstream output;
+    const char* status = !compatible ? "incompatible_contract" : (identical ? "identical" : "different");
+    output << "{\"status\":\"" << status << "\""
+           << ",\"code\":\"" << escape_json(code) << "\""
+           << ",\"compatible\":" << (compatible ? "true" : "false")
+           << ",\"difference_count\":" << difference_count
+           << ",\"truncated\":" << (truncated ? "true" : "false")
+           << ",\"differences\":[";
+    for (std::size_t index = 0; index < differences.size(); ++index) {
+        if (index > 0) {
+            output << ',';
+        }
+        const auto& difference = differences[index];
+        output << "{\"step_index\":" << difference.step_index
+               << ",\"field_path\":\"" << escape_json(difference.field_path) << "\""
+               << ",\"left_value\":\"" << escape_json(difference.left_value) << "\""
+               << ",\"right_value\":\"" << escape_json(difference.right_value) << "\"}";
+    }
+    output << "]}";
+    return output.str();
+}
+
+TraceDiffResult diff_trace_text(
+    std::string_view left,
+    std::string_view right,
+    const TraceDiffOptions& options) {
     const std::vector<std::string> left_lines = split_lines(left);
     const std::vector<std::string> right_lines = split_lines(right);
     const std::size_t common_count = std::min(left_lines.size(), right_lines.size());
+    const std::size_t max_differences = std::max<std::size_t>(1, options.max_differences);
+    TraceDiffResult result;
 
     for (std::size_t index = 0; index < common_count; ++index) {
         if (left_lines[index] == right_lines[index]) {
             continue;
         }
 
+        const auto left_contract = scalar_for_key(left_lines[index], "contract_version");
+        const auto right_contract = scalar_for_key(right_lines[index], "contract_version");
+        const bool contract_missing = left_contract.has_value() != right_contract.has_value();
+        const bool contract_incompatible = left_contract && right_contract
+            && *left_contract != *right_contract
+            && !is_compatible_contract_version(*left_contract, *right_contract);
+        if (contract_missing || contract_incompatible) {
+            result.compatible = false;
+            result.code = "incompatible_contract_version";
+            append_difference(
+                result,
+                {
+                    index,
+                    "contract_version",
+                    left_contract.value_or("<missing>"),
+                    right_contract.value_or("<missing>"),
+                },
+                max_differences);
+            finalize_result(result);
+            return result;
+        }
+
+        bool found_recognized_change =
+            left_contract && right_contract && *left_contract != *right_contract;
         for (const std::string& field : telemetry_fields()) {
             const auto left_value = value_for_field(left_lines[index], field);
             const auto right_value = value_for_field(right_lines[index], field);
             if (left_value && right_value && *left_value != *right_value) {
-                return make_difference(index, field, *left_value, *right_value);
+                found_recognized_change = true;
+                if (!values_equal(*left_value, *right_value, options)) {
+                    append_difference(result, {index, field, *left_value, *right_value}, max_differences);
+                }
+            } else if (left_value.has_value() != right_value.has_value()) {
+                append_difference(
+                    result,
+                    {index, field, left_value.value_or("<missing>"), right_value.value_or("<missing>")},
+                    max_differences);
+                found_recognized_change = true;
             }
         }
 
-        return make_difference(index, "<raw_line>", left_lines[index], right_lines[index]);
+        if (!found_recognized_change) {
+            append_difference(
+                result,
+                {index, "<raw_line>", left_lines[index], right_lines[index]},
+                max_differences);
+        }
     }
 
     if (left_lines.size() != right_lines.size()) {
-        return make_difference(
-            common_count,
-            "<line_count>",
-            std::to_string(left_lines.size()),
-            std::to_string(right_lines.size()));
+        append_difference(
+            result,
+            {common_count, "<line_count>", std::to_string(left_lines.size()), std::to_string(right_lines.size())},
+            max_differences);
     }
 
-    return {};
+    finalize_result(result);
+    return result;
 }
 
 } // namespace agbot::flight_sim

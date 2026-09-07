@@ -59,13 +59,28 @@ build:
 # Build release version
 build-release:
     @echo "🔨 Building release version..."
-    cargo build --release
+    cargo build --locked --release
 
 # Build the standalone C++ flight simulator
 flight-sim-build:
     @echo "🛩️ Building AgBot FlightSim C++..."
     cmake -S flight_sim_cpp -B flight_sim_cpp/build
     cmake --build flight_sim_cpp/build
+
+# Build + run the native geo_viewer desktop app (Mac desktop tier).
+# Self-contained release build (no dynamic_linking). Point it at a server with
+# GEO_HUB_URL (default http://127.0.0.1:8080); optional GEO_VIEWER_SCENE_ID.
+viewer *ARGS:
+    @echo "🛰️  Building geo_viewer (release, self-contained)..."
+    cargo build --release -p geo_viewer
+    @echo "🛰️  Launching geo_viewer against GEO_HUB_URL=${GEO_HUB_URL:-http://127.0.0.1:8080}"
+    ./target/release/geo_viewer {{ARGS}}
+
+# Build + run flight_sim_cpp headless with baked defaults (Mac desktop tier).
+# Runs with zero required args; pass extra flags via ARGS to override.
+sim *ARGS: flight-sim-build
+    @echo "🛩️  Running AgBot FlightSim (headless, baked defaults)..."
+    flight_sim_cpp/build/agbot_flight_sim_headless {{ARGS}}
 
 # Test the standalone C++ flight simulator
 flight-sim-test: flight-sim-build
@@ -159,7 +174,7 @@ docker:
 # Cross-compile for ARM64 (Jetson)
 arm64:
     @echo "🔧 Cross-compiling for ARM64..."
-    cross build --target aarch64-unknown-linux-gnu --release
+    cross build --locked --target aarch64-unknown-linux-gnu --release
 
 # Smoke-check ARM64 artifacts under cross/QEMU
 arm64-smoke: arm64
@@ -177,7 +192,7 @@ arm64-ci: arm64 arm64-smoke arm64-package
 # Cross-compile for ARM (Raspberry Pi)
 arm:
     @echo "🔧 Cross-compiling for ARM..."
-    cross build --target armv7-unknown-linux-gnueabihf --release
+    cross build --locked --target armv7-unknown-linux-gnueabihf --release
 
 # Smoke-check ARMv7 artifacts under cross/QEMU
 arm-smoke: arm

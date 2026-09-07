@@ -98,6 +98,22 @@ pub async fn run_drought_watch_app(
     Ok(Json(record))
 }
 
+/// Run the water-balance watch application (batch 42): read registered
+/// `water_balance` L3 verdicts into findings, recorded as a governed run.
+/// Its `water_balance_deficit_zone` findings feed Track C alert evaluation
+/// and irrigation proposals — closing the water detect -> warn -> propose
+/// loop.
+pub async fn run_water_balance_watch_app(
+    State(state): State<AppState>,
+    Json(request): Json<crate::water_balance_run::WaterBalanceRunRequest>,
+) -> AppResult<Json<crate::applications::ApplicationRunRecord>> {
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let record = crate::water_balance_run::run(&state.pool, &request, &now)
+        .await
+        .map_err(application_error)?;
+    Ok(Json(record))
+}
+
 pub async fn run_anomaly_app(
     State(state): State<AppState>,
     Json(request): Json<crate::anomaly_run::AnomalyRunRequest>,

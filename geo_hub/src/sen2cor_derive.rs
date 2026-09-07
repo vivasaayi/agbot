@@ -345,7 +345,7 @@ async fn band_product(
     scene_id: &str,
     kind: &str,
 ) -> Result<RegisteredProduct, Sen2CorDeriveError> {
-    let mut products = catalog::list_products(
+    let products = catalog::list_products(
         pool,
         &ProductFilter {
             scene_id: Some(scene_id.to_string()),
@@ -357,7 +357,8 @@ async fn band_product(
     )
     .await?;
     products
-        .pop()
+        .into_iter()
+        .next()
         .ok_or_else(|| Sen2CorDeriveError::BandNotFound {
             scene_id: scene_id.to_string(),
             kind: kind.to_string(),
@@ -632,6 +633,11 @@ pub async fn derive_sen2cor_index(
     let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let index_product_id =
         catalog::register_product_with_actor(pool, &draft, &actor, &created_at).await?;
+
+    // Per-field time series (batch S-3): best-effort, never fails the derive.
+    if request.field_id.is_some() {
+        crate::field_timeseries::append_field_stats_best_effort(pool, &index_product_id).await;
+    }
 
     Ok(Sen2CorIndexOutcome {
         stac_item_href: format!(

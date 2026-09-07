@@ -293,6 +293,28 @@ Vec3 wind_fault_for_step(const FaultInjectionPlan& plan, std::uint64_t step) {
     return wind;
 }
 
+double battery_drop_for_step(const FaultInjectionPlan& plan, std::uint64_t step) {
+    double drop = 0.0;
+    for (const auto& fault : plan.faults) {
+        if (fault.fault_class == FaultClass::LowBattery && fault.start_step == step) {
+            drop += default_magnitude(fault, 20.0);
+        }
+    }
+    return drop;
+}
+
+double actuator_response_for_step(const FaultInjectionPlan& plan, std::uint64_t step) {
+    double response = 1.0;
+    for (const auto& fault : plan.faults) {
+        if (fault.fault_class != FaultClass::ActuatorLag || !is_fault_active(fault, step)) {
+            continue;
+        }
+        const double lag_fraction = std::clamp(default_magnitude(fault, 0.25), 0.0, 0.95);
+        response *= 1.0 - lag_fraction;
+    }
+    return std::clamp(response, 0.0, 1.0);
+}
+
 DroneState apply_observation_faults(
     const DroneState& state,
     const FaultInjectionPlan& plan,
@@ -318,21 +340,13 @@ DroneState apply_observation_faults(
                 observed.roll_rad += symmetric_unit(seed, step, 0x3003U) * magnitude;
                 break;
             }
-            case FaultClass::LowBattery: {
-                const double drop = default_magnitude(fault, 20.0);
-                observed.battery_percent = std::max(0.0, observed.battery_percent - drop);
-                break;
-            }
-            case FaultClass::ActuatorLag: {
-                const double lag_fraction = std::clamp(default_magnitude(fault, 0.25), 0.0, 0.95);
-                observed.velocity = observed.velocity * (1.0 - lag_fraction);
-                break;
-            }
             case FaultClass::WindGust:
             case FaultClass::SensorDropout:
             case FaultClass::CommLoss:
+            case FaultClass::LowBattery:
             case FaultClass::StaleTerrain:
             case FaultClass::BadTile:
+            case FaultClass::ActuatorLag:
                 break;
         }
     }

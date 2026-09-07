@@ -8,6 +8,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -15,7 +16,7 @@ namespace agbot::flight_sim {
 
 /// Version of the simulator's binary/behavior. Bump on any change that can
 /// alter telemetry output so golden fixtures and manifests stay attributable.
-inline constexpr char kSimulatorVersion[] = "0.1.0";
+inline constexpr char kSimulatorVersion[] = "0.2.0";
 
 /// Version of the twin wire contract (commands, telemetry, trace, manifest).
 /// This is the seed of TwinContractV1 (story 02-24): any breaking change to the
@@ -30,17 +31,20 @@ inline constexpr char kTwinContractVersion[] = "1.0.0";
 [[nodiscard]] std::uint64_t fnv1a64(std::string_view bytes);
 [[nodiscard]] std::string to_hex(std::uint64_t value);
 
-/// Configuration for a single deterministic run. A run is fully reproducible
-/// from (mission, seed, timestep) alone: no wall-clock, no unseeded RNG.
+/// Configuration for a single deterministic run. Every physical, sensor, and
+/// fault input is explicit: no wall-clock and no unseeded RNG.
 struct RunConfig {
     std::uint64_t seed = 0;
+    PlantModel plant_model = PlantModel::Simple;
     double timestep_s = 1.0 / 60.0;
     double record_interval_s = 0.25;
     double max_time_s = 600.0;
+    SafetyEnvelope safety;
     Vec3 steady_wind_mps;
     SensorCalibrationProfile sensor_profile = ideal_sensor_profile();
     LidarRaycastConfig lidar;
     FaultInjectionPlan faults;
+    std::optional<RuntimeTerrain> terrain;
 };
 
 /// Per-run scenario manifest (story 02-28, minimal first slice). Records the
@@ -55,6 +59,7 @@ struct RunManifest {
     double record_interval_s = 0.0;
     std::string mission_name;
     std::string mission_hash;     // SHA-256 hash of the canonical mission JSON
+    std::string plant_model;      // omitted for the backward-compatible simple plant
     std::uint64_t step_count = 0; // fixed-timestep steps executed
     std::uint64_t sample_count = 0;
     std::uint64_t prng_nonce = 0; // first draw from the seeded PRNG; proves the
@@ -72,6 +77,8 @@ struct RunManifest {
     std::string lidar_output_hash;
     std::string safety_config_json = "{}";
     std::string safety_config_hash;
+    std::string validation_report_json;
+    std::string validation_report_hash;
     std::size_t trace_retention_keep = 0;
     std::string trace_retention_deleted_json = "[]";
     std::string faults_json = "[]";
@@ -79,7 +86,9 @@ struct RunManifest {
     std::string fault_events_json = "[]";
     std::string fault_events_hash;
     std::string output_hash;      // SHA-256 hash of the emitted JSONL trace
-    bool completed = false;
+    std::string termination_reason; // populated for unsuccessful runs
+    std::string safety_violation;   // populated when a safety rule caused termination
+    bool completed = false;         // true only when all mission waypoints completed
 
     [[nodiscard]] std::string to_json() const;
 };

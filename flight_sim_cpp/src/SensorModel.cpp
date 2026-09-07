@@ -1,5 +1,7 @@
 #include "agbot_flight_sim/SensorModel.hpp"
 
+#include "agbot_flight_sim/AssetPaths.hpp"
+
 #include <cctype>
 #include <filesystem>
 #include <fstream>
@@ -82,9 +84,7 @@ std::string canonical_profile_name(std::string_view name) {
 }
 
 std::filesystem::path calibration_profile_path(std::string_view name) {
-    return std::filesystem::path(AGBOT_FLIGHT_SIM_SOURCE_DIR)
-        / "calibration"
-        / (std::string(name) + ".toml");
+    return sim_calibration_dir() / (std::string(name) + ".toml");
 }
 
 void apply_profile_value(

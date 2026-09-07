@@ -50,6 +50,7 @@ using agbot::flight_sim::SimulationEventType;
 using agbot::flight_sim::TileCoordinate;
 using agbot::flight_sim::TelemetryRecorder;
 using agbot::flight_sim::TelemetryReplay;
+using agbot::flight_sim::WaypointAction;
 using agbot::flight_sim::HudUiState;
 using agbot::flight_sim::hud_telemetry_from_state;
 
@@ -166,6 +167,8 @@ void test_loads_mission() {
     const auto mission = MissionLoader::load_from_text(kMissionJson);
     assert(mission.name == "Unit Test Mission");
     assert(mission.waypoints.size() == 4);
+    assert(mission.altitude_reference ==
+           agbot::flight_sim::AltitudeReference::AboveGroundLevel);
     assert(std::abs(mission.cruise_speed_mps - 10.0) < 1e-9);
     assert(std::abs(mission.acceptance_radius_m - 0.5) < 1e-9);
 }
@@ -396,12 +399,38 @@ void test_steady_wind_disturbs_ground_track() {
     assert(windy.state().position.x > calm.state().position.x + 0.1);
 }
 
+void test_guidance_state_changes_autopilot_control_solution() {
+    auto baseline_mission = MissionLoader::load_from_text(kMissionJson);
+    DroneSimulation baseline(std::move(baseline_mission));
+    baseline.step(0.5);
+
+    auto biased_mission = MissionLoader::load_from_text(kMissionJson);
+    DroneSimulation biased(std::move(biased_mission));
+    agbot::flight_sim::DroneState observed = biased.state();
+    observed.position.x = 10.0;
+    biased.set_guidance_state(observed);
+    biased.step(0.5);
+
+    assert(biased.state().position.x < baseline.state().position.x - 0.1);
+    assert(biased.state().position.y > 0.0);
+
+    biased.clear_guidance_state();
+    biased.step(0.5);
+    assert(biased.state().mode != DroneMode::Failsafe);
+}
+
 void test_mission_round_trip() {
     auto mission = MissionLoader::load_from_text(kMissionJson);
+    mission.altitude_reference =
+        agbot::flight_sim::AltitudeReference::MeanSeaLevel;
     const std::string json = agbot::flight_sim::mission_to_json(mission);
+    assert(json.find("\"altitude_reference\": \"msl\"") !=
+           std::string::npos);
     const auto reloaded = MissionLoader::load_from_text(json);
     assert(reloaded.name == mission.name);
     assert(reloaded.waypoints.size() == mission.waypoints.size());
+    assert(reloaded.altitude_reference ==
+           agbot::flight_sim::AltitudeReference::MeanSeaLevel);
 }
 
 void test_twin_backend_executes_shared_command_and_returns_telemetry() {
@@ -1234,6 +1263,237 @@ void test_builds_terrain_mesh_from_heightmap() {
     assert(std::abs(mesh.vertices[4].normal.length() - 1.0) < 0.001);
 }
 
+agbot::flight_sim::TerrainMesh terrain_from_x_profile(
+    const std::vector<float>& x_heights,
+    float base_elevation_m = 0.0F) {
+    const int resolution = static_cast<int>(x_heights.size());
+    std::vector<float> heightmap;
+    heightmap.reserve(
+        static_cast<std::size_t>(resolution * resolution));
+    for (int z = 0; z < resolution; ++z) {
+        heightmap.insert(
+            heightmap.end(), x_heights.begin(), x_heights.end());
+    }
+    auto mesh = agbot::flight_sim::build_terrain_mesh(
+        heightmap, resolution, 40.0, 40.0);
+    for (auto& vertex : mesh.vertices) {
+        vertex.position.y += base_elevation_m;
+    }
+    mesh.min_elevation_m += base_elevation_m;
+    mesh.max_elevation_m += base_elevation_m;
+    mesh.has_elevation = true;
+    return mesh;
+}
+
+void test_altitude_references_resolve_against_physical_terrain() {
+    agbot::flight_sim::Mission mission;
+    mission.home = {-20.0, 0.0, 0.0};
+    mission.waypoints.push_back(
+        {"terrain_target", {20.0, 10.0, 0.0}});
+
+    agbot::flight_sim::SimulationConfig config;
+    config.terrain = terrain_from_x_profile(
+        {0.0F, 2.5F, 5.0F, 7.5F, 10.0F}, 100.0F);
+
+    mission.altitude_reference =
+        agbot::flight_sim::AltitudeReference::AboveGroundLevel;
+    DroneSimulation agl_simulation(mission, config);
+    assert(std::abs(
+        agl_simulation.resolved_waypoint_position(
+            mission.waypoints.front()).y - 20.0) < 0.001);
+
+    mission.altitude_reference =
+        agbot::flight_sim::AltitudeReference::RelativeHome;
+    DroneSimulation relative_simulation(mission, config);
+    assert(std::abs(
+        relative_simulation.resolved_waypoint_position(
+            mission.waypoints.front()).y - 10.0) < 0.001);
+
+    mission.altitude_reference =
+        agbot::flight_sim::AltitudeReference::MeanSeaLevel;
+    mission.waypoints.front().position.y = 115.0;
+    DroneSimulation msl_simulation(mission, config);
+    assert(std::abs(
+        msl_simulation.resolved_waypoint_position(
+            mission.waypoints.front()).y - 15.0) < 0.001);
+    assert(std::abs(msl_simulation.world_elevation_m({20.0, 15.0, 0.0}) -
+                    115.0) < 0.001);
+}
+
+void test_preflight_applies_altitude_ceiling_to_agl() {
+    agbot::flight_sim::Mission mission;
+    mission.name = "Terrain-aware preflight";
+    mission.home = {-20.0, 0.0, 0.0};
+    mission.altitude_reference =
+        agbot::flight_sim::AltitudeReference::RelativeHome;
+    mission.waypoints.push_back(
+        {"slope_clearance", {20.0, 15.0, 0.0}});
+
+    agbot::flight_sim::MissionValidationConfig config;
+    config.safety.max_altitude_m = 6.0;
+    config.terrain = terrain_from_x_profile(
+        {0.0F, 2.5F, 5.0F, 7.5F, 10.0F}, 100.0F);
+    const auto relative_report =
+        agbot::flight_sim::validate_mission(mission, config);
+    assert(!relative_report.blocked);
+    assert(relative_report.terrain_policy == "runtime_terrain");
+
+    mission.altitude_reference =
+        agbot::flight_sim::AltitudeReference::MeanSeaLevel;
+    mission.waypoints.front().position.y = 115.0;
+    const auto msl_report =
+        agbot::flight_sim::validate_mission(mission, config);
+    assert(!msl_report.blocked);
+
+    config.terrain.reset();
+    const auto missing_terrain =
+        agbot::flight_sim::validate_mission(mission, config);
+    assert(missing_terrain.blocked);
+    assert(missing_terrain.to_json().find(
+               "MSL altitude validation requires runtime terrain") !=
+           std::string::npos);
+}
+
+void test_terrain_ridge_causes_deterministic_collision() {
+    agbot::flight_sim::Mission mission;
+    mission.name = "Ridge collision";
+    mission.home = {-20.0, 0.0, 0.0};
+    mission.altitude_reference =
+        agbot::flight_sim::AltitudeReference::RelativeHome;
+    mission.cruise_speed_mps = 8.0;
+    mission.acceptance_radius_m = 0.25;
+    mission.waypoints = {
+        {"takeoff", {-20.0, 10.0, 0.0},
+         std::nullopt, WaypointAction::Takeoff},
+        {"cross_ridge", {20.0, 10.0, 0.0},
+         std::nullopt, WaypointAction::FlyThrough},
+    };
+
+    agbot::flight_sim::SimulationConfig config;
+    config.terrain =
+        terrain_from_x_profile({0.0F, 2.0F, 20.0F, 2.0F, 0.0F});
+    DroneSimulation simulation(mission, config);
+    for (int step = 0; step < 60 * 30 && !simulation.is_complete();
+         ++step) {
+        simulation.step(1.0 / 60.0);
+    }
+
+    assert(simulation.state().mode == DroneMode::Failsafe);
+    assert(simulation.last_safety_violation().has_value());
+    assert(simulation.last_safety_violation()->code ==
+           agbot::flight_sim::SafetyViolationCode::TerrainCollision);
+    assert(simulation.altitude_agl_m().has_value());
+    assert(std::abs(*simulation.altitude_agl_m()) < 0.01);
+}
+
+void test_landing_uses_sloped_terrain_surface() {
+    agbot::flight_sim::Mission mission;
+    mission.name = "Slope landing";
+    mission.home = {-20.0, 0.0, 0.0};
+    mission.altitude_reference =
+        agbot::flight_sim::AltitudeReference::RelativeHome;
+    mission.cruise_speed_mps = 6.0;
+    mission.acceptance_radius_m = 0.2;
+    mission.waypoints = {
+        {"takeoff", {-20.0, 15.0, 0.0},
+         std::nullopt, WaypointAction::Takeoff},
+        {"cross_slope", {20.0, 15.0, 0.0},
+         std::nullopt, WaypointAction::FlyThrough},
+        {"land_on_slope", {20.0, 0.0, 0.0},
+         std::nullopt, WaypointAction::Land},
+    };
+
+    agbot::flight_sim::SimulationConfig config;
+    config.terrain = terrain_from_x_profile(
+        {0.0F, 2.5F, 5.0F, 7.5F, 10.0F}, 100.0F);
+    DroneSimulation simulation(mission, config);
+    for (int step = 0; step < 60 * 45 && !simulation.is_complete();
+         ++step) {
+        simulation.step(1.0 / 60.0);
+    }
+
+    assert(simulation.state().mode == DroneMode::Completed);
+    assert(!simulation.last_safety_violation().has_value());
+    assert(std::abs(simulation.state().position.y - 10.0) < 0.01);
+    assert(simulation.altitude_agl_m().has_value());
+    assert(std::abs(*simulation.altitude_agl_m()) < 0.01);
+    assert(std::abs(
+        simulation.world_elevation_m(simulation.state().position) -
+        110.0) < 0.01);
+}
+
+void test_landing_rejects_unsafe_terrain_slope() {
+    agbot::flight_sim::Mission mission;
+    mission.name = "Unsafe slope landing";
+    mission.home = {-20.0, 0.0, 0.0};
+    mission.altitude_reference =
+        agbot::flight_sim::AltitudeReference::RelativeHome;
+    mission.cruise_speed_mps = 8.0;
+    mission.acceptance_radius_m = 0.25;
+    mission.waypoints = {
+        {"takeoff", {-20.0, 50.0, 0.0},
+         std::nullopt, WaypointAction::Takeoff},
+        {"approach", {20.0, 50.0, 0.0},
+         std::nullopt, WaypointAction::FlyThrough},
+        {"land", {20.0, 0.0, 0.0},
+         std::nullopt, WaypointAction::Land},
+    };
+
+    agbot::flight_sim::SimulationConfig config;
+    config.max_landing_slope_deg = 15.0;
+    config.terrain = terrain_from_x_profile(
+        {0.0F, 7.5F, 15.0F, 22.5F, 30.0F}, 100.0F);
+    DroneSimulation simulation(mission, config);
+    for (int step = 0; step < 60 * 45 && !simulation.is_complete();
+         ++step) {
+        simulation.step(1.0 / 60.0);
+    }
+
+    assert(simulation.state().mode == DroneMode::Failsafe);
+    assert(simulation.last_safety_violation().has_value());
+    assert(simulation.last_safety_violation()->code ==
+           agbot::flight_sim::SafetyViolationCode::UnsafeLandingSlope);
+}
+
+void test_manual_descent_rejects_unsafe_terrain_slope() {
+    agbot::flight_sim::Mission mission;
+    mission.name = "Unsafe manual descent";
+    mission.home = {0.0, 0.0, 0.0};
+    mission.waypoints.push_back(
+        {"hold", {0.0, 20.0, 0.0},
+         std::nullopt, WaypointAction::Loiter});
+
+    agbot::flight_sim::SimulationConfig config;
+    config.max_landing_slope_deg = 15.0;
+    config.terrain = terrain_from_x_profile(
+        {0.0F, 7.5F, 15.0F, 22.5F, 30.0F}, 100.0F);
+    DroneSimulation simulation(mission, config);
+    simulation.set_control_mode(
+        agbot::flight_sim::ControlMode::Manual);
+    simulation.set_manual_input({
+        0.0, 0.0, 0.0, 0.0, true, false, true});
+
+    for (int step = 0; step < 60 * 10; ++step) {
+        simulation.step(1.0 / 60.0);
+        if (simulation.altitude_agl_m().value_or(0.0) >= 3.0) {
+            break;
+        }
+    }
+    assert(simulation.altitude_agl_m().value_or(0.0) >= 3.0);
+
+    simulation.set_manual_input({
+        -1.0, 0.0, 0.0, 0.0, false, false, false});
+    for (int step = 0; step < 60 * 10 && !simulation.is_complete();
+         ++step) {
+        simulation.step(1.0 / 60.0);
+    }
+
+    assert(simulation.state().mode == DroneMode::Failsafe);
+    assert(simulation.last_safety_violation().has_value());
+    assert(simulation.last_safety_violation()->code ==
+           agbot::flight_sim::SafetyViolationCode::UnsafeLandingSlope);
+}
+
 void test_lidar_raycast_ranges_match_flat_terrain_cloud_tolerance() {
     const std::vector<float> heightmap(9, 0.0f);
     const auto terrain = agbot::flight_sim::build_terrain_mesh(heightmap, 3, 40.0, 40.0);
@@ -1476,6 +1736,23 @@ void test_deterministic_runner_is_byte_identical() {
     assert(a.manifest.completed);
 }
 
+void test_deterministic_runner_supports_multirotor_plant() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    auto config = unit_run_config();
+    config.plant_model = agbot::flight_sim::PlantModel::Multirotor;
+
+    const auto baseline = agbot::flight_sim::run_deterministic(mission, unit_run_config());
+    const auto a = agbot::flight_sim::run_deterministic(mission, config);
+    const auto b = agbot::flight_sim::run_deterministic(mission, config);
+
+    assert(a.manifest.completed);
+    assert(a.trace_jsonl == b.trace_jsonl);
+    assert(a.manifest.to_json() == b.manifest.to_json());
+    assert(a.trace_jsonl != baseline.trace_jsonl);
+    assert(a.manifest.to_json().find("\"plant_model\":\"multirotor\"") != std::string::npos);
+    assert(baseline.manifest.to_json().find("\"plant_model\"") == std::string::npos);
+}
+
 void test_golden_regression_matches_committed_reference_missions() {
     const auto cases = agbot::flight_sim::load_golden_regression_cases();
     const auto report = agbot::flight_sim::run_golden_regression_suite(cases);
@@ -1613,6 +1890,97 @@ void test_run_manifest_records_geodetic_terrain_fallback_evidence() {
     assert(result.manifest.terrain_tiles_json.find("\"bounds\":{") != std::string::npos);
     assert(result.manifest.terrain_tiles_hash == agbot::flight_sim::sha256_hex(result.manifest.terrain_tiles_json));
     assert(json.find("\"terrain_tiles\":[{") != std::string::npos);
+}
+
+void test_runtime_terrain_is_manifested_and_drives_lidar() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    const auto flat_mesh =
+        agbot::flight_sim::build_lidar_flat_terrain_for_mission(mission, 8, 40.0);
+
+    agbot::flight_sim::RuntimeTerrain runtime_terrain;
+    runtime_terrain.mesh = flat_mesh;
+    for (auto& vertex : runtime_terrain.mesh.vertices) {
+        vertex.position.y += 125.0;
+    }
+    runtime_terrain.mesh.min_elevation_m = 125.0F;
+    runtime_terrain.mesh.max_elevation_m = 125.0F;
+    runtime_terrain.mesh.has_elevation = true;
+    runtime_terrain.bounds = {40.0, -76.0, 40.001, -75.999};
+    runtime_terrain.world_hash = 4242;
+    runtime_terrain.source_id = "catalog:dem";
+    runtime_terrain.vertical_datum = "EGM2008";
+    runtime_terrain.elevation_state = "authoritative";
+    runtime_terrain.resolution = 8;
+
+    auto terrain_config = unit_run_config();
+    terrain_config.terrain = runtime_terrain;
+    const auto with_terrain =
+        agbot::flight_sim::run_deterministic(mission, terrain_config);
+    const auto repeated =
+        agbot::flight_sim::run_deterministic(mission, terrain_config);
+    const auto flat =
+        agbot::flight_sim::run_deterministic(mission, unit_run_config());
+
+    assert(with_terrain.trace_jsonl == flat.trace_jsonl);
+    assert(with_terrain.lidar_scans_jsonl != flat.lidar_scans_jsonl);
+    assert(with_terrain.manifest.output_hash == flat.manifest.output_hash);
+    assert(with_terrain.manifest.run_id != flat.manifest.run_id);
+    assert(with_terrain.manifest.lidar_output_hash !=
+           flat.manifest.lidar_output_hash);
+    assert(with_terrain.lidar_scans_jsonl == repeated.lidar_scans_jsonl);
+    assert(with_terrain.manifest.to_json() == repeated.manifest.to_json());
+    assert(with_terrain.manifest.terrain_tiles_json.find("\"world_hash\":4242") !=
+           std::string::npos);
+    assert(with_terrain.manifest.terrain_tiles_json.find("\"source_id\":\"catalog:dem\"") !=
+           std::string::npos);
+    assert(with_terrain.manifest.terrain_tiles_json.find("\"vertical_datum\":\"EGM2008\"") !=
+           std::string::npos);
+    assert(with_terrain.manifest.terrain_tiles_json.find("\"state\":\"authoritative\"") !=
+           std::string::npos);
+    assert(with_terrain.manifest.terrain_tiles_json.find("flat_fallback") ==
+           std::string::npos);
+    assert(with_terrain.manifest.terrain_tiles_hash ==
+           agbot::flight_sim::sha256_hex(with_terrain.manifest.terrain_tiles_json));
+}
+
+void test_deterministic_runner_reports_terrain_collision() {
+    agbot::flight_sim::Mission mission;
+    mission.name = "Headless ridge collision";
+    mission.home = {-20.0, 0.0, 0.0};
+    mission.altitude_reference =
+        agbot::flight_sim::AltitudeReference::RelativeHome;
+    mission.cruise_speed_mps = 8.0;
+    mission.acceptance_radius_m = 0.25;
+    mission.waypoints = {
+        {"takeoff", {-20.0, 10.0, 0.0},
+         std::nullopt, WaypointAction::Takeoff},
+        {"cross_ridge", {20.0, 10.0, 0.0},
+         std::nullopt, WaypointAction::FlyThrough},
+    };
+
+    agbot::flight_sim::RuntimeTerrain runtime_terrain;
+    runtime_terrain.mesh =
+        terrain_from_x_profile({0.0F, 2.0F, 20.0F, 2.0F, 0.0F});
+    runtime_terrain.bounds = {40.0, -76.0, 40.001, -75.999};
+    runtime_terrain.world_hash = 9001;
+    runtime_terrain.source_id = "ridge-dem";
+    runtime_terrain.vertical_datum = "EGM2008";
+    runtime_terrain.elevation_state = "authoritative";
+    runtime_terrain.resolution = 5;
+
+    auto config = unit_run_config();
+    config.max_time_s = 30.0;
+    config.terrain = runtime_terrain;
+    const auto result =
+        agbot::flight_sim::run_deterministic(mission, config);
+    const auto repeated =
+        agbot::flight_sim::run_deterministic(mission, config);
+
+    assert(!result.manifest.completed);
+    assert(result.manifest.termination_reason == "failsafe");
+    assert(result.manifest.safety_violation == "terrain_collision");
+    assert(result.trace_jsonl == repeated.trace_jsonl);
+    assert(result.manifest.to_json() == repeated.manifest.to_json());
 }
 
 void test_zero_wind_keeps_deterministic_trace_identical() {
@@ -1895,6 +2263,67 @@ void test_trace_diff_reports_divergent_field() {
     assert(identical.identical);
 }
 
+void test_trace_diff_supports_tolerance_multi_diff_and_contract_checks() {
+    const std::string baseline =
+        "{\"contract_version\":\"1.0.0\",\"time_s\":1.000,\"mode\":\"flying\","
+        "\"position\":{\"x\":10.000,\"y\":20.000,\"z\":30.000},"
+        "\"velocity\":{\"x\":1.000,\"y\":2.000,\"z\":3.000}}\n";
+    const std::string slightly_different =
+        "{\"contract_version\":\"1.0.0\",\"time_s\":1.001,\"mode\":\"flying\","
+        "\"position\":{\"x\":10.005,\"y\":20.020,\"z\":30.000},"
+        "\"velocity\":{\"x\":1.000,\"y\":2.000,\"z\":3.000}}\n";
+
+    agbot::flight_sim::TraceDiffOptions tolerant;
+    tolerant.absolute_tolerance = 0.01;
+    tolerant.max_differences = 4;
+    const auto diff = agbot::flight_sim::diff_trace_text(baseline, slightly_different, tolerant);
+
+    assert(!diff.identical);
+    assert(diff.compatible);
+    assert(diff.differences.size() == 1);
+    assert(diff.differences[0].field_path == "position.y");
+    assert(diff.to_json().find("\"difference_count\":1") != std::string::npos);
+
+    const std::string many_differences =
+        "{\"contract_version\":\"1.0.0\",\"time_s\":1.000,\"mode\":\"flying\","
+        "\"position\":{\"x\":11.000,\"y\":22.000,\"z\":30.000},"
+        "\"velocity\":{\"x\":1.000,\"y\":2.000,\"z\":3.000}}\n";
+    const auto multi = agbot::flight_sim::diff_trace_text(baseline, many_differences, tolerant);
+    assert(multi.differences.size() == 2);
+    assert(multi.differences[0].field_path == "position.x");
+    assert(multi.differences[1].field_path == "position.y");
+
+    agbot::flight_sim::TraceDiffOptions bounded;
+    bounded.relative_tolerance = 0.1;
+    bounded.max_differences = 1;
+    const auto relative = agbot::flight_sim::diff_trace_text(baseline, many_differences, bounded);
+    assert(relative.identical);
+
+    bounded.relative_tolerance = 0.0;
+    const auto truncated = agbot::flight_sim::diff_trace_text(baseline, many_differences, bounded);
+    assert(truncated.difference_count == 2);
+    assert(truncated.differences.size() == 1);
+    assert(truncated.truncated);
+
+    const std::string incompatible =
+        "{\"contract_version\":\"2.0.0\",\"time_s\":1.000,\"mode\":\"flying\","
+        "\"position\":{\"x\":10.000,\"y\":20.000,\"z\":30.000},"
+        "\"velocity\":{\"x\":1.000,\"y\":2.000,\"z\":3.000}}\n";
+    const auto contract_diff = agbot::flight_sim::diff_trace_text(baseline, incompatible, tolerant);
+    assert(!contract_diff.compatible);
+    assert(contract_diff.code == "incompatible_contract_version");
+    assert(contract_diff.to_json().find("\"status\":\"incompatible_contract\"") != std::string::npos);
+
+    const std::string missing_contract =
+        "{\"time_s\":1.000,\"mode\":\"flying\","
+        "\"position\":{\"x\":10.000,\"y\":20.000,\"z\":30.000},"
+        "\"velocity\":{\"x\":1.000,\"y\":2.000,\"z\":3.000}}\n";
+    const auto missing_contract_diff =
+        agbot::flight_sim::diff_trace_text(baseline, missing_contract, tolerant);
+    assert(!missing_contract_diff.compatible);
+    assert(missing_contract_diff.right_value == "<missing>");
+}
+
 // Stories 02-01 / 02-02: golden-telemetry regression. The committed golden
 // trace pins physics + flight-controller behavior; any change to the step loop
 // or telemetry shape fails this test with a byte mismatch.
@@ -2027,6 +2456,7 @@ void test_fault_injection_gps_drift_is_seeded_and_reproducible() {
     assert(a.trace_jsonl == b.trace_jsonl);
     assert(a.manifest.to_json() == b.manifest.to_json());
     assert(a.trace_jsonl != baseline.trace_jsonl);
+    assert(a.manifest.step_count != baseline.manifest.step_count);
     assert(a.manifest.faults_json.find("\"class\":\"gps_drift\"") != std::string::npos);
     assert(a.manifest.fault_events_json.find("\"class\":\"gps_drift\"") != std::string::npos);
 
@@ -2054,6 +2484,90 @@ void test_fault_injection_sensor_dropout_prunes_samples_and_records_event() {
     assert(faulted.manifest.sample_count < baseline.manifest.sample_count);
     assert(faulted.manifest.faults_json.find("\"class\":\"sensor_dropout\"") != std::string::npos);
     assert(faulted.manifest.fault_events_json.find("\"class\":\"sensor_dropout\"") != std::string::npos);
+}
+
+void test_fault_injection_low_battery_triggers_physical_failsafe() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    auto faulted_config = unit_run_config();
+    faulted_config.faults.faults.push_back({
+        agbot::flight_sim::FaultClass::LowBattery,
+        4321,
+        0,
+        std::nullopt,
+        95.0,
+        "battery",
+    });
+
+    const auto baseline = agbot::flight_sim::run_deterministic(mission, unit_run_config());
+    const auto faulted = agbot::flight_sim::run_deterministic(mission, faulted_config);
+
+    assert(faulted.manifest.step_count < baseline.manifest.step_count);
+    assert(!faulted.manifest.completed);
+    assert(faulted.trace_jsonl.find("\"mode\":\"failsafe\"") != std::string::npos);
+    assert(faulted.trace_jsonl.find("\"battery_percent\":5.000") != std::string::npos);
+    const std::string manifest = faulted.manifest.to_json();
+    assert(manifest.find("\"termination_reason\":\"failsafe\"") != std::string::npos);
+    assert(manifest.find("\"safety_violation\":\"low_battery_abort\"") != std::string::npos);
+}
+
+void test_deterministic_runner_records_time_limit_outcome() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    auto config = unit_run_config();
+    config.max_time_s = config.timestep_s * 2.0;
+
+    const auto result = agbot::flight_sim::run_deterministic(mission, config);
+
+    assert(!result.manifest.completed);
+    assert(result.manifest.to_json().find("\"termination_reason\":\"time_limit\"") != std::string::npos);
+    assert(result.manifest.to_json().find("\"safety_violation\"") == std::string::npos);
+}
+
+void test_deterministic_runner_enforces_configured_safety_envelope() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    auto config = unit_run_config();
+    config.safety.max_altitude_m = 5.0;
+
+    const auto baseline = agbot::flight_sim::run_deterministic(mission, unit_run_config());
+    const auto result = agbot::flight_sim::run_deterministic(mission, config);
+
+    assert(!result.manifest.completed);
+    assert(result.manifest.termination_reason == "failsafe");
+    assert(result.manifest.safety_violation == "altitude_ceiling_violation");
+    assert(result.manifest.safety_config_json.find("\"max_altitude_m\":5.000") != std::string::npos);
+    assert(result.manifest.safety_config_hash != baseline.manifest.safety_config_hash);
+    assert(result.manifest.run_id != baseline.manifest.run_id);
+}
+
+void test_run_manifest_serializes_validation_evidence() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    auto result = agbot::flight_sim::run_deterministic(mission, unit_run_config());
+    const auto report = agbot::flight_sim::validate_mission(mission);
+    result.manifest.validation_report_json = report.to_json();
+    result.manifest.validation_report_hash =
+        agbot::flight_sim::sha256_hex(result.manifest.validation_report_json);
+
+    const std::string manifest = result.manifest.to_json();
+    assert(manifest.find("\"validation_report\":{") != std::string::npos);
+    assert(manifest.find("\"validation_report_hash\":\"") != std::string::npos);
+}
+
+void test_fault_injection_actuator_lag_slows_physical_response() {
+    const auto mission = MissionLoader::load_from_text(kMissionJson);
+    auto faulted_config = unit_run_config();
+    faulted_config.faults.faults.push_back({
+        agbot::flight_sim::FaultClass::ActuatorLag,
+        9876,
+        0,
+        std::nullopt,
+        0.8,
+        "motors",
+    });
+
+    const auto baseline = agbot::flight_sim::run_deterministic(mission, unit_run_config());
+    const auto faulted = agbot::flight_sim::run_deterministic(mission, faulted_config);
+
+    assert(faulted.manifest.step_count > baseline.manifest.step_count);
+    assert(faulted.manifest.fault_events_json.find("\"class\":\"actuator_lag\"") != std::string::npos);
 }
 
 void test_fault_injection_bad_tile_marks_flat_fallback_in_manifest() {
@@ -2112,6 +2626,7 @@ int main() {
     test_simulation_emergency_event_suppresses_normal_events();
     test_manual_controls_move_drone();
     test_steady_wind_disturbs_ground_track();
+    test_guidance_state_changes_autopilot_control_solution();
     test_mission_round_trip();
     test_twin_backend_executes_shared_command_and_returns_telemetry();
     test_twin_backend_unavailable_fails_closed_without_telemetry();
@@ -2142,6 +2657,12 @@ int main() {
     test_telemetry_video_stream_sends_decodable_aligned_frames_to_collector();
     test_telemetry_video_stream_buffers_when_collector_unreachable();
     test_builds_terrain_mesh_from_heightmap();
+    test_altitude_references_resolve_against_physical_terrain();
+    test_preflight_applies_altitude_ceiling_to_agl();
+    test_terrain_ridge_causes_deterministic_collision();
+    test_landing_uses_sloped_terrain_surface();
+    test_landing_rejects_unsafe_terrain_slope();
+    test_manual_descent_rejects_unsafe_terrain_slope();
     test_lidar_raycast_ranges_match_flat_terrain_cloud_tolerance();
     test_lidar_raycast_seeded_cloud_json_is_reproducible();
     test_lidar_raycast_empty_scene_returns_empty_capture_scan();
@@ -2149,6 +2670,7 @@ int main() {
     test_multispectral_capture_emits_georeferenced_bands_round_trip();
     test_multispectral_capture_reports_no_coverage_outside_terrain();
     test_deterministic_runner_is_byte_identical();
+    test_deterministic_runner_supports_multirotor_plant();
     test_golden_regression_matches_committed_reference_missions();
     test_golden_regression_names_divergent_field();
     test_golden_regression_rejects_incompatible_contract_version();
@@ -2157,6 +2679,8 @@ int main() {
     test_deterministic_runner_emits_capture_shaped_lidar_jsonl();
     test_run_manifest_records_contract_and_hashes();
     test_run_manifest_records_geodetic_terrain_fallback_evidence();
+    test_runtime_terrain_is_manifested_and_drives_lidar();
+    test_deterministic_runner_reports_terrain_collision();
     test_zero_wind_keeps_deterministic_trace_identical();
     test_steady_wind_is_reproducible_and_manifested();
     test_zero_noise_sensor_profile_is_exact();
@@ -2167,6 +2691,7 @@ int main() {
     test_twin_contract_version_compatibility();
     test_canonical_runner_mission_and_telemetry_follow_twin_contract();
     test_trace_diff_reports_divergent_field();
+    test_trace_diff_supports_tolerance_multi_diff_and_contract_checks();
     test_deterministic_runner_matches_golden();
     test_fnv1a64_is_stable_and_distinct();
     test_simulation_health_reports_pass_and_seed_failure();
@@ -2174,6 +2699,11 @@ int main() {
     test_tile_cache_clear_removes_entries_but_keeps_directory();
     test_fault_injection_gps_drift_is_seeded_and_reproducible();
     test_fault_injection_sensor_dropout_prunes_samples_and_records_event();
+    test_fault_injection_low_battery_triggers_physical_failsafe();
+    test_deterministic_runner_records_time_limit_outcome();
+    test_deterministic_runner_enforces_configured_safety_envelope();
+    test_run_manifest_serializes_validation_evidence();
+    test_fault_injection_actuator_lag_slows_physical_response();
     test_fault_injection_bad_tile_marks_flat_fallback_in_manifest();
     test_fault_injection_rejects_fault_without_seed();
     std::cout << "agbot_flight_sim_tests passed\n";

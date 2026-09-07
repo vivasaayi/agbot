@@ -1,5 +1,7 @@
 #include "agbot_flight_sim/DroneSimulation.hpp"
 
+#include "agbot_vehicles/MultirotorModel.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -51,8 +53,16 @@ DroneSimulation::DroneSimulation(Mission mission, SimulationConfig config)
     if (mission_.waypoints.empty()) {
         throw std::runtime_error("DroneSimulation requires a mission with waypoints");
     }
+    if (config_.plant_model == PlantModel::Multirotor) {
+        multirotor_model_ = std::make_unique<agbot::vehicles::MultirotorModel>();
+    }
+    refresh_home_ground_elevation();
     reset();
 }
+
+DroneSimulation::~DroneSimulation() = default;
+DroneSimulation::DroneSimulation(DroneSimulation&&) noexcept = default;
+DroneSimulation& DroneSimulation::operator=(DroneSimulation&&) noexcept = default;
 
 void DroneSimulation::reset() {
     state_ = {};
@@ -60,6 +70,12 @@ void DroneSimulation::reset() {
     state_.mode = DroneMode::Idle;
     state_.control_mode = ControlMode::Autopilot;
     manual_input_ = {};
+    guidance_state_.reset();
+    actuator_response_factor_ = 1.0;
+    if (multirotor_model_) {
+        multirotor_model_->clear_velocity_setpoint();
+        multirotor_model_->set_response_factor(1.0);
+    }
     emergency_abort_requested_ = false;
     last_safety_violation_.reset();
     event_log_.clear();
@@ -81,6 +97,10 @@ void DroneSimulation::replace_mission(Mission mission) {
         throw std::runtime_error("Replacement mission must contain at least one waypoint");
     }
     mission_ = std::move(mission);
+    // Terrain meshes are expressed in the previous mission's local frame.
+    // A replacement mission must explicitly load/re-align its own surface.
+    config_.terrain.reset();
+    refresh_home_ground_elevation();
     reset();
 }
 
@@ -99,8 +119,29 @@ void DroneSimulation::set_manual_input(ManualControlInput input) {
     manual_input_ = input;
 }
 
+void DroneSimulation::set_guidance_state(std::optional<DroneState> state) {
+    guidance_state_ = std::move(state);
+}
+
+void DroneSimulation::clear_guidance_state() {
+    guidance_state_.reset();
+}
+
+void DroneSimulation::inject_battery_drop(double percent) {
+    state_.battery_percent = std::max(0.0, state_.battery_percent - std::max(0.0, percent));
+}
+
+void DroneSimulation::set_actuator_response_factor(double factor) {
+    actuator_response_factor_ = std::clamp(factor, 0.0, 1.0);
+}
+
 void DroneSimulation::set_wind(Vec3 wind_mps) {
     wind_mps_ = wind_mps;
+}
+
+void DroneSimulation::set_terrain(std::optional<TerrainMesh> terrain) {
+    config_.terrain = std::move(terrain);
+    refresh_home_ground_elevation();
 }
 
 void DroneSimulation::request_emergency_abort() {
@@ -117,8 +158,10 @@ void DroneSimulation::arm() {
 void DroneSimulation::disarm() {
     state_.armed = false;
     state_.velocity = {};
-    if (state_.position.y <= 0.05) {
-        state_.position.y = 0.0;
+    const auto ground_y = ground_local_y(state_.position);
+    if (ground_y.has_value() &&
+        state_.position.y <= *ground_y + 0.05) {
+        state_.position.y = *ground_y;
         state_.mode = DroneMode::Idle;
     }
 }
@@ -141,6 +184,79 @@ ControlMode DroneSimulation::control_mode() const {
 
 Vec3 DroneSimulation::wind() const {
     return wind_mps_;
+}
+
+std::optional<double> DroneSimulation::ground_elevation_m(
+    Vec3 local_position) const {
+    if (!config_.terrain.has_value()) {
+        return 0.0;
+    }
+    return terrain_height_at(
+        *config_.terrain, local_position.x, local_position.z);
+}
+
+std::optional<double> DroneSimulation::ground_local_y(
+    Vec3 local_position) const {
+    const auto elevation = ground_elevation_m(local_position);
+    if (!elevation.has_value()) {
+        return std::nullopt;
+    }
+    return *elevation - home_ground_elevation_m_;
+}
+
+std::optional<double> DroneSimulation::altitude_agl_m() const {
+    return altitude_agl_m(state_.position);
+}
+
+std::optional<double> DroneSimulation::altitude_agl_m(
+    Vec3 local_position) const {
+    const auto ground_y = ground_local_y(local_position);
+    if (!ground_y.has_value()) {
+        return std::nullopt;
+    }
+    return local_position.y - *ground_y;
+}
+
+double DroneSimulation::world_elevation_m(Vec3 local_position) const {
+    return local_position.y + home_ground_elevation_m_;
+}
+
+std::optional<Vec3> DroneSimulation::try_resolved_waypoint_position(
+    const Waypoint& waypoint) const {
+    Vec3 target = waypoint.position;
+    const auto ground_y = ground_local_y(waypoint.position);
+    if (!ground_y.has_value()) {
+        return std::nullopt;
+    }
+
+    if (waypoint.action == WaypointAction::Land) {
+        target.y = *ground_y;
+        return target;
+    }
+
+    switch (mission_.altitude_reference) {
+        case AltitudeReference::AboveGroundLevel:
+            target.y = *ground_y + waypoint.position.y;
+            break;
+        case AltitudeReference::RelativeHome:
+            target.y = waypoint.position.y;
+            break;
+        case AltitudeReference::MeanSeaLevel:
+            target.y =
+                waypoint.position.y - home_ground_elevation_m_;
+            break;
+    }
+    return target;
+}
+
+Vec3 DroneSimulation::resolved_waypoint_position(
+    const Waypoint& waypoint) const {
+    const auto target = try_resolved_waypoint_position(waypoint);
+    if (!target.has_value()) {
+        throw std::runtime_error(
+            "Waypoint is outside the configured terrain surface");
+    }
+    return *target;
 }
 
 const std::vector<SimulationEvent>& DroneSimulation::events() const {
@@ -196,6 +312,9 @@ void DroneSimulation::step_fixed(double dt_s) {
         step_autopilot(dt_s);
     }
 
+    if (state_.mode == DroneMode::Failsafe) {
+        return;
+    }
     if (fail_if_safety_violated()) {
         return;
     }
@@ -223,12 +342,26 @@ void DroneSimulation::step_autopilot(double dt_s) {
         state_.mode = mode_for_waypoint(*waypoint);
     }
 
-    const Vec3 to_target = waypoint->position - state_.position;
+    if (waypoint->action == WaypointAction::Land &&
+        fail_if_landing_site_unsafe(waypoint->position)) {
+        return;
+    }
+
+    const auto target_position =
+        try_resolved_waypoint_position(*waypoint);
+    if (!target_position.has_value()) {
+        fail_for_terrain(
+            SafetyViolationCode::TerrainUnavailable,
+            "Waypoint is outside the configured terrain surface");
+        return;
+    }
+    const DroneState& guidance_state = guidance_state_.has_value() ? *guidance_state_ : state_;
+    const Vec3 to_target = *target_position - guidance_state.position;
     const double distance = to_target.length();
     const double acceptance = std::max(0.1, mission_.acceptance_radius_m);
 
     if (distance <= acceptance) {
-        state_.position = waypoint->position;
+        state_.position = *target_position;
         state_.velocity = {};
 
         if (waypoint->hold_seconds > 0.0 && state_.hold_elapsed_s < waypoint->hold_seconds) {
@@ -245,12 +378,18 @@ void DroneSimulation::step_autopilot(double dt_s) {
 
     const double speed = std::min(waypoint->speed_mps.value_or(mission_.cruise_speed_mps), config_.max_horizontal_speed_mps);
     const Vec3 desired_velocity = to_target.normalized() * std::max(0.1, speed);
-    move_towards_velocity(desired_velocity, dt_s);
+    if (move_towards_velocity(
+            desired_velocity,
+            dt_s,
+            waypoint->action == WaypointAction::Land)) {
+        return;
+    }
     state_.mode = mode_for_waypoint(*waypoint);
 
-    const double remaining_after_move = (waypoint->position - state_.position).length();
+    const double remaining_after_move =
+        (*target_position - state_.position).length();
     if (remaining_after_move <= acceptance) {
-        state_.position = waypoint->position;
+        state_.position = *target_position;
         state_.velocity = {};
     }
 }
@@ -262,7 +401,9 @@ void DroneSimulation::step_manual(double dt_s) {
 
     if (!state_.armed) {
         state_.mode = DroneMode::Idle;
-        move_towards_velocity({}, dt_s);
+        if (move_towards_velocity({}, dt_s, true)) {
+            return;
+        }
         state_.battery_percent -= config_.idle_battery_drain_percent_per_s * dt_s;
         return;
     }
@@ -272,14 +413,27 @@ void DroneSimulation::step_manual(double dt_s) {
     const Vec3 forward(std::sin(state_.yaw_rad), 0.0, std::cos(state_.yaw_rad));
     const Vec3 right(std::cos(state_.yaw_rad), 0.0, -std::sin(state_.yaw_rad));
 
+    const auto current_agl = altitude_agl_m();
+    if (!current_agl.has_value()) {
+        fail_for_terrain(
+            SafetyViolationCode::TerrainUnavailable,
+            "Aircraft is outside the configured terrain surface");
+        return;
+    }
+
     double vertical_axis = manual_input_.throttle;
-    if (manual_input_.takeoff && state_.position.y < config_.manual_takeoff_altitude_m) {
+    if (manual_input_.takeoff &&
+        *current_agl < config_.manual_takeoff_altitude_m) {
         vertical_axis = 0.75;
         state_.mode = DroneMode::Takeoff;
     } else if (manual_input_.land) {
+        if (fail_if_landing_site_unsafe(state_.position)) {
+            return;
+        }
         vertical_axis = -0.55;
         state_.mode = DroneMode::Landing;
-    } else if (std::abs(vertical_axis) < 0.02 && state_.position.y > 0.05) {
+    } else if (std::abs(vertical_axis) < 0.02 &&
+               *current_agl > 0.05) {
         state_.mode = DroneMode::Hovering;
     } else {
         state_.mode = DroneMode::Flying;
@@ -292,10 +446,18 @@ void DroneSimulation::step_manual(double dt_s) {
         horizontal.z
     );
 
-    move_towards_velocity(desired_velocity, dt_s);
+    if (move_towards_velocity(
+            desired_velocity,
+            dt_s,
+            manual_input_.land || desired_velocity.y < 0.0)) {
+        return;
+    }
 
-    if (state_.position.y <= 0.0) {
-        state_.position.y = 0.0;
+    const auto agl_after_move = altitude_agl_m();
+    const auto ground_y = ground_local_y(state_.position);
+    if (agl_after_move.has_value() && ground_y.has_value() &&
+        *agl_after_move <= 0.0) {
+        state_.position.y = *ground_y;
         if (manual_input_.land || desired_velocity.y < 0.0) {
             state_.velocity = {};
             state_.mode = DroneMode::Idle;
@@ -304,19 +466,63 @@ void DroneSimulation::step_manual(double dt_s) {
     }
 }
 
-void DroneSimulation::move_towards_velocity(Vec3 desired_velocity, double dt_s) {
-    const Vec3 delta = desired_velocity - state_.velocity;
-    state_.velocity += clamp_vector_delta(delta, config_.max_acceleration_mps2 * dt_s);
-
-    Vec3 ground_velocity = state_.velocity;
-    if (state_.position.y > 0.05 || desired_velocity.y > 0.0) {
-        ground_velocity += wind_mps_;
+bool DroneSimulation::move_towards_velocity(
+    Vec3 desired_velocity,
+    double dt_s,
+    bool allow_ground_contact) {
+    const auto initial_agl = altitude_agl_m();
+    if (!initial_agl.has_value()) {
+        return fail_for_terrain(
+            SafetyViolationCode::TerrainUnavailable,
+            "Aircraft is outside the configured terrain surface");
     }
 
-    state_.position += ground_velocity * dt_s;
+    if (multirotor_model_) {
+        agbot::vehicles::EntityState plant_state;
+        plant_state.position = state_.position;
+        plant_state.velocity = state_.velocity;
+        plant_state.yaw_rad = state_.yaw_rad;
+        plant_state.pitch_rad = state_.pitch_rad;
+        plant_state.roll_rad = state_.roll_rad;
+        plant_state.time_s = state_.mission_time_s;
 
-    if (state_.position.y < 0.0) {
-        state_.position.y = 0.0;
+        multirotor_model_->set_velocity_setpoint(desired_velocity);
+        multirotor_model_->set_response_factor(actuator_response_factor_);
+        const auto next = multirotor_model_->step(plant_state, {}, dt_s);
+        state_.position = next.position;
+        state_.velocity = next.velocity;
+        state_.yaw_rad = next.yaw_rad;
+        state_.pitch_rad = next.pitch_rad;
+        state_.roll_rad = next.roll_rad;
+    } else {
+        const Vec3 delta = desired_velocity - state_.velocity;
+        state_.velocity += clamp_vector_delta(
+            delta,
+            config_.max_acceleration_mps2 * actuator_response_factor_ * dt_s);
+        state_.position += state_.velocity * dt_s;
+    }
+
+    if (*initial_agl > 0.05 || desired_velocity.y > 0.0) {
+        state_.position += wind_mps_ * dt_s;
+    }
+
+    const auto ground_y = ground_local_y(state_.position);
+    if (!ground_y.has_value()) {
+        return fail_for_terrain(
+            SafetyViolationCode::TerrainUnavailable,
+            "Aircraft left the configured terrain surface");
+    }
+    if (state_.position.y < *ground_y) {
+        state_.position.y = *ground_y;
+        state_.velocity.y = 0.0;
+        if (!allow_ground_contact) {
+            return fail_for_terrain(
+                SafetyViolationCode::TerrainCollision,
+                "Aircraft intersected the terrain surface");
+        }
+        if (fail_if_landing_site_unsafe(state_.position)) {
+            return true;
+        }
     }
 
     if (state_.velocity.horizontal_length() > 0.001) {
@@ -329,13 +535,75 @@ void DroneSimulation::move_towards_velocity(Vec3 desired_velocity, double dt_s) 
     const double movement_factor = std::clamp(state_.velocity.length() / std::max(0.1, mission_.cruise_speed_mps), 0.0, 2.0);
     state_.battery_percent -= (config_.flight_battery_drain_percent_per_s * std::max(0.25, movement_factor)) * dt_s;
     state_.battery_percent = std::max(0.0, state_.battery_percent);
+    return false;
+}
+
+bool DroneSimulation::fail_for_terrain(
+    SafetyViolationCode code,
+    std::string message) {
+    last_safety_violation_ = SafetyViolation {
+        code,
+        to_string(code),
+        state_.target_waypoint_index,
+        std::move(message),
+    };
+    state_.mode = DroneMode::Failsafe;
+    state_.velocity = {};
+    state_.armed = false;
+    emit_event(
+        SimulationEventType::Emergency,
+        last_safety_violation_->message,
+        code);
+    return true;
+}
+
+bool DroneSimulation::fail_if_landing_site_unsafe(
+    Vec3 local_position) {
+    if (!config_.terrain.has_value()) {
+        return false;
+    }
+    const auto slope = terrain_slope_degrees_at(
+        *config_.terrain, local_position.x, local_position.z);
+    if (!slope.has_value()) {
+        return fail_for_terrain(
+            SafetyViolationCode::TerrainUnavailable,
+            "Landing zone is outside the configured terrain surface");
+    }
+    if (*slope > config_.max_landing_slope_deg) {
+        return fail_for_terrain(
+            SafetyViolationCode::UnsafeLandingSlope,
+            "Landing zone exceeds the configured slope limit");
+    }
+    return false;
+}
+
+void DroneSimulation::refresh_home_ground_elevation() {
+    if (!config_.terrain.has_value()) {
+        home_ground_elevation_m_ = 0.0;
+        return;
+    }
+    const auto elevation = terrain_height_at(
+        *config_.terrain, mission_.home.x, mission_.home.z);
+    if (!elevation.has_value()) {
+        throw std::invalid_argument(
+            "Configured terrain does not cover the mission home");
+    }
+    home_ground_elevation_m_ = *elevation;
 }
 
 bool DroneSimulation::fail_if_safety_violated() {
     SafetyEnvelope envelope = config_.safety;
     envelope.min_battery_percent = config_.min_battery_percent;
+    const auto agl = altitude_agl_m();
+    if (!agl.has_value()) {
+        return fail_for_terrain(
+            SafetyViolationCode::TerrainUnavailable,
+            "Aircraft is outside the configured terrain surface");
+    }
+    Vec3 safety_position = state_.position;
+    safety_position.y = *agl;
     const SafetySample sample {
-        state_.position,
+        safety_position,
         state_.battery_percent,
         state_.target_waypoint_index,
         emergency_abort_requested_,
@@ -418,6 +686,26 @@ const char* to_string(DroneMode mode) {
             return "failsafe";
     }
     return "unknown";
+}
+
+const char* to_string(PlantModel model) {
+    switch (model) {
+        case PlantModel::Simple:
+            return "simple";
+        case PlantModel::Multirotor:
+            return "multirotor";
+    }
+    return "unknown";
+}
+
+PlantModel plant_model_from_string(std::string_view value) {
+    if (value == "simple") {
+        return PlantModel::Simple;
+    }
+    if (value == "multirotor") {
+        return PlantModel::Multirotor;
+    }
+    throw std::invalid_argument("unknown plant model: " + std::string(value));
 }
 
 const char* to_string(ControlMode mode) {

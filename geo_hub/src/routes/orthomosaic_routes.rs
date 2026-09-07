@@ -323,4 +323,3 @@ pub async fn apply_orthomosaic_publish_gate(
 
     Ok(Json(decision))
 }
-

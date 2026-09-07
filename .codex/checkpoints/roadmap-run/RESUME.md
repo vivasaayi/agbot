@@ -1,14 +1,30 @@
 # Roadmap Run — Resume
 
-- **Run ID**: run-02-sim
-- **Roadmap hash**: a3c0e52f1429f1d062e9a95e76d95f44ba739ec5
-- **Last implementation commit**: 83a77b4 (`batch-20260618100014`)
-- **Latest checkpoint commit**: 38948b9
-- **Current batch**: none
-- **Completed feature rows**: 494 committed; 0 tests_passed; 2 skipped; 2 blocked; 0 pending in this run.
-- **Blocker**: `07-11` GIS/geospatial hub and `18-10` payments/escrow remain blocked; no pending/claimed/in-progress/test-passed rows remain.
+- **Run ID**: `run-02-sim`
+- **Canonical inventory**: 498 roadmap story IDs; the ledger matches one-for-one
+- **Roadmap hash**: `824257d0572b0997fc24491b3524053451a3989cf89de2381dd3ea1cd0536485`
+- **Hash command**: `git ls-files docs/product-roadmap prompts | LC_ALL=C sort | xargs shasum -a 256 | shasum -a 256`
+- **Reconciled baseline**: `9290ede7570c2705fee70eefa3cf6dcf4bae4eee` (242 commits after the previous Codex baseline)
+- **Last implementation commit**: `3e08b44` (`release-readiness-20260906`)
+- **Current batch**: none; `release-readiness-20260906` is committed with validation blockers recorded
+- **Roadmap status**: 494 committed; 2 superseded/skipped; 2 blocked; 0 pending
+- **Supplemental history**: `.claude` records 83 completed rows across later tracks but remains separate because its feature table has no run ownership and its resume prose is stale.
+- **Blockers**: `07-11` requires a spatial storage-backend decision; `18-10` requires external payments/compliance scope and approval.
 
-## Latest verification
+## Current release-readiness validation
+
+- `cargo fmt --all -- --check` — pass after formatting five previously nonconforming files
+- `cargo clippy -p alerting --all-targets -- -D warnings` — pass after fixing nine lints
+- `cargo check -p geo_hub` — pass (existing warnings)
+- GIS suites — pass: shared 323 tests, Geo Hub library/integration suites, Geo Viewer 60 tests, and 5 acceptance tests
+- FlightSim build and CTest — pass: 21 tests passed; unavailable macOS CGL self-check skipped
+- Secret, ARM CI, delivery, container, and appliance contract scripts — pass
+- Production appliance Docker build and `/health` smoke check — pass
+- Full all-features Clippy/tests — fail locally because Rust `gdal` 0.16 does not support Homebrew GDAL 3.13; the generated-binding path also fails against GDAL 3.13 API changes
+- Dependency audit — fail: 24 vulnerabilities and 22 allowed warnings reported by `cargo audit`
+- Locked-build contract — fixed by making the generated workspace `Cargo.lock` trackable; it was previously ignored while CI required `--locked`
+
+## Historical verification through `83a77b4`
 
 - `cargo test -p shared biodiversity_proxy` — pass
 - `cargo test -p geo_hub biodiversity_proxy` — pass
@@ -203,6 +219,6 @@
 - `cargo check -p post_processor` — pass with existing warnings
 - `05-21` — stale tests-passed checkpoint row revalidated and normalized to committed with historical implementation commit `a9ca52b`
 
-## Next action
+## Exact next action
 
-- No pending, claimed, in-progress, or tests-passed feature rows remain; only blocked/skipped rows remain.
+Resolve the GDAL 3.13/Rust binding compatibility and remediate the RustSec vulnerability set, then rerun all-features Clippy/tests and `cargo audit`.

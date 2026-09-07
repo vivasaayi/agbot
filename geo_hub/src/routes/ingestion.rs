@@ -11,6 +11,57 @@ use anyhow::Error;
 use axum::extract::State;
 use axum::Json;
 
+/// Discover elevation source profiles accepted by
+/// `POST /api/ingest/elevation`. The profiles expose provider, sensor,
+/// resolution, vertical-datum, and licensing defaults to acquisition clients.
+pub async fn list_elevation_sources(
+) -> Json<&'static [crate::elevation_ingest::ElevationSourceProfile]> {
+    Json(crate::elevation_ingest::supported_elevation_sources())
+}
+
+/// Ingest a server-local provider DEM/DSM GeoTIFF, retaining source evidence
+/// and publishing it as a globally web-tileable catalog layer.
+pub async fn ingest_elevation(
+    State(state): State<AppState>,
+    Json(request): Json<crate::elevation_ingest::ElevationIngestRequest>,
+) -> AppResult<Json<crate::elevation_ingest::ElevationIngestOutcome>> {
+    let outcome =
+        crate::elevation_ingest::ingest_elevation(&state.pool, &state.config.data_root, &request)
+            .await
+            .map_err(|error| {
+                if error.is_client_error() {
+                    AppError::BadRequest(error.to_string())
+                } else {
+                    AppError::Anyhow(Error::new(error))
+                }
+            })?;
+    Ok(Json(outcome))
+}
+
+/// Compile a registered L1 elevation product into the canonical C++ simulator
+/// world format and register the resulting package as an L3 catalog product.
+pub async fn derive_sim_terrain(
+    State(state): State<AppState>,
+    Json(request): Json<crate::terrain_derive::TerrainDeriveRequest>,
+) -> AppResult<Json<crate::terrain_derive::TerrainDeriveOutcome>> {
+    let compiler = std::sync::Arc::new(crate::terrain_derive::ProcessTerrainCompiler::new(
+        state.config.terrain_compiler_path(),
+    ));
+    let outcome = crate::terrain_derive::derive_sim_terrain(
+        &state.pool,
+        &state.config.data_root,
+        &request,
+        compiler,
+    )
+    .await
+    .map_err(|error| match error {
+        crate::terrain_derive::TerrainDeriveError::ProductNotFound(_) => AppError::NotFound,
+        error if error.is_client_error() => AppError::BadRequest(error.to_string()),
+        error => AppError::Anyhow(Error::new(error)),
+    })?;
+    Ok(Json(outcome))
+}
+
 /// The scene-ingest health view (retry/backoff state of the ingest pipeline).
 pub async fn get_ingest_health(
     State(state): State<AppState>,

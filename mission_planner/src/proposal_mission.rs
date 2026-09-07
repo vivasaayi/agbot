@@ -101,10 +101,7 @@ mod tests {
         assert!(result.leg_count >= 1);
         assert!(result.coverage_fraction > 0.0);
         // Tagged to the proposal so the stored plan traces back to its origin.
-        assert_eq!(
-            result.mission.name,
-            "proposal-mission:proposal:finding:1"
-        );
+        assert_eq!(result.mission.name, "proposal-mission:proposal:finding:1");
         assert_eq!(result.mission.field_id, "field-1");
     }
 

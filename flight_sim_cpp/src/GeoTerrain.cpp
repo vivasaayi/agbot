@@ -712,6 +712,127 @@ TerrainMesh build_terrain_mesh(
     return mesh;
 }
 
+std::optional<int> terrain_grid_resolution(const TerrainMesh& terrain) {
+    const double root = std::sqrt(static_cast<double>(terrain.vertices.size()));
+    const int resolution = static_cast<int>(std::llround(root));
+    if (resolution < 2 ||
+        static_cast<std::size_t>(resolution * resolution) != terrain.vertices.size()) {
+        return std::nullopt;
+    }
+    return resolution;
+}
+
+std::optional<double> terrain_height_at(const TerrainMesh& terrain, double x, double z) {
+    const auto resolution = terrain_grid_resolution(terrain);
+    if (!resolution.has_value()) {
+        return std::nullopt;
+    }
+
+    const Vec3& first = terrain.vertices.front().position;
+    const Vec3& x_edge =
+        terrain.vertices[static_cast<std::size_t>(*resolution - 1)].position;
+    const Vec3& z_edge =
+        terrain.vertices[
+            static_cast<std::size_t>((*resolution - 1) * *resolution)].position;
+    const double min_x = std::min(first.x, x_edge.x);
+    const double max_x = std::max(first.x, x_edge.x);
+    const double min_z = std::min(first.z, z_edge.z);
+    const double max_z = std::max(first.z, z_edge.z);
+    if (max_x <= min_x || max_z <= min_z ||
+        x < min_x || x > max_x || z < min_z || z > max_z) {
+        return std::nullopt;
+    }
+
+    const double u = (x - first.x) / (x_edge.x - first.x);
+    const double v = (z - first.z) / (z_edge.z - first.z);
+    const double fx = u * static_cast<double>(*resolution - 1);
+    const double fz = v * static_cast<double>(*resolution - 1);
+    const int x0 = static_cast<int>(std::floor(fx));
+    const int z0 = static_cast<int>(std::floor(fz));
+    const int x1 = std::min(x0 + 1, *resolution - 1);
+    const int z1 = std::min(z0 + 1, *resolution - 1);
+    const double tx = fx - static_cast<double>(x0);
+    const double tz = fz - static_cast<double>(z0);
+
+    const auto at = [&terrain, resolution](int grid_x, int grid_z) {
+        return terrain.vertices[
+            static_cast<std::size_t>(grid_z * *resolution + grid_x)].position.y;
+    };
+    const double top = at(x0, z0) * (1.0 - tx) + at(x1, z0) * tx;
+    const double bottom = at(x0, z1) * (1.0 - tx) + at(x1, z1) * tx;
+    return top * (1.0 - tz) + bottom * tz;
+}
+
+std::optional<double> terrain_slope_degrees_at(
+    const TerrainMesh& terrain,
+    double x,
+    double z) {
+    const auto resolution = terrain_grid_resolution(terrain);
+    if (!resolution.has_value()) {
+        return std::nullopt;
+    }
+
+    const Vec3& first = terrain.vertices.front().position;
+    const Vec3& x_edge =
+        terrain.vertices[static_cast<std::size_t>(*resolution - 1)].position;
+    const Vec3& z_edge =
+        terrain.vertices[
+            static_cast<std::size_t>((*resolution - 1) * *resolution)].position;
+    const double min_x = std::min(first.x, x_edge.x);
+    const double max_x = std::max(first.x, x_edge.x);
+    const double min_z = std::min(first.z, z_edge.z);
+    const double max_z = std::max(first.z, z_edge.z);
+    if (x < min_x || x > max_x || z < min_z || z > max_z) {
+        return std::nullopt;
+    }
+
+    const double cell_x =
+        (max_x - min_x) / static_cast<double>(*resolution - 1);
+    const double cell_z =
+        (max_z - min_z) / static_cast<double>(*resolution - 1);
+    const double left_x = std::max(min_x, x - cell_x);
+    const double right_x = std::min(max_x, x + cell_x);
+    const double low_z = std::max(min_z, z - cell_z);
+    const double high_z = std::min(max_z, z + cell_z);
+    if (right_x <= left_x || high_z <= low_z) {
+        return std::nullopt;
+    }
+
+    const auto left = terrain_height_at(terrain, left_x, z);
+    const auto right = terrain_height_at(terrain, right_x, z);
+    const auto low = terrain_height_at(terrain, x, low_z);
+    const auto high = terrain_height_at(terrain, x, high_z);
+    if (!left.has_value() || !right.has_value() ||
+        !low.has_value() || !high.has_value()) {
+        return std::nullopt;
+    }
+
+    const double gradient_x = (*right - *left) / (right_x - left_x);
+    const double gradient_z = (*high - *low) / (high_z - low_z);
+    constexpr double kRadiansToDegrees =
+        180.0 / 3.14159265358979323846;
+    return std::atan(std::hypot(gradient_x, gradient_z)) *
+        kRadiansToDegrees;
+}
+
+bool terrain_covers_mission(const RuntimeTerrain& terrain, const Mission& mission) {
+    if (!mission.home_geo.has_value() || terrain.mesh.vertices.empty()) {
+        return false;
+    }
+    if (!bounds_contain(terrain.bounds, *mission.home_geo)) {
+        return false;
+    }
+    const GeoCoordinate origin = *mission.home_geo;
+    return std::all_of(
+        mission.waypoints.begin(),
+        mission.waypoints.end(),
+        [&terrain, &origin](const Waypoint& waypoint) {
+            return bounds_contain(
+                terrain.bounds,
+                waypoint.geo.value_or(geo_from_local(waypoint.position, origin)));
+        });
+}
+
 std::string terrain_tiles_json(const ElevationComposite& composite) {
     if (composite.tile_states.empty() || !composite.profile.asserted) {
         return "[]";
@@ -743,6 +864,28 @@ std::string terrain_tiles_json(const ElevationComposite& composite) {
                << "}";
     }
     output << "]";
+    return output.str();
+}
+
+std::string terrain_tiles_json(const RuntimeTerrain& terrain) {
+    if (terrain.mesh.vertices.empty() || terrain.resolution < 2) {
+        return "[]";
+    }
+
+    std::ostringstream output;
+    output << std::fixed << std::setprecision(3)
+           << "[{\"tile\":\"world/package/terrain\""
+           << ",\"world_hash\":" << terrain.world_hash
+           << ",\"source_id\":\"" << escape_json(terrain.source_id) << "\""
+           << ",\"state\":\"" << escape_json(terrain.elevation_state) << "\""
+           << ",\"crs\":\"EPSG:4326\""
+           << ",\"vertical_datum\":\"" << escape_json(terrain.vertical_datum) << "\",";
+    write_bounds_json(output, terrain.bounds);
+    output << ",\"resolution\":" << terrain.resolution
+           << ",\"nodata_cells\":" << terrain.nodata_cells
+           << ",\"min_elevation_m\":" << terrain.mesh.min_elevation_m
+           << ",\"max_elevation_m\":" << terrain.mesh.max_elevation_m
+           << "}]";
     return output.str();
 }
 

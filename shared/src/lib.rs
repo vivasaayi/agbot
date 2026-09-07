@@ -16,6 +16,7 @@ pub mod product_graph;
 pub mod resource_budget;
 pub mod schemas;
 pub mod secrets;
+pub mod timeseries_naming;
 pub mod twin_contract_v1;
 pub mod types;
 

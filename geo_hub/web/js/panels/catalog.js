@@ -7,7 +7,31 @@ import {
   farmFieldsPath,
   fieldScenesPath,
   scenePath,
+  catalogProductsPath,
+  fieldTimeseriesPath,
 } from "../api.js";
+import {
+  addCatalogProductLayer,
+  removeCatalogProductLayer,
+  hasCatalogProductLayer,
+} from "../map.js";
+
+const TRUE_COLOR_KINDS = new Set(["rgb", "truecolor", "true_color"]);
+const GEOTIFF_FORMATS = new Set(["tif", "tiff", "geotiff", "cog"]);
+
+// Every stored GeoTIFF can use the global catalog tile endpoint. True-color
+// composites are also tileable even though their three band paths live in
+// product parameters instead of a single artifact path.
+function isTileableRasterProduct(product) {
+  if (TRUE_COLOR_KINDS.has(product?.kind)) return true;
+  const format = String(product?.format ?? "").toLowerCase();
+  const path = String(product?.path ?? "").toLowerCase();
+  return (
+    GEOTIFF_FORMATS.has(format) ||
+    path.endsWith(".tif") ||
+    path.endsWith(".tiff")
+  );
+}
 
 function asItems(page) {
   if (Array.isArray(page)) return page;
@@ -101,6 +125,156 @@ async function expandFarm(container, farm, onSelectScene) {
   container.replaceChildren(list);
 }
 
+const LEVELS = ["l0", "l1", "l2", "l3"];
+const LEVEL_LABELS = {
+  l0: "L0 — raw / source",
+  l1: "L1 — calibrated bands",
+  l2: "L2 — surface products",
+  l3: "L3 — analysis / indices",
+};
+
+// Draw a compact inline-SVG sparkline of {t, value} points.
+function sparkline(points) {
+  const width = 220;
+  const height = 40;
+  const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+  svg.setAttribute("class", "sparkline");
+  svg.setAttribute("width", String(width));
+  svg.setAttribute("height", String(height));
+  if (points.length === 0) return svg;
+  const values = points.map((p) => p.value);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const span = max - min || 1;
+  const step = points.length > 1 ? width / (points.length - 1) : 0;
+  const coords = points.map((p, i) => {
+    const x = i * step;
+    const y = height - ((p.value - min) / span) * (height - 4) - 2;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  });
+  const path = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+  path.setAttribute("points", coords.join(" "));
+  path.setAttribute("fill", "none");
+  path.setAttribute("stroke", "currentColor");
+  path.setAttribute("stroke-width", "1.5");
+  svg.appendChild(path);
+  return svg;
+}
+
+// Plot the field's time-series for a metric under `host` (part 2.3c: link a
+// scene's L2/L3 product to the field's level series).
+async function plotSeries(host, fieldId, metric) {
+  host.replaceChildren(statusLine(`Loading ${metric}…`));
+  try {
+    const series = await apiGet(fieldTimeseriesPath(fieldId, { metric }));
+    const points = Array.isArray(series?.merged) ? series.merged : [];
+    host.replaceChildren();
+    if (points.length === 0) {
+      host.appendChild(statusLine(`No ${metric} observations for this field yet.`));
+      return;
+    }
+    host.appendChild(sparkline(points));
+    const last = points[points.length - 1];
+    const caption = document.createElement("p");
+    caption.className = "status";
+    caption.textContent = `${points.length} obs · latest ${Number(last.value).toFixed(3)} @ ${last.t}`;
+    host.appendChild(caption);
+  } catch (error) {
+    host.replaceChildren(statusLine(`Series unavailable: ${error.message}`, true));
+  }
+}
+
+// Render the scene's catalog products grouped by processing level (L0–L3),
+// with a per-product link to plot the field's series for L2/L3 metrics.
+async function renderLevelBrowser(inspector, sceneId) {
+  const section = document.createElement("section");
+  section.className = "level-browser";
+  const heading = document.createElement("h4");
+  heading.className = "pipeline-heading";
+  heading.textContent = "Products by level";
+  section.appendChild(heading);
+  inspector.appendChild(section);
+
+  let products;
+  try {
+    products = await apiGet(catalogProductsPath({ scene_id: sceneId }));
+  } catch (error) {
+    section.appendChild(statusLine(`Products unavailable: ${error.message}`, true));
+    return;
+  }
+  if (!Array.isArray(products) || products.length === 0) {
+    section.appendChild(statusLine("No cataloged products for this scene."));
+    return;
+  }
+
+  const fieldId = products.find((p) => p.field_id)?.field_id ?? null;
+
+  for (const level of LEVELS) {
+    const atLevel = products.filter((p) => p.level === level);
+    if (atLevel.length === 0) continue;
+    const group = document.createElement("div");
+    group.className = "level-group";
+    const label = document.createElement("h5");
+    label.className = "level-label";
+    label.textContent = `${LEVEL_LABELS[level]} (${atLevel.length})`;
+    group.appendChild(label);
+
+    const list = document.createElement("ul");
+    list.className = "level-product-list";
+    for (const product of atLevel) {
+      const li = document.createElement("li");
+      const line = document.createElement("div");
+      line.className = "level-product-row";
+      line.textContent = `${product.kind} · ${product.status}`;
+      if (product.temporal_start) {
+        line.textContent += ` · ${product.temporal_start.slice(0, 10)}`;
+      }
+      li.appendChild(line);
+
+      // All catalog GeoTIFFs (including elevation DSM/DTM products) render
+      // through the global XYZ tile path and can be toggled on the GIS map.
+      if (level !== "l0" && isTileableRasterProduct(product)) {
+        const toggle = document.createElement("button");
+        toggle.type = "button";
+        toggle.className = "pipeline-refresh";
+        const sync = () => {
+          toggle.textContent = hasCatalogProductLayer(product.product_id)
+            ? "Hide layer"
+            : "Show layer";
+        };
+        toggle.addEventListener("click", () => {
+          if (hasCatalogProductLayer(product.product_id)) {
+            removeCatalogProductLayer(product.product_id);
+          } else {
+            addCatalogProductLayer(product.product_id);
+          }
+          sync();
+        });
+        sync();
+        li.appendChild(toggle);
+      }
+
+      // L2/L3 metric products: offer to plot the field's series for the
+      // conventional `sat.<kind>.mean` metric.
+      if ((level === "l2" || level === "l3") && fieldId) {
+        const metric = `sat.${product.kind}.mean`;
+        const plotHost = document.createElement("div");
+        plotHost.className = "level-series";
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "pipeline-refresh";
+        button.textContent = `Plot ${metric}`;
+        button.addEventListener("click", () => plotSeries(plotHost, fieldId, metric));
+        li.append(button, plotHost);
+      }
+      list.appendChild(li);
+    }
+    group.appendChild(list);
+    section.appendChild(group);
+  }
+}
+
 export async function renderSceneDetail(inspector, sceneId) {
   inspector.replaceChildren(statusLine("Loading scene…"));
   try {
@@ -120,6 +294,7 @@ export async function renderSceneDetail(inspector, sceneId) {
       dl.append(dt, dd);
     }
     inspector.appendChild(dl);
+    await renderLevelBrowser(inspector, sceneId);
   } catch (error) {
     inspector.replaceChildren(statusLine(`Failed to load scene: ${error.message}`, true));
   }
