@@ -489,6 +489,17 @@ async fn subscription_crud_routes_roundtrip() -> Result<()> {
     .await?;
     assert_eq!(body["subscriptions"][0]["status"], "paused");
 
+    // Landsat surface temperature is an explicit subscription product.
+    let (status, body) = send_json(
+        &app,
+        "POST",
+        &format!("/api/fields/{FIELD}/subscriptions"),
+        Some(json!({ "dataset": "landsat", "indices": ["ndvi", "lst"] })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["indices"], json!(["ndvi", "lst"]));
+
     // Validation failures.
     let (status, _) = send_json(
         &app,
@@ -506,6 +517,42 @@ async fn subscription_crud_routes_roundtrip() -> Result<()> {
     )
     .await?;
     assert_eq!(status, StatusCode::BAD_REQUEST, "empty indices");
+    let (status, _) = send_json(
+        &app,
+        "POST",
+        &format!("/api/fields/{FIELD}/subscriptions"),
+        Some(json!({ "dataset": "landsat", "indices": ["ndre"] })),
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "Landsat has no red-edge band"
+    );
+    let (status, _) = send_json(
+        &app,
+        "POST",
+        &format!("/api/fields/{FIELD}/subscriptions"),
+        Some(json!({ "dataset": "sentinel2", "indices": ["lst"] })),
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "LST is a Landsat-only Collection-2 Level-2 product"
+    );
+    let (status, _) = send_json(
+        &app,
+        "POST",
+        &format!("/api/fields/{FIELD}/subscriptions"),
+        Some(json!({ "dataset": "hls", "indices": ["ndvi"] })),
+    )
+    .await?;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "HLS has no automated discovery adapter"
+    );
     let (status, _) = send_json(
         &app,
         "POST",

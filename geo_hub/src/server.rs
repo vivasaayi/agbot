@@ -1,7 +1,7 @@
+use crate::pc_sign::ProductionCogResolver;
 use crate::pipeline_worker::{
     spawn_pipeline_worker, EarthSearchItemFetcher, PipelineWorkerContext,
 };
-use crate::satellite_derivation::UrlCogResolver;
 use crate::{config::HubConfig, routes, state::AppState};
 use anyhow::Result;
 use axum::{
@@ -1248,7 +1248,7 @@ pub async fn serve(config: HubConfig, pool: crate::db::DbPool) -> Result<()> {
         let worker_ctx = PipelineWorkerContext {
             pool: pool.clone(),
             config: Arc::clone(&shared_config),
-            cog_resolver: Arc::new(UrlCogResolver),
+            cog_resolver: Arc::new(ProductionCogResolver::new()?),
             item_fetcher: Arc::new(EarthSearchItemFetcher),
         };
         Some(spawn_pipeline_worker(worker_ctx, worker_shutdown_rx))

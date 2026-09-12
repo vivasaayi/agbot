@@ -145,6 +145,30 @@ pub async fn derive_landsat_product_route(
         &request,
     )
     .await?;
+
+    if state.config.pipeline.qa_min_confidence > 0.0 {
+        let confidence = crate::catalog::get_product(&state.pool, &outcome.product_id)
+            .await
+            .map_err(anyhow::Error::from)?
+            .and_then(|product| product.confidence);
+        let policy = crate::catalog::QaPolicy {
+            min_confidence: state.config.pipeline.qa_min_confidence,
+        };
+        if let crate::catalog::QaVerdict::Quarantine { reason } =
+            crate::catalog::qa_verdict(confidence, &policy)
+        {
+            crate::catalog::quarantine_product(&state.pool, &outcome.product_id)
+                .await
+                .map_err(anyhow::Error::from)?;
+            return Err(AppError::UnprocessableEntity(format!(
+                "product failed QA: {reason}"
+            )));
+        }
+    }
+    if request.field_id.is_some() {
+        crate::field_timeseries::extract_and_append_field_stats(&state.pool, &outcome.product_id)
+            .await?;
+    }
     Ok(Json(outcome))
 }
 

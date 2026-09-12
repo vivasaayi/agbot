@@ -1,8 +1,8 @@
 //! Integration tests for the orchestrated L3 suite (batch S-12): the
 //! `l3_recompute` job now carries a `product` selector, and the
 //! `monthly_composite` success path fans out into follow-up recomputes:
-//! seasonal `climatology` (>= 2 same-calendar-month composites across years),
-//! `phenology` (season-end month, >= 3 months in the season), and the
+//! seasonal `climatology` (>= 5 same-calendar-month composites across years),
+//! `phenology` (configured season-end month and minimum observations), and the
 //! `drought_stack` (VCI/TCI/VHI/SPI) which then enqueues the `drought_watch`
 //! app run.
 //!
@@ -230,14 +230,28 @@ fn l3_payload_defaults_product_to_monthly_composite() {
 
 // --- climatology -------------------------------------------------------------
 
-/// A new month's composite triggers a climatology recompute; with two same
+/// A new month's composite triggers a climatology recompute; with five same
 /// calendar-month composites across years the NDVI climatology registers.
 #[tokio::test]
 async fn new_month_composite_enqueues_climatology() -> Result<()> {
     let (tmp, ctx) = worker_ctx().await?;
-    // Two Junes across years -> the calendar-June climatology has 2 years.
-    register_composite(&ctx, &tmp, "field-1", "ndvi", "2024-06", vec![0.2; 4]).await?;
-    register_composite(&ctx, &tmp, "field-1", "ndvi", "2025-06", vec![0.6; 4]).await?;
+    for (year, value) in [
+        (2021, 0.2),
+        (2022, 0.3),
+        (2023, 0.4),
+        (2024, 0.5),
+        (2025, 0.6),
+    ] {
+        register_composite(
+            &ctx,
+            &tmp,
+            "field-1",
+            "ndvi",
+            &format!("{year}-06"),
+            vec![value; 4],
+        )
+        .await?;
+    }
 
     enqueue_l3_product(&ctx, "field-1", "ndvi", "climatology", "2025-06").await?;
     let outcome = run_one_tick(&ctx).await?;
@@ -260,12 +274,22 @@ async fn new_month_composite_enqueues_climatology() -> Result<()> {
     Ok(())
 }
 
-/// With only one calendar-month composite the climatology recompute is a
-/// logged no-op (needs >= 2 years), not a failure.
+/// Four calendar years remain below the production climatology floor and
+/// therefore complete as a logged no-op rather than publishing weak evidence.
 #[tokio::test]
-async fn climatology_requires_two_years_else_noop() -> Result<()> {
+async fn climatology_requires_five_years_else_noop() -> Result<()> {
     let (tmp, ctx) = worker_ctx().await?;
-    register_composite(&ctx, &tmp, "field-1", "ndvi", "2025-06", vec![0.6; 4]).await?;
+    for year in 2022..=2025 {
+        register_composite(
+            &ctx,
+            &tmp,
+            "field-1",
+            "ndvi",
+            &format!("{year}-06"),
+            vec![0.6; 4],
+        )
+        .await?;
+    }
 
     enqueue_l3_product(&ctx, "field-1", "ndvi", "climatology", "2025-06").await?;
     let outcome = run_one_tick(&ctx).await?;
@@ -284,15 +308,15 @@ async fn climatology_requires_two_years_else_noop() -> Result<()> {
     .await?;
     assert!(
         climatologies.is_empty(),
-        "no climatology from one year: {climatologies:?}"
+        "no climatology from four years: {climatologies:?}"
     );
     Ok(())
 }
 
 // --- phenology ---------------------------------------------------------------
 
-/// A season-end month (09/10) composite triggers a phenology recompute; with
-/// >= 3 months in the season a `phenology` L3 registers.
+/// A configured season-end month composite triggers a phenology recompute;
+/// with the configured minimum months a `phenology` L3 registers.
 #[tokio::test]
 async fn season_end_composite_enqueues_phenology() -> Result<()> {
     let (tmp, ctx) = worker_ctx().await?;
@@ -349,6 +373,37 @@ async fn phenology_requires_three_months_else_noop() -> Result<()> {
     Ok(())
 }
 
+/// Temperature and other non-NDVI products must never enter the vegetation
+/// phenology classifier, including jobs left in a queue by an older worker.
+#[tokio::test]
+async fn phenology_rejects_non_ndvi_products() -> Result<()> {
+    let (tmp, ctx) = worker_ctx().await?;
+    for month in ["2026-07", "2026-08", "2026-09"] {
+        register_composite(&ctx, &tmp, "field-1", "lst", month, vec![300.0; 4]).await?;
+    }
+
+    enqueue_l3_product(&ctx, "field-1", "lst", "phenology", "2026-09").await?;
+    let outcome = run_one_tick(&ctx).await?;
+    assert_eq!(outcome.result, Some(JobRunResult::Succeeded), "{outcome:?}");
+
+    let phenology = catalog::list_products(
+        &ctx.pool,
+        &ProductFilter {
+            kind: Some("phenology".to_string()),
+            level: Some(ProductLevel::L3),
+            status: Some("registered".to_string()),
+            field_id: Some("field-1".to_string()),
+            ..ProductFilter::default()
+        },
+    )
+    .await?;
+    assert!(
+        phenology.is_empty(),
+        "LST must not produce a phenology raster: {phenology:?}"
+    );
+    Ok(())
+}
+
 // --- drought stack -----------------------------------------------------------
 
 /// The drought stack for a subscribed field: with an NDVI climatology present
@@ -358,10 +413,24 @@ async fn phenology_requires_three_months_else_noop() -> Result<()> {
 async fn drought_stack_recomputes_for_subscribed_field() -> Result<()> {
     let (tmp, ctx) = worker_ctx().await?;
     subscribe(&ctx, "field-1").await?;
-    // NDVI composites across years -> climatology, plus a current month.
-    register_composite(&ctx, &tmp, "field-1", "ndvi", "2024-06", vec![0.2; 4]).await?;
-    register_composite(&ctx, &tmp, "field-1", "ndvi", "2025-06", vec![0.6; 4]).await?;
-    register_composite(&ctx, &tmp, "field-1", "ndvi", "2026-06", vec![0.4; 4]).await?;
+    // Five NDVI calendar years -> production climatology, including current.
+    for (year, value) in [
+        (2022, 0.2),
+        (2023, 0.3),
+        (2024, 0.5),
+        (2025, 0.6),
+        (2026, 0.4),
+    ] {
+        register_composite(
+            &ctx,
+            &tmp,
+            "field-1",
+            "ndvi",
+            &format!("{year}-06"),
+            vec![value; 4],
+        )
+        .await?;
+    }
 
     // Climatology must exist first (VCI gates on it).
     enqueue_l3_product(&ctx, "field-1", "ndvi", "climatology", "2026-06").await?;
@@ -411,10 +480,24 @@ async fn drought_stack_recomputes_for_subscribed_field() -> Result<()> {
 async fn drought_watch_app_run_fires_alerts() -> Result<()> {
     let (tmp, ctx) = worker_ctx().await?;
     subscribe(&ctx, "field-1").await?;
-    // A current NDVI that scores low against the baseline -> stressed VCI.
-    register_composite(&ctx, &tmp, "field-1", "ndvi", "2024-06", vec![0.6; 4]).await?;
-    register_composite(&ctx, &tmp, "field-1", "ndvi", "2025-06", vec![0.9; 4]).await?;
-    register_composite(&ctx, &tmp, "field-1", "ndvi", "2026-06", vec![0.6; 4]).await?;
+    // A current NDVI that scores at the five-year baseline minimum -> stress.
+    for (year, value) in [
+        (2022, 0.6),
+        (2023, 0.7),
+        (2024, 0.8),
+        (2025, 0.9),
+        (2026, 0.6),
+    ] {
+        register_composite(
+            &ctx,
+            &tmp,
+            "field-1",
+            "ndvi",
+            &format!("{year}-06"),
+            vec![value; 4],
+        )
+        .await?;
+    }
 
     enqueue_l3_product(&ctx, "field-1", "ndvi", "climatology", "2026-06").await?;
     run_one_tick(&ctx).await?;

@@ -51,7 +51,7 @@ use crate::pipeline::{
     L3RecomputePayload, PipelineError, PipelineJob,
 };
 use crate::satellite_derivation::{
-    derive_satellite_index, index_kind_from_key, CogStoreResolver, DeriveRequest,
+    derive_product_from_key, derive_satellite_index, CogStoreResolver, DeriveRequest,
 };
 use post_processor::temporal_composite::CompositeCadence;
 use shared::product_graph::ProductLevel;
@@ -799,8 +799,8 @@ async fn execute_derive(ctx: &PipelineWorkerContext, job: &PipelineJob) -> JobRu
         Ok(payload) => payload,
         Err(err) => return client_failure(format!("invalid derive payload: {err}")),
     };
-    let index = match index_kind_from_key(&payload.index) {
-        Ok(index) => index,
+    let product = match derive_product_from_key(&payload.index) {
+        Ok(product) => product,
         Err(err) => return client_failure(err.to_string()),
     };
     let aoi = match aoi_bounds_from_geojson(&payload.aoi_geojson) {
@@ -824,7 +824,7 @@ async fn execute_derive(ctx: &PipelineWorkerContext, job: &PipelineJob) -> JobRu
     let request = DeriveRequest {
         item,
         aoi,
-        index,
+        product,
         field_id: Some(payload.field_id.clone()),
         season_id: payload.season_id.clone(),
     };
@@ -872,6 +872,19 @@ async fn execute_derive(ctx: &PipelineWorkerContext, job: &PipelineJob) -> JobRu
             );
             return JobRunResult::Succeeded;
         }
+    }
+
+    // Field observations become visible only after the quality policy has
+    // accepted the raster. This prevents quarantined products from affecting
+    // trends, alerts, and recommendations.
+    if let Err(err) =
+        crate::field_timeseries::extract_and_append_field_stats(&ctx.pool, &outcome.product_id)
+            .await
+    {
+        return transient_failure(format!(
+            "product {} passed QA but field-stat extraction failed: {err}",
+            outcome.product_id
+        ));
     }
 
     // Post-derive hook (S-9): the registration is durable, so a follow-up
@@ -970,23 +983,6 @@ async fn enqueue_post_derive_jobs(
     }
     Ok(())
 }
-
-/// Season-end calendar months that trigger a phenology recompute (batch
-/// S-12, v1 simplification): kharif harvest window. This hardcoded rule is a
-/// placeholder for per-field season configuration; the config follow-up will
-/// read the field's registered season boundaries instead.
-const SEASON_END_MONTHS: &[u32] = &[9, 10];
-
-/// Minimum distinct calendar-year composites a climatology period needs
-/// (batch S-12). Two years is the pipeline floor; the HTTP path defaults
-/// higher (`DEFAULT_MIN_YEARS`), but the automated loop materializes a usable
-/// baseline as soon as two seasons exist.
-const CLIMATOLOGY_MIN_YEARS: u32 = 2;
-
-/// Minimum months in a season before phenology is worth computing (batch
-/// S-12): the phenology engine needs a rising/falling arc to place season
-/// markers.
-const PHENOLOGY_MIN_MONTHS: usize = 3;
 
 /// Execute one L3 recompute. The payload's `product` selects the derivation
 /// (batch S-12): `monthly_composite` (default) composites the month's L2
@@ -1132,9 +1128,9 @@ async fn execute_l3_monthly_composite(
 /// (batch S-12), each debounced by its own `l3:` suite job key:
 ///
 /// - **climatology** for the composite's calendar month, always (the handler
-///   no-ops when fewer than two same-month years exist);
-/// - **phenology** only when the month is a season-end month (v1 rule:
-///   [`SEASON_END_MONTHS`]; the handler no-ops on a short season);
+///   no-ops until the configured minimum same-month years exist);
+/// - **phenology** only for NDVI when the month is one of the configured
+///   season-end months; the handler no-ops on a short season;
 /// - **drought_stack** for the month, only when the field has any active
 ///   subscription (v1 simplification: any subscription opts the field in).
 async fn enqueue_l3_followups(
@@ -1147,11 +1143,18 @@ async fn enqueue_l3_followups(
     // climatology (debounced per calendar month).
     enqueue_l3_suite_job(ctx, payload, "climatology", month, now).await?;
 
-    // phenology only at a season-end month (v1 rule).
+    // Phenology only at a deployment-configured season-end month.
     let calendar_month: Option<u32> = month
         .split_once('-')
         .and_then(|(_, mm)| mm.parse::<u32>().ok());
-    if calendar_month.is_some_and(|m| SEASON_END_MONTHS.contains(&m)) {
+    if payload.index == "ndvi"
+        && calendar_month.is_some_and(|month| {
+            ctx.config
+                .pipeline
+                .phenology_season_end_months
+                .contains(&month)
+        })
+    {
         enqueue_l3_suite_job(ctx, payload, "phenology", month, now).await?;
     }
 
@@ -1213,24 +1216,25 @@ async fn field_has_active_subscription(
 /// field's index climatology from its monthly composites through the same
 /// core the drought route uses ([`drought_rasters::derive_index_climatology`]),
 /// then supersede prior climatologies of the same identity. No usable
-/// composites (fewer than two same-month years yields a sentinel-only,
-/// still-registered climatology; zero composites yields
+/// composites (fewer than the configured same-month years yields a
+/// sentinel-only, still-registered climatology; zero composites yields
 /// [`DroughtRasterError::NoUsableObservations`]) completes as a logged no-op.
 async fn execute_l3_climatology(
     ctx: &PipelineWorkerContext,
     payload: &L3RecomputePayload,
 ) -> JobRunResult {
     // Gate: a usable climatology needs at least one calendar month with
-    // >= CLIMATOLOGY_MIN_YEARS distinct years of composites. Enforced here
+    // >= the configured distinct years of composites. Enforced here
     // (before registration) so an under-populated field is a clean no-op and
     // no sentinel-only climatology is exposed.
     match max_calendar_month_year_span(ctx, &payload.field_id, &payload.index).await {
-        Ok(span) if span < CLIMATOLOGY_MIN_YEARS as usize => {
+        Ok(span) if span < ctx.config.pipeline.climatology_min_years as usize => {
             tracing::info!(
                 field_id = %payload.field_id,
                 index = %payload.index,
                 span,
-                "l3 climatology: fewer than two same-month years; completing as no-op"
+                min_years = ctx.config.pipeline.climatology_min_years,
+                "l3 climatology: insufficient same-month years; completing as no-op"
             );
             return JobRunResult::Succeeded;
         }
@@ -1249,7 +1253,7 @@ async fn execute_l3_climatology(
             field_id: payload.field_id.clone(),
             season_id,
             cadence: CompositeCadence::Monthly,
-            min_years: CLIMATOLOGY_MIN_YEARS,
+            min_years: ctx.config.pipeline.climatology_min_years,
         },
     )
     .await
@@ -1297,41 +1301,51 @@ async fn execute_l3_climatology(
 /// Execute a `phenology` L3 recompute (batch S-12): run the phenology +
 /// land-cover core ([`landcover_rasters::derive_landcover`]) over the field's
 /// season window (the composite series), superseding prior phenology of the
-/// same identity. A season with fewer than [`PHENOLOGY_MIN_MONTHS`] composites
+/// same identity. A season with fewer than the configured minimum composites
 /// completes as a logged no-op.
 async fn execute_l3_phenology(
     ctx: &PipelineWorkerContext,
     payload: &L3RecomputePayload,
 ) -> JobRunResult {
+    if payload.index != "ndvi" {
+        tracing::info!(
+            field_id = %payload.field_id,
+            index = %payload.index,
+            "l3 phenology is defined only for NDVI; completing as no-op"
+        );
+        return JobRunResult::Succeeded;
+    }
     let Some((_, end)) = month_window(&payload.month) else {
         return client_failure(format!(
             "l3 phenology month {:?} is not YYYY-MM",
             payload.month
         ));
     };
-    // Season window: v1 fixed 6-month lookback ending at the composite month,
-    // covering the kharif arc. Config-driven season boundaries are follow-up.
+    // Configured season window ending at the triggering composite month.
+    let lookback_months = ctx.config.pipeline.phenology_lookback_months.max(1);
     let Some(season_start) = end
         .with_day(1)
-        .and_then(|d| d.checked_sub_months(chrono::Months::new(5)))
+        .and_then(|d| d.checked_sub_months(chrono::Months::new(lookback_months - 1)))
     else {
         return client_failure(format!("l3 phenology month {:?} underflows", payload.month));
     };
     let start = season_start;
 
-    // Gate: at least PHENOLOGY_MIN_MONTHS composites of the index in the
+    // Gate: at least the configured composites of the index in the
     // window (the engine needs an arc to place season markers).
     let months =
         match count_composite_months(ctx, &payload.field_id, &payload.index, &start, &end).await {
             Ok(months) => months,
             Err(err) => return transient_failure(err.to_string()),
         };
-    if months < PHENOLOGY_MIN_MONTHS {
+    let min_observations = ctx.config.pipeline.phenology_min_observations as usize;
+    if months < min_observations {
         tracing::info!(
             field_id = %payload.field_id,
             index = %payload.index,
             months,
-            "l3 phenology: fewer than three season months; completing as no-op"
+            min_observations,
+            "l3 phenology: insufficient season months; completing as no-op"
         );
         return JobRunResult::Succeeded;
     }
@@ -1347,7 +1361,7 @@ async fn execute_l3_phenology(
             season_id,
             start: start.format("%Y-%m-%d").to_string(),
             end: end.format("%Y-%m-%d").to_string(),
-            min_observations: PHENOLOGY_MIN_MONTHS as u32,
+            min_observations: ctx.config.pipeline.phenology_min_observations,
             season_threshold_fraction: default_phenology_threshold(),
             series: "composites".to_string(),
         },
@@ -1430,7 +1444,7 @@ async fn execute_l3_drought_stack(
                         field_id: field_id.clone(),
                         season_id: season_id.clone(),
                         cadence: CompositeCadence::Monthly,
-                        min_years: CLIMATOLOGY_MIN_YEARS,
+                        min_years: ctx.config.pipeline.climatology_min_years,
                         series: "composites".to_string(),
                     },
                 )
@@ -2161,6 +2175,30 @@ fn collect_position_envelope(
     value: &serde_json::Value,
     bounds: &mut Option<GeoBounds>,
 ) -> Result<(), String> {
+    if let Some(object) = value.as_object() {
+        if let (Some(lon), Some(lat)) = (
+            object.get("longitude").and_then(serde_json::Value::as_f64),
+            object.get("latitude").and_then(serde_json::Value::as_f64),
+        ) {
+            match bounds {
+                None => {
+                    *bounds = Some(GeoBounds {
+                        min_lon: lon,
+                        max_lon: lon,
+                        min_lat: lat,
+                        max_lat: lat,
+                    });
+                }
+                Some(bounds) => {
+                    bounds.min_lon = bounds.min_lon.min(lon);
+                    bounds.max_lon = bounds.max_lon.max(lon);
+                    bounds.min_lat = bounds.min_lat.min(lat);
+                    bounds.max_lat = bounds.max_lat.max(lat);
+                }
+            }
+            return Ok(());
+        }
+    }
     let array = value
         .as_array()
         .ok_or_else(|| format!("expected coordinate array, got {value}"))?;
@@ -2239,6 +2277,17 @@ mod tests {
         let via_feature = aoi_bounds_from_geojson(&feature).unwrap();
         assert_eq!(via_feature.min_lon, bounds.min_lon);
         assert_eq!(via_feature.max_lat, bounds.max_lat);
+
+        let stored_field_boundary = json!({
+            "coordinates": [
+                {"longitude": 76.64, "latitude": 11.34},
+                {"longitude": 76.65, "latitude": 11.35}
+            ],
+            "crs": "EPSG:4326"
+        });
+        let stored = aoi_bounds_from_geojson(&stored_field_boundary).unwrap();
+        assert_eq!(stored.min_lon, 76.64);
+        assert_eq!(stored.max_lat, 11.35);
     }
 
     #[tokio::test]

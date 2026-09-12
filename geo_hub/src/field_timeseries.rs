@@ -32,6 +32,7 @@ use timeseries::{
 
 use crate::catalog;
 use crate::db::DbPool;
+use crate::drought_rasters::LoadedRaster;
 use shared::product_graph::ProductLevel;
 
 /// Reason-coded failure of one extraction attempt. `NoFieldScope` is the
@@ -53,6 +54,8 @@ pub enum FieldTimeseriesError {
     NoTemporalStart(String),
     #[error("product {0} raster has no valid pixels; value statistics are undefined")]
     NoValidPixels(String),
+    #[error("field {field_id} boundary cannot be rasterized: {message}")]
+    InvalidFieldBoundary { field_id: String, message: String },
     #[error("failed to read raster {path}: {source}")]
     Raster {
         path: String,
@@ -146,6 +149,104 @@ pub(crate) fn zonal_stats(values: &[f32], nodata: Option<f32>) -> Option<Vec<(Zo
     ])
 }
 
+fn point_in_ring(point: (f64, f64), ring: &[serde_json::Value]) -> bool {
+    let mut inside = false;
+    let mut previous = ring.last().and_then(position);
+    for vertex in ring {
+        let current = position(vertex);
+        if let (Some((xi, yi)), Some((xj, yj))) = (current, previous) {
+            if ((yi > point.1) != (yj > point.1))
+                && point.0 < (xj - xi) * (point.1 - yi) / (yj - yi) + xi
+            {
+                inside = !inside;
+            }
+        }
+        previous = current;
+    }
+    inside
+}
+
+fn position(value: &serde_json::Value) -> Option<(f64, f64)> {
+    if let Some(values) = value.as_array() {
+        return Some((values.first()?.as_f64()?, values.get(1)?.as_f64()?));
+    }
+    Some((
+        value.get("longitude")?.as_f64()?,
+        value.get("latitude")?.as_f64()?,
+    ))
+}
+
+fn point_in_polygon(point: (f64, f64), rings: &[serde_json::Value]) -> bool {
+    let Some(exterior) = rings.first().and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    point_in_ring(point, exterior)
+        && !rings.iter().skip(1).any(|ring| {
+            ring.as_array()
+                .is_some_and(|vertices| point_in_ring(point, vertices))
+        })
+}
+
+fn geometry_contains(geometry: &serde_json::Value, point: (f64, f64)) -> Result<bool, String> {
+    let geometry = geometry.get("geometry").unwrap_or(geometry);
+    if geometry.get("type").is_none() {
+        let ring = geometry
+            .get("coordinates")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| "missing field coordinates".to_string())?;
+        return Ok(point_in_ring(point, ring));
+    }
+    let kind = geometry
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "missing geometry type".to_string())?;
+    let coordinates = geometry
+        .get("coordinates")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "missing coordinate array".to_string())?;
+    match kind {
+        "Polygon" => Ok(point_in_polygon(point, coordinates)),
+        "MultiPolygon" => Ok(coordinates.iter().any(|polygon| {
+            polygon
+                .as_array()
+                .is_some_and(|rings| point_in_polygon(point, rings))
+        })),
+        other => Err(format!("expected Polygon or MultiPolygon, got {other}")),
+    }
+}
+
+fn values_within_field(
+    raster: &LoadedRaster,
+    boundary: &serde_json::Value,
+) -> Result<Vec<f32>, String> {
+    let epsg = raster
+        .epsg
+        .ok_or_else(|| "raster has no EPSG code".to_string())?;
+    let zone = crate::utm::UtmZone::from_epsg(epsg).map_err(|err| err.to_string())?;
+    let transform = raster
+        .geo_transform
+        .ok_or_else(|| "raster has no geotransform".to_string())?;
+    let mut selected = Vec::new();
+    for row in 0..raster.height {
+        for col in 0..raster.width {
+            let x = transform[0]
+                + (f64::from(col) + 0.5) * transform[1]
+                + (f64::from(row) + 0.5) * transform[2];
+            let y = transform[3]
+                + (f64::from(col) + 0.5) * transform[4]
+                + (f64::from(row) + 0.5) * transform[5];
+            let (lat, lon) = crate::utm::utm_to_wgs84(x, y, zone);
+            if geometry_contains(boundary, (lon, lat))? {
+                selected.push(raster.values[(row * raster.width + col) as usize]);
+            }
+        }
+    }
+    if selected.is_empty() {
+        return Err("field contains no raster pixel centers".to_string());
+    }
+    Ok(selected)
+}
+
 /// Extract the five zonal statistics from a field-scoped L2 index product
 /// and append them to `time_series_points` (one row per stat, idempotent via
 /// `INSERT OR IGNORE` on the `(entity_ref, metric, t, source_ref)` key).
@@ -192,6 +293,37 @@ pub async fn extract_and_append_field_stats(
     let mut reader = raster_io::GeoTiffReader::open(path).map_err(raster_error)?;
     let nodata = reader.info().nodata.map(|n| n as f32);
     let values = reader.read_band().map_err(raster_error)?.to_f32();
+    let loaded = LoadedRaster {
+        values,
+        valid_mask: Vec::new(),
+        spatial_ref: reader.spatial_ref().map_err(raster_error)?,
+        epsg: reader.info().epsg,
+        geo_transform: reader.info().geo_transform,
+        width: reader.info().width,
+        height: reader.info().height,
+    };
+    let boundary: Option<(String,)> =
+        sqlx::query_as("SELECT boundary_json FROM fields WHERE field_id = ?")
+            .bind(field_id)
+            .fetch_optional(pool)
+            .await?;
+    let values = match boundary {
+        Some((json,)) => {
+            let boundary: serde_json::Value = serde_json::from_str(&json).map_err(|err| {
+                FieldTimeseriesError::InvalidFieldBoundary {
+                    field_id: field_id.to_string(),
+                    message: err.to_string(),
+                }
+            })?;
+            values_within_field(&loaded, &boundary).map_err(|message| {
+                FieldTimeseriesError::InvalidFieldBoundary {
+                    field_id: field_id.to_string(),
+                    message,
+                }
+            })?
+        }
+        None => loaded.values,
+    };
     let stats = zonal_stats(&values, nodata)
         .ok_or_else(|| FieldTimeseriesError::NoValidPixels(product.product_id.clone()))?;
 
@@ -807,6 +939,31 @@ mod tests {
         assert!((stat(ZonalStat::ValidFraction) - 4.0 / 6.0).abs() < 1e-12);
         // All masked -> undefined.
         assert!(zonal_stats(&[f32::NAN, -9999.0], Some(-9999.0)).is_none());
+    }
+
+    #[test]
+    fn polygon_membership_respects_holes_and_multipolygons() {
+        let polygon = serde_json::json!({
+            "type": "Polygon",
+            "coordinates": [
+                [[0,0],[4,0],[4,4],[0,4],[0,0]],
+                [[1,1],[3,1],[3,3],[1,3],[1,1]]
+            ]
+        });
+        assert!(geometry_contains(&polygon, (0.5, 0.5)).unwrap());
+        assert!(!geometry_contains(&polygon, (2.0, 2.0)).unwrap());
+        assert!(!geometry_contains(&polygon, (5.0, 5.0)).unwrap());
+        let legacy = serde_json::json!({
+            "coordinates": [
+                {"longitude": 0, "latitude": 0},
+                {"longitude": 4, "latitude": 0},
+                {"longitude": 4, "latitude": 4},
+                {"longitude": 0, "latitude": 4},
+                {"longitude": 0, "latitude": 0}
+            ],
+            "crs": "EPSG:4326"
+        });
+        assert!(geometry_contains(&legacy, (2.0, 2.0)).unwrap());
     }
 
     fn point(t: &str, value: f64, source: &str) -> SeriesPointOut {

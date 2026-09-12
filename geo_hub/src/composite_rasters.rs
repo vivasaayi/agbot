@@ -32,6 +32,74 @@ use crate::drought_rasters::{
     artifact_file_component, file_checksum, geotiff_artifact_path, load_raster, DroughtRasterError,
     SkippedObservation,
 };
+
+fn resample_to_reference(
+    source: &crate::drought_rasters::LoadedRaster,
+    target: &crate::drought_rasters::LoadedRaster,
+) -> Result<(Vec<f32>, Vec<bool>), String> {
+    let source_transform = source
+        .geo_transform
+        .ok_or_else(|| "source has no geotransform".to_string())?;
+    let target_transform = target
+        .geo_transform
+        .ok_or_else(|| "target has no geotransform".to_string())?;
+    let source_epsg = source
+        .epsg
+        .ok_or_else(|| "source has no EPSG".to_string())?;
+    let target_epsg = target
+        .epsg
+        .ok_or_else(|| "target has no EPSG".to_string())?;
+    let source_zone = crate::utm::UtmZone::from_epsg(source_epsg).map_err(|e| e.to_string())?;
+    let target_zone = crate::utm::UtmZone::from_epsg(target_epsg).map_err(|e| e.to_string())?;
+    let determinant =
+        source_transform[1] * source_transform[5] - source_transform[2] * source_transform[4];
+    if determinant.abs() < 1e-12 {
+        return Err("source geotransform is singular".to_string());
+    }
+    let mut values = vec![INDEX_NODATA; (target.width * target.height) as usize];
+    let mut valid = vec![false; values.len()];
+    let mut overlap = 0usize;
+    for row in 0..target.height {
+        for col in 0..target.width {
+            let tx = target_transform[0]
+                + (f64::from(col) + 0.5) * target_transform[1]
+                + (f64::from(row) + 0.5) * target_transform[2];
+            let ty = target_transform[3]
+                + (f64::from(col) + 0.5) * target_transform[4]
+                + (f64::from(row) + 0.5) * target_transform[5];
+            let (sx, sy) = if source_epsg == target_epsg {
+                (tx, ty)
+            } else {
+                let (lat, lon) = crate::utm::utm_to_wgs84(tx, ty, target_zone);
+                crate::utm::wgs84_to_utm(lat, lon, source_zone).map_err(|e| e.to_string())?
+            };
+            let dx = sx - source_transform[0];
+            let dy = sy - source_transform[3];
+            let source_col = (source_transform[5] * dx - source_transform[2] * dy) / determinant;
+            let source_row = (-source_transform[4] * dx + source_transform[1] * dy) / determinant;
+            let source_col = source_col.floor() as i64;
+            let source_row = source_row.floor() as i64;
+            if source_col < 0
+                || source_row < 0
+                || source_col >= i64::from(source.width)
+                || source_row >= i64::from(source.height)
+            {
+                continue;
+            }
+            overlap += 1;
+            let source_index = (source_row as u32 * source.width + source_col as u32) as usize;
+            let target_index = (row * target.width + col) as usize;
+            if source.valid_mask[source_index] {
+                values[target_index] = source.values[source_index];
+                valid[target_index] = true;
+            }
+        }
+    }
+    if overlap == 0 {
+        return Err("source and target grids do not overlap".to_string());
+    }
+    Ok((values, valid))
+}
 use crate::satellite_derivation::INDEX_NODATA;
 
 /// Mask rule recorded in evidence: validity comes from each input's own
@@ -192,25 +260,38 @@ pub async fn derive_composite(
                 continue;
             }
         };
-        if let Some(reference) = &reference {
+        let (values, valid_mask, spatial_ref) = if let Some(reference) = &reference {
             if raster.epsg != reference.epsg
                 || raster.geo_transform != reference.geo_transform
                 || (raster.width, raster.height) != (reference.width, reference.height)
             {
-                skip(&product.product_id, "grid_mismatch", &mut skipped);
-                continue;
+                match resample_to_reference(&raster, reference) {
+                    Ok((values, valid)) => (values, valid, reference.spatial_ref.clone()),
+                    Err(_) => {
+                        skip(&product.product_id, "grid_mismatch", &mut skipped);
+                        continue;
+                    }
+                }
+            } else {
+                (
+                    raster.values.clone(),
+                    raster.valid_mask.clone(),
+                    reference.spatial_ref.clone(),
+                )
             }
-        }
-        let spatial_ref = reference
-            .as_ref()
-            .map(|reference| reference.spatial_ref.clone())
-            .unwrap_or_else(|| raster.spatial_ref.clone());
+        } else {
+            (
+                raster.values.clone(),
+                raster.valid_mask.clone(),
+                raster.spatial_ref.clone(),
+            )
+        };
         observations.push(CompositeObservation {
             product_id: product.product_id.clone(),
             scene_id: product.scene_id.clone().unwrap_or_default(),
             observed_on: date,
-            bands: vec![raster.values.clone()],
-            valid_mask: raster.valid_mask.clone(),
+            bands: vec![values],
+            valid_mask,
             spatial_ref,
         });
         used_ids.push(product.product_id.clone());
@@ -326,4 +407,41 @@ pub async fn list_composite_products(
         },
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shared::schemas::RasterSpatialRef;
+
+    fn raster(values: Vec<f32>, transform: [f64; 6]) -> crate::drought_rasters::LoadedRaster {
+        crate::drought_rasters::LoadedRaster {
+            valid_mask: vec![true; values.len()],
+            values,
+            spatial_ref: RasterSpatialRef {
+                georeferenced: true,
+                crs: Some("EPSG:32643".to_string()),
+                bbox: None,
+                geo_transform: Some(transform),
+                resolution: None,
+            },
+            epsg: Some(32643),
+            geo_transform: Some(transform),
+            width: 2,
+            height: 2,
+        }
+    }
+
+    #[test]
+    fn shifted_observation_resamples_onto_reference_grid() {
+        let source = raster(
+            vec![1.0, 2.0, 3.0, 4.0],
+            [10.0, 10.0, 0.0, 20.0, 0.0, -10.0],
+        );
+        let target = raster(vec![0.0; 4], [0.0, 10.0, 0.0, 20.0, 0.0, -10.0]);
+        let (values, valid) = resample_to_reference(&source, &target).unwrap();
+        assert_eq!(valid, vec![false, true, false, true]);
+        assert_eq!(values[1], 1.0);
+        assert_eq!(values[3], 3.0);
+    }
 }

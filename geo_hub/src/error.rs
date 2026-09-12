@@ -13,6 +13,8 @@ pub enum AppError {
     #[error("{0}")]
     BadRequest(String),
     #[error("{0}")]
+    UnprocessableEntity(String),
+    #[error("{0}")]
     Forbidden(String),
     #[error("unauthorized")]
     Unauthorized,
@@ -27,6 +29,9 @@ impl IntoResponse for AppError {
             }
             AppError::NotFound => (StatusCode::NOT_FOUND, "not found").into_response(),
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg).into_response(),
+            AppError::UnprocessableEntity(msg) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, msg).into_response()
+            }
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg).into_response(),
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized").into_response(),
         }

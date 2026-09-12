@@ -191,6 +191,9 @@ async fn landsat_bands_derive_qa_masked_ndvi_and_lst() -> Result<()> {
     let st = register_band(&ctx, &tmp, "band_st_b10", vec![44177; 4]).await?;
     // QA_PIXEL: pixel 1 cloud (bit 3 = 8), rest clear (bit 6 = 64).
     let qa = register_band(&ctx, &tmp, "band_qa_pixel", vec![64, 8, 64, 64]).await?;
+    let radsat = register_band(&ctx, &tmp, "band_qa_radsat", vec![0; 4]).await?;
+    let aerosol = register_band(&ctx, &tmp, "band_sr_qa_aerosol", vec![0, 0, 0b11 << 6, 0]).await?;
+    register_band(&ctx, &tmp, "band_st_qa", vec![150; 4]).await?;
 
     // --- NDVI: (0.6 - 0.2)/(0.6 + 0.2) = 0.5, cloud pixel masked.
     let (status, outcome) = send(
@@ -203,7 +206,7 @@ async fn landsat_bands_derive_qa_masked_ndvi_and_lst() -> Result<()> {
     assert_eq!(status, StatusCode::OK, "{outcome}");
     assert_eq!(outcome["product"], "ndvi");
     assert_eq!(outcome["qa_applied"], true);
-    assert_eq!(outcome["valid_pixels"], 3);
+    assert_eq!(outcome["valid_pixels"], 2);
     let ndvi = catalog::get_product(&ctx.pool, outcome["product_id"].as_str().unwrap())
         .await?
         .unwrap();
@@ -216,7 +219,8 @@ async fn landsat_bands_derive_qa_masked_ndvi_and_lst() -> Result<()> {
         reader.read_band()?.to_f32()
     };
     assert_eq!(values[1], NODATA, "cloud pixel masked");
-    for pixel in [0usize, 2, 3] {
+    assert_eq!(values[2], NODATA, "high-aerosol pixel masked");
+    for pixel in [0usize, 3] {
         assert!(
             (values[pixel] - 0.5).abs() < 1e-3,
             "NDVI ~0.5, got {}",
@@ -233,7 +237,9 @@ async fn landsat_bands_derive_qa_masked_ndvi_and_lst() -> Result<()> {
         roles,
         vec![
             ("nir", nir.as_str()),
+            ("qa_aerosol", aerosol.as_str()),
             ("qa_pixel", qa.as_str()),
+            ("qa_radsat", radsat.as_str()),
             ("red", red.as_str())
         ]
     );
@@ -310,6 +316,9 @@ async fn landsat_derivation_uses_the_newest_registered_band_revision() -> Result
     )
     .await?;
     register_band(&ctx, &tmp, "band_sr_b5", vec![29091; 4]).await?;
+    register_band(&ctx, &tmp, "band_qa_pixel", vec![64; 4]).await?;
+    register_band(&ctx, &tmp, "band_qa_radsat", vec![0; 4]).await?;
+    register_band(&ctx, &tmp, "band_sr_qa_aerosol", vec![0; 4]).await?;
 
     let (status, outcome) = send(
         &ctx.app,
@@ -338,6 +347,40 @@ async fn landsat_derivation_uses_the_newest_registered_band_revision() -> Result
     Ok(())
 }
 
+#[tokio::test]
+async fn landsat_derivation_without_complete_qa_is_quarantined() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = ctx(&tmp).await?;
+    let scene = "LC08_L2SP_144051_20240617_02_T1";
+    register_band_for(&ctx, &tmp, scene, "band_sr_b4", vec![14545; 4]).await?;
+    register_band_for(&ctx, &tmp, scene, "band_sr_b5", vec![29091; 4]).await?;
+
+    let (status, body) = send(
+        &ctx.app,
+        "POST",
+        "/api/ingest/landsat/derive",
+        Some(json!({ "scene_id": scene, "product": "ndvi" })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(body
+        .as_str()
+        .is_some_and(|message| message.contains("confidence is unknown")));
+
+    let quarantined = catalog::list_products(
+        &ctx.pool,
+        &catalog::ProductFilter {
+            scene_id: Some(scene.to_string()),
+            level: Some(ProductLevel::L2),
+            status: Some(catalog::STATUS_FAILED_QA.to_string()),
+            ..catalog::ProductFilter::default()
+        },
+    )
+    .await?;
+    assert_eq!(quarantined.len(), 1);
+    Ok(())
+}
+
 /// Batch 38 (Landsat parity): the spec table derives the water/moisture/
 /// burn/enhanced-vegetation indices from the already-ingested OLI bands —
 /// hand-computed MNDWI/NBR 0.5 and EVI ~0.4124 — and the ST_QA band turns
@@ -355,8 +398,18 @@ async fn parity_indices_and_st_qa_confidence_derive_from_oli_bands() -> Result<(
     register_band(&ctx, &tmp, "band_sr_b7", vec![14545; 4]).await?; // swir2 ~0.2
     register_band(&ctx, &tmp, "band_st_b10", vec![44177; 4]).await?; // ~300 K
     register_band(&ctx, &tmp, "band_qa_pixel", vec![64, 8, 64, 64]).await?;
-    // ST_QA (Kelvin*100): pixels 0/1/3 at 1.5 K, pixel 2 at 3.5 K.
-    register_band(&ctx, &tmp, "band_st_qa", vec![150, 150, 350, 150]).await?;
+    // Pixel 3 has saturation in every optical band and OLI terrain occlusion
+    // despite being cloud-clear, so every requested product rejects it.
+    register_band(
+        &ctx,
+        &tmp,
+        "band_qa_radsat",
+        vec![0, 0, 0, 0b0000_1000_0111_1110],
+    )
+    .await?;
+    register_band(&ctx, &tmp, "band_sr_qa_aerosol", vec![0; 4]).await?;
+    // ST_QA nodata at pixel 2 must not become a perfect 0 K uncertainty.
+    register_band(&ctx, &tmp, "band_st_qa", vec![150, 150, 0, 150]).await?;
 
     // MNDWI = (0.6-0.2)/0.8 = 0.5; NBR likewise; EVI =
     // 2.5*(0.6-0.2)/(0.6 + 6*0.2 - 7.5*0.05 + 1) ~= 0.4124.
@@ -385,7 +438,8 @@ async fn parity_indices_and_st_qa_confidence_derive_from_oli_bands() -> Result<(
             reader.read_band()?.to_f32()
         };
         assert_eq!(values[1], NODATA, "{product}: cloud pixel masked");
-        for pixel in [0usize, 2, 3] {
+        assert_eq!(values[3], NODATA, "{product}: saturated pixel masked");
+        for pixel in [0usize, 2] {
             assert!(
                 (values[pixel] - expected).abs() < 1e-3,
                 "{product} pixel {pixel}: {} != {expected}",
@@ -394,8 +448,9 @@ async fn parity_indices_and_st_qa_confidence_derive_from_oli_bands() -> Result<(
         }
     }
 
-    // LST with ST_QA: computed pixels are 0/2/3 (pixel 1 is cloud);
-    // uncertainties 1.5/3.5/1.5 K -> low-uncertainty fraction 2/3, recorded
+    // LST with ST_QA: computed pixels are 0/2 (cloud and saturation remove
+    // 1/3); uncertainty is 1.5 K at pixel 0 and nodata at pixel 2, so the
+    // low-uncertainty fraction is 1/2, recorded
     // as the product confidence with the ST_QA product in the lineage.
     let (status, outcome) = send(
         &ctx.app,
@@ -406,13 +461,14 @@ async fn parity_indices_and_st_qa_confidence_derive_from_oli_bands() -> Result<(
     .await?;
     assert_eq!(status, StatusCode::OK, "{outcome}");
     let fraction = outcome["st_qa_low_uncertainty_fraction"].as_f64().unwrap();
-    assert!((fraction - 2.0 / 3.0).abs() < 1e-6, "{fraction}");
+    assert!((fraction - 0.5).abs() < 1e-6, "{fraction}");
     let lst = catalog::get_product(&ctx.pool, outcome["product_id"].as_str().unwrap())
         .await?
         .unwrap();
-    assert!((lst.confidence.unwrap() - 2.0 / 3.0).abs() < 1e-6);
+    assert!((lst.confidence.unwrap() - 0.5).abs() < 1e-6);
     let edges = catalog::trace_inputs(&ctx.pool, &lst.product_id).await?;
     assert!(edges.iter().any(|e| e.role == "st_qa"));
+    assert!(edges.iter().any(|e| e.role == "qa_radsat"));
 
     Ok(())
 }
@@ -428,6 +484,9 @@ async fn tm_scene_resolves_red_nir_through_its_own_band_numbering() -> Result<()
 
     register_band_for(&ctx, &tmp, scene, "band_sr_b3", vec![14545; 4]).await?; // TM red
     register_band_for(&ctx, &tmp, scene, "band_sr_b4", vec![29091; 4]).await?; // TM nir
+    register_band_for(&ctx, &tmp, scene, "band_qa_pixel", vec![64; 4]).await?;
+    register_band_for(&ctx, &tmp, scene, "band_qa_radsat", vec![0; 4]).await?;
+    register_band_for(&ctx, &tmp, scene, "band_sr_cloud_qa", vec![0; 4]).await?;
 
     let (status, outcome) = send(
         &ctx.app,
@@ -438,7 +497,7 @@ async fn tm_scene_resolves_red_nir_through_its_own_band_numbering() -> Result<()
     .await?;
     assert_eq!(status, StatusCode::OK, "{outcome}");
     assert_eq!(outcome["instrument"], "tm_etm");
-    assert_eq!(outcome["qa_applied"], false);
+    assert_eq!(outcome["qa_applied"], true);
     let ndvi = catalog::get_product(&ctx.pool, outcome["product_id"].as_str().unwrap())
         .await?
         .unwrap();
@@ -508,6 +567,10 @@ async fn landsat_lst_and_ndvi_pair_derives_the_triangle_et_fraction() -> Result<
         2,
     )
     .await?;
+    register_band_sized(&ctx, &tmp, "band_qa_pixel", vec![64; 8], 4, 2).await?;
+    register_band_sized(&ctx, &tmp, "band_qa_radsat", vec![0; 8], 4, 2).await?;
+    register_band_sized(&ctx, &tmp, "band_sr_qa_aerosol", vec![0; 8], 4, 2).await?;
+    register_band_sized(&ctx, &tmp, "band_st_qa", vec![150; 8], 4, 2).await?;
 
     let mut ids = std::collections::BTreeMap::new();
     for product in ["ndvi", "lst"] {

@@ -18,10 +18,10 @@ use crate::pipeline::{
 };
 use crate::state::AppState;
 
-/// Datasets a subscription may watch. `hls` is accepted at the subscription
-/// level (HLS products register through `/api/ingest/hls`), even though the
-/// Earth Search discover seam only serves `sentinel2` and `landsat`.
-const ALLOWED_DATASETS: [&str; 3] = ["landsat", "sentinel2", "hls"];
+/// Datasets backed by the automated Earth Search discovery worker. HLS can be
+/// ingested explicitly through `/api/ingest/hls`, but cannot be subscribed
+/// until an LP DAAC discovery adapter exists.
+const ALLOWED_DATASETS: [&str; 2] = ["landsat", "sentinel2"];
 
 const DEFAULT_CADENCE_HOURS: i64 = 24;
 const DEFAULT_MAX_CLOUD_COVER: f64 = 60.0;
@@ -108,6 +108,43 @@ fn validate_dataset(dataset: &str) -> Result<(), PipelineRouteError> {
     }
 }
 
+fn validate_indices(dataset: &str, indices: &[String]) -> Result<(), PipelineRouteError> {
+    if indices.is_empty() || indices.iter().any(|index| index.trim().is_empty()) {
+        return Err(PipelineRouteError::bad_request(
+            "invalid_indices",
+            "indices must be a non-empty list of index keys",
+        ));
+    }
+    for index in indices {
+        let product =
+            crate::satellite_derivation::derive_product_from_key(index).map_err(|_| {
+                PipelineRouteError::bad_request(
+                    "unknown_index",
+                    format!("unsupported satellite index: {index}"),
+                )
+            })?;
+        if dataset != "landsat" && product == crate::satellite_derivation::DeriveProduct::LandsatLst
+        {
+            return Err(PipelineRouteError::bad_request(
+                "unsupported_index_for_dataset",
+                "lst is available only from Landsat Collection-2 Level-2",
+            ));
+        }
+        if dataset == "landsat"
+            && product
+                == crate::satellite_derivation::DeriveProduct::Index(
+                    imagery_processor::IndexKind::Ndre,
+                )
+        {
+            return Err(PipelineRouteError::bad_request(
+                "unsupported_index_for_dataset",
+                "ndre requires a red-edge band, which Landsat does not provide",
+            ));
+        }
+    }
+    Ok(())
+}
+
 // --- Subscriptions -------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -130,12 +167,7 @@ pub async fn upsert_field_subscription(
     Json(body): Json<SubscriptionBody>,
 ) -> Result<Json<serde_json::Value>, PipelineRouteError> {
     validate_dataset(&body.dataset)?;
-    if body.indices.is_empty() || body.indices.iter().any(|index| index.trim().is_empty()) {
-        return Err(PipelineRouteError::bad_request(
-            "invalid_indices",
-            "indices must be a non-empty list of index keys",
-        ));
-    }
+    validate_indices(&body.dataset, &body.indices)?;
     let cadence_hours = body.cadence_hours.unwrap_or(DEFAULT_CADENCE_HOURS);
     let lookback_days = body.lookback_days.unwrap_or(DEFAULT_LOOKBACK_DAYS);
     let max_cloud_cover = body.max_cloud_cover.unwrap_or(DEFAULT_MAX_CLOUD_COVER);

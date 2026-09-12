@@ -44,11 +44,16 @@ use thiserror::Error;
 
 use crate::db::DbPool;
 use crate::earth_search::{
-    landsat_asset_key, s2_asset_key, EarthSearchItem, LANDSAT_QA_PIXEL_ASSET_KEY, S2_SCL_ASSET_KEY,
+    landsat_asset_key, s2_asset_key, EarthSearchItem, LANDSAT_CLOUD_QA_ASSET_KEY,
+    LANDSAT_LWIR11_ASSET_KEY, LANDSAT_LWIR_ASSET_KEY, LANDSAT_QA_AEROSOL_ASSET_KEY,
+    LANDSAT_QA_PIXEL_ASSET_KEY, LANDSAT_QA_RADSAT_ASSET_KEY, LANDSAT_ST_QA_ASSET_KEY,
+    S2_SCL_ASSET_KEY,
 };
 use crate::ingest_contract::{commit_ingest, IngestScene, NormalizedIngest};
 use crate::landsat_derive::{
-    instrument_for_scene, qa_pixel_clear, LandsatInstrument, QA_PIXEL_REJECT_BITS,
+    cloud_qa_clear, instrument_for_scene, qa_aerosol_acceptable, qa_pixel_clear,
+    qa_radsat_reject_mask, LandsatInstrument, QA_PIXEL_REJECT_BITS, ST_QA_LOW_UNCERTAINTY_K,
+    ST_QA_SCALE_K,
 };
 use crate::utm::{utm_to_wgs84, wgs84_to_utm, UtmError, UtmZone};
 
@@ -58,7 +63,7 @@ pub const INDEX_NODATA: f32 = -9999.0;
 
 const SENTINEL2_COLLECTION: &str = "sentinel-2-l2a";
 const LANDSAT_COLLECTION: &str = "landsat-c2-l2";
-const ALGORITHM_VERSION: &str = "1.0.0";
+const ALGORITHM_VERSION: &str = "1.1.0";
 
 #[derive(Debug, Error)]
 pub enum DerivationError {
@@ -66,6 +71,8 @@ pub enum DerivationError {
     UnsupportedDataset(Option<String>),
     #[error("unknown index kind {0}; expected one of the imagery_processor index catalog (e.g. ndvi, mndwi, ndmi)")]
     UnknownIndexKind(String),
+    #[error("product {product} is not supported for collection {collection}")]
+    UnsupportedProductForDataset { product: String, collection: String },
     #[error("item {item_id} has no {asset_key} asset")]
     MissingAsset { item_id: String, asset_key: String },
     #[error("item {0} has no proj:epsg/proj:code CRS")]
@@ -114,6 +121,7 @@ impl DerivationError {
             self,
             DerivationError::UnsupportedDataset(_)
                 | DerivationError::UnknownIndexKind(_)
+                | DerivationError::UnsupportedProductForDataset { .. }
                 | DerivationError::MissingAsset { .. }
                 | DerivationError::MissingEpsg(_)
                 | DerivationError::MissingDatetime(_)
@@ -413,15 +421,40 @@ pub fn index_kind_from_key(key: &str) -> Result<IndexKind, DerivationError> {
         .map_err(|_| DerivationError::UnknownIndexKind(key.to_string()))
 }
 
+/// Product supported by the remote satellite derivation path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeriveProduct {
+    Index(IndexKind),
+    /// Provider-produced Landsat Collection-2 Level-2 surface temperature.
+    LandsatLst,
+}
+
+impl DeriveProduct {
+    pub fn key(self) -> String {
+        match self {
+            Self::Index(index) => index_kind_key(index),
+            Self::LandsatLst => "lst".to_string(),
+        }
+    }
+}
+
+pub fn derive_product_from_key(key: &str) -> Result<DeriveProduct, DerivationError> {
+    if key.trim().eq_ignore_ascii_case("lst") {
+        Ok(DeriveProduct::LandsatLst)
+    } else {
+        index_kind_from_key(key).map(DeriveProduct::Index)
+    }
+}
+
 // --- Orchestration -----------------------------------------------------------
 
-/// A satellite index derivation request.
+/// A satellite index or Landsat surface-temperature derivation request.
 #[derive(Debug, Clone)]
 pub struct DeriveRequest {
     pub item: EarthSearchItem,
     /// WGS84 lon/lat AOI.
     pub aoi: GeoBounds,
-    pub index: IndexKind,
+    pub product: DeriveProduct,
     /// Field this derivation is scoped to; threaded into every registered
     /// product's [`ProductScope`] so the per-field time series can find it.
     pub field_id: Option<String>,
@@ -451,6 +484,7 @@ struct BandRead {
     grid: BandGrid,
     window: RasterWindow,
     dns: Vec<u16>,
+    valid_mask: Vec<bool>,
     metrics: RemoteFetchMetrics,
 }
 
@@ -473,14 +507,42 @@ fn sanitize_scene_component(value: &str) -> String {
     }
 }
 
-fn band_to_u16(band: RasterBand, name: &str) -> Result<Vec<u16>, DerivationError> {
+fn band_to_u16(
+    band: RasterBand,
+    nodata: Option<f64>,
+    name: &str,
+) -> Result<(Vec<u16>, Vec<bool>), DerivationError> {
     match band {
-        RasterBand::U16(values) => Ok(values),
-        RasterBand::U8(values) => Ok(values.into_iter().map(u16::from).collect()),
+        RasterBand::U16(values) => {
+            let valid = values
+                .iter()
+                .map(|value| nodata != Some(f64::from(*value)))
+                .collect();
+            Ok((values, valid))
+        }
+        RasterBand::U8(values) => {
+            let valid = values
+                .iter()
+                .map(|value| nodata != Some(f64::from(*value)))
+                .collect();
+            Ok((values.into_iter().map(u16::from).collect(), valid))
+        }
         // Landsat C2 / Sentinel-2 Int16 SR: negative values are the -9999
         // fill (nonphysical reflectance), clamped to 0 — the nodata sentinel
         // the SCL masking + calibration downstream already treats as fill.
-        RasterBand::I16(values) => Ok(values.into_iter().map(|v| v.max(0) as u16).collect()),
+        RasterBand::I16(values) => {
+            let valid = values
+                .iter()
+                .map(|value| *value >= 0 && nodata != Some(f64::from(*value)))
+                .collect();
+            Ok((
+                values
+                    .into_iter()
+                    .map(|value| value.max(0) as u16)
+                    .collect(),
+                valid,
+            ))
+        }
         RasterBand::F32(_) => Err(DerivationError::UnsupportedBandDtype {
             band: name.to_string(),
             dtype: "f32",
@@ -527,7 +589,8 @@ async fn read_band_window(
         None => snap_rect_outward(aoi_rect, &grid, asset_key)?,
     };
     let window = window_from_rect(&grid, &snapped_rect)?;
-    let dns = band_to_u16(reader.read_window(window).await?, asset_key)?;
+    let nodata = info.nodata;
+    let (dns, valid_mask) = band_to_u16(reader.read_window(window).await?, nodata, asset_key)?;
     Ok((
         BandRead {
             asset_key: asset_key.to_string(),
@@ -535,6 +598,7 @@ async fn read_band_window(
             grid,
             window,
             dns,
+            valid_mask,
             metrics: reader.fetch_metrics(),
         },
         snapped_rect,
@@ -573,6 +637,19 @@ fn landsat_sensor_profile() -> (SensorProfile, serde_json::Value) {
             "profile": "landsat_c2l2_sr",
             "scale": profile.scale(),
             "offset": profile.offset(),
+        }),
+    )
+}
+
+fn landsat_temperature_profile() -> (SensorProfile, serde_json::Value) {
+    let profile = SensorProfile::LandsatC2L2St;
+    (
+        profile,
+        serde_json::json!({
+            "profile": "landsat_c2l2_st",
+            "scale": profile.scale(),
+            "offset": profile.offset(),
+            "unit": "kelvin",
         }),
     )
 }
@@ -712,6 +789,14 @@ pub async fn derive_satellite_index(
     let profile_kind = CollectionProfile::from_collection(item.collection.as_deref())
         .ok_or_else(|| DerivationError::UnsupportedDataset(item.collection.clone()))?;
     let collection = profile_kind.id().to_string();
+    let is_lst = request.product == DeriveProduct::LandsatLst;
+    if is_lst && profile_kind != CollectionProfile::LandsatC2L2 {
+        return Err(DerivationError::UnsupportedProductForDataset {
+            product: "lst".to_string(),
+            collection,
+        });
+    }
+    let instrument = instrument_for_scene(&item.id);
     let item_epsg = item
         .epsg()
         .ok_or_else(|| DerivationError::MissingEpsg(item.id.clone()))?;
@@ -738,13 +823,26 @@ pub async fn derive_satellite_index(
             None
         };
 
-    let roles = request.index.required_bands();
+    // The temperature path uses the NIR enum slot only as an internal map key;
+    // its evidence and catalog role remain explicitly `surface_temperature`.
+    let roles: Vec<IndexBandRole> = match request.product {
+        DeriveProduct::Index(index) => index.required_bands().to_vec(),
+        DeriveProduct::LandsatLst => vec![IndexBandRole::Nir],
+    };
     let mut band_reads: Vec<(IndexBandRole, BandRead)> = Vec::with_capacity(roles.len());
-    for role in roles {
+    for role in &roles {
+        let asset_key = if is_lst {
+            match instrument {
+                LandsatInstrument::Oli => LANDSAT_LWIR11_ASSET_KEY,
+                LandsatInstrument::TmEtm => LANDSAT_LWIR_ASSET_KEY,
+            }
+        } else {
+            profile_kind.band_asset_key(*role, &item.id)?
+        };
         let (read, rect) = read_band_window(
             resolver,
             item,
-            profile_kind.band_asset_key(*role, &item.id)?,
+            asset_key,
             item_epsg,
             &aoi_rect,
             snapped.as_ref(),
@@ -767,12 +865,70 @@ pub async fn derive_satellite_index(
         .expect("every index requires at least one band");
     let (out_width, out_height) = (target_window.width, target_window.height);
     let pixel_count = out_width as usize * out_height as usize;
+    let radsat_reject_mask = qa_radsat_reject_mask(instrument, &roles, is_lst);
+    let radsat_read = if matches!(profile_kind, CollectionProfile::LandsatC2L2)
+        && item.asset(LANDSAT_QA_RADSAT_ASSET_KEY).is_some()
+    {
+        Some(
+            read_band_window(
+                resolver,
+                item,
+                LANDSAT_QA_RADSAT_ASSET_KEY,
+                item_epsg,
+                &aoi_rect,
+                Some(&snapped),
+            )
+            .await?
+            .0,
+        )
+    } else {
+        None
+    };
+    let surface_qa_key = match instrument {
+        LandsatInstrument::Oli => LANDSAT_QA_AEROSOL_ASSET_KEY,
+        LandsatInstrument::TmEtm => LANDSAT_CLOUD_QA_ASSET_KEY,
+    };
+    let surface_qa_read = if !is_lst
+        && matches!(profile_kind, CollectionProfile::LandsatC2L2)
+        && item.asset(surface_qa_key).is_some()
+    {
+        Some(
+            read_band_window(
+                resolver,
+                item,
+                surface_qa_key,
+                item_epsg,
+                &aoi_rect,
+                Some(&snapped),
+            )
+            .await?
+            .0,
+        )
+    } else {
+        None
+    };
+    let st_qa_read = if is_lst && item.asset(LANDSAT_ST_QA_ASSET_KEY).is_some() {
+        Some(
+            read_band_window(
+                resolver,
+                item,
+                LANDSAT_ST_QA_ASSET_KEY,
+                item_epsg,
+                &aoi_rect,
+                Some(&snapped),
+            )
+            .await?
+            .0,
+        )
+    } else {
+        None
+    };
 
     // Clear-sky mask on the mask band's native window grid, then
     // nearest-resampled to the target grid. Sentinel-2 uses SCL class
     // masking with dilation at SCL resolution (per the design masking rule);
     // Landsat uses the Collection-2 QA_PIXEL bitmask when the asset exists.
-    let (clear_mask, mask_json) = match profile_kind {
+    let (mut clear_mask, mut mask_json) = match profile_kind {
         CollectionProfile::Sentinel2 => {
             let scl_read = mask_read
                 .as_ref()
@@ -834,10 +990,73 @@ pub async fn derive_satellite_index(
             ),
         },
     };
+    if let Some(radsat) = &radsat_read {
+        let codes = resample_nearest(
+            &radsat.dns,
+            radsat.window.width,
+            radsat.window.height,
+            out_width,
+            out_height,
+        );
+        let valid = resample_nearest(
+            &radsat.valid_mask,
+            radsat.window.width,
+            radsat.window.height,
+            out_width,
+            out_height,
+        );
+        let mut rejected = 0usize;
+        for ((clear, code), valid) in clear_mask.iter_mut().zip(codes).zip(valid) {
+            if !valid || code & radsat_reject_mask != 0 {
+                *clear = false;
+                rejected += 1;
+            }
+        }
+        mask_json["qa_radsat_applied"] = serde_json::json!(true);
+        mask_json["qa_radsat_reject_mask"] = serde_json::json!(radsat_reject_mask);
+        mask_json["qa_radsat_rejected_pixels"] = serde_json::json!(rejected);
+    } else if matches!(profile_kind, CollectionProfile::LandsatC2L2) {
+        mask_json["qa_radsat_applied"] = serde_json::json!(false);
+    }
+    if let Some(surface_qa) = &surface_qa_read {
+        let codes = resample_nearest(
+            &surface_qa.dns,
+            surface_qa.window.width,
+            surface_qa.window.height,
+            out_width,
+            out_height,
+        );
+        let mut rejected = 0usize;
+        for (clear, code) in clear_mask.iter_mut().zip(codes) {
+            let acceptable = match instrument {
+                LandsatInstrument::Oli => qa_aerosol_acceptable(code),
+                LandsatInstrument::TmEtm => cloud_qa_clear(code),
+            };
+            if !acceptable {
+                *clear = false;
+                rejected += 1;
+            }
+        }
+        mask_json["surface_reflectance_qa"] = serde_json::json!({
+            "asset_key": surface_qa_key,
+            "applied": true,
+            "rejected_pixels": rejected,
+            "policy": match instrument {
+                LandsatInstrument::Oli => "reject_fill_and_high_aerosol",
+                LandsatInstrument::TmEtm => "reject_cloud_shadow_adjacent_and_snow",
+            },
+        });
+    } else if !is_lst && matches!(profile_kind, CollectionProfile::LandsatC2L2) {
+        mask_json["surface_reflectance_qa"] = serde_json::json!({
+            "asset_key": surface_qa_key,
+            "applied": false,
+        });
+    }
 
     // Calibrate each band (resampling DNs to the target grid first).
     let (profile, calibration_json) = match profile_kind {
         CollectionProfile::Sentinel2 => s2_sensor_profile(item),
+        CollectionProfile::LandsatC2L2 if is_lst => landsat_temperature_profile(),
         CollectionProfile::LandsatC2L2 => landsat_sensor_profile(),
     };
     let mut calibrated: BTreeMap<IndexBandRole, Vec<IndexPixelValue>> = BTreeMap::new();
@@ -856,7 +1075,11 @@ pub async fn derive_satellite_index(
         };
         let scaled = apply_radiometric_scaling(profile, &dns);
         band_evidence.push(serde_json::json!({
-            "role": format!("{role:?}").to_lowercase(),
+            "role": if is_lst {
+                "surface_temperature".to_string()
+            } else {
+                format!("{role:?}").to_lowercase()
+            },
             "asset_key": read.asset_key,
             "href": read.href,
             "window": window_json(read.window),
@@ -871,8 +1094,72 @@ pub async fn derive_satellite_index(
         calibrated.insert(*role, scaled.pixels);
     }
 
-    let index_grid = compute_masked_index(request.index, &calibrated, &clear_mask)?;
-    let index_key = index_kind_key(request.index);
+    let product_grid = match request.product {
+        DeriveProduct::Index(index) => compute_masked_index(index, &calibrated, &clear_mask)?,
+        DeriveProduct::LandsatLst => {
+            let pixels = calibrated
+                .get(&IndexBandRole::Nir)
+                .expect("temperature band is calibrated");
+            let mut values = Vec::with_capacity(pixel_count);
+            let mut valid_pixels = 0usize;
+            let mut reason_counts = BTreeMap::new();
+            for (pixel, clear) in pixels.iter().zip(&clear_mask) {
+                match (pixel, clear) {
+                    (IndexPixelValue::Valid(value), true) if value.is_finite() => {
+                        values.push(*value);
+                        valid_pixels += 1;
+                    }
+                    (IndexPixelValue::Invalid { reason }, true) => {
+                        *reason_counts.entry((*reason).to_string()).or_insert(0) += 1;
+                        values.push(INDEX_NODATA);
+                    }
+                    _ => {
+                        *reason_counts.entry("masked".to_string()).or_insert(0) += 1;
+                        values.push(INDEX_NODATA);
+                    }
+                }
+            }
+            IndexGrid {
+                values,
+                valid_pixels,
+                invalid_pixels: pixel_count - valid_pixels,
+                reason_counts,
+            }
+        }
+    };
+    let index_key = request.product.key();
+    let st_qa_low_uncertainty_fraction = st_qa_read.as_ref().map(|read| {
+        let codes = resample_nearest(
+            &read.dns,
+            read.window.width,
+            read.window.height,
+            out_width,
+            out_height,
+        );
+        let qa_valid = resample_nearest(
+            &read.valid_mask,
+            read.window.width,
+            read.window.height,
+            out_width,
+            out_height,
+        );
+        let low = product_grid
+            .values
+            .iter()
+            .zip(codes)
+            .zip(qa_valid)
+            .filter(|((value, uncertainty_dn), uncertainty_valid)| {
+                **value != INDEX_NODATA
+                    && *uncertainty_valid
+                    && f32::from(*uncertainty_dn) * ST_QA_SCALE_K <= ST_QA_LOW_UNCERTAINTY_K
+            })
+            .count();
+        if product_grid.valid_pixels == 0 {
+            0.0
+        } else {
+            low as f64 / product_grid.valid_pixels as f64
+        }
+    });
 
     // Write the windowed GeoTIFF product into the scene products directory.
     let scene_component = sanitize_scene_component(&item.id);
@@ -882,19 +1169,39 @@ pub async fn derive_satellite_index(
         what: "scene products directory",
         source,
     })?;
-    let product_path = products_dir.join(format!("{index_key}.tif"));
+    // A scene/index pair can be cropped independently for many fields and
+    // seasons. Include the complete crop identity in the immutable artifact
+    // name so later or concurrent derivations cannot replace earlier bytes.
+    let artifact_identity = serde_json::json!({
+        "index": index_key,
+        "aoi": [request.aoi.min_lon, request.aoi.min_lat, request.aoi.max_lon, request.aoi.max_lat],
+        "field_id": request.field_id,
+        "season_id": request.season_id,
+    });
+    let artifact_hash = format!(
+        "{:x}",
+        Sha256::digest(
+            serde_json::to_vec(&artifact_identity).expect("artifact identity serializes")
+        )
+    );
+    let product_path = products_dir.join(format!("{index_key}-{}.tif", &artifact_hash[..16]));
+    let temporary_path = product_path.with_extension(format!("tif.tmp-{}", uuid::Uuid::new_v4()));
     let out_transform = output_transform(&target_grid, target_window);
     write_geotiff_f32(
-        &product_path,
+        &temporary_path,
         out_width,
         out_height,
-        &index_grid.values,
+        &product_grid.values,
         &GeoTiffTags {
             epsg: Some(item_epsg),
             geo_transform: Some(out_transform),
             nodata: Some(f64::from(INDEX_NODATA)),
         },
     )?;
+    std::fs::rename(&temporary_path, &product_path).map_err(|source| DerivationError::Store {
+        what: "atomic derived product publication",
+        source,
+    })?;
     let artifact_bytes = std::fs::read(&product_path).map_err(|source| DerivationError::Store {
         what: "derived product readback",
         source,
@@ -951,11 +1258,33 @@ pub async fn derive_satellite_index(
     let mut l2_inputs = vec![];
     let all_reads = band_reads
         .iter()
-        .map(|(role, read)| (format!("band:{}", format!("{role:?}").to_lowercase()), read))
+        .map(|(role, read)| {
+            let input_role = if is_lst {
+                "band:surface_temperature".to_string()
+            } else {
+                format!("band:{}", format!("{role:?}").to_lowercase())
+            };
+            (input_role, read)
+        })
         .chain(
             mask_read
                 .as_ref()
                 .map(|read| (profile_kind.mask_input_role().to_string(), read)),
+        )
+        .chain(
+            radsat_read
+                .as_ref()
+                .map(|read| ("mask:qa_radsat".to_string(), read)),
+        )
+        .chain(
+            surface_qa_read
+                .as_ref()
+                .map(|read| (format!("mask:{surface_qa_key}"), read)),
+        )
+        .chain(
+            st_qa_read
+                .as_ref()
+                .map(|read| ("quality:st_qa".to_string(), read)),
         );
     for (input_role, read) in all_reads {
         let draft = ProductRecordDraft {
@@ -1026,13 +1355,15 @@ pub async fn derive_satellite_index(
     let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     commit_ingest(pool, &ingest, &actor, &created_at).await?;
 
-    // --- L2 index product with full evidence.
+    // --- L2 index or temperature product with full evidence.
     let out_bbox_wgs84 = rect_to_wgs84(&snapped, zone);
     let mut evidence = serde_json::json!({
         "item_id": item.id,
         "collection": collection,
         "index": index_key,
         "aoi_wgs84": [request.aoi.min_lon, request.aoi.min_lat, request.aoi.max_lon, request.aoi.max_lat],
+        "field_id": request.field_id,
+        "season_id": request.season_id,
         "crs": format!("EPSG:{item_epsg}"),
         "window": window_json(target_window),
         "geo_transform": out_transform,
@@ -1041,9 +1372,16 @@ pub async fn derive_satellite_index(
         "bands": band_evidence,
         "pixels": {
             "total": pixel_count,
-            "valid": index_grid.valid_pixels,
-            "invalid": index_grid.invalid_pixels,
-            "reasons": index_grid.reason_counts,
+            "valid": product_grid.valid_pixels,
+            "invalid": product_grid.invalid_pixels,
+            "reasons": product_grid.reason_counts,
+        },
+        "unit": if is_lst { "kelvin" } else { "ratio" },
+        "st_qa_low_uncertainty_fraction": st_qa_low_uncertainty_fraction,
+        "st_qa_low_uncertainty_k": if is_lst {
+            Some(ST_QA_LOW_UNCERTAINTY_K)
+        } else {
+            None
         },
         "nodata": INDEX_NODATA,
     });
@@ -1060,10 +1398,25 @@ pub async fn derive_satellite_index(
             "bytes_fetched": read.metrics.bytes_fetched,
         });
     }
+    let landsat_qa_complete = mask_read.is_some()
+        && radsat_read.is_some()
+        && if is_lst {
+            st_qa_read.is_some()
+        } else {
+            surface_qa_read.is_some()
+        };
+    let quality_complete = match profile_kind {
+        CollectionProfile::Sentinel2 => mask_read.is_some(),
+        CollectionProfile::LandsatC2L2 => landsat_qa_complete,
+    };
     let l2 = ProductRecordDraft {
         level: ProductLevel::L2,
         kind: index_key.clone(),
-        algorithm_id: format!("satellite.index.{index_key}"),
+        algorithm_id: if is_lst {
+            "satellite.temperature.landsat_c2_l2".to_string()
+        } else {
+            format!("satellite.index.{index_key}")
+        },
         algorithm_version: ALGORITHM_VERSION.to_string(),
         parameters: evidence.clone(),
         inputs: l2_inputs,
@@ -1092,23 +1445,31 @@ pub async fn derive_satellite_index(
             checksum_sha256: Some(checksum.clone()),
         }),
         quality_mask: None,
-        confidence: None,
-        confidence_method: None,
+        confidence: if !quality_complete {
+            None
+        } else if is_lst {
+            st_qa_low_uncertainty_fraction
+        } else {
+            Some(product_grid.valid_pixels as f64 / pixel_count.max(1) as f64)
+        },
+        confidence_method: if !quality_complete {
+            None
+        } else if is_lst {
+            Some("st_qa_low_uncertainty_fraction".to_string())
+        } else {
+            Some("valid_pixel_fraction_after_quality_mask".to_string())
+        },
         quality_summary: Some(serde_json::json!({
-            "valid_pixels": index_grid.valid_pixels,
-            "invalid_pixels": index_grid.invalid_pixels,
-            "reasons": index_grid.reason_counts,
+            "valid_pixels": product_grid.valid_pixels,
+            "invalid_pixels": product_grid.invalid_pixels,
+            "reasons": product_grid.reason_counts,
+            "st_qa_low_uncertainty_fraction": st_qa_low_uncertainty_fraction,
         })),
         evidence_digests: vec![checksum],
         source_id: Some(source_id),
     };
     let product_id =
         crate::catalog::register_product_with_actor(pool, &l2, &actor, &created_at).await?;
-
-    // Per-field time series (batch S-3): best-effort, never fails the derive.
-    if request.field_id.is_some() {
-        crate::field_timeseries::append_field_stats_best_effort(pool, &product_id).await;
-    }
 
     Ok(DerivationOutcome {
         stac_item_href: format!("/api/stac/collections/{index_key}/items/{product_id}"),
@@ -1119,8 +1480,8 @@ pub async fn derive_satellite_index(
         product_path,
         width: out_width,
         height: out_height,
-        valid_pixels: index_grid.valid_pixels,
-        invalid_pixels: index_grid.invalid_pixels,
+        valid_pixels: product_grid.valid_pixels,
+        invalid_pixels: product_grid.invalid_pixels,
         evidence,
     })
 }
@@ -1460,5 +1821,9 @@ mod tests {
             index_kind_from_key("not-an-index"),
             Err(DerivationError::UnknownIndexKind(_))
         ));
+        assert_eq!(
+            derive_product_from_key("LST").unwrap(),
+            DeriveProduct::LandsatLst
+        );
     }
 }

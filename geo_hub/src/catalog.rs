@@ -491,11 +491,14 @@ pub enum QaVerdict {
     Quarantine { reason: String },
 }
 
-/// Evaluate a product's `confidence` against `policy`. An unknown confidence
-/// (`None`) passes — the gate rejects only a *measured* low score, never the
-/// absence of a measurement — as does any score at or above the minimum.
+/// Evaluate a product's `confidence` against `policy`. When the gate is
+/// enabled, missing quality evidence fails closed: an unmeasured product must
+/// not enter automated downstream decisions.
 pub fn qa_verdict(confidence: Option<f64>, policy: &QaPolicy) -> QaVerdict {
     match confidence {
+        None if policy.min_confidence > 0.0 => QaVerdict::Quarantine {
+            reason: "confidence is unknown".to_string(),
+        },
         Some(score) if score < policy.min_confidence => QaVerdict::Quarantine {
             reason: format!(
                 "confidence {score:.3} below minimum {:.3}",
@@ -748,7 +751,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn qa_verdict_quarantines_only_a_measured_below_threshold_score() {
+    fn qa_verdict_fails_closed_when_enabled() {
         let policy = QaPolicy {
             min_confidence: 0.5,
         };
@@ -760,12 +763,15 @@ mod tests {
         // At or above threshold -> pass.
         assert_eq!(qa_verdict(Some(0.5), &policy), QaVerdict::Pass);
         assert_eq!(qa_verdict(Some(0.9), &policy), QaVerdict::Pass);
-        // Unknown confidence -> pass (the gate never rejects a missing measure).
-        assert_eq!(qa_verdict(None, &policy), QaVerdict::Pass);
+        match qa_verdict(None, &policy) {
+            QaVerdict::Quarantine { reason } => assert!(reason.contains("unknown")),
+            other => panic!("expected quarantine, got {other:?}"),
+        }
         // Disabled policy (0) accepts everything, including a 0 score.
         let off = QaPolicy {
             min_confidence: 0.0,
         };
         assert_eq!(qa_verdict(Some(0.0), &off), QaVerdict::Pass);
+        assert_eq!(qa_verdict(None, &off), QaVerdict::Pass);
     }
 }

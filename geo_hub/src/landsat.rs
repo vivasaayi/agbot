@@ -18,7 +18,7 @@ const PLANETARY_COMPUTER_DATA_ITEM: &str =
 const USGS_M2M_JSON_API: &str = "https://m2m.cr.usgs.gov/api/api/json/stable";
 const USGS_LANDSAT_DATASET: &str = "landsat_ot_c2_l2";
 pub const AGBOT_USGS_USERNAME_ENV: &str = "AGBOT_USGS_USERNAME";
-pub const AGBOT_USGS_PASSWORD_ENV: &str = "AGBOT_USGS_PASSWORD";
+pub const AGBOT_USGS_APPLICATION_TOKEN_ENV: &str = "AGBOT_USGS_APPLICATION_TOKEN";
 pub const AGBOT_RUN_USGS_INTEGRATION_ENV: &str = "AGBOT_RUN_USGS_INTEGRATION";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,16 +75,16 @@ pub struct LandsatSceneCandidate {
 #[derive(Clone, PartialEq, Eq)]
 pub struct UsgsCredentials {
     username: String,
-    password: String,
+    application_token: String,
 }
 
 impl UsgsCredentials {
     pub fn new(
         username: impl Into<String>,
-        password: impl Into<String>,
+        application_token: impl Into<String>,
     ) -> UsgsVerificationResult<Self> {
         let username = username.into();
-        let password = password.into();
+        let application_token = application_token.into();
         if username.trim().is_empty() {
             return Err(UsgsVerificationError::new(
                 UsgsVerificationErrorCode::MissingCredentials,
@@ -92,14 +92,17 @@ impl UsgsCredentials {
                 None,
             ));
         }
-        if password.trim().is_empty() {
+        if application_token.trim().is_empty() {
             return Err(UsgsVerificationError::new(
                 UsgsVerificationErrorCode::MissingCredentials,
-                "USGS password is required",
+                "USGS application token is required",
                 None,
             ));
         }
-        Ok(Self { username, password })
+        Ok(Self {
+            username,
+            application_token,
+        })
     }
 
     pub fn from_env() -> UsgsVerificationResult<Self> {
@@ -110,18 +113,18 @@ impl UsgsCredentials {
                 None,
             )
         })?;
-        let password = env::var(AGBOT_USGS_PASSWORD_ENV).map_err(|_| {
+        let application_token = env::var(AGBOT_USGS_APPLICATION_TOKEN_ENV).map_err(|_| {
             UsgsVerificationError::new(
                 UsgsVerificationErrorCode::MissingCredentials,
-                format!("{AGBOT_USGS_PASSWORD_ENV} is required"),
+                format!("{AGBOT_USGS_APPLICATION_TOKEN_ENV} is required"),
                 None,
             )
         })?;
-        Self::new(username, password)
+        Self::new(username, application_token)
     }
 
     fn secret_values(&self) -> [&str; 2] {
-        [self.username.as_str(), self.password.as_str()]
+        [self.username.as_str(), self.application_token.as_str()]
     }
 }
 
@@ -130,7 +133,7 @@ impl fmt::Debug for UsgsCredentials {
         formatter
             .debug_struct("UsgsCredentials")
             .field("username", &"<redacted>")
-            .field("password", &"<redacted>")
+            .field("application_token", &"<redacted>")
             .finish()
     }
 }
@@ -320,11 +323,11 @@ async fn authenticate_usgs(
     credentials: &UsgsCredentials,
 ) -> UsgsVerificationResult<String> {
     let response = client
-        .post(format!("{USGS_M2M_JSON_API}/login"))
+        .post(format!("{USGS_M2M_JSON_API}/login-token"))
         .header(reqwest::header::USER_AGENT, "agbot-geo-hub/0.1")
         .json(&json!({
             "username": &credentials.username,
-            "password": &credentials.password,
+            "token": &credentials.application_token,
         }))
         .send()
         .await
@@ -1801,13 +1804,13 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires AGBOT_RUN_USGS_INTEGRATION=1 and real AGBOT_USGS_USERNAME/AGBOT_USGS_PASSWORD"]
+    #[ignore = "requires AGBOT_RUN_USGS_INTEGRATION=1 and real AGBOT_USGS_USERNAME/AGBOT_USGS_APPLICATION_TOKEN"]
     async fn credentialed_usgs_landsat_ingest_verifies_search_download_and_store(
     ) -> UsgsVerificationResult<()> {
         if std::env::var(AGBOT_RUN_USGS_INTEGRATION_ENV).as_deref() != Ok("1") {
             eprintln!(
                 "skipping live USGS verification; set {AGBOT_RUN_USGS_INTEGRATION_ENV}=1, \
-                 {AGBOT_USGS_USERNAME_ENV}, and {AGBOT_USGS_PASSWORD_ENV}"
+                 {AGBOT_USGS_USERNAME_ENV}, and {AGBOT_USGS_APPLICATION_TOKEN_ENV}"
             );
             return Ok(());
         }

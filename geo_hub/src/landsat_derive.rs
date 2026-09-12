@@ -47,20 +47,42 @@ use crate::drought_rasters::{
 use crate::satellite_derivation::{compute_masked_index, INDEX_NODATA};
 
 /// QA_PIXEL bits rejected for a clear pixel: 0 fill, 1 dilated cloud,
-/// 2 cirrus, 3 cloud, 4 cloud shadow. Snow (5), clear (6), and water (7)
-/// are valid ground.
-pub const QA_PIXEL_REJECT_BITS: u16 = 0b0001_1111;
+/// 2 cirrus, 3 cloud, 4 cloud shadow, and 5 snow. Clear (6) and water (7)
+/// are valid ground; retaining water is required for water indices.
+pub const QA_PIXEL_REJECT_BITS: u16 = 0b0011_1111;
 
 /// Collection-2 `ST_QA` scale: DN * 0.01 = surface-temperature uncertainty
 /// in Kelvin.
 pub const ST_QA_SCALE_K: f32 = 0.01;
 /// LST pixels with ST_QA uncertainty at or below this (Kelvin) count as
-/// low-uncertainty for the product confidence fraction.
-pub const ST_QA_LOW_UNCERTAINTY_K: f32 = 2.0;
+/// decision-usable for the product confidence fraction. USGS defines ST_QA
+/// as per-pixel uncertainty and states that higher values indicate greater
+/// uncertainty, but does not prescribe an acceptance cutoff. Five Kelvin is
+/// the conservative operational ceiling used by AGBot; deployments still
+/// control the required accepted-pixel fraction through `qa_min_confidence`.
+pub const ST_QA_LOW_UNCERTAINTY_K: f32 = 5.0;
 
 /// `true` when a Collection-2 QA_PIXEL code marks usable ground.
 pub fn qa_pixel_clear(code: u16) -> bool {
     code & QA_PIXEL_REJECT_BITS == 0
+}
+
+/// Landsat 8/9 LaSRC surface-reflectance pixels accepted by the production
+/// aerosol policy. Fill and high-aerosol retrievals are excluded. Water and
+/// interpolated retrievals remain represented so water indices and areas with
+/// sparse retrievals are not silently erased; their quality evidence remains
+/// available in the source QA band.
+pub fn qa_aerosol_acceptable(code: u16) -> bool {
+    let is_fill = code & 1 != 0;
+    let aerosol_level = (code >> 6) & 0b11;
+    !is_fill && aerosol_level != 0b11
+}
+
+/// Landsat 4-7 LEDAPS surface-reflectance QA policy. Reject cloud, shadow,
+/// cloud-adjacent, and snow flags while retaining DDV and water classifications.
+pub fn cloud_qa_clear(code: u16) -> bool {
+    const REJECT_BITS: u16 = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4);
+    code & REJECT_BITS == 0
 }
 
 /// The two Collection-2 band-numbering families.
@@ -82,6 +104,49 @@ pub fn instrument_for_scene(scene_id: &str) -> LandsatInstrument {
     }
 }
 
+/// QA_RADSAT bits that invalidate the requested product. Saturation is
+/// band-specific, so a saturated blue band must not discard an NDVI pixel.
+/// The instrument-wide dropped-pixel (TM/ETM+) or terrain-occlusion (OLI)
+/// bit is always included. Collection-2 QA_RADSAT does not expose a TIRS
+/// Band 10 saturation bit, so OLI LST uses only the terrain-occlusion flag.
+pub fn qa_radsat_reject_mask(
+    instrument: LandsatInstrument,
+    roles: &[IndexBandRole],
+    surface_temperature: bool,
+) -> u16 {
+    let mut mask = match instrument {
+        LandsatInstrument::Oli => 1 << 11,
+        LandsatInstrument::TmEtm => 1 << 9,
+    };
+    if surface_temperature {
+        if instrument == LandsatInstrument::TmEtm {
+            mask |= (1 << 5) | (1 << 8);
+        }
+        return mask;
+    }
+    for role in roles {
+        let bit = match (instrument, role) {
+            (LandsatInstrument::Oli, IndexBandRole::Blue) => Some(1),
+            (LandsatInstrument::Oli, IndexBandRole::Green) => Some(2),
+            (LandsatInstrument::Oli, IndexBandRole::Red) => Some(3),
+            (LandsatInstrument::Oli, IndexBandRole::Nir) => Some(4),
+            (LandsatInstrument::Oli, IndexBandRole::Swir1) => Some(5),
+            (LandsatInstrument::Oli, IndexBandRole::Swir2) => Some(6),
+            (LandsatInstrument::TmEtm, IndexBandRole::Blue) => Some(0),
+            (LandsatInstrument::TmEtm, IndexBandRole::Green) => Some(1),
+            (LandsatInstrument::TmEtm, IndexBandRole::Red) => Some(2),
+            (LandsatInstrument::TmEtm, IndexBandRole::Nir) => Some(3),
+            (LandsatInstrument::TmEtm, IndexBandRole::Swir1) => Some(4),
+            (LandsatInstrument::TmEtm, IndexBandRole::Swir2) => Some(6),
+            (_, IndexBandRole::RedEdge) => None,
+        };
+        if let Some(bit) = bit {
+            mask |= 1 << bit;
+        }
+    }
+    mask
+}
+
 /// Band roles the derive resolves against the catalog.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BandRole {
@@ -93,6 +158,9 @@ enum BandRole {
     Swir2,
     SurfaceTemperature,
     QaPixel,
+    QaRadsat,
+    QaAerosol,
+    CloudQa,
     StQa,
 }
 
@@ -107,6 +175,9 @@ impl BandRole {
             BandRole::Swir2 => "swir2",
             BandRole::SurfaceTemperature => "surface_temperature",
             BandRole::QaPixel => "qa_pixel",
+            BandRole::QaRadsat => "qa_radsat",
+            BandRole::QaAerosol => "qa_aerosol",
+            BandRole::CloudQa => "cloud_qa",
             BandRole::StQa => "st_qa",
         }
     }
@@ -135,6 +206,10 @@ fn candidates(instrument: LandsatInstrument, role: BandRole) -> &'static [&'stat
         (TmEtm, Swir2) => &["band_sr_b7", "band_swir2"],
         (TmEtm, SurfaceTemperature) => &["band_st_b6", "band_lwir"],
         (_, QaPixel) => &["band_qa_pixel", "band_qa"],
+        (_, QaRadsat) => &["band_qa_radsat"],
+        (Oli, QaAerosol) => &["band_sr_qa_aerosol", "band_qa_aerosol"],
+        (TmEtm, CloudQa) => &["band_sr_cloud_qa", "band_cloud_qa"],
+        (Oli, CloudQa) | (TmEtm, QaAerosol) => &[],
         (_, StQa) => &["band_st_qa"],
     }
 }
@@ -193,13 +268,68 @@ fn index_spec(product: &str) -> Option<(IndexKind, &'static [(IndexBandRole, Ban
                 (IndexBandRole::Nir, BandRole::Nir),
             ],
         )),
+        "evi2" => Some((
+            IndexKind::Evi2,
+            &[
+                (IndexBandRole::Red, BandRole::Red),
+                (IndexBandRole::Nir, BandRole::Nir),
+            ],
+        )),
+        "msavi" => Some((
+            IndexKind::Msavi,
+            &[
+                (IndexBandRole::Red, BandRole::Red),
+                (IndexBandRole::Nir, BandRole::Nir),
+            ],
+        )),
+        "osavi" => Some((
+            IndexKind::Osavi,
+            &[
+                (IndexBandRole::Red, BandRole::Red),
+                (IndexBandRole::Nir, BandRole::Nir),
+            ],
+        )),
+        "gndvi" => Some((
+            IndexKind::Gndvi,
+            &[
+                (IndexBandRole::Green, BandRole::Green),
+                (IndexBandRole::Nir, BandRole::Nir),
+            ],
+        )),
+        "vari" => Some((
+            IndexKind::Vari,
+            &[
+                (IndexBandRole::Blue, BandRole::Blue),
+                (IndexBandRole::Green, BandRole::Green),
+                (IndexBandRole::Red, BandRole::Red),
+            ],
+        )),
+        "awei_nsh" => Some((
+            IndexKind::AweiNsh,
+            &[
+                (IndexBandRole::Green, BandRole::Green),
+                (IndexBandRole::Nir, BandRole::Nir),
+                (IndexBandRole::Swir1, BandRole::Swir1),
+                (IndexBandRole::Swir2, BandRole::Swir2),
+            ],
+        )),
+        "awei_sh" => Some((
+            IndexKind::AweiSh,
+            &[
+                (IndexBandRole::Blue, BandRole::Blue),
+                (IndexBandRole::Green, BandRole::Green),
+                (IndexBandRole::Nir, BandRole::Nir),
+                (IndexBandRole::Swir1, BandRole::Swir1),
+                (IndexBandRole::Swir2, BandRole::Swir2),
+            ],
+        )),
         _ => None,
     }
 }
 
 #[derive(Debug, Error)]
 pub enum LandsatDeriveError {
-    #[error("product {0:?} is not derivable from Landsat C2 bands (supported: ndvi, ndwi, mndwi, ndmi, nbr, evi, savi, lst)")]
+    #[error("product {0:?} is not derivable from Landsat C2 bands (supported: ndvi, ndwi, mndwi, ndmi, nbr, evi, evi2, savi, msavi, osavi, gndvi, vari, awei_nsh, awei_sh, lst)")]
     UnsupportedProduct(String),
     #[error("scene {scene_id} has no registered band for {role} (looked for {kinds:?})")]
     BandNotFound {
@@ -245,8 +375,8 @@ impl LandsatDeriveError {
 pub struct LandsatDeriveRequest {
     /// Scene id of a registered USGS Landsat scene (the L1 bands' scene).
     pub scene_id: String,
-    /// `ndvi` (default), `ndwi`, `mndwi`, `ndmi`, `nbr`, `evi`, `savi`, or
-    /// `lst`.
+    /// Spectral index key (default `ndvi`) or `lst`; see
+    /// [`index_spec`] for the Landsat-supported index set.
     #[serde(default = "default_product")]
     pub product: String,
     #[serde(default)]
@@ -374,6 +504,7 @@ pub async fn derive_landsat_product(
 ) -> Result<LandsatDeriveOutcome, LandsatDeriveError> {
     let product_key = request.product.trim().to_ascii_lowercase();
     let optical_spec = index_spec(&product_key);
+    let is_optical = optical_spec.is_some();
     if optical_spec.is_none() && product_key != "lst" {
         return Err(LandsatDeriveError::UnsupportedProduct(
             request.product.clone(),
@@ -408,13 +539,17 @@ pub async fn derive_landsat_product(
         candidates(instrument, BandRole::QaPixel),
     )
     .await?;
-    let (clear, qa_applied, qa_input) = match &qa_product {
+    let (mut clear, qa_applied, qa_input) = match &qa_product {
         Some(product) => {
             let qa = load_band(product)?;
             ensure_same_grid(reference, &qa)?;
             let codes = band_to_dn(&qa);
             (
-                codes.iter().map(|code| qa_pixel_clear(*code)).collect(),
+                codes
+                    .iter()
+                    .zip(&qa.valid_mask)
+                    .map(|(code, valid)| *valid && qa_pixel_clear(*code))
+                    .collect(),
                 true,
                 Some(ProductInputRef {
                     product_id: product.product_id.clone(),
@@ -423,6 +558,65 @@ pub async fn derive_landsat_product(
             )
         }
         None => (vec![true; pixel_count], false, None),
+    };
+    let radsat_product = find_band(
+        pool,
+        &request.scene_id,
+        candidates(instrument, BandRole::QaRadsat),
+    )
+    .await?;
+    let radsat_reject_mask = qa_radsat_reject_mask(
+        instrument,
+        &roles.iter().map(|(role, _)| *role).collect::<Vec<_>>(),
+        !is_optical,
+    );
+    let radsat_input = if let Some(product) = &radsat_product {
+        let qa = load_band(product)?;
+        ensure_same_grid(reference, &qa)?;
+        for ((keep, code), valid) in clear.iter_mut().zip(band_to_dn(&qa)).zip(&qa.valid_mask) {
+            if !valid || code & radsat_reject_mask != 0 {
+                *keep = false;
+            }
+        }
+        Some(ProductInputRef {
+            product_id: product.product_id.clone(),
+            role: BandRole::QaRadsat.label().to_string(),
+        })
+    } else {
+        None
+    };
+    let surface_qa_role = match instrument {
+        LandsatInstrument::Oli => BandRole::QaAerosol,
+        LandsatInstrument::TmEtm => BandRole::CloudQa,
+    };
+    let surface_qa_product = if is_optical {
+        find_band(
+            pool,
+            &request.scene_id,
+            candidates(instrument, surface_qa_role),
+        )
+        .await?
+    } else {
+        None
+    };
+    let surface_qa_input = if let Some(product) = &surface_qa_product {
+        let qa = load_band(product)?;
+        ensure_same_grid(reference, &qa)?;
+        for ((keep, code), valid) in clear.iter_mut().zip(band_to_dn(&qa)).zip(&qa.valid_mask) {
+            let acceptable = match instrument {
+                LandsatInstrument::Oli => qa_aerosol_acceptable(code),
+                LandsatInstrument::TmEtm => cloud_qa_clear(code),
+            };
+            if !valid || !acceptable {
+                *keep = false;
+            }
+        }
+        Some(ProductInputRef {
+            product_id: product.product_id.clone(),
+            role: surface_qa_role.label().to_string(),
+        })
+    } else {
+        None
     };
 
     // Calibrate + compute.
@@ -473,6 +667,8 @@ pub async fn derive_landsat_product(
             let mut low = 0usize;
             for (pixel, value) in values.iter().enumerate() {
                 if *value != INDEX_NODATA
+                    && st_qa.valid_mask[pixel]
+                    && uncertainties[pixel] != 0
                     && f32::from(uncertainties[pixel]) * ST_QA_SCALE_K <= ST_QA_LOW_UNCERTAINTY_K
                 {
                     low += 1;
@@ -498,6 +694,30 @@ pub async fn derive_landsat_product(
     };
 
     let scene_product = &band_products[0].2;
+    let qa_complete =
+        qa_applied && radsat_product.is_some() && (!is_optical || surface_qa_product.is_some());
+    let (confidence, confidence_method) = if product_key == "lst" {
+        if qa_complete {
+            (
+                st_qa_fraction.map(f64::from),
+                st_qa_fraction.map(|_| "st_qa_low_uncertainty_fraction".to_string()),
+            )
+        } else {
+            (None, None)
+        }
+    } else if qa_complete {
+        (
+            Some(if pixel_count == 0 {
+                0.0
+            } else {
+                valid_pixels as f64 / pixel_count as f64
+            }),
+            Some("valid_pixel_fraction_after_qa_pixel_and_qa_radsat".to_string()),
+        )
+    } else {
+        (None, None)
+    };
+
     let mut draft = ProductRecordDraft {
         level: ProductLevel::L2,
         kind: product_key.clone(),
@@ -517,6 +737,18 @@ pub async fn derive_landsat_product(
                 "landsat_c2l2_sr"
             },
             "qa_applied": qa_applied,
+            "qa_radsat_applied": radsat_product.is_some(),
+            "qa_radsat_reject_mask": radsat_reject_mask,
+            "surface_reflectance_qa": if is_optical {
+                Some(serde_json::json!({
+                    "role": surface_qa_role.label(),
+                    "applied": surface_qa_product.is_some(),
+                }))
+            } else {
+                None
+            },
+            "field_id": request.field_id,
+            "season_id": request.season_id,
             "st_qa_low_uncertainty_k": st_qa_fraction.map(|_| ST_QA_LOW_UNCERTAINTY_K),
             "unit": unit,
         }),
@@ -527,6 +759,8 @@ pub async fn derive_landsat_product(
                 role: band_role.label().to_string(),
             })
             .chain(qa_input)
+            .chain(radsat_input)
+            .chain(surface_qa_input)
             .chain(st_qa_input)
             .collect(),
         scope: ProductScope {
@@ -547,8 +781,8 @@ pub async fn derive_landsat_product(
         gsd_m_per_px: reference.geo_transform.map(|t| t[1].abs()),
         artifact: None,
         quality_mask: None,
-        confidence: st_qa_fraction.map(f64::from),
-        confidence_method: st_qa_fraction.map(|_| "st_qa_low_uncertainty_fraction".to_string()),
+        confidence,
+        confidence_method,
         quality_summary: None,
         evidence_digests: Vec::new(),
         source_id: scene_product.source_id.clone(),
@@ -586,6 +820,9 @@ pub async fn derive_landsat_product(
         "invalid_pixels": invalid_pixels,
         "reasons": reasons,
         "qa_applied": qa_applied,
+        "qa_radsat_applied": radsat_product.is_some(),
+        "qa_radsat_reject_mask": radsat_reject_mask,
+        "surface_reflectance_qa_applied": is_optical && surface_qa_product.is_some(),
         "st_qa_low_uncertainty_fraction": st_qa_fraction,
     }));
 
@@ -593,11 +830,6 @@ pub async fn derive_landsat_product(
     let created_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
     let product_id =
         catalog::register_product_with_actor(pool, &draft, &actor, &created_at).await?;
-
-    // Per-field time series (batch S-3): best-effort, never fails the derive.
-    if request.field_id.is_some() {
-        crate::field_timeseries::append_field_stats_best_effort(pool, &product_id).await;
-    }
 
     Ok(LandsatDeriveOutcome {
         stac_item_href: format!("/api/stac/collections/{product_key}/items/{product_id}"),
@@ -620,13 +852,32 @@ mod tests {
 
     #[test]
     fn qa_pixel_bits_are_pinned() {
-        // fill(1), dilated cloud(2), cirrus(4), cloud(8), shadow(16) reject;
-        // snow(32), clear(64), water(128) keep.
-        for rejected in [1u16, 2, 4, 8, 16, 8 | 64, 21824 | 8] {
+        // fill(1), dilated cloud(2), cirrus(4), cloud(8), shadow(16), and
+        // snow(32) reject; clear(64) and water(128) remain usable.
+        for rejected in [1u16, 2, 4, 8, 16, 32, 8 | 64, 32 | 64, 21824 | 8] {
             assert!(!qa_pixel_clear(rejected), "{rejected}");
         }
-        for kept in [0u16, 32, 64, 128, 64 | 128, 32 | 64] {
+        for kept in [0u16, 64, 128, 64 | 128] {
             assert!(qa_pixel_clear(kept), "{kept}");
+        }
+    }
+
+    #[test]
+    fn sensor_surface_reflectance_qa_policies_are_pinned() {
+        assert!(qa_aerosol_acceptable(0));
+        assert!(qa_aerosol_acceptable(1 << 5), "interpolated is retained");
+        assert!(qa_aerosol_acceptable(1 << 2), "water is retained");
+        assert!(!qa_aerosol_acceptable(1), "fill is rejected");
+        assert!(
+            !qa_aerosol_acceptable(0b11 << 6),
+            "high aerosol is rejected"
+        );
+
+        assert!(cloud_qa_clear(0));
+        assert!(cloud_qa_clear(1), "dense dark vegetation is retained");
+        assert!(cloud_qa_clear(1 << 5), "water is retained");
+        for rejected in [1 << 1, 1 << 2, 1 << 3, 1 << 4] {
+            assert!(!cloud_qa_clear(rejected));
         }
     }
 
@@ -663,12 +914,34 @@ mod tests {
 
     #[test]
     fn index_specs_cover_the_documented_products() {
-        for product in ["ndvi", "ndwi", "mndwi", "ndmi", "nbr", "evi", "savi"] {
+        for product in [
+            "ndvi", "ndwi", "mndwi", "ndmi", "nbr", "evi", "evi2", "savi", "msavi", "osavi",
+            "gndvi", "vari", "awei_nsh", "awei_sh",
+        ] {
             assert!(index_spec(product).is_some(), "{product}");
         }
         assert!(index_spec("lst").is_none(), "lst is the thermal path");
         assert!(index_spec("evi9").is_none());
         // EVI is the three-band spec.
         assert_eq!(index_spec("evi").unwrap().1.len(), 3);
+    }
+
+    #[test]
+    fn qa_radsat_masks_only_contributing_bands_and_instrument_failures() {
+        let ndvi_roles = [IndexBandRole::Red, IndexBandRole::Nir];
+        let oli_ndvi = qa_radsat_reject_mask(LandsatInstrument::Oli, &ndvi_roles, false);
+        assert_eq!(oli_ndvi, (1 << 3) | (1 << 4) | (1 << 11));
+        assert_eq!(oli_ndvi & (1 << 1), 0, "blue saturation is irrelevant");
+
+        let etm_ndvi = qa_radsat_reject_mask(LandsatInstrument::TmEtm, &ndvi_roles, false);
+        assert_eq!(etm_ndvi, (1 << 2) | (1 << 3) | (1 << 9));
+        assert_eq!(
+            qa_radsat_reject_mask(LandsatInstrument::TmEtm, &[], true),
+            (1 << 5) | (1 << 8) | (1 << 9)
+        );
+        assert_eq!(
+            qa_radsat_reject_mask(LandsatInstrument::Oli, &[], true),
+            1 << 11
+        );
     }
 }

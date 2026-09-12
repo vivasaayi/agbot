@@ -80,6 +80,17 @@ pub struct PipelineConfig {
     /// L3/app fan-out) instead of silently entering the graph. `0` disables the
     /// gate (every product with a defined confidence passes).
     pub qa_min_confidence: f64,
+    /// Minimum distinct years required before the automated worker publishes
+    /// a climatology. The drought algorithms require at least five years;
+    /// deployments may raise this floor when a longer archive is available.
+    pub climatology_min_years: u32,
+    /// Calendar months that close a configured growing season and therefore
+    /// trigger an automated phenology recompute.
+    pub phenology_season_end_months: Vec<u32>,
+    /// Inclusive number of calendar months in the phenology season window.
+    pub phenology_lookback_months: u32,
+    /// Minimum monthly composites required inside the season window.
+    pub phenology_min_observations: u32,
 }
 
 impl Default for PipelineConfig {
@@ -91,10 +102,61 @@ impl Default for PipelineConfig {
             // 30 minutes: far above any legitimate derive/composite, low enough
             // to bound a wedged worker. Always on by default.
             job_timeout_secs: 1800,
-            // Off by default so existing behavior (accept all) is preserved;
-            // the appliance can raise it to quarantine low-confidence products.
-            qa_min_confidence: 0.0,
+            // Require at least 25% usable, quality-masked coverage. Missing
+            // confidence fails closed whenever this gate is enabled.
+            qa_min_confidence: 0.25,
+            climatology_min_years: crate::drought_rasters::DEFAULT_MIN_YEARS,
+            phenology_season_end_months: vec![9, 10],
+            phenology_lookback_months: 6,
+            phenology_min_observations: 3,
         }
+    }
+}
+
+impl PipelineConfig {
+    fn validate(&self) -> Result<()> {
+        if !(0.0..=1.0).contains(&self.qa_min_confidence) {
+            return Err(anyhow!(
+                "pipeline.qa_min_confidence must be between 0 and 1"
+            ));
+        }
+        if self.climatology_min_years < crate::drought_rasters::DEFAULT_MIN_YEARS {
+            return Err(anyhow!(
+                "pipeline.climatology_min_years must be at least {}",
+                crate::drought_rasters::DEFAULT_MIN_YEARS
+            ));
+        }
+        if self.phenology_season_end_months.is_empty()
+            || self
+                .phenology_season_end_months
+                .iter()
+                .any(|month| !(1..=12).contains(month))
+        {
+            return Err(anyhow!(
+                "pipeline.phenology_season_end_months must contain calendar months 1 through 12"
+            ));
+        }
+        let mut months = self.phenology_season_end_months.clone();
+        months.sort_unstable();
+        months.dedup();
+        if months.len() != self.phenology_season_end_months.len() {
+            return Err(anyhow!(
+                "pipeline.phenology_season_end_months must not contain duplicates"
+            ));
+        }
+        if self.phenology_lookback_months == 0 {
+            return Err(anyhow!(
+                "pipeline.phenology_lookback_months must be at least 1"
+            ));
+        }
+        if self.phenology_min_observations < 3
+            || self.phenology_min_observations > self.phenology_lookback_months
+        {
+            return Err(anyhow!(
+                "pipeline.phenology_min_observations must be between 3 and pipeline.phenology_lookback_months"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -297,6 +359,7 @@ impl HubConfig {
         if !has_landsat_credential_source {
             config.landsat.credential_source = config.runtime_mode.default_credential_source();
         }
+        config.pipeline.validate()?;
         if config.database_url.starts_with("sqlite://") && !config.database_url.contains('?') {
             // Enable WAL mode for better concurrency
             config.database_url.push_str("?mode=rwc");
@@ -486,6 +549,11 @@ source = "landsat"
         assert!(!default_config.pipeline.enabled);
         assert_eq!(default_config.pipeline.poll_interval_ms, 1000);
         assert_eq!(default_config.pipeline.provider_min_delay_ms, 250);
+        assert_eq!(default_config.pipeline.climatology_min_years, 5);
+        assert_eq!(
+            default_config.pipeline.phenology_season_end_months,
+            vec![9, 10]
+        );
 
         let (_tmp, path) = write_config(
             r#"
@@ -501,6 +569,10 @@ source = "sample"
 enabled = true
 poll_interval_ms = 2500
 provider_min_delay_ms = 500
+climatology_min_years = 7
+phenology_season_end_months = [4, 11]
+phenology_lookback_months = 8
+phenology_min_observations = 4
 "#,
         );
 
@@ -508,6 +580,37 @@ provider_min_delay_ms = 500
         assert!(config.pipeline.enabled);
         assert_eq!(config.pipeline.poll_interval_ms, 2500);
         assert_eq!(config.pipeline.provider_min_delay_ms, 500);
+        assert_eq!(config.pipeline.climatology_min_years, 7);
+        assert_eq!(config.pipeline.phenology_season_end_months, vec![4, 11]);
+        assert_eq!(config.pipeline.phenology_lookback_months, 8);
+        assert_eq!(config.pipeline.phenology_min_observations, 4);
+    }
+
+    #[test]
+    fn hub_config_rejects_unsafe_pipeline_science_thresholds() {
+        let base = r#"
+runtime_mode = "simulation"
+bind_address = "127.0.0.1:8787"
+database_url = "sqlite://geo_hub_test.db"
+data_root = "tmp/geo_hub"
+
+[landsat]
+source = "sample"
+
+[pipeline]
+"#;
+        for setting in [
+            "climatology_min_years = 4",
+            "phenology_season_end_months = []",
+            "phenology_season_end_months = [9, 9]",
+            "phenology_lookback_months = 2\nphenology_min_observations = 3",
+        ] {
+            let (_tmp, path) = write_config(&format!("{base}{setting}\n"));
+            assert!(
+                HubConfig::load_with_path(Some(&path)).is_err(),
+                "unsafe setting should fail: {setting}"
+            );
+        }
     }
 
     #[test]

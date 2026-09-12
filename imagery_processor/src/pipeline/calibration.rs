@@ -1,8 +1,9 @@
 //! Sensor radiometric scaling: DN -> surface reflectance / surface temperature.
 //!
 //! Applies the published per-sensor linear scale/offset to raw digital numbers
-//! (DN), maps fill/nodata DNs to invalid pixels, and clamps reflectance to its
-//! physical [0.0, 1.0] range. Everything applied is recorded in the crate's
+//! (DN) and maps fill/nodata DNs to invalid pixels. Scaled reflectance is
+//! retained as published, including negative water/aerosol-correction values
+//! and values above one. Everything applied is recorded in the crate's
 //! existing `RadiometricCalibrationEvidence` so downstream products stay
 //! evidence-backed. Per-pixel outcomes reuse `IndexPixelValue` and its
 //! `&'static str` reason codes (see `pipeline/indices.rs`).
@@ -17,7 +18,6 @@ pub const REASON_FILL: &str = "fill";
 /// and was clamped. The pixels remain valid; the count is evidence.
 pub const REASON_CLAMPED_OUT_OF_RANGE: &str = "clamped_out_of_range";
 
-const REFLECTANCE_RANGE: (f32, f32) = (0.0, 1.0);
 const U16_MAX_DN: f32 = u16::MAX as f32;
 
 /// Published radiometric scaling profiles for supported sensor products.
@@ -68,16 +68,10 @@ impl SensorProfile {
         }
     }
 
-    /// Valid output range the scaled value is clamped to, if any.
-    /// Reflectance products clamp to [0.0, 1.0]; temperature and generic
-    /// linear outputs are not clamped.
+    /// Optional output clamp. Published sensor profiles preserve scaled
+    /// values so QA, rather than silent clipping, determines usability.
     pub fn valid_output_range(self) -> Option<(f32, f32)> {
-        match self {
-            SensorProfile::LandsatC2L2Sr
-            | SensorProfile::Sentinel2L2ABaseline0400
-            | SensorProfile::Sentinel2L2ALegacy => Some(REFLECTANCE_RANGE),
-            SensorProfile::LandsatC2L2St | SensorProfile::Linear { .. } => None,
-        }
+        None
     }
 
     pub fn calibration_status(self) -> CalibrationStatus {
@@ -135,8 +129,7 @@ pub struct ScaledBand {
 /// Apply a sensor profile's scale/offset to a DN band buffer.
 ///
 /// - Fill/nodata DNs become `IndexPixelValue::Invalid { reason: "fill" }`.
-/// - Reflectance outputs are clamped to [0.0, 1.0]; clamped pixels stay valid
-///   and are counted under `clamped_out_of_range`.
+/// - Values outside the nominal reflectance interval remain unchanged.
 pub fn apply_radiometric_scaling(profile: SensorProfile, dns: &[u16]) -> ScaledBand {
     let scale = profile.scale();
     let offset = profile.offset();
@@ -285,22 +278,19 @@ mod tests {
     }
 
     #[test]
-    fn reflectance_is_clamped_to_unit_range_and_counted() {
-        // High clamp: 60000 * 0.0000275 - 0.2 = 1.45 -> 1.0
-        // Low clamp: 1 * 0.0000275 - 0.2 = -0.19997... -> 0.0
+    fn reflectance_outside_unit_range_is_preserved() {
         let scaled = apply_radiometric_scaling(SensorProfile::LandsatC2L2Sr, &[60000, 1, 10000]);
 
-        assert_eq!(scaled.pixels[0], IndexPixelValue::Valid(1.0));
-        assert_eq!(scaled.pixels[1], IndexPixelValue::Valid(0.0));
+        assert_close(scaled.pixels[0].value().unwrap(), 1.45, 1e-6);
+        assert_close(scaled.pixels[1].value().unwrap(), -0.199_972_5, 1e-6);
         assert_close(scaled.pixels[2].value().unwrap(), 0.075, 1e-6);
-        assert_eq!(scaled.clamped_pixel_count, 2);
+        assert_eq!(scaled.clamped_pixel_count, 0);
         assert_eq!(scaled.valid_pixel_count, 3);
-        assert_eq!(scaled.reason_counts.get("clamped_out_of_range"), Some(&2));
+        assert!(scaled.reason_counts.is_empty());
 
-        // Sentinel-2 baseline 04.00 below-offset DN also clamps low, not -0.09.
         let s2 = apply_radiometric_scaling(SensorProfile::Sentinel2L2ABaseline0400, &[100]);
-        assert_eq!(s2.pixels[0], IndexPixelValue::Valid(0.0));
-        assert_eq!(s2.clamped_pixel_count, 1);
+        assert_close(s2.pixels[0].value().unwrap(), -0.09, 1e-6);
+        assert_eq!(s2.clamped_pixel_count, 0);
     }
 
     #[test]
@@ -337,7 +327,8 @@ mod tests {
         let b4 = evidence.coefficients.get("B4").unwrap();
         assert_close(b4.gain, 0.0000275, 1e-12);
         assert_close(b4.offset, -0.2, 1e-12);
-        assert_eq!((b4.output_min, b4.output_max), (0.0, 1.0));
+        assert_close(b4.output_min, -0.2, 1e-6);
+        assert_close(b4.output_max, 1.602_212_4, 1e-6);
 
         let st_evidence = SensorProfile::LandsatC2L2St.calibration_evidence(&["B10"]);
         assert_eq!(

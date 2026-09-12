@@ -42,6 +42,10 @@ use thiserror::Error;
 
 use crate::satellite_derivation::{CogStoreResolver, DerivationError, UrlCogResolver};
 
+/// Planetary Computer's public mirror of the USGS Collection-2 bucket used
+/// by Earth Search Landsat items.
+pub const LANDSAT_PC_BLOB_BASE: &str = "https://landsateuwest.blob.core.windows.net/landsat-c2";
+
 /// Planetary Computer anonymous SAS token endpoint base; the collection id
 /// is appended as the final path segment.
 pub const PC_SAS_TOKEN_API: &str = "https://planetarycomputer.microsoft.com/api/sas/v1/token";
@@ -434,6 +438,37 @@ pub struct PcSignedCogResolver {
     collection: String,
 }
 
+/// Production resolver for the mixed asset URLs returned by Earth Search.
+/// Sentinel HTTPS assets pass through unchanged. Earth Search's requester-
+/// pays `s3://usgs-landsat/...` URLs are routed to the equivalent Planetary
+/// Computer mirror and signed there; native PC blob URLs are signed too.
+pub struct ProductionCogResolver {
+    landsat: PcSignedCogResolver,
+}
+
+impl ProductionCogResolver {
+    pub fn new() -> Result<Self, PcSignError> {
+        Ok(Self {
+            landsat: PcSignedCogResolver::new(Arc::new(PcSasTokenCache::new()?), "landsat-c2-l2"),
+        })
+    }
+
+    fn provider_href(href: &str) -> String {
+        href.strip_prefix("s3://usgs-landsat/")
+            .map(|path| {
+                let path = path.strip_prefix("collection02/").unwrap_or(path);
+                format!("{LANDSAT_PC_BLOB_BASE}/{path}")
+            })
+            .unwrap_or_else(|| href.to_string())
+    }
+}
+
+impl CogStoreResolver for ProductionCogResolver {
+    fn resolve(&self, href: &str) -> Result<(Arc<dyn ObjectStore>, String), DerivationError> {
+        self.landsat.resolve(&Self::provider_href(href))
+    }
+}
+
 impl PcSignedCogResolver {
     pub fn new(cache: Arc<PcSasTokenCache>, collection: impl Into<String>) -> Self {
         Self {
@@ -477,6 +512,20 @@ mod tests {
         ));
         assert!(!requires_sas("s3://usgs-landsat/x.TIF"));
         assert!(!requires_sas("not a url"));
+    }
+
+    #[test]
+    fn production_resolver_maps_earth_search_landsat_s3_to_pc_mirror() {
+        assert_eq!(
+            ProductionCogResolver::provider_href(
+                "s3://usgs-landsat/collection02/level-2/scene/B4.TIF"
+            ),
+            format!("{LANDSAT_PC_BLOB_BASE}/level-2/scene/B4.TIF")
+        );
+        assert_eq!(
+            ProductionCogResolver::provider_href("https://sentinel.example/B04.tif"),
+            "https://sentinel.example/B04.tif"
+        );
     }
 
     #[test]

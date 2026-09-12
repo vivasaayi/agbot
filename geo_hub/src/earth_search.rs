@@ -12,10 +12,12 @@
 //! `sentinel-cogs.s3.us-west-2.amazonaws.com`. The CRS is
 //! `properties["proj:epsg"]` (integer), and each asset carries
 //! `proj:shape`/`proj:transform`. `landsat-c2-l2` items use `red`, `green`,
-//! `blue`, `nir08`, `swir16`, `swir22`, `qa_pixel` — but their hrefs point at
-//! the **requester-pays** `s3://usgs-landsat` bucket, so Landsat is search
-//! metadata only here (no free band reads). Both shapes are pinned by the
-//! fixtures in `tests/fixtures/earth_search_*.json` (captured live).
+//! `blue`, `nir08`, `swir16`, `swir22`, `qa_pixel`, `qa_radsat`, and the
+//! sensor-specific surface-reflectance QA band — but their hrefs point at
+//! the **requester-pays** `s3://usgs-landsat` bucket. Production rewrites
+//! those paths to the Planetary Computer mirror and signs range reads through
+//! `pc_sign::ProductionCogResolver`. Both shapes are pinned by fixtures in
+//! `tests/fixtures/earth_search_*.json` (captured live).
 
 use anyhow::{anyhow, Context, Result};
 use chrono::{Duration as ChronoDuration, NaiveDate};
@@ -125,6 +127,18 @@ pub const S2_SCL_ASSET_KEY: &str = "scl";
 /// Landsat C2 L2 pixel-quality bitmask asset key (same key on every
 /// instrument family).
 pub const LANDSAT_QA_PIXEL_ASSET_KEY: &str = "qa_pixel";
+/// Landsat Collection-2 per-band radiometric saturation flags.
+pub const LANDSAT_QA_RADSAT_ASSET_KEY: &str = "qa_radsat";
+/// Landsat 8/9 LaSRC aerosol retrieval-quality flags.
+pub const LANDSAT_QA_AEROSOL_ASSET_KEY: &str = "qa_aerosol";
+/// Landsat 4-7 LEDAPS surface-reflectance cloud/adjacency flags.
+pub const LANDSAT_CLOUD_QA_ASSET_KEY: &str = "cloud_qa";
+/// Landsat 4-7 Collection-2 surface-temperature band.
+pub const LANDSAT_LWIR_ASSET_KEY: &str = "lwir";
+/// Landsat 8/9 Collection-2 surface-temperature band.
+pub const LANDSAT_LWIR11_ASSET_KEY: &str = "lwir11";
+/// Landsat 4-9 surface-temperature uncertainty band (ST_QA).
+pub const LANDSAT_ST_QA_ASSET_KEY: &str = "qa";
 
 /// Verified Landsat C2 L2 asset key for an index band role. The keys are
 /// common across TM/ETM+/OLI instrument families (the `_SR_Bn` file
@@ -148,6 +162,39 @@ pub fn landsat_asset_key(role: IndexBandRole) -> Option<&'static str> {
 struct ItemCollection {
     #[serde(default)]
     features: Vec<EarthSearchItem>,
+    #[serde(default)]
+    links: Vec<ItemCollectionLink>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ItemCollectionLink {
+    rel: String,
+    href: String,
+    #[serde(default)]
+    method: Option<String>,
+    #[serde(default)]
+    body: Option<serde_json::Value>,
+}
+
+type PageRequest = (String, String, Option<serde_json::Value>);
+
+fn next_page_request(
+    current_url: &str,
+    links: Vec<ItemCollectionLink>,
+) -> Result<Option<PageRequest>> {
+    let Some(link) = links.into_iter().find(|link| link.rel == "next") else {
+        return Ok(None);
+    };
+    let base = reqwest::Url::parse(current_url).context("invalid Earth Search page URL")?;
+    let href = base
+        .join(&link.href)
+        .context("invalid Earth Search next-link URL")?
+        .to_string();
+    Ok(Some((
+        link.method.unwrap_or_else(|| "GET".to_string()),
+        href,
+        link.body,
+    )))
 }
 
 /// Parse an Earth Search `POST /search` response body. Pure.
@@ -314,26 +361,48 @@ pub async fn search_items_range(
         max_cloud_cover,
         limit,
     );
-    let response = http_client()?
-        .post(format!("{EARTH_SEARCH_API}/search"))
-        .header(reqwest::header::USER_AGENT, "agbot-geo-hub/0.1")
-        .json(&body)
-        .send()
-        .await
-        .context("failed to call Earth Search STAC search")?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let retry_after = retry_after_header_secs(response.headers());
-        let text = response.text().await.unwrap_or_default();
-        return Err(upstream_error(
-            "Earth Search STAC search",
-            status,
-            retry_after,
-            &text,
-        ));
+    let client = http_client()?;
+    let mut next = Some((
+        "POST".to_string(),
+        format!("{EARTH_SEARCH_API}/search"),
+        Some(body),
+    ));
+    let mut items = Vec::new();
+    let mut pages = 0usize;
+    while let Some((method, url, request_body)) = next.take() {
+        pages += 1;
+        if pages > 200 || items.len() > 10_000 {
+            return Err(anyhow!("Earth Search pagination exceeded safety limit"));
+        }
+        let method = reqwest::Method::from_bytes(method.as_bytes())
+            .context("Earth Search next link has invalid method")?;
+        let mut request = client
+            .request(method.clone(), &url)
+            .header(reqwest::header::USER_AGENT, "agbot-geo-hub/0.1");
+        if let Some(request_body) = request_body {
+            request = request.json(&request_body);
+        }
+        let response = request
+            .send()
+            .await
+            .context("failed to call Earth Search STAC search")?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let retry_after = retry_after_header_secs(response.headers());
+            let text = response.text().await.unwrap_or_default();
+            return Err(upstream_error(
+                "Earth Search STAC search",
+                status,
+                retry_after,
+                &text,
+            ));
+        }
+        let text = response.text().await?;
+        let page: ItemCollection =
+            serde_json::from_str(&text).context("failed to parse Earth Search search response")?;
+        items.extend(page.features);
+        next = next_page_request(&url, page.links)?;
     }
-    let text = response.text().await?;
-    let mut items = parse_search_response(&text)?;
     sort_items_by_datetime(&mut items);
     Ok(items)
 }
@@ -454,6 +523,32 @@ mod tests {
 
         assert!(parse_search_response("{}").unwrap().is_empty());
         assert!(parse_search_response("not json").is_err());
+    }
+
+    #[test]
+    fn pagination_preserves_method_and_body_and_resolves_relative_href() {
+        let links: Vec<ItemCollectionLink> = serde_json::from_value(serde_json::json!([
+            {
+                "rel": "self",
+                "href": "https://earth-search.aws.element84.com/v1/search"
+            },
+            {
+                "rel": "next",
+                "href": "search?page=2",
+                "method": "POST",
+                "body": { "token": "page-2" }
+            }
+        ]))
+        .unwrap();
+        let next = next_page_request("https://earth-search.aws.element84.com/v1/search", links)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.0, "POST");
+        assert_eq!(
+            next.1,
+            "https://earth-search.aws.element84.com/v1/search?page=2"
+        );
+        assert_eq!(next.2.unwrap()["token"], "page-2");
     }
 
     #[test]

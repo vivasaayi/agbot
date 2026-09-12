@@ -8,13 +8,15 @@
 //! and can wrap this later), and returns the registered product references.
 //!
 //! Tests inject an in-memory COG store through the optional
-//! [`SatelliteCogResolver`] request extension; production falls back to
-//! [`UrlCogResolver`] (plain HTTPS range reads).
+//! [`SatelliteCogResolver`] request extension; production uses
+//! [`ProductionCogResolver`] for signed Landsat reads and plain Sentinel
+//! HTTPS reads.
 
 use crate::earth_search::{self, EarthSearchItem};
+use crate::pc_sign::ProductionCogResolver;
 use crate::satellite_derivation::{
-    derive_satellite_index, index_kind_from_key, DerivationError, DeriveRequest,
-    SatelliteCogResolver, UrlCogResolver,
+    derive_product_from_key, derive_satellite_index, DerivationError, DeriveRequest,
+    SatelliteCogResolver,
 };
 use crate::state::AppState;
 use axum::extract::{Extension, State};
@@ -36,7 +38,7 @@ pub struct SatelliteDeriveBody {
     pub item_id: Option<String>,
     /// WGS84 `[min_lon, min_lat, max_lon, max_lat]`.
     pub aoi: [f64; 4],
-    /// Index kind key, e.g. `ndvi`, `mndwi`, `ndmi`.
+    /// Product key, e.g. `ndvi`, `mndwi`, `ndmi`, or Landsat `lst`.
     pub index: String,
     /// Optional field scope threaded into every registered product so the
     /// per-field time series can query the catalog by field.
@@ -108,7 +110,7 @@ pub async fn satellite_derive(
     resolver: Option<Extension<SatelliteCogResolver>>,
     Json(body): Json<SatelliteDeriveBody>,
 ) -> Result<Json<serde_json::Value>, SatelliteDeriveError> {
-    let index = index_kind_from_key(&body.index)?;
+    let product = derive_product_from_key(&body.index)?;
     let [min_lon, min_lat, max_lon, max_lat] = body.aoi;
     let aoi = GeoBounds {
         min_lon,
@@ -141,11 +143,15 @@ pub async fn satellite_derive(
     let request = DeriveRequest {
         item,
         aoi,
-        index,
+        product,
         field_id: body.field_id,
         season_id: body.season_id,
     };
-    let default_resolver = UrlCogResolver;
+    let default_resolver = ProductionCogResolver::new().map_err(|err| SatelliteDeriveError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "cog_resolver_initialization_failed".to_string(),
+        message: err.to_string(),
+    })?;
     let resolver_ref: &dyn crate::satellite_derivation::CogStoreResolver = match &resolver {
         Some(Extension(SatelliteCogResolver(inner))) => inner.as_ref(),
         None => &default_resolver,
@@ -153,6 +159,45 @@ pub async fn satellite_derive(
     let outcome =
         derive_satellite_index(&state.pool, &state.config.data_root, resolver_ref, &request)
             .await?;
+
+    if state.config.pipeline.qa_min_confidence > 0.0 {
+        let confidence = crate::catalog::get_product(&state.pool, &outcome.product_id)
+            .await
+            .map_err(|err| SatelliteDeriveError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "qa_lookup_failed".to_string(),
+                message: err.to_string(),
+            })?
+            .and_then(|product| product.confidence);
+        let policy = crate::catalog::QaPolicy {
+            min_confidence: state.config.pipeline.qa_min_confidence,
+        };
+        if let crate::catalog::QaVerdict::Quarantine { reason } =
+            crate::catalog::qa_verdict(confidence, &policy)
+        {
+            crate::catalog::quarantine_product(&state.pool, &outcome.product_id)
+                .await
+                .map_err(|err| SatelliteDeriveError {
+                    status: StatusCode::INTERNAL_SERVER_ERROR,
+                    code: "qa_quarantine_failed".to_string(),
+                    message: err.to_string(),
+                })?;
+            return Err(SatelliteDeriveError {
+                status: StatusCode::UNPROCESSABLE_ENTITY,
+                code: "product_failed_qa".to_string(),
+                message: reason,
+            });
+        }
+    }
+    if request.field_id.is_some() {
+        crate::field_timeseries::extract_and_append_field_stats(&state.pool, &outcome.product_id)
+            .await
+            .map_err(|err| SatelliteDeriveError {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                code: "field_statistics_failed".to_string(),
+                message: err.to_string(),
+            })?;
+    }
 
     Ok(Json(serde_json::json!({
         "product_id": outcome.product_id,

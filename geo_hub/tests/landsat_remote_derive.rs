@@ -18,6 +18,7 @@ use axum::{
 };
 use geo_hub::earth_search::{landsat_asset_key, EarthSearchItem};
 use geo_hub::landsat_derive::{instrument_for_scene, LandsatInstrument};
+use geo_hub::product_tiler::{tile_containing, TILE_SIZE};
 use geo_hub::satellite_derivation::{CogStoreResolver, DerivationError, SatelliteCogResolver};
 use geo_hub::state::AppState;
 use geo_hub::utm::{utm_to_wgs84, UtmZone};
@@ -55,7 +56,8 @@ impl CogStoreResolver for MemResolver {
 
 /// Fixture bands (30 m, 32x32): red DN 10000 everywhere; nir08 DN 20000 with
 /// one fill (0) pixel at image (8, 8); QA_PIXEL "clear" (64) with one cloud
-/// (bit 3 = 8) at image (10, 10).
+/// (bit 3 = 8) at image (10, 10); SR_CLOUD_QA with one cloud-adjacent pixel
+/// (bit 3 = 8) at image (9, 9).
 async fn fixture_store() -> Arc<InMemory> {
     let store = Arc::new(InMemory::new());
     let band = |pixels: Pixels, nodata: &str| FixtureSpec {
@@ -78,8 +80,31 @@ async fn fixture_store() -> Arc<InMemory> {
     let mut qa_pixels = vec![64u16; 32 * 32]; // clear bit
     qa_pixels[10 * 32 + 10] = 8; // cloud bit at window-local (2, 2)
     let qa_pixel = band(Pixels::U16(qa_pixels), "1");
+    // ETM+ Band 1 (blue) is saturated everywhere. NDVI and LST do not use
+    // that band, so the product-specific QA_RADSAT policy must retain it.
+    let qa_radsat = band(Pixels::U16(vec![1; 32 * 32]), "65535");
+    let mut cloud_qa_pixels = vec![0u16; 32 * 32];
+    cloud_qa_pixels[9 * 32 + 9] = 8;
+    let cloud_qa = band(Pixels::U16(cloud_qa_pixels), "255");
+    let mut aerosol_qa_pixels = vec![0u16; 32 * 32];
+    aerosol_qa_pixels[9 * 32 + 9] = 0b11 << 6;
+    let aerosol_qa = band(Pixels::U16(aerosol_qa_pixels), "1");
+    let surface_temperature = band(Pixels::U16(vec![44_177; 32 * 32]), "0");
+    let mut st_qa_pixels = vec![150u16; 32 * 32];
+    st_qa_pixels[8 * 32 + 9] = 600; // 6 K: above the decision-usable ceiling
+    st_qa_pixels[8 * 32 + 10] = u16::MAX; // signed-provider nodata analogue
+    let st_qa = band(Pixels::U16(st_qa_pixels), "65535");
 
-    for (name, spec) in [("red", &red), ("nir08", &nir08), ("qa_pixel", &qa_pixel)] {
+    for (name, spec) in [
+        ("red", &red),
+        ("nir08", &nir08),
+        ("qa_pixel", &qa_pixel),
+        ("qa_radsat", &qa_radsat),
+        ("cloud_qa", &cloud_qa),
+        ("qa_aerosol", &aerosol_qa),
+        ("lwir", &surface_temperature),
+        ("st_qa", &st_qa),
+    ] {
         store
             .put(
                 &ObjectPath::from(format!("fixtures/landsat/{name}.tif")),
@@ -103,6 +128,18 @@ fn fixture_item() -> serde_json::Value {
         item["assets"][name]["href"] =
             json!(format!("https://cogs.test/fixtures/landsat/{name}.tif"));
     }
+    let mut radsat = item["assets"]["qa_pixel"].clone();
+    radsat["href"] = json!("https://cogs.test/fixtures/landsat/qa_radsat.tif");
+    item["assets"]["qa_radsat"] = radsat;
+    let mut cloud_qa = item["assets"]["qa_pixel"].clone();
+    cloud_qa["href"] = json!("https://cogs.test/fixtures/landsat/cloud_qa.tif");
+    item["assets"]["cloud_qa"] = cloud_qa;
+    let mut lwir = item["assets"]["red"].clone();
+    lwir["href"] = json!("https://cogs.test/fixtures/landsat/lwir.tif");
+    item["assets"]["lwir"] = lwir;
+    let mut st_qa = item["assets"]["qa_pixel"].clone();
+    st_qa["href"] = json!("https://cogs.test/fixtures/landsat/st_qa.tif");
+    item["assets"]["qa"] = st_qa;
     item
 }
 
@@ -145,6 +182,23 @@ async fn ctx(tmp: &TempDir) -> Result<Router> {
     Ok(server::build_router(state).layer(Extension(resolver)))
 }
 
+async fn production_ctx(tmp: &TempDir) -> Result<(Router, db::DbPool)> {
+    let db_path = tmp.path().join("landsat_live.db");
+    let config = HubConfig {
+        database_url: format!("sqlite://{}?mode=rwc", db_path.display()),
+        data_root: tmp.path().join("data"),
+        ..HubConfig::default()
+    };
+    config.ensure_data_dirs()?;
+    let pool = db::connect_pool(&config).await?;
+    let state = AppState {
+        pool: pool.clone(),
+        config: Arc::new(config),
+        scene_search_cache: Default::default(),
+    };
+    Ok((server::build_router(state), pool))
+}
+
 async fn send(
     app: &Router,
     method: &str,
@@ -171,13 +225,153 @@ fn derive_body() -> serde_json::Value {
     json!({ "item": fixture_item(), "aoi": aoi(), "index": "ndvi" })
 }
 
+fn oli_fixture_item() -> serde_json::Value {
+    let mut item = fixture_item();
+    item["id"] = json!("LC08_L2SP_028031_20230721_02_T1");
+    item["properties"]["platform"] = json!("landsat-8");
+    item["assets"].as_object_mut().unwrap().remove("cloud_qa");
+    let mut aerosol = item["assets"]["qa_pixel"].clone();
+    aerosol["href"] = json!("https://cogs.test/fixtures/landsat/qa_aerosol.tif");
+    item["assets"]["qa_aerosol"] = aerosol;
+    item
+}
+
+/// Manual provider-to-product smoke test for the production Landsat access
+/// path: Earth Search item lookup, requester-pays URL translation, Planetary
+/// Computer SAS signing, COG range reads, QA masks, calibration, field-zonal
+/// statistics, catalog registration, and web-tile rendering.
+///
+/// Run with:
+/// `cargo test -p geo_hub --test landsat_remote_derive -- --ignored live_landsat`
+#[tokio::test]
+#[ignore = "network: hits Earth Search, Planetary Computer SAS, and Azure Blob Storage"]
+async fn live_landsat_production_derivation_smoke() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let (app, pool) = production_ctx(&tmp).await?;
+    let field_id = "live-landsat-field";
+    let season_id = "2023-growing-season";
+    let boundary = json!({
+        "type": "Polygon",
+        "coordinates": [[
+            [-96.50, 41.80],
+            [-96.49, 41.80],
+            [-96.49, 41.81],
+            [-96.50, 41.81],
+            [-96.50, 41.80]
+        ]]
+    });
+    sqlx::query(
+        "INSERT INTO fields (field_id, name, season, boundary_json, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )
+    .bind(field_id)
+    .bind("Live Landsat smoke field")
+    .bind(season_id)
+    .bind(boundary.to_string())
+    .bind("2023-07-21T00:00:00Z")
+    .execute(&pool)
+    .await?;
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/api/satellite/derive",
+        Some(json!({
+            "collection": "landsat-c2-l2",
+            "item_id": "LE07_L2SP_028031_20230721_02_T1",
+            "aoi": [-96.50, 41.80, -96.49, 41.81],
+            "index": "ndvi",
+            "field_id": field_id,
+            "season_id": season_id
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["valid_pixels"].as_u64().is_some_and(|count| count > 0));
+    let product_id = body["product_id"]
+        .as_str()
+        .expect("derive returns product_id");
+
+    let stats_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM time_series_points WHERE entity_ref = ?1 AND source_ref = ?2",
+    )
+    .bind(format!("field:{field_id}"))
+    .bind(format!("product:{product_id}"))
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(stats_count, 5, "mean, median, p10, p90, valid_fraction");
+
+    let z = 14u8;
+    let (x, y) = tile_containing(41.805, -96.495, z);
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/catalog/products/{product_id}/tiles/{z}/{x}/{y}.png"
+                ))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("image/png")
+    );
+    let tile = to_bytes(response.into_body(), 4 * 1024 * 1024).await?;
+    let image = image::load_from_memory(&tile)?.to_rgba8();
+    assert_eq!(image.dimensions(), (TILE_SIZE, TILE_SIZE));
+    assert!(
+        image.pixels().any(|pixel| pixel.0[3] > 0),
+        "derived field footprint must be visible in its catalog tile"
+    );
+
+    let (status, lst) = send(
+        &app,
+        "POST",
+        "/api/satellite/derive",
+        Some(json!({
+            "collection": "landsat-c2-l2",
+            "item_id": "LC09_L2SP_029031_20230918_02_T1",
+            "aoi": [-96.50, 41.80, -96.49, 41.81],
+            "index": "lst",
+            "field_id": field_id,
+            "season_id": season_id
+        })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{lst}");
+    assert!(lst["valid_pixels"].as_u64().is_some_and(|count| count > 0));
+    assert_eq!(lst["evidence"]["unit"], "kelvin");
+    assert!(lst["evidence"]["st_qa_low_uncertainty_fraction"].is_number());
+    let lst_product_id = lst["product_id"]
+        .as_str()
+        .expect("LST derive returns product_id");
+    let lst_stats_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM time_series_points WHERE entity_ref = ?1 AND source_ref = ?2",
+    )
+    .bind(format!("field:{field_id}"))
+    .bind(format!("product:{lst_product_id}"))
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        lst_stats_count, 5,
+        "LST publishes mean, median, p10, p90, and valid_fraction"
+    );
+    Ok(())
+}
+
 /// Expected 4x4 NDVI window, hand-computed:
 /// - QA cloud at image (10, 10) = window-local (2, 2) -> masked (1 nodata).
+/// - SR_CLOUD_QA adjacency at image (9, 9) = local (1, 1) -> masked.
 /// - nir08 fill DN at image (8, 8) = window-local (0, 0) -> fill (1 nodata).
 /// - everything else = (0.35 - 0.075) / (0.35 + 0.075).
 fn expected_values() -> Vec<f32> {
     let mut values = vec![EXPECTED_NDVI; 16];
     values[2 * 4 + 2] = NODATA;
+    values[4 + 1] = NODATA;
     values[0] = NODATA;
     values
 }
@@ -194,9 +388,9 @@ async fn landsat_remote_derive_masks_qa_pixel() -> Result<()> {
     assert_eq!(body["index"], "ndvi");
     assert_eq!(body["width_px"], 4);
     assert_eq!(body["height_px"], 4);
-    assert_eq!(body["valid_pixels"], 14, "{body}");
-    assert_eq!(body["invalid_pixels"], 2);
-    assert_eq!(body["evidence"]["pixels"]["reasons"]["masked"], 1);
+    assert_eq!(body["valid_pixels"], 13, "{body}");
+    assert_eq!(body["invalid_pixels"], 3);
+    assert_eq!(body["evidence"]["pixels"]["reasons"]["masked"], 2);
     assert_eq!(body["evidence"]["pixels"]["reasons"]["fill"], 1);
     // Landsat evidence: C2 L2 calibration + QA_PIXEL mask scheme.
     assert_eq!(
@@ -252,8 +446,8 @@ async fn landsat_remote_derive_masks_qa_pixel() -> Result<()> {
         .collect();
     assert_eq!(
         derived_from.len(),
-        3,
-        "red + nir08 + qa_pixel lineage: {item}"
+        5,
+        "red + nir08 + qa_pixel + qa_radsat + cloud_qa lineage: {item}"
     );
 
     // Idempotency: re-deriving the same request lands on the same product.
@@ -264,13 +458,11 @@ async fn landsat_remote_derive_masks_qa_pixel() -> Result<()> {
 }
 
 #[tokio::test]
-async fn landsat_derive_without_qa_pixel_is_unmasked() -> Result<()> {
+async fn landsat_derive_without_qa_pixel_is_quarantined() -> Result<()> {
     let tmp = TempDir::new()?;
     let app = ctx(&tmp).await?;
 
-    // QA_PIXEL is applied opportunistically (mirrors landsat_derive's
-    // local-band behavior): an item without the asset still derives, with the
-    // mask recorded as not applied and only the nir fill pixel invalid.
+    // Missing pixel-quality evidence is not allowed into production outputs.
     let mut item = fixture_item();
     item["assets"]
         .as_object_mut()
@@ -284,25 +476,88 @@ async fn landsat_derive_without_qa_pixel_is_unmasked() -> Result<()> {
         Some(json!({ "item": item, "aoi": aoi(), "index": "ndvi" })),
     )
     .await?;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["valid_pixels"], 15, "{body}");
-    assert_eq!(body["invalid_pixels"], 1);
-    assert_eq!(body["evidence"]["pixels"]["reasons"]["fill"], 1);
-    assert_eq!(body["evidence"]["mask"]["scheme"], "qa_pixel");
-    assert_eq!(body["evidence"]["mask"]["applied"], false);
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "product_failed_qa");
+    Ok(())
+}
 
-    // Lineage: only the two band reads, no mask product.
-    let product_id = body["product_id"].as_str().unwrap();
-    let (_, items) = send(&app, "GET", "/api/stac/collections/ndvi/items", None).await?;
-    let item = &items["features"][0];
-    assert_eq!(item["id"].as_str().unwrap(), product_id);
-    let derived_from = item["links"]
-        .as_array()
+#[tokio::test]
+async fn landsat_derive_without_sensor_surface_reflectance_qa_is_quarantined() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let app = ctx(&tmp).await?;
+
+    let mut item = fixture_item();
+    item["assets"]
+        .as_object_mut()
         .unwrap()
-        .iter()
-        .filter(|l| l["rel"] == "derived_from")
-        .count();
-    assert_eq!(derived_from, 2, "red + nir08 only: {item}");
+        .remove("cloud_qa")
+        .expect("ETM fixture has cloud_qa");
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/api/satellite/derive",
+        Some(json!({ "item": item, "aoi": aoi(), "index": "ndvi" })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "product_failed_qa");
+    Ok(())
+}
+
+#[tokio::test]
+async fn landsat_oli_high_aerosol_is_masked() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let app = ctx(&tmp).await?;
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/api/satellite/derive",
+        Some(json!({ "item": oli_fixture_item(), "aoi": aoi(), "index": "ndvi" })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["valid_pixels"], 13, "high aerosol is excluded: {body}");
+    assert_eq!(
+        body["evidence"]["mask"]["surface_reflectance_qa"]["asset_key"],
+        "qa_aerosol"
+    );
+    assert_eq!(
+        body["evidence"]["mask"]["surface_reflectance_qa"]["rejected_pixels"],
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn landsat_remote_surface_temperature_uses_st_qa() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let app = ctx(&tmp).await?;
+    let (status, body) = send(
+        &app,
+        "POST",
+        "/api/satellite/derive",
+        Some(json!({ "item": fixture_item(), "aoi": aoi(), "index": "lst" })),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["index"], "lst");
+    assert_eq!(body["valid_pixels"], 15, "QA_PIXEL cloud is masked: {body}");
+    assert_eq!(body["evidence"]["unit"], "kelvin");
+    let uncertainty_fraction = body["evidence"]["st_qa_low_uncertainty_fraction"]
+        .as_f64()
+        .expect("numeric ST_QA confidence");
+    assert!(
+        (uncertainty_fraction - 13.0 / 15.0).abs() < 1e-6,
+        "13 of 15 temperature pixels have valid ST_QA <= 5 K: {body}"
+    );
+    let mut reader = GeoTiffReader::open(body["product_path"].as_str().unwrap())?;
+    let values = reader.read_band()?.to_f32();
+    assert_eq!(values[2 * 4 + 2], NODATA);
+    for (pixel, value) in values.iter().enumerate() {
+        if pixel != 2 * 4 + 2 {
+            assert!((value - 300.0).abs() < 0.01, "pixel {pixel}: {value}");
+        }
+    }
     Ok(())
 }
 
@@ -345,4 +600,28 @@ fn tm_and_oli_band_keys_resolve() {
         None,
         "Landsat has no red-edge band"
     );
+}
+
+#[tokio::test]
+async fn landsat_field_crops_have_distinct_identity_and_immutable_artifacts() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let app = ctx(&tmp).await?;
+    let mut first_body = derive_body();
+    first_body["field_id"] = json!("field-one");
+    first_body["season_id"] = json!("season-one");
+    let (status, first) = send(&app, "POST", "/api/satellite/derive", Some(first_body)).await?;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let first_path = first["product_path"].as_str().unwrap();
+    let first_bytes = std::fs::read(first_path)?;
+
+    let mut second_body = derive_body();
+    second_body["field_id"] = json!("field-two");
+    second_body["season_id"] = json!("season-two");
+    let (status, second) = send(&app, "POST", "/api/satellite/derive", Some(second_body)).await?;
+    assert_eq!(status, StatusCode::OK, "{second}");
+
+    assert_ne!(first["product_id"], second["product_id"]);
+    assert_ne!(first["product_path"], second["product_path"]);
+    assert_eq!(std::fs::read(first_path)?, first_bytes);
+    Ok(())
 }
