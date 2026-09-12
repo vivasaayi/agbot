@@ -5,12 +5,12 @@
 - **Roadmap hash**: `824257d0572b0997fc24491b3524053451a3989cf89de2381dd3ea1cd0536485`
 - **Hash command**: `git ls-files docs/product-roadmap prompts | LC_ALL=C sort | xargs shasum -a 256 | shasum -a 256`
 - **Reconciled baseline**: `9290ede7570c2705fee70eefa3cf6dcf4bae4eee` (242 commits after the previous Codex baseline)
-- **Last implementation commit**: `cdae0f6` (`feat(geo): close advisor MVP workflow`)
-- **Current batch**: `landsat-advisor-automation-20260912`; implemented and verified, ready to commit
+- **Last implementation commit**: `36cb476` (`feat(geo): automate Landsat advisor findings`)
+- **Current batch**: none; Landsat-to-Advisor automation is committed and verified
 - **Roadmap status**: 494 committed; 2 superseded/skipped; 2 blocked; 0 pending
 - **Supplemental history**: `.claude` records 83 completed rows across later tracks but remains separate because its feature table has no run ownership and its resume prose is stale.
 - **Blockers**: none for the Advisor MVP acceptance batch. Repository-level blockers remain: `07-11` requires a spatial storage-backend decision; `18-10` requires external payments/compliance scope and approval.
-- **Exact next action**: commit the verified Landsat observation → advisor-visible findings automation batch.
+- **Exact next action**: connect authenticated grower PDF generation and share lifecycle to the advisor workflow.
 
 ## Current release-readiness validation
 
