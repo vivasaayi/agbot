@@ -91,6 +91,9 @@ async fn browse_serves_html_page() -> Result<()> {
         "id=\"advisor-recommendation-annotation\"",
         "id=\"advisor-findings\"",
         "id=\"advisor-generate-report\"",
+        "id=\"advisor-portal-auth\"",
+        "id=\"advisor-generate-grower-report\"",
+        "id=\"advisor-grower-report\"",
         "id=\"advisor-reports\"",
         "id=\"advisor-lineage\"",
     ] {
@@ -128,6 +131,10 @@ async fn browse_assets_have_correct_content_types() -> Result<()> {
         "/lineage",
         "/exports/recommendations.",
         "/findings",
+        "/api/portal/fields/",
+        "/grower-report",
+        "/api/portal/reports/",
+        "/shares",
     ] {
         assert!(
             body.contains(endpoint),
@@ -177,6 +184,12 @@ async fn browse_assets_have_correct_content_types() -> Result<()> {
         "Use finding",
         "zone_geometry",
         "catalogQualityEntries",
+        "agbot_portal_token",
+        "Authorization: `Bearer",
+        "Download PDF",
+        "Create share link",
+        "Copy link",
+        "revokeAdvisorShare",
         "Verify lineage",
         "evidence_refs",
     ] {
@@ -199,6 +212,8 @@ async fn browse_assets_have_correct_content_types() -> Result<()> {
         ".lineage-ok",
         ".quality-badge",
         ".finding-list",
+        ".grower-report-box",
+        ".share-box",
     ] {
         assert!(body.contains(marker), "style.css missing {marker}");
     }

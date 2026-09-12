@@ -448,6 +448,7 @@ pub async fn generate_scene_report(
 }
 
 pub async fn download_scene_report(
+    identity: OptionalPortalIdentity,
     Path((scene_id, report_id)): Path<(String, String)>,
     State(state): State<AppState>,
 ) -> AppResult<Response> {
@@ -458,6 +459,7 @@ pub async fn download_scene_report(
     let report = load_report(&state, &scene_id, &report_id)
         .await?
         .ok_or(AppError::NotFound)?;
+    enforce_report_owner(&state, &identity, &report).await?;
     report_file_response(&report).await
 }
 
@@ -483,6 +485,7 @@ pub async fn get_scene_report_lineage(
 }
 
 pub async fn create_report_share(
+    identity: OptionalPortalIdentity,
     Path((scene_id, report_id)): Path<(String, String)>,
     State(state): State<AppState>,
     Json(request): Json<CreateReportShareRequest>,
@@ -494,7 +497,11 @@ pub async fn create_report_share(
     let report = load_report(&state, &scene_id, &report_id)
         .await?
         .ok_or(AppError::NotFound)?;
-    if report.visibility != ReportVisibility::Shared {
+    enforce_report_owner(&state, &identity, &report).await?;
+    if !matches!(
+        report.visibility,
+        ReportVisibility::Shared | ReportVisibility::Grower
+    ) {
         return Err(AppError::BadRequest(
             "org-only report cannot be shared".to_string(),
         ));
@@ -531,10 +538,49 @@ pub async fn create_report_share(
     Ok(Json(report_share_response(&share)))
 }
 
+pub async fn portal_create_report_share(
+    identity: PortalIdentity,
+    Path(report_id): Path<String>,
+    State(state): State<AppState>,
+    Json(request): Json<CreateReportShareRequest>,
+) -> AppResult<Json<ReportShareResponse>> {
+    let report = load_report_by_id(&state, &report_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    enforce_report_owner(&state, &OptionalPortalIdentity(Some(identity)), &report).await?;
+    if !matches!(
+        report.visibility,
+        ReportVisibility::Shared | ReportVisibility::Grower
+    ) {
+        return Err(AppError::BadRequest(
+            "org-only report cannot be shared".to_string(),
+        ));
+    }
+    let share = ReportShareRecord {
+        share_token: Uuid::new_v4().to_string(),
+        report_id,
+        scene_id: report.scene_id,
+        expires_at: normalize_share_expires_at(request.expires_at)?,
+        revoked_at: None,
+        created_at: current_record_timestamp(),
+    };
+    sqlx::query("INSERT INTO report_shares (share_token, report_id, scene_id, expires_at, revoked_at, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")
+        .bind(&share.share_token).bind(&share.report_id).bind(&share.scene_id)
+        .bind(&share.expires_at).bind(&share.revoked_at).bind(&share.created_at)
+        .execute(&state.pool).await.map_err(Error::from)?;
+    audit_report_share_event(&state, &share, "share_created", None).await?;
+    Ok(Json(report_share_response(&share)))
+}
+
 pub async fn revoke_report_share(
+    identity: OptionalPortalIdentity,
     Path((scene_id, report_id, share_token)): Path<(String, String, String)>,
     State(state): State<AppState>,
 ) -> AppResult<StatusCode> {
+    let report = load_report(&state, &scene_id, &report_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    enforce_report_owner(&state, &identity, &report).await?;
     let revoked_at = current_record_timestamp();
     let result = sqlx::query(
         r#"
@@ -562,6 +608,28 @@ pub async fn revoke_report_share(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub async fn portal_revoke_report_share(
+    identity: PortalIdentity,
+    Path((report_id, share_token)): Path<(String, String)>,
+    State(state): State<AppState>,
+) -> AppResult<StatusCode> {
+    let report = load_report_by_id(&state, &report_id)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    enforce_report_owner(&state, &OptionalPortalIdentity(Some(identity)), &report).await?;
+    let result = sqlx::query("UPDATE report_shares SET revoked_at = COALESCE(revoked_at, ?1) WHERE report_id = ?2 AND share_token = ?3")
+        .bind(current_record_timestamp()).bind(&report_id).bind(&share_token)
+        .execute(&state.pool).await.map_err(Error::from)?;
+    if result.rows_affected() == 0 {
+        return Err(AppError::NotFound);
+    }
+    let share = load_report_share(&state, &share_token)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    audit_report_share_event(&state, &share, "share_revoked", None).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 pub async fn download_shared_report(
     Path(share_token): Path<String>,
     State(state): State<AppState>,
@@ -571,16 +639,30 @@ pub async fn download_shared_report(
         .ok_or(AppError::NotFound)?;
 
     if share.share.revoked_at.is_some() {
+        audit_report_share_event(&state, &share.share, "share_access_denied", Some("revoked"))
+            .await?;
         return Err(AppError::Forbidden(
             "report share link has been revoked".to_string(),
         ));
     }
     if share_expired(&share.share.expires_at)? {
+        audit_report_share_event(&state, &share.share, "share_access_denied", Some("expired"))
+            .await?;
         return Err(AppError::Forbidden(
             "report share link has expired".to_string(),
         ));
     }
-    if share.report.visibility != ReportVisibility::Shared {
+    if !matches!(
+        share.report.visibility,
+        ReportVisibility::Shared | ReportVisibility::Grower
+    ) {
+        audit_report_share_event(
+            &state,
+            &share.share,
+            "share_access_denied",
+            Some("visibility"),
+        )
+        .await?;
         return Err(AppError::Forbidden(
             "report is not publicly shareable".to_string(),
         ));

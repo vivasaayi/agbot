@@ -11829,6 +11829,17 @@ async fn load_report(
     row.map(|row| decode_report_record(&row)).transpose()
 }
 
+async fn load_report_by_id(state: &AppState, report_id: &str) -> AppResult<Option<ReportRecord>> {
+    let row = sqlx::query(
+        "SELECT report_id, scene_id, field_id, title, format, path, visibility, annotation_count, recommendation_count, created_at FROM reports WHERE report_id = ?1",
+    )
+    .bind(report_id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    row.map(|row| decode_report_record(&row)).transpose()
+}
+
 async fn build_report_lineage_records(
     state: &AppState,
     report: &ReportRecord,
@@ -12504,10 +12515,11 @@ async fn report_file_response(report: &ReportRecord) -> AppResult<Response> {
     let body = Body::from_stream(stream);
 
     let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("text/html; charset=utf-8"),
-    );
+    let content_type = match report.format {
+        ReportFormat::Pdf => "application/pdf",
+        ReportFormat::Html => "text/html; charset=utf-8",
+    };
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     if let Some(filename) = report_path.file_name().and_then(|name| name.to_str()) {
         if let Ok(value) = HeaderValue::from_str(&format!("inline; filename=\"{}\"", filename)) {
             headers.insert(header::CONTENT_DISPOSITION, value);
@@ -12515,6 +12527,33 @@ async fn report_file_response(report: &ReportRecord) -> AppResult<Response> {
     }
 
     Ok((headers, body).into_response())
+}
+
+async fn enforce_report_owner(
+    state: &AppState,
+    identity: &OptionalPortalIdentity,
+    report: &ReportRecord,
+) -> AppResult<()> {
+    let Some(identity_org) = identity.org_id() else {
+        return Ok(());
+    };
+    let owner = if let Some(field_id) = report.field_id.as_deref() {
+        sqlx::query_scalar::<_, String>("SELECT owner FROM fields WHERE field_id = ?1")
+            .bind(field_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(Error::from)?
+    } else {
+        sqlx::query_scalar::<_, String>("SELECT owner FROM scenes WHERE scene_id = ?1")
+            .bind(&report.scene_id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(Error::from)?
+    };
+    if owner.as_deref() != Some(identity_org) {
+        return Err(AppError::NotFound);
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]

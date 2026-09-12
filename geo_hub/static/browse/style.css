@@ -406,3 +406,7 @@ details.derive > summary {
 .advisor-form .coordinate-row { display: flex; gap: 6px; }
 .advisor-form .coordinate-row label { flex: 1; }
 .lineage-ok { color: #027a48; font-size: 11px; }
+.grower-report-box button { margin-right: 5px; }
+.share-box { padding: 7px; border: 1px solid #b2ddff; border-radius: 4px; background: #eff8ff; }
+.share-box small { display: block; margin-bottom: 5px; color: #344054; }
+.share-box a, .share-box button { margin-right: 7px; font-size: 11px; }

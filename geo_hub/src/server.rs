@@ -613,6 +613,14 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/portal/reports", get(routes::portal_list_reports))
         .route(
+            "/api/portal/reports/:report_id/shares",
+            post(routes::portal_create_report_share),
+        )
+        .route(
+            "/api/portal/reports/:report_id/shares/:share_token",
+            delete(routes::portal_revoke_report_share),
+        )
+        .route(
             "/api/portal/reports/:report_id/read",
             post(routes::portal_mark_report_read),
         )

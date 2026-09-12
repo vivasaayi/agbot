@@ -705,12 +705,48 @@ const advisorEls = {
   title: document.getElementById("advisor-report-title"),
   visibility: document.getElementById("advisor-report-visibility"),
   generate: document.getElementById("advisor-generate-report"),
+  portalAuth: document.getElementById("advisor-portal-auth"),
+  generateGrower: document.getElementById("advisor-generate-grower-report"),
+  growerReport: document.getElementById("advisor-grower-report"),
   reports: document.getElementById("advisor-reports"),
   lineage: document.getElementById("advisor-lineage"),
 };
 let advisorSceneId = "";
 let advisorFieldId = "";
 let selectedFinding = null;
+let activeReportShare = null;
+
+function portalToken() { return localStorage.getItem("agbot_portal_token") || ""; }
+
+async function portalRequest(url, options = {}, expectBlob = false) {
+  const token = portalToken();
+  if (!token) throw new Error("No portal session. Sign in through /portal first.");
+  const response = await fetch(url, {
+    ...options,
+    headers: { Accept: expectBlob ? "application/pdf" : "application/json", ...(options.headers || {}), Authorization: `Bearer ${token}` },
+  });
+  if (!response.ok) {
+    let detail = "";
+    try { const body = await response.json(); detail = body.error || body.message || ""; } catch (_) { /* response is not JSON */ }
+    throw new Error(detail || `HTTP ${response.status}`);
+  }
+  if (response.status === 204) return null;
+  return expectBlob ? response.blob() : response.json();
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a"); anchor.href = url; anchor.download = filename; anchor.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function updatePortalAuthState() {
+  const authenticated = Boolean(portalToken());
+  advisorEls.portalAuth.textContent = authenticated
+    ? "Portal session found. PDF generation and authenticated download are available."
+    : "No portal session found. Sign in at /portal to generate or download a grower PDF.";
+  advisorEls.generateGrower.disabled = !authenticated || !advisorFieldId;
+}
 
 function advisorHeading(text, count) {
   const h = document.createElement("h3");
@@ -743,6 +779,7 @@ async function selectAdvisorScene(sceneId, productId) {
   } catch (_) {
     advisorFieldId = "";
   }
+  updatePortalAuthState();
   await loadAdvisorWorkflow();
 }
 
@@ -879,6 +916,64 @@ function renderAdvisorReports(items) {
   }
   advisorEls.reports.appendChild(list);
 }
+
+async function createAdvisorShare(report) {
+  const expires = window.prompt("Share expires at (RFC 3339), or leave blank for the default:", "");
+  if (expires === null) return;
+  try {
+    activeReportShare = await portalRequest(`/api/portal/reports/${encodeURIComponent(report.report_id)}/shares`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ expires_at: expires.trim() || null }),
+    });
+    renderAdvisorShare();
+  } catch (err) { setStatus(`Share creation failed: ${err.message}`, true); }
+}
+
+function renderAdvisorShare() {
+  const share = activeReportShare;
+  if (!share) return;
+  const box = document.createElement("div"); box.className = "share-box";
+  const link = new URL(share.url_path, window.location.origin).href;
+  const expiry = document.createElement("small"); expiry.textContent = `Expires ${share.expires_at}`;
+  const open = document.createElement("a"); open.href = link; open.target = "_blank"; open.rel = "noopener"; open.textContent = "Open link";
+  const copy = document.createElement("button"); copy.type = "button"; copy.textContent = "Copy link";
+  copy.addEventListener("click", async () => { await navigator.clipboard.writeText(link); setStatus("Share link copied."); });
+  const revoke = document.createElement("button"); revoke.type = "button"; revoke.textContent = "Revoke";
+  revoke.addEventListener("click", revokeAdvisorShare);
+  box.append(expiry, open, copy, revoke); advisorEls.lineage.replaceChildren(box);
+}
+
+async function revokeAdvisorShare() {
+  if (!activeReportShare) return;
+  const share = activeReportShare;
+  try {
+    await portalRequest(`/api/portal/reports/${encodeURIComponent(share.report_id)}/shares/${encodeURIComponent(share.share_token)}`, { method: "DELETE" });
+    activeReportShare = null; advisorEls.lineage.replaceChildren(advisorEmpty("Share link revoked."));
+  } catch (err) { setStatus(`Share revocation failed: ${err.message}`, true); }
+}
+
+function renderGrowerReport(report) {
+  advisorEls.growerReport.replaceChildren();
+  const title = document.createElement("p"); title.textContent = report.title;
+  const download = document.createElement("button"); download.type = "button"; download.textContent = "Download PDF";
+  download.addEventListener("click", async () => {
+    try {
+      const blob = await portalRequest(`/api/portal/reports/${encodeURIComponent(report.report_id)}/download`, {}, true);
+      downloadBlob(blob, `${report.report_id}.pdf`);
+    } catch (err) { setStatus(`PDF download failed: ${err.message}`, true); }
+  });
+  const share = document.createElement("button"); share.type = "button"; share.textContent = "Create share link";
+  share.addEventListener("click", () => createAdvisorShare(report));
+  title.append(download, share); advisorEls.growerReport.appendChild(title);
+}
+
+advisorEls.generateGrower.addEventListener("click", async () => {
+  advisorEls.generateGrower.disabled = true; setStatus("Generating authenticated grower PDF…");
+  try {
+    const report = await portalRequest(`/api/portal/fields/${encodeURIComponent(advisorFieldId)}/grower-report`, { method: "POST" });
+    renderGrowerReport(report); setStatus("Grower PDF generated.");
+  } catch (err) { setStatus(`Grower PDF generation failed: ${err.message}`, true); }
+  finally { updatePortalAuthState(); }
+});
 
 async function loadAdvisorLineage(reportId) {
   advisorEls.lineage.replaceChildren(advisorEmpty("Tracing report to source evidence…"));
@@ -1451,4 +1546,5 @@ async function loadTsSummary(fieldId, metric) {
 // --- Boot -------------------------------------------------------------------------
 
 setStatus("Loading collections…");
+updatePortalAuthState();
 loadCollections().then(() => setStatus("Ready."));

@@ -6,7 +6,7 @@
 use anyhow::Result;
 use axum::{
     body::{to_bytes, Body},
-    http::{Request, StatusCode},
+    http::{header, Request, StatusCode},
     Router,
 };
 use chrono::{Duration, SecondsFormat, Utc};
@@ -605,5 +605,206 @@ async fn grower_report_cross_org_field_is_not_found() -> Result<()> {
     )
     .await?;
     assert_eq!(status, StatusCode::NOT_FOUND, "cross-org must be 404");
+    Ok(())
+}
+
+#[tokio::test]
+async fn authenticated_grower_pdf_delivery_and_revocable_advisor_share_are_tenant_scoped(
+) -> Result<()> {
+    let app = test_app().await?;
+    seed_account(&app.pool, "grower-1", "org-grower").await?;
+    seed_account(&app.pool, "advisor-2", "org-advisor").await?;
+    let grower_token = seed_session(&app.pool, "grower-1", "org-grower").await?;
+    let advisor_token = seed_session(&app.pool, "advisor-2", "org-advisor").await?;
+
+    seed_farm(&app.pool, "farm-grower", "org-grower", "Grower Farm").await?;
+    seed_field(
+        &app.pool,
+        "field-grower",
+        "farm-grower",
+        "org-grower",
+        "North Forty",
+    )
+    .await?;
+    seed_scene(
+        &app.pool,
+        "scene-grower",
+        "field-grower",
+        "2026-07-15T10:00:00Z",
+    )
+    .await?;
+    seed_catalog_product(
+        &app.pool,
+        "product-grower-ndvi",
+        "scene-grower",
+        "field-grower",
+        "ndvi",
+    )
+    .await?;
+    seed_finding(
+        &app.pool,
+        "finding-grower",
+        "field-grower",
+        "high",
+        "2026-07-15T11:00:00Z",
+    )
+    .await?;
+    seed_recommendation(
+        &app.pool,
+        "recommendation-grower",
+        "field-grower",
+        "Scout the north irrigation line",
+        "high",
+        "open",
+    )
+    .await?;
+
+    seed_farm(&app.pool, "farm-advisor", "org-advisor", "Advisor Farm").await?;
+    seed_field(
+        &app.pool,
+        "field-advisor",
+        "farm-advisor",
+        "org-advisor",
+        "Foreign Field",
+    )
+    .await?;
+    seed_scene(
+        &app.pool,
+        "scene-advisor",
+        "field-advisor",
+        "2026-07-15T10:00:00Z",
+    )
+    .await?;
+
+    let (status, generated) = request(
+        &app,
+        "POST",
+        "/api/portal/fields/field-grower/grower-report",
+        Some(&grower_token),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "generation failed: {generated}");
+    let report_id = generated["report_id"]
+        .as_str()
+        .expect("generated report id")
+        .to_string();
+    assert_eq!(generated["format"], "pdf");
+
+    let (status, inbox) = request(&app, "GET", "/api/portal/reports", Some(&grower_token)).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(inbox.as_array().map(Vec::len), Some(1));
+    assert_eq!(inbox[0]["report_id"], report_id);
+
+    let download = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/portal/reports/{report_id}/download"))
+                .header("authorization", format!("Bearer {grower_token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(download.status(), StatusCode::OK);
+    assert_eq!(
+        download
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok()),
+        Some("application/pdf")
+    );
+    let pdf = to_bytes(download.into_body(), 8 * 1024 * 1024).await?;
+    assert!(pdf.starts_with(b"%PDF"));
+
+    let share_response = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/portal/reports/{report_id}/shares"))
+                .header("authorization", format!("Bearer {grower_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(r#"{"expires_at":"2099-01-01T00:00:00Z"}"#))?,
+        )
+        .await?;
+    assert_eq!(share_response.status(), StatusCode::OK);
+    let body = to_bytes(share_response.into_body(), 64 * 1024).await?;
+    let share: Value = serde_json::from_slice(&body)?;
+    let share_token = share["share_token"]
+        .as_str()
+        .expect("share token")
+        .to_string();
+    let public_path = share["url_path"]
+        .as_str()
+        .expect("public share path")
+        .to_string();
+
+    let (status, public_pdf) = request_bytes(&app, "GET", &public_path, None).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert!(public_pdf.starts_with(b"%PDF"));
+    let created_events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM report_share_events WHERE share_token = ?1")
+            .bind(&share_token)
+            .fetch_one(&app.pool)
+            .await?;
+    assert_eq!(created_events, 2, "creation and public access are audited");
+
+    // A caller from another org cannot discover, download, generate, or share
+    // the grower's report even when it knows the resource identifiers.
+    let (status, foreign_inbox) =
+        request(&app, "GET", "/api/portal/reports", Some(&advisor_token)).await?;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(foreign_inbox.as_array().map(Vec::len), Some(0));
+    let (status, _) = request(
+        &app,
+        "GET",
+        &format!("/api/portal/reports/{report_id}/download"),
+        Some(&advisor_token),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = request(
+        &app,
+        "POST",
+        "/api/portal/fields/field-grower/grower-report",
+        Some(&advisor_token),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let foreign_share = app
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/portal/reports/{report_id}/shares"))
+                .header("authorization", format!("Bearer {advisor_token}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))?,
+        )
+        .await?;
+    assert_eq!(foreign_share.status(), StatusCode::NOT_FOUND);
+
+    let (status, _) = request(
+        &app,
+        "DELETE",
+        &format!("/api/portal/reports/{report_id}/shares/{share_token}"),
+        Some(&grower_token),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, _) = request_bytes(&app, "GET", &public_path, None).await?;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    let final_events: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM report_share_events WHERE share_token = ?1")
+            .bind(&share_token)
+            .fetch_one(&app.pool)
+            .await?;
+    assert_eq!(
+        final_events, 4,
+        "create, access, revoke, and revoked denial are audited"
+    );
     Ok(())
 }
