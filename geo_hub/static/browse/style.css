@@ -88,6 +88,9 @@ button:hover {
   background: #eef1f5;
 }
 
+.button-link { padding: 4px 8px; border: 1px solid #cfd6de; border-radius: 4px; background: #fff; color: #175cd3; font-size: 11px; text-decoration: none; }
+.button-link.disabled { color: #98a2b3; pointer-events: none; }
+
 .toggle-row {
   display: block;
   padding: 2px 0;
@@ -155,6 +158,8 @@ button:hover {
   font-size: 11px;
   margin-top: 2px;
 }
+
+.item .open-advisor { margin-top: 5px; padding: 2px 7px; color: #175cd3; font-size: 11px; }
 
 .item .undisplayable {
   color: #b42318;
@@ -382,3 +387,18 @@ details.derive > summary {
   border-bottom: 1px solid #f0f2f5;
   color: #344054;
 }
+
+#advisor-details > summary { cursor: pointer; color: #667085; font-size: 12px; font-weight: 600; letter-spacing: 0.05em; text-transform: uppercase; }
+.advisor-actions { flex-wrap: wrap; margin: 6px 0; }
+.advisor-group { margin-top: 9px; }
+.advisor-group h3, .advisor-form h3 { margin: 0 0 4px; color: #344054; font-size: 12px; }
+.advisor-list { margin: 0; padding-left: 18px; font-size: 12px; }
+.advisor-list li { margin-bottom: 5px; }
+.advisor-list small { display: block; color: #667085; overflow-wrap: anywhere; }
+.advisor-list.report-list li button { margin-left: 6px; padding: 1px 5px; font-size: 10px; }
+.advisor-form { margin-top: 10px; padding: 7px; border: 1px solid #e2e6eb; border-radius: 4px; background: #fff; }
+.advisor-form label { display: block; margin: 5px 0; color: #344054; font-size: 11px; }
+.advisor-form input, .advisor-form select, .advisor-form textarea { width: 100%; margin-top: 2px; padding: 4px; border: 1px solid #cfd6de; border-radius: 4px; font: inherit; }
+.advisor-form .coordinate-row { display: flex; gap: 6px; }
+.advisor-form .coordinate-row label { flex: 1; }
+.lineage-ok { color: #027a48; font-size: 11px; }

@@ -82,6 +82,16 @@ async fn browse_serves_html_page() -> Result<()> {
         "id=\"ts-chart\"",
         "id=\"ts-harmonization\"",
         "id=\"ts-summary\"",
+        "id=\"advisor-panel\"",
+        "id=\"advisor-refresh\"",
+        "id=\"advisor-annotation-form\"",
+        "id=\"advisor-annotation-lat\"",
+        "id=\"advisor-annotation-lon\"",
+        "id=\"advisor-recommendation-form\"",
+        "id=\"advisor-recommendation-annotation\"",
+        "id=\"advisor-generate-report\"",
+        "id=\"advisor-reports\"",
+        "id=\"advisor-lineage\"",
     ] {
         assert!(body.contains(marker), "index.html missing {marker}");
     }
@@ -111,6 +121,11 @@ async fn browse_assets_have_correct_content_types() -> Result<()> {
         "/api/water-management/extent/derive",
         "/api/ingest/sen2cor/index/derive",
         "/api/composites/derive",
+        "/annotations",
+        "/recommendations",
+        "/reports",
+        "/lineage",
+        "/exports/recommendations.",
     ] {
         assert!(
             body.contains(endpoint),
@@ -152,6 +167,12 @@ async fn browse_assets_have_correct_content_types() -> Result<()> {
         "per_year",
         "is_anomalous",
         "stroke-dasharray",
+        "selectAdvisorScene",
+        "geometry: { type: \"point\"",
+        "annotation_ids:",
+        "action_category:",
+        "Verify lineage",
+        "evidence_refs",
     ] {
         assert!(app_js.contains(marker), "app.js missing {marker}");
     }
@@ -166,6 +187,10 @@ async fn browse_assets_have_correct_content_types() -> Result<()> {
         ".ts-legend",
         ".ts-anomaly-badge",
         ".ts-year-table",
+        ".advisor-form",
+        ".coordinate-row",
+        ".advisor-list",
+        ".lineage-ok",
     ] {
         assert!(body.contains(marker), "style.css missing {marker}");
     }

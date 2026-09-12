@@ -78,6 +78,58 @@
       </details>
     </section>
 
+    <section id="advisor-panel">
+      <details id="advisor-details">
+        <summary>Advisor workflow</summary>
+        <p id="advisor-scope" class="hint">Select “Open advisor” on a scene product.</p>
+        <div class="filter-actions advisor-actions">
+          <button id="advisor-refresh" type="button" disabled>Refresh</button>
+          <a id="advisor-export-csv" class="button-link disabled" aria-disabled="true">CSV export</a>
+          <a id="advisor-export-geojson" class="button-link disabled" aria-disabled="true">GeoJSON export</a>
+        </div>
+        <form id="advisor-annotation-form" class="advisor-form">
+          <h3>Add point annotation</h3>
+          <label>Label <input id="advisor-annotation-label" required /></label>
+          <label>Severity
+            <select id="advisor-annotation-severity"><option value="">Unspecified</option><option>low</option><option>medium</option><option>high</option></select>
+          </label>
+          <label>Note <textarea id="advisor-annotation-note" rows="2"></textarea></label>
+          <div class="coordinate-row">
+            <label>Latitude <input id="advisor-annotation-lat" type="number" min="-90" max="90" step="any" required /></label>
+            <label>Longitude <input id="advisor-annotation-lon" type="number" min="-180" max="180" step="any" required /></label>
+          </div>
+          <button id="advisor-create-annotation" type="submit" disabled>Add annotation</button>
+        </form>
+        <div id="advisor-annotations" class="advisor-group"></div>
+        <form id="advisor-recommendation-form" class="advisor-form">
+          <h3>Create recommendation</h3>
+          <label>Annotation <select id="advisor-recommendation-annotation" required><option value="">— select annotation —</option></select></label>
+          <label>Title <input id="advisor-recommendation-title" required /></label>
+          <label>Action category <input id="advisor-recommendation-category" placeholder="scout, irrigate, treat…" required /></label>
+          <label>Priority
+            <select id="advisor-recommendation-priority"><option>low</option><option selected>medium</option><option>high</option><option>critical</option></select>
+          </label>
+          <label>Note <textarea id="advisor-recommendation-note" rows="2"></textarea></label>
+          <button id="advisor-create-recommendation" type="submit" disabled>Create recommendation</button>
+        </form>
+        <div id="advisor-recommendations" class="advisor-group"></div>
+        <form id="advisor-report-form" class="advisor-form">
+          <h3>Grower report</h3>
+          <label>Title <input id="advisor-report-title" type="text" placeholder="Field health report" /></label>
+          <label>Visibility
+            <select id="advisor-report-visibility">
+              <option value="org">Organization</option>
+              <option value="shared">Shareable</option>
+              <option value="grower">Grower</option>
+            </select>
+          </label>
+          <button id="advisor-generate-report" type="submit" disabled>Generate report</button>
+        </form>
+        <div id="advisor-reports" class="advisor-group"></div>
+        <div id="advisor-lineage" class="advisor-group" aria-live="polite"></div>
+      </details>
+    </section>
+
     <section>
       <h2>Collections</h2>
       <div id="collections"><p class="hint">Loading…</p></div>

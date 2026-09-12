@@ -14761,6 +14761,316 @@ async fn acceptance_import_field_link_scene_and_load_layer() -> Result<()> {
 }
 
 #[tokio::test]
+async fn acceptance_advisor_flow_from_field_to_shared_report() -> Result<()> {
+    let tmp = TempDir::new()?;
+    let ctx = test_app(&tmp).await?;
+    let fixture = setup_golden_acceptance_fixture(&ctx, &tmp).await?;
+
+    let product_path = ctx
+        .data_root
+        .join("scenes")
+        .join(&fixture.scene_id)
+        .join("products")
+        .join("ndvi")
+        .join("sample.png");
+    let catalog_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/catalog/products")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "level": "l2",
+                        "kind": "ndvi",
+                        "algorithm_id": "advisor.acceptance.ndvi",
+                        "algorithm_version": "1.0.0",
+                        "parameters": { "scene_id": fixture.scene_id },
+                        "inputs": [],
+                        "scope": {
+                            "farm_id": "acceptance-farm",
+                            "field_id": fixture.field_id,
+                            "season_id": "2026",
+                            "scene_id": fixture.scene_id,
+                            "temporal_start": "2025-01-01T00:00:00Z",
+                            "temporal_end": "2025-01-01T00:00:00Z"
+                        },
+                        "artifact": {
+                            "path": product_path.to_string_lossy(),
+                            "format": "image/png",
+                            "checksum_sha256": null
+                        },
+                        "confidence": 0.97,
+                        "confidence_method": "validated_test_fixture",
+                        "quality_summary": {
+                            "trusted": true,
+                            "cloud_cover_fraction": 0.0
+                        },
+                        "evidence_digests": ["sha256:advisor-acceptance-ndvi"],
+                        "source_id": "landsat8"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(catalog_response.status(), StatusCode::OK);
+    let body = to_bytes(catalog_response.into_body(), 128 * 1024).await?;
+    let registered: serde_json::Value = serde_json::from_slice(&body)?;
+    let product_id = registered
+        .get("product_id")
+        .and_then(|value| value.as_str())
+        .expect("catalog product id should exist")
+        .to_string();
+
+    let catalog_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/catalog/products/{product_id}"))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(catalog_response.status(), StatusCode::OK);
+    let body = to_bytes(catalog_response.into_body(), 128 * 1024).await?;
+    let catalog_product: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        catalog_product
+            .get("status")
+            .and_then(|value| value.as_str()),
+        Some("registered")
+    );
+    assert_eq!(
+        catalog_product
+            .pointer("/quality_summary/trusted")
+            .and_then(|value| value.as_bool()),
+        Some(true)
+    );
+
+    let layer_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/scenes/{}/products/ndvi", fixture.scene_id))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(layer_response.status(), StatusCode::OK);
+    let body = to_bytes(layer_response.into_body(), 64 * 1024).await?;
+    assert_eq!(body.as_ref(), TEST_PNG_BYTES);
+
+    let anomaly_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/applications/anomaly/runs")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "field_id": fixture.field_id,
+                        "zones": [{
+                            "zone_id": "northwest-stress",
+                            "index_value": 0.18,
+                            "area_m2": 12_500.0,
+                            "input_product_ids": [product_id]
+                        }],
+                        "low_threshold": 0.30
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(anomaly_response.status(), StatusCode::OK);
+    let body = to_bytes(anomaly_response.into_body(), 128 * 1024).await?;
+    let run: serde_json::Value = serde_json::from_slice(&body)?;
+    let finding_id = run
+        .pointer("/output_finding_ids/0")
+        .and_then(|value| value.as_str())
+        .expect("anomaly finding id should exist")
+        .to_string();
+
+    let findings_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/api/fields/{}/findings", fixture.field_id))
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(findings_response.status(), StatusCode::OK);
+    let body = to_bytes(findings_response.into_body(), 128 * 1024).await?;
+    let findings: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+    assert_eq!(findings.len(), 1);
+    assert_eq!(
+        findings[0]
+            .pointer("/finding/kind")
+            .and_then(|value| value.as_str()),
+        Some("index_anomaly_zone")
+    );
+    assert_eq!(
+        findings[0]
+            .pointer("/finding/evidence_refs/0")
+            .and_then(|value| value.as_str()),
+        Some(product_id.as_str())
+    );
+
+    let annotation_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/scenes/{}/annotations", fixture.scene_id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "annotation_id": "advisor-flow-ann",
+                        "label": "Confirmed northwest stress",
+                        "note": "Ground review agrees with the NDVI anomaly",
+                        "severity": "high",
+                        "geometry": {
+                            "type": "point",
+                            "coordinate": { "longitude": -96.45, "latitude": 41.25 }
+                        }
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(annotation_response.status(), StatusCode::OK);
+
+    let recommendation_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/scenes/{}/recommendations", fixture.scene_id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "recommendation_id": "advisor-flow-rec",
+                        "title": "Inspect northwest irrigation emitters",
+                        "category": "irrigation",
+                        "priority": "high",
+                        "status": "open",
+                        "evidence_refs": [finding_id],
+                        "annotation_ids": ["advisor-flow-ann"]
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(recommendation_response.status(), StatusCode::OK);
+
+    let report_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/scenes/{}/reports", fixture.scene_id))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "title": "Advisor MVP field report",
+                        "visibility": "shared"
+                    })
+                    .to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(report_response.status(), StatusCode::OK);
+    let body = to_bytes(report_response.into_body(), 256 * 1024).await?;
+    let report: serde_json::Value = serde_json::from_slice(&body)?;
+    assert_eq!(
+        report.get("annotation_count").and_then(|v| v.as_u64()),
+        Some(1)
+    );
+    assert_eq!(
+        report
+            .get("recommendation_count")
+            .and_then(|value| value.as_u64()),
+        Some(1)
+    );
+    let report_id = report
+        .get("report_id")
+        .and_then(|value| value.as_str())
+        .expect("report id should exist");
+
+    let share_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!(
+                    "/api/scenes/{}/reports/{report_id}/shares",
+                    fixture.scene_id
+                ))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({ "expires_at": "2099-01-01T00:00:00Z" }).to_string(),
+                ))
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(share_response.status(), StatusCode::OK);
+    let body = to_bytes(share_response.into_body(), 64 * 1024).await?;
+    let share: serde_json::Value = serde_json::from_slice(&body)?;
+    let public_path = share
+        .get("url_path")
+        .and_then(|value| value.as_str())
+        .expect("share URL should exist");
+
+    let public_response = ctx
+        .app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(public_path)
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should handle request");
+    assert_eq!(public_response.status(), StatusCode::OK);
+    let body = to_bytes(public_response.into_body(), 256 * 1024).await?;
+    let html = String::from_utf8(body.to_vec())?;
+    assert!(html.contains("Advisor MVP field report"));
+    assert!(html.contains("Inspect northwest irrigation emitters"));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn acceptance_annotation_lifecycle_roundtrip() -> Result<()> {
     let tmp = TempDir::new()?;
     let ctx = test_app(&tmp).await?;

@@ -241,6 +241,15 @@ function renderItem(item) {
   date.textContent = props.datetime || "no datetime";
   li.appendChild(date);
 
+  if (props["agbot:scene_id"]) {
+    const advisor = document.createElement("button");
+    advisor.type = "button";
+    advisor.className = "open-advisor";
+    advisor.textContent = "Open advisor";
+    advisor.addEventListener("click", () => selectAdvisorScene(props["agbot:scene_id"], item.id));
+    li.appendChild(advisor);
+  }
+
   if (!displayable.ok) {
     const why = document.createElement("span");
     why.className = "undisplayable";
@@ -635,6 +644,227 @@ function removeItemLayer(itemId) {
   activeLayers.delete(itemId);
   setStatus(`Removed ${itemId}.`);
 }
+
+// --- Scene advisor workflow ----------------------------------------------------
+
+const advisorEls = {
+  details: document.getElementById("advisor-details"),
+  scope: document.getElementById("advisor-scope"),
+  refresh: document.getElementById("advisor-refresh"),
+  csv: document.getElementById("advisor-export-csv"),
+  geojson: document.getElementById("advisor-export-geojson"),
+  annotationForm: document.getElementById("advisor-annotation-form"),
+  annotationLabel: document.getElementById("advisor-annotation-label"),
+  annotationSeverity: document.getElementById("advisor-annotation-severity"),
+  annotationNote: document.getElementById("advisor-annotation-note"),
+  annotationLat: document.getElementById("advisor-annotation-lat"),
+  annotationLon: document.getElementById("advisor-annotation-lon"),
+  createAnnotation: document.getElementById("advisor-create-annotation"),
+  annotations: document.getElementById("advisor-annotations"),
+  recommendationForm: document.getElementById("advisor-recommendation-form"),
+  recommendationAnnotation: document.getElementById("advisor-recommendation-annotation"),
+  recommendationTitle: document.getElementById("advisor-recommendation-title"),
+  recommendationCategory: document.getElementById("advisor-recommendation-category"),
+  recommendationPriority: document.getElementById("advisor-recommendation-priority"),
+  recommendationNote: document.getElementById("advisor-recommendation-note"),
+  createRecommendation: document.getElementById("advisor-create-recommendation"),
+  recommendations: document.getElementById("advisor-recommendations"),
+  form: document.getElementById("advisor-report-form"),
+  title: document.getElementById("advisor-report-title"),
+  visibility: document.getElementById("advisor-report-visibility"),
+  generate: document.getElementById("advisor-generate-report"),
+  reports: document.getElementById("advisor-reports"),
+  lineage: document.getElementById("advisor-lineage"),
+};
+let advisorSceneId = "";
+
+function advisorHeading(text, count) {
+  const h = document.createElement("h3");
+  h.textContent = `${text} (${count})`;
+  return h;
+}
+
+function advisorEmpty(text) {
+  const p = document.createElement("p");
+  p.className = "hint";
+  p.textContent = text;
+  return p;
+}
+
+async function selectAdvisorScene(sceneId, productId) {
+  advisorSceneId = sceneId;
+  advisorEls.details.open = true;
+  advisorEls.scope.textContent = `Scene ${sceneId} · evidence product ${productId}`;
+  advisorEls.refresh.disabled = false;
+  advisorEls.createAnnotation.disabled = false;
+  advisorEls.generate.disabled = false;
+  for (const [link, suffix] of [[advisorEls.csv, "csv"], [advisorEls.geojson, "geojson"]]) {
+    link.href = `/api/scenes/${encodeURIComponent(sceneId)}/exports/recommendations.${suffix}`;
+    link.classList.remove("disabled");
+    link.removeAttribute("aria-disabled");
+  }
+  await loadAdvisorWorkflow();
+}
+
+async function loadAdvisorWorkflow() {
+  if (!advisorSceneId) return;
+  advisorEls.refresh.disabled = true;
+  advisorEls.annotations.replaceChildren(advisorEmpty("Loading annotations…"));
+  advisorEls.recommendations.replaceChildren(advisorEmpty("Loading recommendations…"));
+  advisorEls.reports.replaceChildren(advisorEmpty("Loading reports…"));
+  advisorEls.lineage.replaceChildren();
+  const base = `/api/scenes/${encodeURIComponent(advisorSceneId)}`;
+  try {
+    const [annotations, recommendations, reports] = await Promise.all([
+      fetchJson(`${base}/annotations`), fetchJson(`${base}/recommendations`), fetchJson(`${base}/reports`),
+    ]);
+    renderAdvisorAnnotations(annotations);
+    renderAdvisorRecommendations(recommendations);
+    renderAdvisorReports(reports);
+    setStatus(`Advisor evidence loaded for ${advisorSceneId}.`);
+  } catch (err) {
+    setStatus(`Advisor workflow failed: ${err.message}`, true);
+  } finally {
+    advisorEls.refresh.disabled = false;
+  }
+}
+
+function renderAdvisorAnnotations(items) {
+  advisorEls.annotations.replaceChildren(advisorHeading("Annotations", items.length));
+  const selected = advisorEls.recommendationAnnotation.value;
+  advisorEls.recommendationAnnotation.innerHTML = '<option value="">— select annotation —</option>';
+  for (const item of items) {
+    const option = document.createElement("option");
+    option.value = item.annotation_id;
+    option.textContent = item.label ? `${item.label} (${item.annotation_id})` : item.annotation_id;
+    advisorEls.recommendationAnnotation.appendChild(option);
+  }
+  if (items.some((item) => item.annotation_id === selected)) advisorEls.recommendationAnnotation.value = selected;
+  advisorEls.createRecommendation.disabled = items.length === 0;
+  if (!items.length) return advisorEls.annotations.appendChild(advisorEmpty("No mapped annotations."));
+  const list = document.createElement("ul"); list.className = "advisor-list";
+  for (const item of items) {
+    const li = document.createElement("li"); li.textContent = item.label || item.annotation_id;
+    const meta = document.createElement("small"); meta.textContent = [item.severity, item.note].filter(Boolean).join(" · ");
+    li.appendChild(meta); list.appendChild(li);
+  }
+  advisorEls.annotations.appendChild(list);
+}
+
+function renderAdvisorRecommendations(items) {
+  advisorEls.recommendations.replaceChildren(advisorHeading("Recommendations", items.length));
+  if (!items.length) return advisorEls.recommendations.appendChild(advisorEmpty("No recommendations for this scene."));
+  const list = document.createElement("ul"); list.className = "advisor-list";
+  for (const item of items) {
+    const li = document.createElement("li"); li.textContent = item.title || item.recommendation_id;
+    const meta = document.createElement("small");
+    meta.textContent = [item.priority, item.action_category || item.category, item.status].filter(Boolean).join(" · ");
+    li.appendChild(meta);
+    if ((item.evidence_refs || []).length) {
+      const evidence = document.createElement("small"); evidence.textContent = `Evidence: ${item.evidence_refs.join(", ")}`;
+      li.appendChild(evidence);
+    }
+    list.appendChild(li);
+  }
+  advisorEls.recommendations.appendChild(list);
+}
+
+function renderAdvisorReports(items) {
+  advisorEls.reports.replaceChildren(advisorHeading("Reports", items.length));
+  if (!items.length) return advisorEls.reports.appendChild(advisorEmpty("No reports generated yet."));
+  const list = document.createElement("ul"); list.className = "advisor-list report-list";
+  for (const item of items) {
+    const li = document.createElement("li");
+    const download = document.createElement("a");
+    download.href = item.download_url || `/api/scenes/${encodeURIComponent(advisorSceneId)}/reports/${encodeURIComponent(item.report_id)}`;
+    download.textContent = item.title || item.report_id;
+    const lineage = document.createElement("button"); lineage.type = "button"; lineage.textContent = "Verify lineage";
+    lineage.addEventListener("click", () => loadAdvisorLineage(item.report_id));
+    li.append(download, lineage);
+    const meta = document.createElement("small");
+    meta.textContent = `${item.annotation_count || 0} annotations · ${item.recommendation_count || 0} recommendations · ${item.visibility || "private"}`;
+    li.appendChild(meta); list.appendChild(li);
+  }
+  advisorEls.reports.appendChild(list);
+}
+
+async function loadAdvisorLineage(reportId) {
+  advisorEls.lineage.replaceChildren(advisorEmpty("Tracing report to source evidence…"));
+  try {
+    const trace = await fetchJson(`/api/scenes/${encodeURIComponent(advisorSceneId)}/reports/${encodeURIComponent(reportId)}/lineage`);
+    const records = trace.records || []; const gaps = trace.gaps || [];
+    const result = document.createElement("p"); result.className = gaps.length ? "error" : "lineage-ok";
+    result.textContent = gaps.length ? `${gaps.length} provenance gap(s) detected.` : `Complete trace: ${records.length} records, no gaps.`;
+    advisorEls.lineage.replaceChildren(advisorHeading("Report lineage", records.length), result);
+  } catch (err) {
+    advisorEls.lineage.replaceChildren(advisorEmpty(`Lineage unavailable: ${err.message}`));
+  }
+}
+
+advisorEls.refresh.addEventListener("click", loadAdvisorWorkflow);
+advisorEls.annotationForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!advisorSceneId) return;
+  const latitude = Number(advisorEls.annotationLat.value);
+  const longitude = Number(advisorEls.annotationLon.value);
+  advisorEls.createAnnotation.disabled = true;
+  setStatus("Adding point annotation…");
+  try {
+    await fetchJson(`/api/scenes/${encodeURIComponent(advisorSceneId)}/annotations`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        label: advisorEls.annotationLabel.value.trim(),
+        severity: advisorEls.annotationSeverity.value || null,
+        note: advisorEls.annotationNote.value.trim() || null,
+        crs: "EPSG:4326",
+        geometry: { type: "point", coordinate: { latitude, longitude } },
+      }),
+    });
+    advisorEls.annotationForm.reset();
+    await loadAdvisorWorkflow();
+    setStatus("Point annotation added to the selected scene.");
+  } catch (err) { setStatus(`Annotation creation failed: ${err.message}`, true); }
+  finally { advisorEls.createAnnotation.disabled = false; }
+});
+
+advisorEls.recommendationForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!advisorSceneId || !advisorEls.recommendationAnnotation.value) return;
+  advisorEls.createRecommendation.disabled = true;
+  setStatus("Creating evidence-linked recommendation…");
+  try {
+    await fetchJson(`/api/scenes/${encodeURIComponent(advisorSceneId)}/recommendations`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        title: advisorEls.recommendationTitle.value.trim(),
+        action_category: advisorEls.recommendationCategory.value.trim(),
+        category: advisorEls.recommendationCategory.value.trim(),
+        priority: advisorEls.recommendationPriority.value,
+        status: "open",
+        note: advisorEls.recommendationNote.value.trim() || null,
+        annotation_ids: [advisorEls.recommendationAnnotation.value],
+      }),
+    });
+    advisorEls.recommendationForm.reset();
+    await loadAdvisorWorkflow();
+    setStatus("Recommendation created and linked to its annotation evidence.");
+  } catch (err) { setStatus(`Recommendation creation failed: ${err.message}`, true); }
+  finally { advisorEls.createRecommendation.disabled = false; }
+});
+
+advisorEls.form.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  if (!advisorSceneId) return;
+  advisorEls.generate.disabled = true; setStatus("Generating grower report…");
+  try {
+    await fetchJson(`/api/scenes/${encodeURIComponent(advisorSceneId)}/reports`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: advisorEls.title.value.trim() || null, visibility: advisorEls.visibility.value }),
+    });
+    await loadAdvisorWorkflow(); setStatus("Grower report generated and ready to download.");
+  } catch (err) { setStatus(`Report generation failed: ${err.message}`, true); }
+  finally { advisorEls.generate.disabled = false; }
+});
 
 // --- Field boundaries overlay ----------------------------------------------------
 

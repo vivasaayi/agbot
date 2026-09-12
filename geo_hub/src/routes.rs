@@ -2527,8 +2527,16 @@ async fn build_annotation_record(
         .unwrap_or_else(|| Uuid::new_v4().to_string());
     let label = normalize_annotation_label(request.label)?;
     validate_annotation_geometry(&request.geometry)?;
-    let field_id =
-        normalize_optional_text(request.field_id).or(load_scene_field_id(state, scene_id).await?);
+    let requested_field_id = normalize_optional_text(request.field_id);
+    let linked_field_id = load_scene_field_id(state, scene_id).await?;
+    if let (Some(requested), Some(linked)) = (&requested_field_id, &linked_field_id) {
+        if requested != linked {
+            return Err(AppError::BadRequest(format!(
+                "scene {scene_id} is linked to field {linked}; annotation field_id {requested} does not match"
+            )));
+        }
+    }
+    let field_id = linked_field_id.or(requested_field_id);
     let audit_id = normalize_optional_text(request.audit_id)
         .unwrap_or_else(|| format!("annotation-audit-{}", Uuid::new_v4()));
 
