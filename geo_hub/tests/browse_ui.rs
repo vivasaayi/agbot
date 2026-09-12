@@ -89,6 +89,7 @@ async fn browse_serves_html_page() -> Result<()> {
         "id=\"advisor-annotation-lon\"",
         "id=\"advisor-recommendation-form\"",
         "id=\"advisor-recommendation-annotation\"",
+        "id=\"advisor-findings\"",
         "id=\"advisor-generate-report\"",
         "id=\"advisor-reports\"",
         "id=\"advisor-lineage\"",
@@ -126,6 +127,7 @@ async fn browse_assets_have_correct_content_types() -> Result<()> {
         "/reports",
         "/lineage",
         "/exports/recommendations.",
+        "/findings",
     ] {
         assert!(
             body.contains(endpoint),
@@ -171,6 +173,10 @@ async fn browse_assets_have_correct_content_types() -> Result<()> {
         "geometry: { type: \"point\"",
         "annotation_ids:",
         "action_category:",
+        "renderAdvisorFindings",
+        "Use finding",
+        "zone_geometry",
+        "catalogQualityEntries",
         "Verify lineage",
         "evidence_refs",
     ] {
@@ -191,6 +197,8 @@ async fn browse_assets_have_correct_content_types() -> Result<()> {
         ".coordinate-row",
         ".advisor-list",
         ".lineage-ok",
+        ".quality-badge",
+        ".finding-list",
     ] {
         assert!(body.contains(marker), "style.css missing {marker}");
     }

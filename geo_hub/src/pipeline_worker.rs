@@ -921,10 +921,41 @@ async fn enqueue_post_derive_jobs(
     payload: &DerivePayload,
     product_id: &str,
 ) -> Result<(), String> {
-    let product = catalog::get_product(&ctx.pool, product_id)
+    enqueue_accepted_product_jobs(
+        &ctx.pool,
+        product_id,
+        &payload.dataset,
+        &payload.index,
+        &payload.field_id,
+    )
+    .await
+}
+
+/// Fan an accepted, field-scoped provider product into the same L3 and
+/// advisor-application jobs used by scheduled satellite derivations.
+///
+/// Provider-specific HTTP derivation paths call this only after their QA gate
+/// passes, keeping quarantined rasters out of findings and recommendations.
+pub async fn enqueue_accepted_product_jobs(
+    pool: &DbPool,
+    product_id: &str,
+    dataset: &str,
+    index: &str,
+    field_id: &str,
+) -> Result<(), String> {
+    let product = catalog::get_product(pool, product_id)
         .await
-        .map_err(|err| format!("catalog lookup failed: {err}"))?;
-    let temporal_start = product.as_ref().and_then(|p| p.temporal_start.clone());
+        .map_err(|err| format!("catalog lookup failed: {err}"))?
+        .ok_or_else(|| format!("catalog product {product_id} not found"))?;
+    if product.status != "registered" {
+        tracing::warn!(
+            product_id,
+            status = %product.status,
+            "non-accepted product; skipping L3/app fan-out"
+        );
+        return Ok(());
+    }
+    let temporal_start = product.temporal_start.clone();
     let Some(temporal_start) = temporal_start.filter(|ts| ts.len() >= 10) else {
         tracing::warn!(
             product_id = %product_id,
@@ -937,20 +968,20 @@ async fn enqueue_post_derive_jobs(
     let now = Utc::now();
 
     let l3_payload = serde_json::to_value(L3RecomputePayload {
-        field_id: payload.field_id.clone(),
-        dataset: payload.dataset.clone(),
-        index: payload.index.clone(),
+        field_id: field_id.to_string(),
+        dataset: dataset.to_string(),
+        index: index.to_string(),
         month: month.to_string(),
         product: pipeline::default_l3_product(),
     })
     .map_err(|err| format!("l3_recompute payload: {err}"))?;
     pipeline::enqueue_job(
-        &ctx.pool,
+        pool,
         JobKind::L3Recompute,
-        &pipeline::l3_job_key(&payload.field_id, &payload.dataset, &payload.index, month),
+        &pipeline::l3_job_key(field_id, dataset, index, month),
         &l3_payload,
-        Some(&payload.field_id),
-        Some(&payload.dataset),
+        Some(field_id),
+        Some(dataset),
         0,
         now,
         None,
@@ -959,19 +990,19 @@ async fn enqueue_post_derive_jobs(
     .await
     .map_err(|err| format!("l3_recompute enqueue: {err}"))?;
 
-    for app_id in apps_for_index(&payload.index) {
+    for app_id in apps_for_index(index) {
         let app_payload = serde_json::to_value(AppRunPayload {
             app_id: app_id.to_string(),
-            field_id: payload.field_id.clone(),
+            field_id: field_id.to_string(),
             date: date.to_string(),
         })
         .map_err(|err| format!("app_run payload: {err}"))?;
         pipeline::enqueue_job(
-            &ctx.pool,
+            pool,
             JobKind::AppRun,
-            &pipeline::app_job_key(app_id, &payload.field_id, date),
+            &pipeline::app_job_key(app_id, field_id, date),
             &app_payload,
-            Some(&payload.field_id),
+            Some(field_id),
             None,
             0,
             now,

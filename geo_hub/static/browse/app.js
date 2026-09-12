@@ -241,6 +241,19 @@ function renderItem(item) {
   date.textContent = props.datetime || "no datetime";
   li.appendChild(date);
 
+  const quality = catalogQualityEntries(props);
+  if (quality.length) {
+    const strip = document.createElement("div");
+    strip.className = "quality-strip";
+    for (const [label, value] of quality) {
+      const badge = document.createElement("span");
+      badge.className = `quality-badge ${String(value).toLowerCase().includes("quarant") || value === false ? "quality-bad" : ""}`;
+      badge.textContent = `${label}: ${formatMetadataValue(value)}`;
+      strip.appendChild(badge);
+    }
+    li.appendChild(strip);
+  }
+
   if (props["agbot:scene_id"]) {
     const advisor = document.createElement("button");
     advisor.type = "button";
@@ -489,6 +502,7 @@ function renderMetadata(item) {
     ["scene", props["agbot:scene_id"]],
     ["bbox (WGS84)", item.bbox ? item.bbox.map((v) => v.toFixed(4)).join(", ") : undefined],
     ["geometry omitted", props["agbot:geometry_omitted_reason"]],
+    ...catalogQualityEntries(props),
   ];
   for (const [label, value] of rows) {
     if (value === undefined || value === null) continue;
@@ -515,6 +529,23 @@ function renderMetadata(item) {
   }
   details.appendChild(dl);
   return details;
+}
+
+function formatMetadataValue(value) {
+  if (typeof value === "number") return Number.isInteger(value) ? String(value) : value.toFixed(3);
+  return String(value);
+}
+
+/** Surface optional trust/QA metadata without assuming a single producer's key spelling. */
+function catalogQualityEntries(props) {
+  const labels = { trusted: "trusted", quality: "quality", coverage: "coverage", quarantine: "quarantine" };
+  const entries = [];
+  for (const [key, value] of Object.entries(props)) {
+    const normalized = key.toLowerCase();
+    const category = Object.keys(labels).find((candidate) => normalized.includes(candidate));
+    if (category && value !== null && typeof value !== "object") entries.push([labels[category], value]);
+  }
+  return entries;
 }
 
 /** An item is displayable when it has a WGS84 bbox to position it and either a
@@ -661,6 +692,7 @@ const advisorEls = {
   annotationLon: document.getElementById("advisor-annotation-lon"),
   createAnnotation: document.getElementById("advisor-create-annotation"),
   annotations: document.getElementById("advisor-annotations"),
+  findings: document.getElementById("advisor-findings"),
   recommendationForm: document.getElementById("advisor-recommendation-form"),
   recommendationAnnotation: document.getElementById("advisor-recommendation-annotation"),
   recommendationTitle: document.getElementById("advisor-recommendation-title"),
@@ -677,6 +709,8 @@ const advisorEls = {
   lineage: document.getElementById("advisor-lineage"),
 };
 let advisorSceneId = "";
+let advisorFieldId = "";
+let selectedFinding = null;
 
 function advisorHeading(text, count) {
   const h = document.createElement("h3");
@@ -703,6 +737,12 @@ async function selectAdvisorScene(sceneId, productId) {
     link.classList.remove("disabled");
     link.removeAttribute("aria-disabled");
   }
+  try {
+    const scene = await fetchJson(`/api/scenes/${encodeURIComponent(sceneId)}`);
+    advisorFieldId = scene.field_id || "";
+  } catch (_) {
+    advisorFieldId = "";
+  }
   await loadAdvisorWorkflow();
 }
 
@@ -712,21 +752,73 @@ async function loadAdvisorWorkflow() {
   advisorEls.annotations.replaceChildren(advisorEmpty("Loading annotations…"));
   advisorEls.recommendations.replaceChildren(advisorEmpty("Loading recommendations…"));
   advisorEls.reports.replaceChildren(advisorEmpty("Loading reports…"));
+  advisorEls.findings.replaceChildren(advisorEmpty(advisorFieldId ? "Loading field findings…" : "Scene has no linked field."));
   advisorEls.lineage.replaceChildren();
   const base = `/api/scenes/${encodeURIComponent(advisorSceneId)}`;
   try {
-    const [annotations, recommendations, reports] = await Promise.all([
+    const [annotations, recommendations, reports, findings] = await Promise.all([
       fetchJson(`${base}/annotations`), fetchJson(`${base}/recommendations`), fetchJson(`${base}/reports`),
+      advisorFieldId ? fetchJson(`/api/fields/${encodeURIComponent(advisorFieldId)}/findings`) : Promise.resolve([]),
     ]);
     renderAdvisorAnnotations(annotations);
     renderAdvisorRecommendations(recommendations);
     renderAdvisorReports(reports);
+    renderAdvisorFindings(findings);
     setStatus(`Advisor evidence loaded for ${advisorSceneId}.`);
   } catch (err) {
     setStatus(`Advisor workflow failed: ${err.message}`, true);
   } finally {
     advisorEls.refresh.disabled = false;
   }
+}
+
+function findingPoint(finding) {
+  const geometry = finding?.finding?.zone_geometry;
+  if (!geometry) return null;
+  if (geometry.type === "Point" && Array.isArray(geometry.coordinates)) return geometry.coordinates;
+  const ring = geometry.type === "Polygon" ? geometry.coordinates?.[0] : null;
+  if (!Array.isArray(ring) || !ring.length) return null;
+  const points = ring.filter((p) => Array.isArray(p) && p.length >= 2);
+  if (!points.length) return null;
+  return [points.reduce((sum, p) => sum + Number(p[0]), 0) / points.length,
+    points.reduce((sum, p) => sum + Number(p[1]), 0) / points.length];
+}
+
+function renderAdvisorFindings(items) {
+  advisorEls.findings.replaceChildren(advisorHeading("Field findings", items.length));
+  if (!items.length) return advisorEls.findings.appendChild(advisorEmpty("No application findings for this field."));
+  const list = document.createElement("ul"); list.className = "advisor-list finding-list";
+  for (const item of items) {
+    const finding = item.finding || {};
+    const li = document.createElement("li"); li.textContent = finding.kind || item.finding_id;
+    const meta = document.createElement("small");
+    meta.textContent = [finding.severity, Number.isFinite(finding.confidence) ? `confidence ${finding.confidence.toFixed(2)}` : null]
+      .filter(Boolean).join(" · "); li.appendChild(meta);
+    const evidence = document.createElement("small");
+    evidence.textContent = `Evidence: ${[item.finding_id, ...(finding.evidence_refs || [])].join(", ")}`; li.appendChild(evidence);
+    const point = findingPoint(item);
+    if (point) {
+      const use = document.createElement("button"); use.type = "button"; use.textContent = "Use finding";
+      use.addEventListener("click", () => useAdvisorFinding(item, point)); li.appendChild(use);
+    } else {
+      const unavailable = document.createElement("small"); unavailable.textContent = "No georeferenced zone available for annotation."; li.appendChild(unavailable);
+    }
+    list.appendChild(li);
+  }
+  advisorEls.findings.appendChild(list);
+}
+
+function useAdvisorFinding(item, point) {
+  selectedFinding = item;
+  const finding = item.finding || {};
+  advisorEls.annotationLabel.value = finding.kind || "application finding";
+  advisorEls.annotationSeverity.value = finding.severity || "";
+  advisorEls.annotationNote.value = `Finding ${item.finding_id}${Number.isFinite(finding.confidence) ? ` · confidence ${finding.confidence.toFixed(2)}` : ""}`;
+  advisorEls.annotationLon.value = point[0]; advisorEls.annotationLat.value = point[1];
+  advisorEls.recommendationTitle.value = `Review ${String(finding.kind || "field finding").replaceAll("_", " ")}`;
+  advisorEls.recommendationCategory.value = finding.kind || "field_review";
+  advisorEls.recommendationPriority.value = finding.severity === "critical" ? "critical" : finding.severity === "high" ? "high" : "medium";
+  setStatus("Finding evidence copied into the annotation and recommendation forms.");
 }
 
 function renderAdvisorAnnotations(items) {
@@ -810,18 +902,16 @@ advisorEls.annotationForm.addEventListener("submit", async (event) => {
   advisorEls.createAnnotation.disabled = true;
   setStatus("Adding point annotation…");
   try {
-    await fetchJson(`/api/scenes/${encodeURIComponent(advisorSceneId)}/annotations`, {
-      method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        label: advisorEls.annotationLabel.value.trim(),
-        severity: advisorEls.annotationSeverity.value || null,
-        note: advisorEls.annotationNote.value.trim() || null,
-        crs: "EPSG:4326",
+    const created = await fetchJson(`/api/scenes/${encodeURIComponent(advisorSceneId)}/annotations`, {
+      method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
+        label: advisorEls.annotationLabel.value.trim(), severity: advisorEls.annotationSeverity.value || null,
+        note: advisorEls.annotationNote.value.trim() || null, crs: "EPSG:4326",
         geometry: { type: "point", coordinate: { latitude, longitude } },
       }),
     });
     advisorEls.annotationForm.reset();
     await loadAdvisorWorkflow();
+    if (selectedFinding && created.annotation_id) advisorEls.recommendationAnnotation.value = created.annotation_id;
     setStatus("Point annotation added to the selected scene.");
   } catch (err) { setStatus(`Annotation creation failed: ${err.message}`, true); }
   finally { advisorEls.createAnnotation.disabled = false; }
@@ -843,9 +933,10 @@ advisorEls.recommendationForm.addEventListener("submit", async (event) => {
         status: "open",
         note: advisorEls.recommendationNote.value.trim() || null,
         annotation_ids: [advisorEls.recommendationAnnotation.value],
+        evidence_refs: selectedFinding ? [selectedFinding.finding_id, ...(selectedFinding.finding?.evidence_refs || [])] : [],
       }),
     });
-    advisorEls.recommendationForm.reset();
+    advisorEls.recommendationForm.reset(); selectedFinding = null;
     await loadAdvisorWorkflow();
     setStatus("Recommendation created and linked to its annotation evidence.");
   } catch (err) { setStatus(`Recommendation creation failed: ${err.message}`, true); }

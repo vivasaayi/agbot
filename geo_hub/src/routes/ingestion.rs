@@ -165,9 +165,18 @@ pub async fn derive_landsat_product_route(
             )));
         }
     }
-    if request.field_id.is_some() {
+    if let Some(field_id) = request.field_id.as_deref() {
         crate::field_timeseries::extract_and_append_field_stats(&state.pool, &outcome.product_id)
             .await?;
+        crate::pipeline_worker::enqueue_accepted_product_jobs(
+            &state.pool,
+            &outcome.product_id,
+            "landsat",
+            &outcome.product,
+            field_id,
+        )
+        .await
+        .map_err(|message| AppError::Anyhow(anyhow::anyhow!(message)))?;
     }
     Ok(Json(outcome))
 }

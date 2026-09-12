@@ -160,6 +160,9 @@ button:hover {
 }
 
 .item .open-advisor { margin-top: 5px; padding: 2px 7px; color: #175cd3; font-size: 11px; }
+.quality-strip { display: flex; flex-wrap: wrap; gap: 3px; margin-top: 4px; }
+.quality-badge { padding: 1px 5px; border-radius: 9px; background: #ecfdf3; color: #027a48; font-size: 10px; }
+.quality-badge.quality-bad { background: #fee4e2; color: #b42318; }
 
 .item .undisplayable {
   color: #b42318;
@@ -396,6 +399,7 @@ details.derive > summary {
 .advisor-list li { margin-bottom: 5px; }
 .advisor-list small { display: block; color: #667085; overflow-wrap: anywhere; }
 .advisor-list.report-list li button { margin-left: 6px; padding: 1px 5px; font-size: 10px; }
+.advisor-list.finding-list li button { display: block; margin-top: 3px; padding: 1px 6px; font-size: 10px; }
 .advisor-form { margin-top: 10px; padding: 7px; border: 1px solid #e2e6eb; border-radius: 4px; background: #fff; }
 .advisor-form label { display: block; margin: 5px 0; color: #344054; font-size: 11px; }
 .advisor-form input, .advisor-form select, .advisor-form textarea { width: 100%; margin-top: 2px; padding: 4px; border: 1px solid #cfd6de; border-radius: 4px; font: inherit; }
