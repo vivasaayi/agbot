@@ -3,12 +3,30 @@
 AGBot ships as one release artifact — the **geo_hub appliance image** — plus an
 `agbot` CLI that runs it on a server and builds the native desktop apps on a Mac.
 
-- **Linux server (headless):** hosts the geo_hub appliance = farmer portal (web)
+- **Linux or macOS with Docker:** hosts the geo_hub appliance = farmer portal (web)
   + web workspace/browse + APIs + satellite ingestion. No GUI.
 - **Mac (ARM/Intel):** builds and runs the native desktop GUIs (`geo_viewer`,
   `flight_sim_cpp` viewer), pointed at the server over the network.
 - **Any device (iPad / Android / desktop):** open the server URL and install the
   farmer PWA from the browser.
+
+## Downloadable farmer launcher
+
+The release workflow packages `agbot-<version>.tar.gz` and a `.sha256` checksum.
+Extract the bundle, start Docker, then open **Start AGBot.command** on an Intel
+Mac or run `./start.sh` on Linux x86-64. The bundle needs neither Git nor Rust.
+It follows its recorded release channel and retains data in named Docker volumes.
+
+These launchers still require a published appliance image. On 2026-09-22 the
+stable `:latest` manifest was absent and `:edge` pointed to an older amd64 image;
+the changes described here have not been published. Native ARM64/Apple Silicon
+and Windows installation remain unverified. See the
+[farmer release gate](../reviews/farmer-day-zero-readiness.md).
+
+The bundle uses Compose project name `agbot`. Existing repository installations
+may use a different project/volume name. Keep using the existing installation
+until its database **and data volume** are migrated and verified; extracting a
+bundle does not migrate existing data automatically.
 
 ## One-line install
 
@@ -19,13 +37,16 @@ curl -fsSL https://raw.githubusercontent.com/vivasaayi/agbot/main/scripts/instal
 This clones the repo into `~/.agbot/repo` and links `agbot` onto your PATH.
 Overrides: `AGBOT_HOME`, `AGBOT_REPO`, `AGBOT_REF`, `BIN_DIR`.
 
-## Server role (Linux)
+## Farmer app (Linux or macOS)
 
-Requires Docker with the Compose plugin.
+Requires Git and Docker with the Compose plugin (Docker Desktop on macOS).
+Start Docker before running `agbot up`. A Rust compiler is not needed for the
+farmer portal.
 
 ```sh
 agbot up                 # pull the channel image by digest and start it
-open http://localhost:8080/portal   # farmer PWA
+open http://127.0.0.1:8080/portal   # farmer PWA
+agbot access-code         # show the first-login code again
 
 agbot status             # container + /health status
 agbot logs               # follow logs
@@ -33,7 +54,23 @@ agbot upgrade            # re-pull, health-check, and roll back on failure
 agbot down               # stop (named volumes retained)
 ```
 
-State is persisted in two named Docker volumes so upgrades never lose data:
+On first startup, the CLI generates a private sign-in code and saves it in
+`~/.agbot/bootstrap-access-code` with owner-only permissions. Sign in with the
+code shown by `agbot up`, then choose **Add field**. Draw the boundary or import
+a GeoJSON polygon, enter your crop and season, and save. Landsat vegetation
+monitoring is enabled by default; initial results depend on provider access and
+usable imagery. The app starts without a sample farm.
+
+The code only provisions a **new database**. Existing accounts retain their
+original code; changing the file does not reset an account. Keep this file with
+your backup. Set `AGBOT_HOME` if you use a different installation directory.
+
+The app listens on `127.0.0.1` by default, so it is accessible from this computer
+only. Remote/phone access needs an explicit network deployment; see the security
+and TLS sections below. Do not infer multi-tenant isolation from the login gate.
+`AGBOT_BIND_ADDRESS` overrides the host interface when configuring such a deployment.
+
+State is persisted in two named Docker volumes across restarts and upgrades:
 
 - `geo_hub_db`   → `/opt/agbot/db`   (SQLite database)
 - `geo_hub_data` → `/opt/agbot/data` (ingested scenes / products)
@@ -50,11 +87,17 @@ Set `AGBOT_DELETE_SUPERSEDED=false` to keep every superseded artifact.
 
 ### Backup & restore
 
+A database snapshot does not include imagery or report files. Back up the
+`geo_hub_data` volume as well for a complete restoration.
+
 The `geo_hub` binary can snapshot and restore its SQLite database. Backup uses
 `VACUUM INTO`, so it is a consistent snapshot safe to take while the server
 runs; restore replaces the live file and should be done with the server stopped.
 
 ```sh
+# Direct Compose commands need the saved bootstrap setting:
+export AGBOT_BOOTSTRAP_ACCESS_CODE="$(agbot access-code)"
+
 # Snapshot into the mounted db volume (safe while running):
 docker compose -f docker-compose.prod.yml exec geo_hub \
   geo_hub backup /opt/agbot/db/backup-$(date +%F).db

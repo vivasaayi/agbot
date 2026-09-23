@@ -5,6 +5,8 @@
 #
 #   AGBOT_IMAGE        full image ref, e.g. ghcr.io/vivasaayi/geo-hub:latest
 #   AGBOT_PORT         host port to expose the portal on (default 8080)
+#   AGBOT_BIND_ADDRESS host interface (default 127.0.0.1, this computer only)
+#   AGBOT_BOOTSTRAP_ACCESS_CODE private first-login code, managed by agbot CLI
 #   AGBOT_ADMIN_TOKEN  bearer token that unlocks the admin access-code API
 #                      (mint / list / revoke). Unset by default → the admin
 #                      API is disabled (fail-closed, 403); first-run portal
@@ -20,17 +22,19 @@ services:
     container_name: agbot-geo-hub
     restart: unless-stopped
     ports:
-      - "${AGBOT_PORT:-8080}:8080"
+      - "${AGBOT_BIND_ADDRESS:-127.0.0.1}:${AGBOT_PORT:-8080}:8080"
     environment:
       # The image bakes absolute GEO_HUB__* defaults; override here only to
       # opt into the pipeline worker or point at a different runtime mode.
-      GEO_HUB__PIPELINE__ENABLED: ${AGBOT_PIPELINE_ENABLED:-false}
+      GEO_HUB__PIPELINE__ENABLED: ${AGBOT_PIPELINE_ENABLED:-true}
+      GEO_HUB__BOOTSTRAP__ACCESS_CODE: ${AGBOT_BOOTSTRAP_ACCESS_CODE:?Run agbot up or set a private first-login access code}
+      GEO_HUB__BOOTSTRAP__SEED_DEMO: ${AGBOT_SEED_DEMO:-false}
       # Hard cap on a single pipeline job's run time (seconds; 0 disables). A
       # hung handler is failed transiently so the serial worker keeps draining.
       GEO_HUB__PIPELINE__JOB_TIMEOUT_SECS: ${AGBOT_JOB_TIMEOUT_SECS:-1800}
       # Minimum confidence a derived product must score to enter the graph; below
       # it the product is quarantined (failed_qa) and its fan-out skipped. 0 off.
-      GEO_HUB__PIPELINE__QA_MIN_CONFIDENCE: ${AGBOT_QA_MIN_CONFIDENCE:-0}
+      GEO_HUB__PIPELINE__QA_MIN_CONFIDENCE: ${AGBOT_QA_MIN_CONFIDENCE:-0.25}
       GEO_HUB__RUNTIME_MODE: ${AGBOT_RUNTIME_MODE:-local}
       # Admin access-code API bearer token. Empty → API disabled (fail-closed).
       GEO_HUB__SECURITY__ADMIN_TOKEN: ${AGBOT_ADMIN_TOKEN:-}

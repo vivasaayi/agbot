@@ -16,8 +16,7 @@ import {
   fieldRecord,
   fieldTimeseries,
   generateGrowerReport,
-  sceneProductAvailable,
-  sceneProductTileUrlTemplate,
+  catalogTileBlob,
   updateActivity,
   updateRecommendationStatus,
 } from "../api.js";
@@ -244,6 +243,11 @@ export function renderField(container, fieldId) {
       <div id="fd-chips" class="chips"></div>
     </div>
     <p id="fd-error" class="error-text" hidden></p>
+    <section class="detail-card" aria-live="polite">
+      <h3>Satellite monitoring</h3>
+      <p id="fd-monitoring">Checking monitoring status…</p>
+      <button type="button" id="fd-refresh" class="small-button secondary">Refresh status</button>
+    </section>
 
     <section class="detail-card">
       <h3>Map</h3>
@@ -305,6 +309,9 @@ export function renderField(container, fieldId) {
   };
 
   loadOverviewAndSections(section, state);
+  section.querySelector("#fd-refresh").addEventListener("click", () => {
+    loadOverviewAndSections(section, state); loadTimeseries(section, state);
+  });
   setupReportButton(section, fieldId);
   setupAddActivityForm(section, state);
   loadActivities(section, state);
@@ -312,24 +319,40 @@ export function renderField(container, fieldId) {
 }
 
 async function loadOverviewAndSections(section, state) {
-  const errorLine = section.querySelector("#fd-error");
-  let overview;
+  // Serialize refreshes, including the initial load: two overlapping Leaflet
+  // initializations on one container otherwise throw and leave a broken map.
+  if (state.overviewLoading) return;
+  state.overviewLoading = true;
+  const refresh = section.querySelector("#fd-refresh");
+  refresh.disabled = true;
+  state.map?.remove();
+  state.map = null;
   try {
-    overview = await fieldOverview(state.fieldId);
-  } catch (error) {
-    section.querySelector("#fd-name").textContent = "Field unavailable";
-    errorLine.textContent = error.offline
-      ? "Offline — field details are unavailable until you reconnect."
-      : "Could not load this field. It may have been removed.";
-    errorLine.hidden = false;
-    section.querySelector("#fd-map").innerHTML = "";
-    return;
-  }
+    const errorLine = section.querySelector("#fd-error");
+    let overview;
+    try {
+      overview = await fieldOverview(state.fieldId);
+    } catch (error) {
+      section.querySelector("#fd-name").textContent = "Field unavailable";
+      errorLine.textContent = error.offline
+        ? "Offline — field details are unavailable until you reconnect."
+        : "Could not load this field. It may have been removed.";
+      errorLine.hidden = false;
+      section.querySelector("#fd-map").innerHTML = "";
+      return;
+    }
 
-  renderHeader(section, overview.field);
-  renderFindings(section, overview);
-  renderRecommendations(section, state, overview);
-  setupMap(section, state, overview);
+    section.querySelector("#fd-monitoring").textContent = overview.monitoring?.message || "Monitoring status is unavailable.";
+    section.querySelector("#fd-generate-report").disabled = !overview.latest_scene;
+    renderHeader(section, overview.field);
+    renderFindings(section, overview);
+    renderRecommendations(section, state, overview);
+    errorLine.hidden = true;
+    await setupMap(section, state, overview);
+  } finally {
+    state.overviewLoading = false;
+    refresh.disabled = false;
+  }
 }
 
 function renderHeader(section, field) {
@@ -370,7 +393,7 @@ async function setupMap(section, state, overview) {
       elWithText(
         "p",
         "muted",
-        "No boundary on file for this field yet — ask your agronomist to import one.",
+        "No boundary is available for this field. Add a field boundary to show its map.",
       ),
     );
     toggle.disabled = true;
@@ -391,50 +414,55 @@ async function setupMap(section, state, overview) {
 
   mapHolder.innerHTML = "";
   const map = leaflet.map(mapHolder, { zoomControl: true, attributionControl: false });
+  state.map = map;
   const polygon = leaflet
     .polygon(latlngs, { color: "#1b5e20", weight: 2, fillOpacity: 0.08 })
     .addTo(map);
   map.fitBounds(polygon.getBounds(), { padding: [12, 12] });
 
-  const scene = overview.latest_scene;
-  if (!scene) {
-    toggle.disabled = true;
-    showHint("No satellite scenes for this field yet.");
+  const layer = overview.latest_layer;
+  if (!layer) {
+    toggle.disabled = true; opacity.disabled = true;
+    showHint("No accepted, georeferenced NDVI imagery is available yet. Satellite monitoring status is shown above.");
     return;
   }
-
-  const available = await sceneProductAvailable(scene.scene_id, "ndvi");
-  if (!available) {
-    toggle.disabled = true;
-    showHint(
-      `No NDVI raster is published for the latest scene (${formatDate(scene.acquired_at)}) yet.`,
-    );
-    return;
-  }
-
-  let ndviLayer = null;
+  const [west, south, east, north] = layer.bbox;
+  // Catalog tiles are true Web Mercator XYZ; legacy scene tiles are pixel-local
+  // and must never be placed on this map as XYZ tiles.
+  const AuthenticatedTiles = leaflet.GridLayer.extend({
+    createTile(coords, done) {
+      const image = document.createElement("img");
+      image.alt = "";
+      catalogTileBlob(layer.product_id, coords).then(blob => {
+        const url = URL.createObjectURL(blob);
+        image.onload = () => { URL.revokeObjectURL(url); done(null, image); };
+        image.onerror = () => { URL.revokeObjectURL(url); done(new Error("Tile could not be decoded"), image); };
+        image.src = url;
+      }).catch(error => { showHint(`Imagery could not load: ${error.message}`); done(error, image); });
+      return image;
+    },
+  });
+  const ndviLayer = new AuthenticatedTiles({
+    tileSize: 256, opacity: Number(opacity.value) / 100, maxZoom: 19,
+    bounds: [[south, west], [north, east]], noWrap: true,
+  });
   toggle.disabled = false;
-  showHint(`NDVI from ${scene.sensor} scene acquired ${formatDate(scene.acquired_at)}.`);
+  toggle.checked = true;
+  opacity.disabled = false;
+  ndviLayer.addTo(map);
+  const valid = layer.quality_summary?.valid_pixels;
+  const invalid = layer.quality_summary?.invalid_pixels;
+  const coverage = Number.isFinite(valid) && Number.isFinite(invalid) && valid + invalid > 0
+    ? ` ${Math.round(100 * valid / (valid + invalid))}% of the processed image pixels passed quality checks.` : "";
+  const resolution = Number.isFinite(layer.gsd_m_per_px)
+    ? ` Pixel size is about ${Math.round(layer.gsd_m_per_px)} m; small fields and narrow features may mix with their surroundings.` : "";
+  showHint(`NDVI acquired ${formatDate(layer.acquired_at)}.${coverage}${resolution} Transparent areas have no usable data. NDVI indicates vegetation condition, not a diagnosis.`);
+  toggle.onchange = () => {
+    if (toggle.checked) ndviLayer.addTo(map); else map.removeLayer(ndviLayer);
+    opacity.disabled = !toggle.checked;
+  };
+  opacity.oninput = () => ndviLayer.setOpacity(Number(opacity.value) / 100);
 
-  toggle.addEventListener("change", () => {
-    if (toggle.checked) {
-      if (!ndviLayer) {
-        ndviLayer = leaflet.tileLayer(
-          sceneProductTileUrlTemplate(scene.scene_id, "ndvi"),
-          { opacity: Number(opacity.value) / 100, maxZoom: 19 },
-        );
-      }
-      ndviLayer.addTo(map);
-      opacity.disabled = false;
-    } else if (ndviLayer) {
-      map.removeLayer(ndviLayer);
-      opacity.disabled = true;
-    }
-  });
-
-  opacity.addEventListener("input", () => {
-    if (ndviLayer) ndviLayer.setOpacity(Number(opacity.value) / 100);
-  });
 }
 
 // --- Time-series chart -----------------------------------------------------------
@@ -471,9 +499,8 @@ function renderChart(state) {
   if (!state.series) return;
   renderTimeseriesChart(state.chartHolder, state.series, state.activities, {
     label: `NDVI trend (${TIMESERIES_METRIC})`,
-    startMs: Date.parse(defaultRangeStart()),
     emptyMessage:
-      "No satellite history yet — subscribe or backfill from the workspace.",
+      "No satellite history yet. Check satellite monitoring status above; clouds and coverage can delay usable imagery.",
   });
 }
 
@@ -499,22 +526,30 @@ function renderFindings(section, overview) {
     );
   }
 
-  const findings = overview.recent_findings || [];
+  const findings = (overview.recent_findings || []).slice(0, 5);
+  const labels = {
+    nominal_zone: "No unusual vegetation signal",
+    healthy_zone: "Vegetation in expected range",
+    declining_zone: "Vegetation signal decreased",
+    improving_zone: "Vegetation signal increased",
+    anomaly_zone: "Unusual vegetation signal — inspect this field",
+  };
   if (findings.length === 0) {
     list.appendChild(elWithText("li", "muted", "No findings for this field."));
     return;
   }
+  list.appendChild(elWithText("li", "muted small-note", "Latest five checks. These are satellite observations, not diagnoses. Processing dates may differ from imagery acquisition dates."));
   for (const finding of findings) {
     const item = document.createElement("li");
     item.className = "finding-row";
-    item.appendChild(elWithText("span", "finding-kind", finding.kind));
+    item.appendChild(elWithText("span", "finding-kind", labels[finding.kind] || finding.kind.replaceAll("_", " ")));
     if (finding.severity) {
       item.appendChild(
-        elWithText("span", `pill ${severityClass(finding.severity)}`, finding.severity),
+        elWithText("span", `pill ${severityClass(finding.severity)}`, `Priority: ${finding.severity}`),
       );
     }
     item.appendChild(
-      elWithText("span", "muted finding-date", formatDate(finding.created_at)),
+      elWithText("span", "muted finding-date", `Processed ${formatDate(finding.created_at)}`),
     );
     list.appendChild(item);
   }
@@ -539,7 +574,7 @@ function renderRecommendations(section, state, overview) {
 
   const recs = overview.open_recommendations || [];
   if (recs.length === 0) {
-    list.appendChild(elWithText("li", "muted", "Nothing to do — all caught up."));
+    list.appendChild(elWithText("li", "muted", "No recommendations have been recorded. Continue normal field scouting."));
     return;
   }
 
@@ -548,7 +583,7 @@ function renderRecommendations(section, state, overview) {
       recommendationRow(rec, state, () => {
         openCount = Math.max(0, openCount - 1);
         if (list.querySelectorAll(".rec-row").length === 0) {
-          list.appendChild(elWithText("li", "muted", "Nothing to do — all caught up."));
+          list.appendChild(elWithText("li", "muted", "No recommendations have been recorded. Continue normal field scouting."));
         }
         updateCountLine();
       }),

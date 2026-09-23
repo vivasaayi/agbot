@@ -31,6 +31,7 @@ pub mod pc_sign;
 pub mod pipeline;
 pub mod pipeline_worker;
 pub mod portal_auth;
+pub mod portal_monitoring;
 pub mod portal_overview;
 pub mod product_catalog;
 pub mod product_tiler;

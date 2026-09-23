@@ -1884,16 +1884,67 @@ async fn field_index_series(
         .collect())
 }
 
-/// Best-effort field area from the backing product's bbox (CRS units are
-/// meters for the projected L2 grids this pipeline derives). `0.0` when the
-/// product or bbox is unavailable — area only grades finding priority.
+/// Whole-field observations use the authoritative field polygon area. For
+/// legacy products without a usable field boundary, only known CRS units are
+/// accepted; square degrees must never be interpreted as square metres.
 async fn product_area_m2(pool: &DbPool, product_id: &str) -> f32 {
-    match catalog::get_product(pool, product_id).await {
-        Ok(Some(product)) => product
-            .bbox
-            .map(|b| (((b[2] - b[0]) * (b[3] - b[1])).abs()) as f32)
-            .unwrap_or(0.0),
-        _ => 0.0,
+    let Ok(Some(product)) = catalog::get_product(pool, product_id).await else {
+        return 0.0;
+    };
+    if let Some(field_id) = product.field_id.as_deref() {
+        let boundary: Option<String> =
+            sqlx::query_scalar("SELECT boundary_json FROM fields WHERE field_id=?")
+                .bind(field_id)
+                .fetch_optional(pool)
+                .await
+                .ok()
+                .flatten();
+        if let Some(validated) = boundary
+            .and_then(|json| serde_json::from_str::<shared::schemas::FieldBoundary>(&json).ok())
+            .filter(|boundary| boundary.crs.as_deref() == Some("EPSG:4326"))
+            .and_then(|boundary| shared::schemas::validate_field_boundary(&boundary).ok())
+        {
+            return (validated.area_ha * 10000.0) as f32;
+        }
+    }
+    bbox_area_m2(product.bbox, product.crs.as_deref())
+}
+
+fn bbox_area_m2(bbox: Option<[f64; 4]>, crs: Option<&str>) -> f32 {
+    let Some([west, south, east, north]) = bbox else {
+        return 0.0;
+    };
+    if [west, south, east, north].iter().any(|n| !n.is_finite()) || west >= east || south >= north {
+        return 0.0;
+    }
+    if crs == Some("EPSG:4326")
+        && west >= -180.0
+        && east <= 180.0
+        && south >= -90.0
+        && north <= 90.0
+    {
+        let points: Vec<_> = [
+            (west, south),
+            (east, south),
+            (east, north),
+            (west, north),
+            (west, south),
+        ]
+        .into_iter()
+        .map(|(longitude, latitude)| shared::schemas::GeoPoint {
+            longitude,
+            latitude,
+        })
+        .collect();
+        return (shared::schemas::polygon_area_hectares(&points) * 10000.0) as f32;
+    }
+    let epsg = crs
+        .and_then(|value| value.strip_prefix("EPSG:"))
+        .and_then(|value| value.parse::<u32>().ok());
+    if epsg.is_some_and(|epsg| (32601..=32660).contains(&epsg) || (32701..=32760).contains(&epsg)) {
+        ((east - west) * (north - south)) as f32
+    } else {
+        0.0
     }
 }
 
@@ -2272,6 +2323,25 @@ fn collect_position_envelope(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn area_fallback_respects_coordinate_units() {
+        assert!(
+            super::bbox_area_m2(Some([-96.5, 41.0, -96.49, 41.01]), Some("EPSG:4326")) > 800_000.0
+        );
+        assert_eq!(
+            super::bbox_area_m2(
+                Some([600000.0, 4700000.0, 600100.0, 4700200.0]),
+                Some("EPSG:32614")
+            ),
+            20_000.0
+        );
+        assert_eq!(super::bbox_area_m2(Some([1.0, 2.0, 3.0, 4.0]), None), 0.0);
+        assert_eq!(
+            super::bbox_area_m2(Some([1.0, 2.0, 3.0, 4.0]), Some("unknown")),
+            0.0
+        );
+    }
+
     use super::*;
     use serde_json::json;
 

@@ -2,6 +2,16 @@
 
 A comprehensive Rust monorepo for autonomous agricultural drone operations, featuring real-time flight control, multi-sensor data collection, AI-powered image analysis, and web-based ground station monitoring.
 
+## Farmer app
+
+The farmer portal runs in a browser on top of the local Geo Hub appliance.
+It does not require a drone or a separately built desktop viewer. Start with
+[installation and first-field setup](docs/ops/install.md).
+
+Farmer day-zero readiness is under active verification; see the
+[release acceptance gate](docs/reviews/farmer-day-zero-readiness.md).
+The development instructions below are for contributors.
+
 ## 🚁 System Architecture
 
 ### Core Services

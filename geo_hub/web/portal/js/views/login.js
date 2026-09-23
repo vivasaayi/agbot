@@ -8,7 +8,7 @@ export function renderLogin(container) {
   section.className = "view login-view";
   section.innerHTML = `
     <h2>Welcome</h2>
-    <p class="muted">Enter the access code from your agronomist to see your
+    <p class="muted">Enter the access code shown during local setup or provided by your administrator to see your
     fields, reports, and alerts.</p>
     <form id="login-form" novalidate>
       <label for="access-code">Access code</label>

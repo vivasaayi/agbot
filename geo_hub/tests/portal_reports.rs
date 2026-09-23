@@ -808,3 +808,88 @@ async fn authenticated_grower_pdf_delivery_and_revocable_advisor_share_are_tenan
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn grower_report_evidence_is_field_scene_and_quality_scoped() -> Result<()> {
+    let app = test_app().await?;
+    seed_account(&app.pool, "scope-account", "org-1").await?;
+    let token = seed_session(&app.pool, "scope-account", "org-1").await?;
+    seed_farm(&app.pool, "farm", "org-1", "Farm").await?;
+    seed_field(&app.pool, "field", "farm", "org-1", "Field").await?;
+    seed_scene(&app.pool, "scene", "field", "2026-07-01T00:00:00Z").await?;
+    for (id, field) in [
+        ("accepted", "field"),
+        ("cloudy", "field"),
+        ("other", "other-field"),
+    ] {
+        seed_catalog_product(&app.pool, id, "scene", field, "ndvi").await?;
+    }
+    sqlx::query("UPDATE catalog_products SET status='failed_qa' WHERE product_id='cloudy'")
+        .execute(&app.pool)
+        .await?;
+    seed_finding(
+        &app.pool,
+        "unrelated-history",
+        "field",
+        "high",
+        "2026-01-01T00:00:00Z",
+    )
+    .await?;
+    sqlx::query("UPDATE application_findings SET evidence_refs_json='[\"old-product\"]' WHERE finding_id='unrelated-history'").execute(&app.pool).await?;
+    seed_recommendation(
+        &app.pool,
+        "old-recommendation",
+        "field",
+        "Old unrelated advice",
+        "high",
+        "open",
+    )
+    .await?;
+    let zone = serde_json::json!({"zone_id":"zone","cell_indices":[],"polygon":{"coordinates":[[0,0],[1,0],[1,1],[0,0]]},"area_m2":1.0,"centroid":[0.5,0.5],"crs":"EPSG:4326","evidence":[]});
+    for (id, metrics) in [
+        (
+            "healthy-observation",
+            serde_json::json!({"reason_code":null,"is_anomaly":false}),
+        ),
+        (
+            "actual-anomaly",
+            serde_json::json!({"reason_code":"below_absolute_threshold","is_anomaly":true}),
+        ),
+    ] {
+        seed_finding(&app.pool, id, "field", "high", "2026-07-01T00:00:00Z").await?;
+        sqlx::query("UPDATE application_findings SET evidence_refs_json='[\"accepted\"]',metrics_json=?,zone_geometry_json=? WHERE finding_id=?")
+            .bind(metrics.to_string()).bind(zone.to_string()).bind(id).execute(&app.pool).await?;
+    }
+    let (status, body) = request(
+        &app,
+        "POST",
+        "/api/portal/fields/field/grower-report",
+        Some(&token),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, bytes) = request_bytes(
+        &app,
+        "GET",
+        &format!(
+            "/api/portal/reports/{}/download",
+            body["report_id"].as_str().unwrap()
+        ),
+        Some(&token),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK);
+    let pdf = String::from_utf8_lossy(&bytes);
+    assert!(pdf.contains("product:accepted"));
+    assert!(pdf.contains("actual-anomaly"));
+    for excluded in [
+        "product:cloudy",
+        "product:other",
+        "unrelated-history",
+        "Old unrelated advice",
+        "healthy-observation",
+    ] {
+        assert!(!pdf.contains(excluded), "included {excluded}");
+    }
+    Ok(())
+}

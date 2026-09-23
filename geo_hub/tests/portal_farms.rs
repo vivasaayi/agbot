@@ -490,3 +490,39 @@ async fn portal_routes_without_token_are_unauthorized() -> Result<()> {
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn catalog_layers_ignore_newer_quarantined_and_other_field_products() -> Result<()> {
+    let app = test_app().await?;
+    seed_account(&app.pool, "layer-account", "org-1").await?;
+    let token = seed_session(&app.pool, "layer-account", "org-1").await?;
+    seed_farm(&app.pool, "farm", "org-1", "Farm").await?;
+    seed_field(&app.pool, "field", "farm", "org-1", "Field").await?;
+    for (id, field, status, time) in [
+        ("accepted", "field", "registered", "2026-07-01T00:00:00Z"),
+        ("cloudy", "field", "failed_qa", "2026-07-20T00:00:00Z"),
+        ("other", "other-field", "registered", "2026-07-22T00:00:00Z"),
+    ] {
+        sqlx::query("INSERT INTO catalog_products (product_id,level,kind,algorithm_id,algorithm_version,parameters_json,parameters_hash,field_id,scene_id,status,temporal_start,path,crs,bbox_min_x,bbox_min_y,bbox_max_x,bbox_max_y,created_at) VALUES (?,'l2','ndvi','test','1','{}',?,?,'shared-scene',?,?, '/tmp/image.tif','EPSG:4326',-96.5,41.0,-96.4,41.1,datetime('now'))")
+            .bind(id).bind(id).bind(field).bind(status).bind(time).execute(&app.pool).await?;
+    }
+    let (status, body) = request(
+        &app,
+        "GET",
+        "/api/portal/fields/field/overview",
+        Some(&token),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["latest_layer"]["product_id"], "accepted");
+    assert_eq!(body["monitoring"]["status"], "worker_disabled");
+    let (status, _) = request(
+        &app,
+        "GET",
+        "/api/portal/fields/other-field/overview",
+        Some(&token),
+    )
+    .await?;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    Ok(())
+}

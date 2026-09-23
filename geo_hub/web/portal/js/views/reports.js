@@ -5,7 +5,7 @@ import {
   fields,
   generateGrowerReport,
   markReportRead,
-  reportDownloadUrl,
+  downloadReport,
   reports,
 } from "../api.js";
 
@@ -17,7 +17,7 @@ function formatDate(iso) {
 function reportRow(report, onOpen) {
   const row = document.createElement("a");
   row.className = report.read ? "report-row" : "report-row unread";
-  row.href = reportDownloadUrl(report.report_id);
+  row.href = "#";
   row.target = "_blank";
   row.rel = "noopener";
   row.innerHTML = `
@@ -33,11 +33,22 @@ function reportRow(report, onOpen) {
   row.querySelector(".report-title").textContent = report.title;
   row.querySelector(".report-field").textContent = report.field_name;
 
-  row.addEventListener("click", () => {
-    // Opening a report marks it read; the download continues in a new tab.
-    if (!report.read) {
-      onOpen(report.report_id);
-    }
+  row.addEventListener("click", async (event) => {
+    event.preventDefault();
+    if (row.getAttribute("aria-busy") === "true") return;
+    row.setAttribute("aria-busy", "true");
+    try {
+      const blob = await downloadReport(report.report_id);
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url; link.download = `${report.report_id}.${report.format}`;
+      link.click(); setTimeout(() => URL.revokeObjectURL(url), 1000);
+      if (!report.read) onOpen(report.report_id);
+    } catch (error) {
+      let message = row.querySelector(".download-error");
+      if (!message) { message = document.createElement("span"); message.className = "download-error error-text"; row.appendChild(message); }
+      message.textContent = error.message;
+    } finally { row.removeAttribute("aria-busy"); }
   });
   return row;
 }

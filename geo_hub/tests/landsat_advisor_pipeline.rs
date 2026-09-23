@@ -199,6 +199,18 @@ async fn enqueue_derive(ctx: &PipelineWorkerContext) -> Result<()> {
 #[tokio::test]
 async fn qa_accepted_landsat_ndvi_runs_advisor_apps_with_finding_lineage() -> Result<()> {
     let (_tmp, ctx) = worker_ctx(0.25).await?;
+    let aoi = aoi_geojson();
+    let coordinates: Vec<_> = aoi["coordinates"][0]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| json!({"longitude":p[0],"latitude":p[1]}))
+        .collect();
+    let boundary_json = json!({"crs":"EPSG:4326","coordinates":coordinates});
+    let boundary: shared::schemas::FieldBoundary = serde_json::from_value(boundary_json.clone())?;
+    let expected_area = shared::schemas::validate_field_boundary(&boundary)?.area_ha * 10000.0;
+    sqlx::query("INSERT INTO fields (field_id,owner,name,boundary_json,created_at) VALUES (?,'org','Field',?,datetime('now'))")
+        .bind(FIELD_ID).bind(boundary_json.to_string()).execute(&ctx.pool).await?;
     enqueue_derive(&ctx).await?;
 
     let derive = run_one_tick(&ctx).await?;
@@ -257,6 +269,18 @@ async fn qa_accepted_landsat_ndvi_runs_advisor_apps_with_finding_lineage() -> Re
         .iter()
         .any(|finding| finding.app_id == "anomaly_detection"));
     for finding in &findings {
+        let area = finding
+            .finding
+            .metrics
+            .as_ref()
+            .and_then(|m| m["area_m2"].as_f64())
+            .expect("finding area");
+        assert!(area > 10000.0, "area must be square metres, got {area}");
+        assert!(
+            (area - expected_area).abs() < 1.0,
+            "field area mismatch: {area} vs {expected_area}"
+        );
+
         assert!(finding.finding.evidence_refs.contains(&ndvi.product_id));
         let lineage =
             geo_hub::provenance_store::trace_backward(&ctx.pool, &finding.finding_id).await?;
@@ -299,5 +323,133 @@ async fn qa_quarantined_landsat_ndvi_does_not_enqueue_advisor_apps() -> Result<(
             .await?
             .is_empty()
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn acceptance_landsat_is_visible_in_authenticated_farmer_portal() -> Result<()> {
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+    let (_tmp, ctx) = worker_ctx(0.25).await?;
+    let token = "farmer-display-test";
+    sqlx::query("INSERT INTO marketplace_accounts (account_id,org_id,party_type,role_refs_json,status,created_at,updated_at) VALUES ('farmer','org','farmer','[]','active',datetime('now'),datetime('now'))").execute(&ctx.pool).await?;
+    sqlx::query("INSERT INTO portal_sessions (session_id,token_hash,account_id,org_id,created_at,expires_at,last_seen_at) VALUES ('session',?,'farmer','org',datetime('now'),?,datetime('now'))")
+        .bind(geo_hub::portal_auth::hash_token(token)).bind((Utc::now()+Duration::days(1)).to_rfc3339()).execute(&ctx.pool).await?;
+    let aoi = aoi_geojson();
+    let coordinates: Vec<_> = aoi["coordinates"][0]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| json!({"longitude":p[0],"latitude":p[1]}))
+        .collect();
+    sqlx::query("INSERT INTO fields (field_id,owner,name,crop,season,boundary_json,status,created_at) VALUES (?,'org','My field','corn','2023',?,'active',datetime('now'))")
+        .bind(FIELD_ID).bind(json!({"crs":"EPSG:4326","coordinates":coordinates}).to_string()).execute(&ctx.pool).await?;
+    enqueue_derive(&ctx).await?;
+    assert_eq!(
+        run_one_tick(&ctx).await?.result,
+        Some(JobRunResult::Succeeded)
+    );
+    let mut config = (*ctx.config).clone();
+    config.security.require_session = true;
+    let app = geo_hub::server::build_router(geo_hub::state::AppState {
+        pool: ctx.pool.clone(),
+        config: Arc::new(config),
+        scene_search_cache: Default::default(),
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/portal/fields/{FIELD_ID}/overview"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let overview: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), 1024 * 1024).await?)?;
+    assert_eq!(overview["latest_scene"]["scene_id"], fixture_item().id);
+    let product_id = overview["latest_layer"]["product_id"]
+        .as_str()
+        .expect("accepted catalog layer");
+    assert_eq!(overview["latest_layer"]["kind"], "ndvi");
+    assert!(overview["latest_layer"]["bbox"].is_array());
+    assert!(overview["monitoring"]["status"].is_string());
+    let (lat, lon) = utm_to_wgs84(
+        600_480.0,
+        4_700_480.0,
+        UtmZone {
+            zone: 14,
+            north: true,
+        },
+    );
+    let (x, y) = geo_hub::product_tiler::tile_containing(lat, lon, 15);
+    let tile = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/catalog/products/{product_id}/tiles/15/{x}/{y}.png"
+                ))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(tile.status(), StatusCode::OK);
+    let bytes = to_bytes(tile.into_body(), 1024 * 1024).await?;
+    assert!(image::load_from_memory(&bytes)?
+        .to_rgba8()
+        .pixels()
+        .any(|p| p[3] > 0));
+    let history = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/fields/{FIELD_ID}/timeseries?metric=sat.ndvi.mean"
+                ))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(history.status(), StatusCode::OK);
+    let series: serde_json::Value =
+        serde_json::from_slice(&to_bytes(history.into_body(), 1024 * 1024).await?)?;
+    assert_eq!(
+        series["per_source"]["landsat"].as_array().map(Vec::len),
+        Some(1)
+    );
+    let generated = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/portal/fields/{FIELD_ID}/grower-report"))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    let status = generated.status();
+    let body = to_bytes(generated.into_body(), 1024 * 1024).await?;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    let report: serde_json::Value = serde_json::from_slice(&body)?;
+    let downloaded = app
+        .oneshot(
+            Request::builder()
+                .uri(format!(
+                    "/api/portal/reports/{}/download",
+                    report["report_id"].as_str().unwrap()
+                ))
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(downloaded.status(), StatusCode::OK);
+    assert!(to_bytes(downloaded.into_body(), 8 * 1024 * 1024)
+        .await?
+        .starts_with(b"%PDF"));
     Ok(())
 }

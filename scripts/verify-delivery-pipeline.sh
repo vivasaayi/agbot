@@ -73,6 +73,16 @@ require_pattern "$compose_file" 'AGBOT_REQUIRE_SESSION:-true' \
     "production compose does not require sessions by default"
 require_pattern "$compose_file" 'AGBOT_RATE_LIMIT_PER_MIN:-120' \
     "production compose does not enable a safe default rate limit"
+require_pattern "$compose_file" 'AGBOT_BIND_ADDRESS:-127.0.0.1' \
+    "farmer appliance is not restricted to this computer by default"
+require_pattern "$compose_file" 'AGBOT_PIPELINE_ENABLED:-true' \
+    "farmer appliance does not enable monitoring by default"
+require_pattern "$compose_file" 'AGBOT_QA_MIN_CONFIDENCE:-0.25' \
+    "farmer appliance does not preserve the default product quality gate"
+require_pattern "$compose_file" 'AGBOT_BOOTSTRAP_ACCESS_CODE:\?' \
+    "farmer appliance permits a shared default login code"
+require_pattern "$compose_file" 'AGBOT_SEED_DEMO:-false' \
+    "farmer appliance seeds an unrelated field by default"
 require_pattern "$cli" 'pin_pulled_image\(\)' \
     "operator CLI does not resolve channel tags to a digest"
 require_pattern "$cli" 'rolling back to' \
@@ -83,4 +93,7 @@ require_pattern "$cli" 'wait_for_health\(\)' \
 if (( failures > 0 )); then
     exit 1
 fi
+sh "$repo_root/scripts/test-agbot-cli.sh"
+sh "$repo_root/scripts/test-installer.sh"
+sh "$repo_root/scripts/test-farmer-bundle.sh"
 echo "delivery-pipeline-check: release gates, provenance, and rollback contract validated"

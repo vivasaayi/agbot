@@ -17199,12 +17199,24 @@ async fn shared_report_link_allows_public_access_until_revoked() -> Result<()> {
         .expect("router should handle request");
     assert_eq!(denied_response.status(), StatusCode::FORBIDDEN);
 
-    let event_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM report_share_events WHERE share_token = ?1")
-            .bind(&share_token)
-            .fetch_one(&ctx.pool)
-            .await?;
-    assert_eq!(event_count, 3);
+    let events: Vec<(String, Option<String>)> = sqlx::query_as(
+        "SELECT event_type, details FROM report_share_events WHERE share_token = ?1 ORDER BY id",
+    )
+    .bind(&share_token)
+    .fetch_all(&ctx.pool)
+    .await?;
+    assert_eq!(
+        events,
+        vec![
+            ("share_created".to_string(), None),
+            ("share_accessed".to_string(), None),
+            ("share_revoked".to_string(), None),
+            (
+                "share_access_denied".to_string(),
+                Some("revoked".to_string())
+            ),
+        ]
+    );
 
     Ok(())
 }

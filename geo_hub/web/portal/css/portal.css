@@ -326,3 +326,31 @@ select:focus {
     padding-top: 1.5rem;
   }
 }
+
+/* Field detail: give the map a real viewport and keep native controls compact. */
+.field-map { height: 320px; min-height: 240px; width: 100%; border: 1px solid var(--border); border-radius: 8px; }
+.field-map--empty { display: grid; place-items: center; padding: 1rem; }
+.detail-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 1rem; margin: 1rem 0; }
+.map-controls, .toggle-row, .chips { display: flex; align-items: center; gap: .65rem; flex-wrap: wrap; }
+.map-controls { margin-top: .75rem; justify-content: space-between; }
+.toggle-row input[type="checkbox"] { width: 22px; height: 22px; margin: 0; }
+.toggle-row input[type="range"] { width: 130px; padding: 0; }
+.chip { display: inline-block; padding: .2rem .65rem; border-radius: 1rem; background: var(--green-soft); }
+.small-note { font-size: .875rem; }
+.download-error { display: block; margin-top: .5rem; }
+.finding-row { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem .75rem; padding: .65rem 0; border-bottom: 1px solid var(--border); }
+.finding-kind { flex: 1 1 220px; }
+.finding-date { font-size: .85rem; }
+.ts-chart { display: block; width: 100%; height: auto; overflow: visible; }
+.ts-axis line { stroke: var(--muted); stroke-width: 1; }
+.ts-axis .ts-grid { stroke: var(--border); stroke-dasharray: 3 3; }
+.ts-tick-label { fill: var(--muted); font-size: 11px; }
+.ts-tick-y { text-anchor: end; }
+.ts-merged-line { fill: none; stroke: var(--green-dark); stroke-width: 2; }
+.ts-source { fill: currentColor; }
+.src-a { color: #1976d2; }.src-b { color: #e65100; }.src-c { color: #7b1fa2; }.src-d { color: #00838f; }.src-e { color: #6d4c41; }
+.ts-legend { display: flex; flex-wrap: wrap; gap: .5rem 1rem; font-size: .85rem; }
+.ts-legend-item::before { content: "●"; margin-right: .35rem; }
+.ts-legend-merged { color: var(--green-dark); }
+.ts-activity line { stroke: var(--muted); }
+.ts-activity-glyph { text-anchor: middle; font-size: 11px; fill: var(--muted); }

@@ -35,8 +35,9 @@ export const endpoints = {
   // Open (non-portal) read routes, called with the same fetch wrapper: the
   // Bearer token is harmless there. Field record carries the boundary
   // polygon the overview response omits.
-  fieldRecord: "/api/fields/:field_id",
+  fieldRecord: "/api/portal/fields/:field_id",
   fieldTimeseries: "/api/fields/:field_id/timeseries",
+  catalogTile: "/api/catalog/products/:product_id/tiles/:z/:x/:y.png",
   sceneProduct: "/api/scenes/:scene_id/products/:kind",
   sceneProductTile: "/api/scenes/:scene_id/products/:kind/tiles/:z/:x/:y.png",
 };
@@ -138,6 +139,10 @@ export function me() {
 
 export function farms() {
   return request("GET", endpoints.farms, {});
+}
+
+export function createField(draft) {
+  return request("POST", endpoints.fields, { body: draft });
 }
 
 export function fields() {
@@ -279,9 +284,29 @@ export function sceneProductTileUrlTemplate(sceneId, kind) {
 export async function sceneProductAvailable(sceneId, kind) {
   const path = buildPath(endpoints.sceneProduct, { scene_id: sceneId, kind });
   try {
-    const response = await fetch(BASE_URL + path, { method: "HEAD" });
+    const response = await fetch(BASE_URL + path, { method: "HEAD", headers: { Authorization: `Bearer ${getToken() || ""}` } });
     return response.ok;
   } catch {
     return false;
   }
+}
+
+/** Binary requests share session-expiry handling with JSON requests. */
+async function requestBlob(path) {
+  const token = getToken();
+  const response = await fetch(BASE_URL + path, {headers: token ? {Authorization: `Bearer ${token}`} : {}});
+  if (response.status === 401) {
+    clearSession(); navigateToLogin();
+    throw new Error("Your session expired. Please sign in again.");
+  }
+  if (!response.ok) throw new Error(`Download failed (${response.status}). Please retry.`);
+  return response.blob();
+}
+
+export function catalogTileBlob(productId, coordinates) {
+  return requestBlob(buildPath(endpoints.catalogTile, {product_id: productId, ...coordinates}));
+}
+
+export function downloadReport(reportId) {
+  return requestBlob(buildPath(endpoints.reportDownload, {report_id: reportId}));
 }

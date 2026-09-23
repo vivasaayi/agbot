@@ -148,6 +148,7 @@ export function renderTimeseriesChart(container, series, activities = [], option
       x: tx,
       y: bottom + 16,
       class: "ts-tick-label ts-tick-x",
+      "text-anchor": fraction === 1 ? "end" : fraction === 0 ? "start" : "middle",
     });
     label.textContent = formatTick(ms, spanMs);
     axis.appendChild(label);

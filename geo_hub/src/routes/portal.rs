@@ -718,8 +718,11 @@ async fn field_recommendations(
 
 async fn field_latest_scene(state: &AppState, field_id: &str) -> AppResult<Option<SceneInput>> {
     let row = sqlx::query(
-        "SELECT scene_id, sensor, acquired_at FROM scenes \
-         WHERE field_id = ?1 ORDER BY acquired_at DESC, scene_id ASC LIMIT 1",
+        "SELECT DISTINCT s.scene_id, s.sensor, s.acquired_at FROM scenes s
+         WHERE s.field_id = ?1 OR EXISTS (
+           SELECT 1 FROM catalog_products p WHERE p.scene_id=s.scene_id
+           AND p.field_id=?1 AND p.status='registered' AND p.level='l2')
+         ORDER BY s.acquired_at DESC, s.scene_id ASC LIMIT 1",
     )
     .bind(field_id)
     .fetch_optional(&state.pool)
@@ -730,6 +733,93 @@ async fn field_latest_scene(state: &AppState, field_id: &str) -> AppResult<Optio
         sensor: row.get("sensor"),
         acquired_at: row.get("acquired_at"),
     }))
+}
+
+async fn field_latest_layer(
+    state: &AppState,
+    field_id: &str,
+) -> AppResult<Option<crate::portal_overview::PortalLayer>> {
+    let mut products = crate::catalog::list_products(
+        &state.pool,
+        &crate::catalog::ProductFilter {
+            field_id: Some(field_id.to_string()),
+            kind: Some("ndvi".into()),
+            level: Some(shared::product_graph::ProductLevel::L2),
+            status: Some("registered".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .map_err(|err| AppError::Anyhow(err.into()))?;
+    products.sort_by(|a, b| {
+        b.temporal_start
+            .cmp(&a.temporal_start)
+            .then_with(|| a.product_id.cmp(&b.product_id))
+    });
+    Ok(products.into_iter().find_map(|p| {
+        let bbox = p.bbox?;
+        if p.crs.as_deref() != Some("EPSG:4326")
+            || bbox.iter().any(|n| !n.is_finite())
+            || bbox[0] >= bbox[2]
+            || bbox[1] >= bbox[3]
+        {
+            return None;
+        }
+        let path = p.path.as_deref()?.to_ascii_lowercase();
+        if !path.ends_with(".tif") && !path.ends_with(".tiff") {
+            return None;
+        }
+        Some(crate::portal_overview::PortalLayer {
+            product_id: p.product_id,
+            kind: p.kind,
+            scene_id: p.scene_id,
+            acquired_at: p.temporal_start?,
+            bbox,
+            confidence: p.confidence,
+            gsd_m_per_px: p.gsd_m_per_px,
+            quality_summary: p.quality_summary,
+        })
+    }))
+}
+
+async fn field_monitoring(
+    state: &AppState,
+    field_id: &str,
+    has_imagery: bool,
+) -> AppResult<crate::portal_monitoring::MonitoringStatus> {
+    let row = sqlx::query(
+        "SELECT COALESCE(SUM(status='running'),0) AS running,
+      COALESCE(SUM(status='queued'),0) AS queued,
+      COALESCE(SUM(status='queued' AND attempts>0),0) AS retrying,
+      COALESCE(SUM(status IN ('failed','dead')),0) AS failed,
+      COALESCE(SUM(status='succeeded' AND kind='discover'),0) AS completed,
+      MIN(CASE WHEN status='queued' THEN run_after END) AS next_attempt_at
+      FROM pipeline_jobs WHERE field_id=?",
+    )
+    .bind(field_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    let active_subscriptions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM satellite_subscriptions WHERE field_id=? AND status='active'",
+    )
+    .bind(field_id)
+    .fetch_one(&state.pool)
+    .await
+    .map_err(Error::from)?;
+    Ok(crate::portal_monitoring::monitoring_status(
+        state.config.pipeline.enabled,
+        has_imagery,
+        crate::portal_monitoring::QueueEvidence {
+            running: row.get("running"),
+            queued: row.get("queued"),
+            retrying: row.get("retrying"),
+            failed: row.get("failed"),
+            completed: row.get("completed"),
+            active_subscriptions,
+            next_attempt_at: row.get("next_attempt_at"),
+        },
+    ))
 }
 
 async fn field_alert_fired_ats(state: &AppState, field_id: &str) -> AppResult<Vec<String>> {
@@ -794,14 +884,19 @@ pub async fn portal_field_overview(
     let latest_scene = field_latest_scene(&state, &field.field_id).await?;
     let alert_fired_ats = field_alert_fired_ats(&state, &field.field_id).await?;
 
-    Ok(Json(build_field_overview(
+    let latest_layer = field_latest_layer(&state, &field.field_id).await?;
+    let monitoring = field_monitoring(&state, &field.field_id, latest_layer.is_some()).await?;
+    let mut overview = build_field_overview(
         field,
         latest_scene,
         findings,
         recommendations,
         &alert_fired_ats,
         Utc::now(),
-    )))
+    );
+    overview.latest_layer = latest_layer;
+    overview.monitoring = Some(monitoring);
+    Ok(Json(overview))
 }
 
 // ---------------------------------------------------------------------------
@@ -996,23 +1091,36 @@ pub async fn portal_download_report(
 /// Derived layer kinds for a scene, as `layer:<kind>` refs. Prefers the
 /// satellite product catalog (`catalog_products`) and falls back to the
 /// legacy `products` table for scenes processed before the catalog existed.
-async fn scene_layer_refs(state: &AppState, scene_id: &str) -> AppResult<Vec<String>> {
-    let mut kinds: Vec<(String,)> = sqlx::query_as(
-        "SELECT DISTINCT kind FROM catalog_products WHERE scene_id = ?1 ORDER BY kind ASC",
+async fn scene_layer_refs(
+    state: &AppState,
+    field_id: &str,
+    scene_id: &str,
+) -> AppResult<Vec<String>> {
+    let products: Vec<(String,)> = sqlx::query_as(
+        "SELECT product_id FROM catalog_products WHERE scene_id=?1 AND field_id=?2
+         AND status='registered' AND level IN ('l2','l3') ORDER BY product_id",
     )
     .bind(scene_id)
+    .bind(field_id)
     .fetch_all(&state.pool)
     .await
     .map_err(Error::from)?;
-    if kinds.is_empty() {
-        kinds = sqlx::query_as(
-            "SELECT DISTINCT kind FROM products WHERE scene_id = ?1 ORDER BY kind ASC",
-        )
-        .bind(scene_id)
-        .fetch_all(&state.pool)
-        .await
-        .map_err(Error::from)?;
+    if !products.is_empty() {
+        return Ok(products
+            .into_iter()
+            .map(|(id,)| format!("product:{id}"))
+            .collect());
     }
+    // Legacy products are valid only when their parent scene belongs to this field.
+    let kinds: Vec<(String,)> = sqlx::query_as(
+        "SELECT DISTINCT p.kind FROM products p JOIN scenes s ON s.scene_id=p.scene_id
+         WHERE p.scene_id=?1 AND s.field_id=?2 ORDER BY p.kind",
+    )
+    .bind(scene_id)
+    .bind(field_id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(Error::from)?;
     Ok(kinds
         .into_iter()
         .map(|(kind,)| format!("layer:{kind}"))
@@ -1032,26 +1140,27 @@ fn grower_priority_from_severity(severity: Option<&str>) -> RecommendationPriori
     }
 }
 
-/// Recover the anomaly reason code from a finding's metrics when the
-/// producing application recorded one; otherwise bucket it as a statistical
-/// anomaly, the generic satellite-finding reason.
-fn grower_reason_code(metrics: &serde_json::Value) -> ProductAnomalyReasonCode {
-    match metrics.get("reason").and_then(|value| value.as_str()) {
-        Some("below_absolute_threshold") => ProductAnomalyReasonCode::BelowAbsoluteThreshold,
-        Some("above_absolute_threshold") => ProductAnomalyReasonCode::AboveAbsoluteThreshold,
-        Some("above_statistical_band") => ProductAnomalyReasonCode::AboveStatisticalBand,
-        _ => ProductAnomalyReasonCode::BelowStatisticalBand,
+/// An anomaly export must have an explicit supported reason; nominal findings
+/// and unknown application metrics never become diagnoses by default.
+fn grower_reason_code(metrics: &serde_json::Value) -> Option<ProductAnomalyReasonCode> {
+    if metrics.get("is_anomaly").and_then(|value| value.as_bool()) == Some(false) {
+        return None;
     }
+    let reason = metrics
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .or_else(|| metrics.get("reason_code").and_then(|value| value.as_str()))?;
+    serde_json::from_value(serde_json::Value::String(reason.to_string())).ok()
 }
 
 /// Map one `application_findings` row into the grower-report export shape.
-/// Application findings often carry no zone geometry; when
-/// `zone_geometry_json` does not decode as an [`AnomalyZone`], a minimal
-/// placeholder zone (empty polygon, zero area, unspecified CRS) keeps the
-/// finding visible in the PDF instead of dropping it.
-fn grower_finding_from_row(row: &sqlx::sqlite::SqliteRow) -> FindingExportRecord {
+/// Missing zone geometry is explicitly represented by the validated whole-field
+/// boundary. Findings without either geometry are omitted, never placed at zero.
+fn grower_finding_from_row(
+    row: &sqlx::sqlite::SqliteRow,
+    whole_field: &Option<AnomalyZone>,
+) -> Option<FindingExportRecord> {
     let finding_id: String = row.get("finding_id");
-    let kind: String = row.get("kind");
     let severity: Option<String> = row.get("severity");
     let metrics: serde_json::Value = row
         .get::<Option<String>, _>("metrics_json")
@@ -1063,24 +1172,8 @@ fn grower_finding_from_row(row: &sqlx::sqlite::SqliteRow) -> FindingExportRecord
         .get::<Option<String>, _>("zone_geometry_json")
         .as_deref()
         .and_then(|raw| serde_json::from_str::<AnomalyZone>(raw).ok())
-        .unwrap_or_else(|| AnomalyZone {
-            zone_id: metrics
-                .get("zone_id")
-                .and_then(|value| value.as_str())
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("zone-{kind}")),
-            cell_indices: Vec::new(),
-            polygon: AnomalyZonePolygon {
-                coordinates: Vec::new(),
-            },
-            area_m2: metrics
-                .get("area_m2")
-                .and_then(|value| value.as_f64())
-                .unwrap_or(0.0) as f32,
-            centroid: (0.0, 0.0),
-            crs: "unspecified".to_string(),
-            evidence: Vec::new(),
-        });
+        .filter(|zone| !zone.polygon.coordinates.is_empty())
+        .or_else(|| whole_field.clone())?;
 
     let evidence_refs = row
         .get::<Option<String>, _>("evidence_refs_json")
@@ -1089,16 +1182,49 @@ fn grower_finding_from_row(row: &sqlx::sqlite::SqliteRow) -> FindingExportRecord
         .filter(|refs| !refs.is_empty())
         .unwrap_or_else(|| vec![format!("finding:{finding_id}")]);
 
-    FindingExportRecord {
+    Some(FindingExportRecord {
         finding_id,
         zone,
-        reason: grower_reason_code(&metrics),
+        reason: grower_reason_code(&metrics)?,
         priority: grower_priority_from_severity(severity.as_deref()),
         evidence_refs,
-    }
+    })
 }
 
-async fn grower_findings(state: &AppState, field_id: &str) -> AppResult<Vec<FindingExportRecord>> {
+async fn grower_findings(
+    state: &AppState,
+    field_id: &str,
+    layer_refs: &[String],
+) -> AppResult<Vec<FindingExportRecord>> {
+    let boundary: String = sqlx::query_scalar("SELECT boundary_json FROM fields WHERE field_id=?")
+        .bind(field_id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(Error::from)?;
+    let whole_field = serde_json::from_str::<FieldBoundary>(&boundary)
+        .ok()
+        .and_then(|boundary| shared::schemas::validate_field_boundary(&boundary).ok())
+        .map(|validated| {
+            let coordinates: Vec<_> = validated
+                .boundary
+                .coordinates
+                .iter()
+                .map(|p| (p.longitude, p.latitude))
+                .collect();
+            let count = coordinates.len() as f64;
+            AnomalyZone {
+                zone_id: format!("whole-field:{field_id}"),
+                cell_indices: vec![],
+                centroid: (
+                    coordinates.iter().map(|p| p.0).sum::<f64>() / count,
+                    coordinates.iter().map(|p| p.1).sum::<f64>() / count,
+                ),
+                polygon: AnomalyZonePolygon { coordinates },
+                area_m2: (validated.area_ha * 10000.0) as f32,
+                crs: "EPSG:4326".into(),
+                evidence: vec![],
+            }
+        });
     let rows = sqlx::query(
         "SELECT finding_id, kind, severity, zone_geometry_json, metrics_json, evidence_refs_json \
          FROM application_findings WHERE field_id = ?1 \
@@ -1108,20 +1234,36 @@ async fn grower_findings(state: &AppState, field_id: &str) -> AppResult<Vec<Find
     .fetch_all(&state.pool)
     .await
     .map_err(Error::from)?;
-    Ok(rows.iter().map(grower_finding_from_row).collect())
+    Ok(rows
+        .iter()
+        .filter(|row| {
+            let refs: Vec<String> = row
+                .get::<Option<String>, _>("evidence_refs_json")
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_default();
+            refs.iter().any(|evidence| {
+                layer_refs
+                    .iter()
+                    .any(|layer| layer.strip_prefix("product:") == Some(evidence.as_str()))
+            })
+        })
+        .filter_map(|row| grower_finding_from_row(row, &whole_field))
+        .collect())
 }
 
 async fn grower_open_recommendations(
     state: &AppState,
     field_id: &str,
+    scene_id: &str,
 ) -> AppResult<Vec<RecommendationRecord>> {
     let rows = sqlx::query(
         "SELECT recommendation_id, scene_id, field_id, title, note, category, priority, status, \
                 evidence_refs_json, created_at, updated_at \
-         FROM recommendations WHERE field_id = ?1 AND status = 'open' \
+         FROM recommendations WHERE field_id = ?1 AND scene_id = ?2 AND status = 'open' \
          ORDER BY created_at ASC, recommendation_id ASC",
     )
     .bind(field_id)
+    .bind(scene_id)
     .fetch_all(&state.pool)
     .await
     .map_err(Error::from)?;
@@ -1164,7 +1306,7 @@ pub async fn portal_generate_grower_report(
             ))
         })?;
 
-    let layer_refs = scene_layer_refs(&state, &scene.scene_id).await?;
+    let layer_refs = scene_layer_refs(&state, &field.field_id, &scene.scene_id).await?;
     if layer_refs.is_empty() {
         return Err(AppError::BadRequest(format!(
             "scene {} has no derived layers; run the pipeline before generating a grower report",
@@ -1172,8 +1314,9 @@ pub async fn portal_generate_grower_report(
         )));
     }
 
-    let findings = grower_findings(&state, &field.field_id).await?;
-    let recommendations = grower_open_recommendations(&state, &field.field_id).await?;
+    let findings = grower_findings(&state, &field.field_id, &layer_refs).await?;
+    let recommendations =
+        grower_open_recommendations(&state, &field.field_id, &scene.scene_id).await?;
 
     let (boundary_json,): (String,) =
         sqlx::query_as("SELECT boundary_json FROM fields WHERE field_id = ?1")

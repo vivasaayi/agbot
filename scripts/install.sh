@@ -6,8 +6,8 @@
 # It clones (or updates) the AGBot repo into $AGBOT_HOME (default ~/.agbot/repo)
 # and links the `agbot` command onto your PATH. Afterwards:
 #
-#   Linux server:  agbot up            # pull + run the geo_hub appliance
-#   Mac desktop:   agbot viewer        # build + run geo_viewer against a server
+#   Linux or Mac: agbot up            # start the farmer app with Docker
+#                 open http://127.0.0.1:8080/portal
 #
 # Environment overrides:
 #   AGBOT_HOME   install root            (default: ~/.agbot)
@@ -29,21 +29,22 @@ command -v git >/dev/null 2>&1 || die "git is required to install agbot"
 os=$(uname -s 2>/dev/null || echo unknown)
 case "$os" in
     Linux)  log "detected Linux — server role available (agbot up)" ;;
-    Darwin) log "detected macOS — desktop role available (agbot viewer / agbot sim)" ;;
+    Darwin) log "detected macOS — farmer app available with Docker Desktop (agbot up)" ;;
     *)      log "unrecognised OS '$os' — proceeding anyway" ;;
 esac
 
 # --- fetch / update the repo ----------------------------------------------
 mkdir -p "$AGBOT_HOME"
 if [ -d "$REPO_DIR/.git" ]; then
+    [ -z "$(git -C "$REPO_DIR" status --porcelain)" ] \
+        || die "local changes exist in $REPO_DIR; installation stopped to preserve them. Commit or move your changes before retrying."
     log "updating existing checkout in $REPO_DIR"
-    git -C "$REPO_DIR" fetch --quiet --depth 1 origin "$AGBOT_REF"
-    git -C "$REPO_DIR" checkout --quiet "$AGBOT_REF"
-    git -C "$REPO_DIR" reset --hard --quiet "origin/$AGBOT_REF" 2>/dev/null || true
+    git -C "$REPO_DIR" fetch --quiet origin "$AGBOT_REF"
+    git -C "$REPO_DIR" merge --ff-only --quiet FETCH_HEAD \
+        || die "cannot fast-forward $REPO_DIR to $AGBOT_REF; local history was preserved. Resolve the checkout manually before retrying."
 else
     log "cloning $AGBOT_REPO ($AGBOT_REF) into $REPO_DIR"
-    git clone --quiet --depth 1 --branch "$AGBOT_REF" "$AGBOT_REPO" "$REPO_DIR" \
-        || git clone --quiet --depth 1 "$AGBOT_REPO" "$REPO_DIR"
+    git clone --quiet --depth 1 --branch "$AGBOT_REF" "$AGBOT_REPO" "$REPO_DIR"
 fi
 
 AGBOT_BIN="$REPO_DIR/scripts/agbot"
@@ -73,10 +74,6 @@ case ":$PATH:" in
 esac
 
 log "done. Next:"
-if [ "$os" = "Darwin" ]; then
-    log "  agbot config set geo_hub_url http://<server>:8080   # point at your server"
-    log "  agbot viewer                                        # build + run the desktop viewer"
-else
-    log "  agbot up                                            # pull + run the geo_hub appliance"
-    log "  open http://localhost:8080/portal                   # farmer portal (PWA)"
-fi
+log "  Start Docker (Docker Desktop on Mac, Docker Engine on Linux)."
+log "  agbot up                          # start the farmer app and show your first-login code"
+log "  Open http://127.0.0.1:8080/portal  # sign in, then add your farm and fields"

@@ -4,6 +4,7 @@
 import { OFFLINE_EVENT, logout, notificationsSummary } from "./api.js";
 import { clearSession, isLoggedIn } from "./auth.js";
 import { renderLogin } from "./views/login.js";
+import { renderAddField } from "./views/add-field.js";
 import { renderHome } from "./views/home.js";
 import { renderReports } from "./views/reports.js";
 import { renderField } from "./views/field.js";
@@ -50,6 +51,9 @@ async function mountRoute() {
       break;
     case "field":
       renderField(view, route.param);
+      break;
+    case "add-field":
+      renderAddField(view);
       break;
     case "home":
     default:

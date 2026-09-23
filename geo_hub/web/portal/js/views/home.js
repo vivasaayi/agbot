@@ -67,6 +67,7 @@ export async function renderHome(container) {
   section.className = "view home-view";
   section.innerHTML = `
     <h2>Your fields</h2>
+    <a href="#/add-field" class="primary-button">Add field</a>
     <p id="home-summary" class="muted" hidden></p>
     <div id="field-list" class="card-list">
       <p class="muted">Loading fields…</p>
@@ -102,7 +103,7 @@ export async function renderHome(container) {
     list.innerHTML = "";
     if (cards.length === 0) {
       list.innerHTML =
-        '<p class="muted">No fields yet. Your agronomist will add them.</p>';
+        '<p class="muted">Add your first field to start monitoring. You can draw its boundary on a map or import a GeoJSON file.</p>';
       return;
     }
     for (const card of cards) {

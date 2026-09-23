@@ -83,9 +83,24 @@ pub struct FieldCard {
     pub recent_alerts_7d: usize,
 }
 
+/// Exact accepted catalog raster, with WGS84 bounds for a Web Mercator tile layer.
+#[derive(Debug, Clone, Serialize)]
+pub struct PortalLayer {
+    pub product_id: String,
+    pub kind: String,
+    pub scene_id: Option<String>,
+    pub acquired_at: String,
+    pub bbox: [f64; 4],
+    pub confidence: Option<f64>,
+    pub gsd_m_per_px: Option<f64>,
+    pub quality_summary: Option<serde_json::Value>,
+}
+
 /// Detail view for one field.
 #[derive(Debug, Clone, Serialize)]
 pub struct FieldOverview {
+    pub latest_layer: Option<PortalLayer>,
+    pub monitoring: Option<crate::portal_monitoring::MonitoringStatus>,
     pub field: FieldInput,
     pub latest_scene: Option<SceneInput>,
     /// Count of every finding for the field, keyed by severity bucket.
@@ -219,6 +234,8 @@ pub fn build_field_overview(
     open_recommendations.truncate(OPEN_RECOMMENDATION_LIMIT);
 
     FieldOverview {
+        latest_layer: None,
+        monitoring: None,
         field,
         latest_scene,
         findings_by_severity,

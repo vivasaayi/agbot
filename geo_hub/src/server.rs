@@ -606,7 +606,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/portal/logout", post(routes::portal_logout))
         .route("/api/portal/me", get(routes::portal_me))
         .route("/api/portal/farms", get(routes::portal_list_farms))
-        .route("/api/portal/fields", get(routes::portal_list_fields))
+        .route(
+            "/api/portal/fields",
+            get(routes::portal_list_fields).post(routes::portal_create_field),
+        )
+        .route(
+            "/api/portal/fields/:field_id",
+            get(routes::portal_get_field),
+        )
         .route(
             "/api/portal/fields/:field_id/overview",
             get(routes::portal_field_overview),
