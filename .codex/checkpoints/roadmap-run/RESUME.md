@@ -2,10 +2,10 @@
 
 - Run: `run-02-sim`
 - Roadmap hash: `824257d0572b0997fc24491b3524053451a3989cf89de2381dd3ea1cd0536485` (unchanged)
-- Base HEAD: `dedcff1`; last implementation commit: `c35f060`.
-- Current batch: `farmer-day-zero-20260922`, implemented, uncommitted.
+- Base HEAD: `dedcff1`; last implementation commit: `6dc4485`.
+- Current batch: none; `farmer-day-zero-20260922` committed as `6dc4485`.
 - User goal: free farmer application usable from day zero; monetization deferred.
-- User explicitly authorized sub-agents; three lanes used. No commit/publication requested.
+- User explicitly authorized sub-agents; three lanes used. The implementation is committed; no publication was requested.
 - Features: SUP-FD-INSTALL, ONBOARD, BUNDLE, DISPLAY, BROWSER, PDF tests passed;
   SUP-FD-VERIFY implemented, full release gates still blocked.
 - Completed: safe local launch/private code/quality defaults; atomic field onboarding;
@@ -23,6 +23,6 @@
 - Evidence and remaining limitations: `docs/reviews/farmer-day-zero-readiness.md`.
 - Logs/test DB/PDF: `/tmp/agbot-farmer-day-zero/`; temporary server stopped.
 - Preview launcher: `/tmp/agbot-farmer-release/agbot-v0.0.0-day-zero-preview.tar.gz`.
-- Next: review this uncommitted batch; resolve validation blockers, build current
-  appliance and verify supported-platform installation before publication.
-  Preserve changes; consult SQLite events and git diff before continuing.
+- Next: resolve validation blockers, build the current appliance, and verify a
+  clean supported-platform installation before publication. Preserve changes;
+  consult SQLite events and git diff before continuing.
