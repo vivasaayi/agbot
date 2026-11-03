@@ -31,5 +31,5 @@ default = []
 gdal-io = ["gdal"]
 
 [dependencies.gdal]
-version = "0.16"
+version = "0.19"
 optional = true
