@@ -18,6 +18,47 @@ use shared::product_graph::{
 use shared::AgroResult;
 use std::path::{Path, PathBuf};
 
+/// Catalog the exact source file, independently of any subsequent cleaning.
+pub fn draft_from_scan_file(
+    record: &crate::LidarScanIngestRecord,
+) -> AgroResult<ProductRecordDraft> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(&record.path)?;
+    let checksum = format!("{:x}", Sha256::digest(&bytes));
+    let timestamp = record.captured_at.to_rfc3339();
+    Ok(ProductRecordDraft {
+        level: ProductLevel::L0,
+        kind: "lidar_scan".into(),
+        algorithm_id: "lidar.scan_file".into(),
+        algorithm_version: "1".into(),
+        parameters: serde_json::json!({"scan_id":record.scan_id,"checksum_sha256":checksum}),
+        inputs: vec![],
+        scope: ProductScope {
+            farm_id: None,
+            field_id: None,
+            season_id: None,
+            scene_id: None,
+            temporal_start: timestamp.clone(),
+            temporal_end: timestamp,
+        },
+        spatial_ref: None,
+        gsd_m_per_px: None,
+        artifact: Some(ProductArtifact {
+            path: std::fs::canonicalize(&record.path)?
+                .to_string_lossy()
+                .into_owned(),
+            format: "json".into(),
+            checksum_sha256: Some(checksum),
+        }),
+        quality_mask: None,
+        confidence: None,
+        confidence_method: None,
+        quality_summary: None,
+        evidence_digests: vec![],
+        source_id: None,
+    })
+}
+
 /// Catalog context the reproducibility evidence does not itself carry: the scene
 /// (optional — LiDAR products may be area-scoped), the acquisition timestamp, the
 /// algorithm version, and the source id.

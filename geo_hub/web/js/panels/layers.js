@@ -4,9 +4,9 @@
 
 import { apiGet, catalogProductsPath } from "../api.js";
 import {
-  addProductLayer,
-  removeProductLayer,
-  setProductLayerOpacity,
+  addCatalogProductLayer,
+  focusCatalogProduct,
+  removeCatalogProductLayer,
 } from "../map.js";
 
 function status(text, isError = false) {
@@ -23,11 +23,12 @@ function layerRow(sceneId, product) {
 
   const toggle = document.createElement("input");
   toggle.type = "checkbox";
-  toggle.id = `layer-${kind}`;
+  toggle.id = `layer-${product.product_id}`;
+  toggle.dataset.productId = product.product_id;
 
   const label = document.createElement("label");
   label.htmlFor = toggle.id;
-  label.textContent = kind;
+  label.textContent = `${kind}${product.quality_summary?.simulation ? " (simulation)" : ""}`;
 
   const opacity = document.createElement("input");
   opacity.type = "range";
@@ -39,15 +40,16 @@ function layerRow(sceneId, product) {
 
   toggle.addEventListener("change", () => {
     if (toggle.checked) {
-      addProductLayer(sceneId, kind, Number(opacity.value));
+      addCatalogProductLayer(product.product_id, Number(opacity.value));
+      focusCatalogProduct(product);
       opacity.disabled = false;
     } else {
-      removeProductLayer(sceneId, kind);
+      removeCatalogProductLayer(product.product_id);
       opacity.disabled = true;
     }
   });
   opacity.addEventListener("input", () => {
-    setProductLayerOpacity(sceneId, kind, Number(opacity.value));
+    addCatalogProductLayer(product.product_id, Number(opacity.value));
   });
 
   row.append(toggle, label, opacity);
@@ -58,18 +60,17 @@ function layerRow(sceneId, product) {
 export async function renderLayersPanel(container, sceneId) {
   container.replaceChildren(status("Loading layers…"));
   try {
-    const products = await apiGet(catalogProductsPath({ scene_id: sceneId }));
+    const products = await apiGet(catalogProductsPath({ scene_id: sceneId, level: "l2" }));
     const items = Array.isArray(products) ? products : (products?.items ?? []);
-    // De-duplicate by kind (a scene may have one tileable product per kind).
-    const seen = new Set();
-    const layers = items.filter((p) => p.kind && !seen.has(p.kind) && seen.add(p.kind));
+    const layers = items.filter(p => p.product_id && p.status === "registered" &&
+      (p.format === "tif" || p.format === "tiff") && p.crs);
     container.replaceChildren();
     if (layers.length === 0) {
-      container.appendChild(status("No tileable products for this scene."));
+      container.appendChild(status("No geographic raster products available."));
       return;
     }
     const heading = document.createElement("h3");
-    heading.textContent = "Layers";
+    heading.textContent = sceneId ? "Scene layers" : "Catalog layers";
     container.appendChild(heading);
     for (const product of layers) {
       container.appendChild(layerRow(sceneId, product));

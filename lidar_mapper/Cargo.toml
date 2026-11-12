@@ -2,12 +2,14 @@
 name = "lidar_mapper"
 version = "0.1.0"
 edition = "2021"
+default-run = "lidar_mapper"
 
 [[bin]]
 name = "lidar_mapper"
 path = "src/main.rs"
 
 [dependencies]
+raster_io = { path = "../raster_io" }
 shared = { path = "../shared" }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
@@ -25,3 +27,4 @@ futures = "0.3"
 rand = "0.8"
 indicatif = "0.17"
 sha2 = "0.10"
+rstar = "0.12"

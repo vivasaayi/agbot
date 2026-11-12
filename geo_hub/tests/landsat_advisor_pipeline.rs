@@ -352,6 +352,32 @@ async fn acceptance_landsat_is_visible_in_authenticated_farmer_portal() -> Resul
         run_one_tick(&ctx).await?.result,
         Some(JobRunResult::Succeeded)
     );
+    let keys: Vec<_> = ["crop_health", "anomaly_detection"]
+        .iter()
+        .map(|app| pipeline::app_job_key(app, FIELD_ID, "2023-07-21"))
+        .collect();
+    let mut completed = false;
+    for _ in 0..32 {
+        let mut done = true;
+        for key in &keys {
+            let job = pipeline::find_job_by_key(&ctx.pool, key)
+                .await?
+                .expect("advisor job enqueued");
+            done &= job.status == JobStatus::Succeeded;
+        }
+        if done {
+            completed = true;
+            break;
+        }
+        let tick = run_one_tick(&ctx).await?;
+        assert_eq!(tick.result, Some(JobRunResult::Succeeded), "{tick:?}");
+    }
+    assert!(completed, "advisor jobs did not finish");
+    assert!(
+        !geo_hub::applications::list_field_findings(&ctx.pool, FIELD_ID)
+            .await?
+            .is_empty()
+    );
     let mut config = (*ctx.config).clone();
     config.security.require_session = true;
     let app = geo_hub::server::build_router(geo_hub::state::AppState {
@@ -437,6 +463,7 @@ async fn acceptance_landsat_is_visible_in_authenticated_farmer_portal() -> Resul
     assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
     let report: serde_json::Value = serde_json::from_slice(&body)?;
     let downloaded = app
+        .clone()
         .oneshot(
             Request::builder()
                 .uri(format!(
@@ -451,5 +478,26 @@ async fn acceptance_landsat_is_visible_in_authenticated_farmer_portal() -> Resul
     assert!(to_bytes(downloaded.into_body(), 8 * 1024 * 1024)
         .await?
         .starts_with(b"%PDF"));
+    if std::env::var("AGBOT_BROWSER_ACCEPTANCE").as_deref() == Ok("1") {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap();
+        let result = tokio::process::Command::new("node")
+            .arg(root.join("scripts/test-farmer-products.cjs"))
+            .env("AGBOT_TEST_URL", &base)
+            .env("AGBOT_TEST_TOKEN", token)
+            .env("AGBOT_TEST_FIELD_ID", FIELD_ID)
+            .env("AGBOT_TEST_DISPOSABLE", "1")
+            .status()
+            .await;
+        server.abort();
+        assert!(
+            result?.success(),
+            "farmer product browser acceptance failed"
+        );
+    }
     Ok(())
 }

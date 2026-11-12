@@ -267,6 +267,7 @@ export function renderField(container, fieldId) {
 
     <section class="detail-card">
       <h3>NDVI trend</h3>
+      <button id="fd-all-history" type="button">Show all history</button>
       <div id="fd-chart" class="chart-holder"><p class="muted">Loading history…</p></div>
     </section>
 
@@ -305,6 +306,7 @@ export function renderField(container, fieldId) {
     fieldId,
     series: null,
     activities: [],
+    allHistory: false,
     chartHolder: section.querySelector("#fd-chart"),
   };
 
@@ -313,6 +315,12 @@ export function renderField(container, fieldId) {
     loadOverviewAndSections(section, state); loadTimeseries(section, state);
   });
   setupReportButton(section, fieldId);
+  section.querySelector("#fd-all-history").addEventListener("click", async (event) => {
+    state.allHistory = true;
+    event.currentTarget.disabled = true;
+    event.currentTarget.textContent = "Showing all available history";
+    await loadTimeseries(section, state);
+  });
   setupAddActivityForm(section, state);
   loadActivities(section, state);
   loadTimeseries(section, state);
@@ -472,7 +480,7 @@ async function loadTimeseries(section, state) {
   try {
     state.series = await fieldTimeseries(state.fieldId, {
       metric: TIMESERIES_METRIC,
-      start: defaultRangeStart(),
+      ...(state.allHistory ? {} : { start: defaultRangeStart() }),
     });
   } catch (error) {
     holder.innerHTML = "";
@@ -499,8 +507,9 @@ function renderChart(state) {
   if (!state.series) return;
   renderTimeseriesChart(state.chartHolder, state.series, state.activities, {
     label: `NDVI trend (${TIMESERIES_METRIC})`,
-    emptyMessage:
-      "No satellite history yet. Check satellite monitoring status above; clouds and coverage can delay usable imagery.",
+    emptyMessage: state.allHistory
+      ? "No satellite history yet. Check satellite monitoring status above; clouds and coverage can delay usable imagery."
+      : `No satellite observations in the past ${TIMESERIES_YEARS} years. Choose Show all history to check older observations.`,
   });
 }
 

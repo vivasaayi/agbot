@@ -3,23 +3,14 @@
 
 import {
   productTilesUrlTemplate,
-  catalogProductTilesUrlTemplate,
+  catalogTileBlob,
 } from "./api.js";
 
 let map = null;
 let compareMap = null;
+let focusedFootprint = null;
 const productLayers = new Map(); // "sceneId::kind" -> L.TileLayer
 const catalogLayers = new Map(); // "productId" -> L.TileLayer
-
-function backdrop(target) {
-  window.L.rectangle(
-    [
-      [-85, -180],
-      [85, 180],
-    ],
-    { color: "#2c313a", weight: 0, fillColor: "#12141a", fillOpacity: 1 },
-  ).addTo(target);
-}
 
 /** Initialize the primary Leaflet map on `element`. Idempotent. */
 export function initMap(element) {
@@ -27,7 +18,6 @@ export function initMap(element) {
   map = window.L.map(element, { center: [40.0, -100.0], zoom: 4, worldCopyJump: true });
   // A neutral offline-friendly backdrop; product tiles overlay on top. No
   // external basemap is loaded (field deployments are offline).
-  backdrop(map);
   return map;
 }
 
@@ -35,7 +25,6 @@ export function initMap(element) {
 export function initCompareMap(element) {
   if (compareMap) return compareMap;
   compareMap = window.L.map(element, { center: [40.0, -100.0], zoom: 4, worldCopyJump: true });
-  backdrop(compareMap);
   return compareMap;
 }
 
@@ -92,13 +81,19 @@ export function addCatalogProductLayer(productId, opacity = 1.0) {
     catalogLayers.get(productId).setOpacity(opacity);
     return;
   }
-  const layer = window.L.tileLayer(catalogProductTilesUrlTemplate(productId), {
-    opacity,
-    tileSize: 256,
-    minZoom: 0,
-    maxZoom: 22,
-    noWrap: true,
+  const Tiles = window.L.GridLayer.extend({
+    createTile(coords, done) {
+      const image = document.createElement("img");
+      catalogTileBlob(productId, coords).then(blob => {
+        const url = URL.createObjectURL(blob);
+        image.onload = () => { URL.revokeObjectURL(url); done(null, image); };
+        image.onerror = () => { URL.revokeObjectURL(url); done(new Error("Tile decode failed"), image); };
+        image.src = url;
+      }).catch(error => done(error, image));
+      return image;
+    },
   });
+  const layer = new Tiles({opacity, tileSize:256, maxZoom:22, noWrap:true});
   layer.addTo(map);
   catalogLayers.set(productId, layer);
 }
@@ -217,4 +212,13 @@ export function captureNextClick(callback) {
   };
   map.on("click", handler);
   return () => map.off("click", handler);
+}
+
+export function focusCatalogProduct(product) {
+  if (!map || product.crs !== "EPSG:4326" || !product.bbox) return;
+  const [west, south, east, north] = product.bbox;
+  const bounds = [[south,west],[north,east]];
+  if (focusedFootprint) map.removeLayer(focusedFootprint);
+  focusedFootprint = window.L.rectangle(bounds, {color:"#67c8e8",weight:1,fill:false}).addTo(map);
+  map.fitBounds(bounds, {maxZoom:19,animate:false});
 }
