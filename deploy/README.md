@@ -89,6 +89,18 @@ bash scripts/test staging
 docker image inspect "agbot:$(git rev-parse HEAD)" --format '{{.Id}} {{.Os}}/{{.Architecture}} {{index .Config.Labels "org.opencontainers.image.revision"}}'
 ```
 
+The build records the clean source revision and immutable image ID in the
+private staging state directory. A default staging deploy checks that receipt,
+the image's revision label, and the current `main` revision still agree. If the
+build failed, the tag was replaced, or `main` advanced, rebuild before the
+default deploy. Starting a new build invalidates the previous receipt even if
+the new build fails; the currently running service is not stopped. The deploy uses the verified image ID, so replacing the tag
+between verification and startup cannot switch the artifact. An existing installation without a receipt also needs one build
+with this adapter; its currently running service and volumes are preserved.
+Passing `--image` explicitly is reserved for deliberate deployment of an already
+tested artifact, such as rollback; the operator must verify its provenance.
+Run `python3 scripts/test-release-integrity.py` to check the guard behavior.
+
 Staging is at `http://127.0.0.1:20080`. The staging smoke checks route responses;
 it does not replace the authenticated farmer journey, real imagery, or backup
 and restore acceptance. Record the commit, image ID, platform, test results,
@@ -126,6 +138,11 @@ Docker host:
 ```sh
 bash scripts/deploy production --image sha256:TESTED_IMAGE_ID
 ```
+
+Production deploys require a full `sha256:` image ID or a registry reference
+with an `@sha256:` digest. Mutable tags such as `latest` are rejected. Pinning
+prevents later tag changes; the operator must still verify that this exact
+platform artifact passed staging acceptance before promotion.
 
 For another host, transfer the exact image through a registry or Docker
 save/load, verify its identity and architecture, then deploy there. Keep the

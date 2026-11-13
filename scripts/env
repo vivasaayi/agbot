@@ -6,4 +6,42 @@ export AGBOT_SOURCE_COMMIT="$(git -C "$product_root" rev-parse HEAD)"
 if [[ -n "$(git -C "$product_root" status --porcelain)" ]]; then
   AGBOT_SOURCE_COMMIT="${AGBOT_SOURCE_COMMIT}-dirty"
 fi
-exec python3 "$org_root/bin/product-env.py" --repo "$product_root" "$@"
+profile=${1:-}
+action=${2:-}
+if [[ "$profile" == --help && $# -eq 1 ]]; then
+  exec python3 "$org_root/bin/product-env.py" --repo "$product_root" --help
+fi
+case "$profile" in
+  worktree|staging|production) ;;
+  *) echo "Usage: bash scripts/env worktree|staging|production ACTION [options]" >&2; exit 2 ;;
+esac
+if [[ "$action" == --help && $# -eq 2 ]]; then
+  exec python3 "$org_root/bin/product-env.py" --repo "$product_root" "$profile" --help
+fi
+if [[ -z "$action" || "$action" == -* ]]; then
+  echo "Specify the environment and action before options." >&2
+  exit 2
+fi
+explicit_image=false
+dry_run=false
+for arg in "$@"; do
+  case "$arg" in
+    --image|--image=*) explicit_image=true ;;
+    --dry-run) dry_run=true ;;
+  esac
+done
+if [[ "$profile" == staging && "$action" == build && "$dry_run" == false ]]; then
+  python3 "$product_root/scripts/release-guard.py" invalidate "$product_root"
+fi
+if [[ "$profile" == staging && ( "$action" == up || "$action" == deploy ) && "$explicit_image" == false && "$dry_run" == false ]]; then
+  verified_image="$(python3 "$product_root/scripts/release-guard.py" verify "$product_root")"
+  set -- "$@" --image "$verified_image"
+fi
+if [[ "$profile" == production && ( "$action" == up || "$action" == deploy ) && "$dry_run" == false ]]; then
+  immutable_image="$(python3 "$product_root/scripts/release-guard.py" production "$product_root" "${@:3}")"
+  set -- "$@" --image "$immutable_image"
+fi
+python3 "$org_root/bin/product-env.py" --repo "$product_root" "$@"
+if [[ "$profile" == staging && "$action" == build && "$dry_run" == false ]]; then
+  python3 "$product_root/scripts/release-guard.py" record "$product_root"
+fi
