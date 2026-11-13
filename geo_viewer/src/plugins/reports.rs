@@ -71,7 +71,7 @@ pub fn start_report_fetch(
     let url = format!("{}/api/scenes/{}/reports", config.base_url, scene_id);
     report_fetch_task.0 = Some(IoTaskPool::get().spawn(async move {
         let response =
-            reqwest::blocking::get(&url).with_context(|| format!("request failed: {}", url))?;
+            crate::http::get(&url).with_context(|| format!("request failed: {}", url))?;
         if !response.status().is_success() {
             anyhow::bail!("geo_hub returned {} for {}", response.status(), url);
         }
@@ -96,9 +96,7 @@ pub fn start_report_generate(
     let payload = serde_json::json!({ "title": title }).to_string();
 
     report_generate_task.0 = Some(IoTaskPool::get().spawn(async move {
-        let client = reqwest::blocking::Client::new();
-        let response = client
-            .post(&url)
+        let response = crate::http::request(reqwest::Method::POST, &url)
             .header("content-type", "application/json")
             .body(payload)
             .send()

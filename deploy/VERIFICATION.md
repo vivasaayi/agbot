@@ -28,4 +28,27 @@ actual staging install, record the image and acceptance evidence, and promote
 the same artifact. Native `geo_viewer` authentication and packaging are not
 implemented. The Mac Studio's Tailscale Serve reported that it is disabled on
 the tailnet, so remote HTTPS was not verified. Existing appliance data was not
-imported. No stable deployment or production promotion was performed.
+imported. At that checkpoint, no stable deployment or production promotion had
+been performed.
+
+Staging was subsequently deployed on the Mac Studio at `127.0.0.1:20080`
+from clean `main` commit `f26b780cea878fc546e0b567ff4615d6a01349e9`. Its
+`linux/arm64` image ID was
+`sha256:6bd3afd0422a1edf2db97537689e3317dc14863f7187ccabc174a2584b111c28`.
+Health, portal authentication, and browser checks against a disposable instance
+of that exact image passed. The operator record is kept in the private staging
+environment state directory. Production promotion has not been performed.
+
+## Native viewer feature worktree
+
+Subsequent work in `feature/viewer-auth` added origin-scoped portal sessions,
+a sign-in launcher, and a separate Mac package. The Linux viewer suite passed
+64 tests, the launcher passed five Python tests, and an ARM64 macOS release
+binary built successfully. The macOS release test suite also passed 64 tests.
+The extracted native binary's headless connection check authenticated to live
+staging through the packaged launcher, validated the identity response, and
+rejected redirects, unauthorized responses, and malformed identity data in
+tests. This was
+a worktree artifact at the time of testing, not a clean `main` release. The Mac desktop
+was locked, so the actual viewer window and rendering have not yet been checked.
+Tailscale Serve remained disabled during this verification.

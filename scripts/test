@@ -6,6 +6,10 @@ case "${1:-}" in
   unit) cargo test -p shared --lib ;;
   integration) just gis-acceptance ;;
   ui) node --test geo_hub/tests/js/*.test.mjs ;;
+  viewer)
+    python3 -m unittest geo_viewer/tests/viewer_launcher_test.py
+    cargo test --locked -p geo_viewer
+    ;;
   browser)
     node scripts/test-farmer-browser.cjs
     node scripts/test-workspace-browser.cjs
@@ -18,5 +22,5 @@ case "${1:-}" in
     done
     echo "Staging health and web routes responded at $url; run the authenticated browser acceptance separately."
     ;;
-  *) echo "Usage: bash scripts/test unit|integration|ui|browser|staging" >&2; exit 2 ;;
+  *) echo "Usage: bash scripts/test unit|integration|ui|viewer|browser|staging" >&2; exit 2 ;;
 esac

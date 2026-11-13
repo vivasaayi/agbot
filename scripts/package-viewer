@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+profile=${1:-worktree}
+case "$profile" in
+  worktree|staging) ;;
+  *) echo "Usage: bash scripts/package-viewer worktree|staging" >&2; exit 2 ;;
+esac
+if [[ "$(uname -s)" != Darwin ]]; then
+  echo "Build the native Mac viewer on the target-compatible Mac." >&2; exit 1
+fi
+revision="$(git -C "$root" rev-parse HEAD)"
+dirty="$(git -C "$root" status --porcelain)"
+if [[ "$profile" == staging ]]; then
+  [[ -z "$dirty" && "$revision" == "$(git -C "$root" rev-parse main)" ]] || {
+    echo "Staging viewer packages require a clean checkout at main." >&2; exit 1;
+  }
+elif [[ -n "$dirty" ]]; then
+  revision="${revision}-dirty"
+fi
+cd "$root"
+cargo build --locked --release -p geo_viewer
+if [[ "$profile" == staging ]] && { [[ -n "$(git status --porcelain)" ]] || [[ "$revision" != "$(git rev-parse HEAD)" ]] || [[ "$revision" != "$(git rev-parse main)" ]]; }; then
+  echo "Source changed during the staging viewer build; no package was created." >&2
+  exit 1
+fi
+bundle="$(mktemp -d "${TMPDIR:-/tmp}/agbot-viewer.XXXXXXXX")"
+trap 'rm -rf "$bundle"' EXIT
+mkdir -p "$bundle/bin" "$bundle/lib" "$root/out/viewer"
+cp "$root/target/release/geo_viewer" "$bundle/bin/geo_viewer"
+cp "$root/scripts/viewer" "$bundle/lib/viewer"
+cat > "$bundle/run-viewer" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+bundle_root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export AGBOT_VIEWER_BIN="$bundle_root/bin/geo_viewer"
+exec python3 "$bundle_root/lib/viewer" "$@"
+EOF
+chmod 755 "$bundle/run-viewer"
+python3 - "$bundle/manifest.json" "$profile" "$revision" "$(uname -m)" <<'PY'
+import json, sys
+with open(sys.argv[1], 'w', encoding='utf-8') as output:
+    json.dump({'component': 'geo_viewer', 'environment': sys.argv[2], 'source_revision': sys.argv[3], 'os': 'macOS', 'architecture': sys.argv[4]}, output, indent=2)
+    output.write('\n')
+PY
+label=${revision:0:12}
+[[ "$revision" != *-dirty ]] || label="${label}-dirty"
+archive="$root/out/viewer/agbot-viewer-${profile}-${label}-$(uname -m)-$(date +%Y%m%d%H%M%S)-$$.tar.gz"
+tar -C "$bundle" -czf "$archive" .
+shasum -a 256 "$archive"
+printf 'Viewer package: %s\n' "$archive"
