@@ -155,23 +155,35 @@ database migration. Both endpoints bind to loopback by default. Remote access
 requires a separately configured and secured access path; do not expose the
 service publicly merely by changing the bind address.
 
-For access from another device on the same tailnet, Tailscale Serve can provide
-HTTPS while the appliance stays on loopback. First check `tailscale serve status`
-for existing services and the tailnet's access policy. The Mac Studio checked
-on 2026-11-12 reported that Serve is disabled on the tailnet; an administrator
-must enable it before this path works. For example, on the Mac Studio, after
-staging is running and verified (use the Tailscale app's CLI path if it is not
-on `PATH`):
+For access from another device on the same tailnet, Tailscale Serve can proxy
+the appliance while it stays on loopback. Check `tailscale serve status` and
+the tailnet's access policy before changing a listener. On 2026-11-12, the Mac
+Studio's HTTP listener on port 20080 worked within the tailnet, but HTTPS
+required an administrator to enable the tailnet setting. For example, with
+staging running (use the Tailscale app's CLI path if it is not on `PATH`):
 
 ```sh
-tailscale serve --bg --https=20080 http://127.0.0.1:20080
+tailscale serve --bg --http=20080 http://127.0.0.1:20080
+tailscale serve status
+```
+
+Tailscale encrypts traffic between tailnet devices, but this is still an HTTP
+browser origin: browser features that require a secure context may not work,
+and the native viewer refuses non-loopback HTTP. The HTTP portal and workspace
+were checked from the Mac Studio; access from a second device still needs a
+check. Prefer HTTPS once the tailnet administrator has enabled it. To add HTTPS
+without taking over the existing HTTP port, use a separate port:
+
+```sh
+tailscale serve --bg --https=20443 http://127.0.0.1:20080
 tailscale serve status
 ```
 
 Open the HTTPS address reported by Tailscale from an authorized tailnet device,
-then sign in through the portal. This is not automatically enabled by the
-adapter; remote access and the tailnet policy must be verified on the target
-devices. Avoid `tailscale serve reset`, which removes other services too.
+then sign in through the portal and verify the viewer there. Once HTTPS works,
+remove only the old listener with `tailscale serve --http=20080 off` if it is
+no longer needed. Neither listener is managed by the product adapter. Avoid
+`tailscale serve reset`, which removes other services too.
 
 Credentials are generated per environment in the shared launcher's private
 `~/.local/share/work-environments/<project>/environment.env` (or
