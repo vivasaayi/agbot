@@ -16,7 +16,9 @@ async function main() {
   const moduleName = process.env.PLAYWRIGHT_MODULE || 'playwright';
   const {chromium} = moduleName.endsWith('.mjs')
     ? await import(pathToFileURL(path.resolve(moduleName)).href) : require(moduleName);
-  const browser = await chromium.launch({headless:true});
+  const args = process.env.AGBOT_TEST_SOFTWARE_WEBGL === '1'
+    ? ['--use-angle=swiftshader', '--enable-unsafe-swiftshader'] : [];
+  const browser = await chromium.launch({headless:true, args});
   try {
     const page = await browser.newPage();
     const errors = [], externalLeaks = [];

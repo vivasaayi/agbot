@@ -63,6 +63,10 @@ AGBOT_TEST_DISPOSABLE=1 AGBOT_TEST_URL=http://127.0.0.1:PORT \
   AGBOT_TEST_ACCESS_CODE=YOUR_TEST_CODE bash scripts/test browser
 ```
 
+If headless Chromium cannot create a WebGL context, add
+`AGBOT_TEST_SOFTWARE_WEBGL=1` to use its software renderer for the workspace
+and browse check.
+
 Sign in at `/portal/` before opening `/workspace/` or `/browse`; those web
 surfaces use the portal session for local API and map requests. The browse
 map also depends on the external MapLibre CDN and OpenStreetMap service.
