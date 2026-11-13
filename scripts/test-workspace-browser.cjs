@@ -1,5 +1,5 @@
-// Browser smoke for a disposable server with session authentication enabled.
-// Set AGBOT_TEST_DISPOSABLE=1, AGBOT_TEST_URL and AGBOT_TEST_ACCESS_CODE.
+// Browser smoke for authenticated workspace and browse; it creates and revokes
+// a session but does not create or change farm data.
 const assert = require('node:assert/strict');
 const { pathToFileURL } = require('node:url');
 const path = require('node:path');
@@ -7,8 +7,8 @@ const path = require('node:path');
 async function main() {
   const base = process.env.AGBOT_TEST_URL;
   const code = process.env.AGBOT_TEST_ACCESS_CODE;
-  if (process.env.AGBOT_TEST_DISPOSABLE !== '1' || !base || !code) {
-    throw new Error('Set AGBOT_TEST_DISPOSABLE=1, AGBOT_TEST_URL and AGBOT_TEST_ACCESS_CODE.');
+  if ((process.env.AGBOT_TEST_DISPOSABLE !== '1' && process.env.AGBOT_TEST_READ_ONLY !== '1') || !base || !code) {
+    throw new Error('Set AGBOT_TEST_READ_ONLY=1 (or AGBOT_TEST_DISPOSABLE=1), AGBOT_TEST_URL and AGBOT_TEST_ACCESS_CODE.');
   }
   const origin = new URL(base);
   assert.ok(['http:', 'https:'].includes(origin.protocol));
@@ -19,8 +19,9 @@ async function main() {
   const args = process.env.AGBOT_TEST_SOFTWARE_WEBGL === '1'
     ? ['--use-angle=swiftshader', '--enable-unsafe-swiftshader'] : [];
   const browser = await chromium.launch({headless:true, args});
+  let page, token;
   try {
-    const page = await browser.newPage();
+    page = await browser.newPage();
     const errors = [], externalLeaks = [];
     page.on('pageerror', error => errors.push(error.message));
     page.on('request', request => {
@@ -28,7 +29,12 @@ async function main() {
     });
     await page.goto(new URL('/portal/', origin).href);
     await page.locator('#access-code').fill(code);
+    const login = page.waitForResponse(r => r.url() === new URL('/api/portal/login', origin).href && r.request().method() === 'POST');
     await page.locator('#login-submit').click();
+    const loginResponse = await login;
+    assert.equal(loginResponse.status(), 200, 'portal login');
+    token = (await loginResponse.json()).token;
+    assert.ok(token, 'portal session');
     await page.waitForURL('**/#/home');
     let next = page.waitForResponse(response => response.url().includes('/api/farms') && response.request().method() === 'GET', {timeout:20000});
     await page.goto(new URL('/workspace/', origin).href);
@@ -53,7 +59,16 @@ async function main() {
     assert.deepEqual(errors, [], 'no uncaught browser exceptions');
     console.log(`Signed-in workspace and browse requests${process.env.AGBOT_TEST_TILE_SCENE ? ' and workspace tile' : ''} passed without leaking the session.`);
   } finally {
-    await browser.close();
+    try {
+      if (page && token) {
+        const result = await page.request.post(new URL('/api/portal/logout', origin).href, {
+          headers: {Authorization: `Bearer ${token}`}, data: {}, maxRedirects: 0,
+        });
+        assert.ok(result.ok(), 'temporary portal session revoked');
+      }
+    } finally {
+      await browser.close();
+    }
   }
 }
 main().catch(error => { console.error(error.message); process.exitCode = 1; });

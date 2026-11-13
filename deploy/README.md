@@ -171,7 +171,19 @@ Tailscale encrypts traffic between tailnet devices, but this is still an HTTP
 browser origin: browser features that require a secure context may not work,
 and the native viewer refuses non-loopback HTTP. The HTTP portal and workspace
 were checked from the Mac Studio; access from a second device still needs a
-check. Prefer HTTPS once the tailnet administrator has enabled it. To add HTTPS
+check. On a Mac with Playwright and Chromium installed, check an existing
+environment without adding farm records (the test creates and revokes a portal
+session):
+
+```sh
+export AGBOT_TEST_URL=http://YOUR-TAILNET-HOST:20080
+read -rs AGBOT_TEST_ACCESS_CODE; export AGBOT_TEST_ACCESS_CODE
+bash scripts/test remote
+unset AGBOT_TEST_ACCESS_CODE
+```
+
+Set `AGBOT_TEST_SOFTWARE_WEBGL=1` for a headless browser that needs software
+rendering. Prefer HTTPS once the tailnet administrator has enabled it. To add HTTPS
 without taking over the existing HTTP port, use a separate port:
 
 ```sh

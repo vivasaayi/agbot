@@ -14,6 +14,9 @@ case "${1:-}" in
     node scripts/test-farmer-browser.cjs
     node scripts/test-workspace-browser.cjs
     ;;
+  remote)
+    AGBOT_TEST_READ_ONLY=1 node scripts/test-workspace-browser.cjs
+    ;;
   staging)
     url=${AGBOT_TEST_URL:-http://127.0.0.1:20080}
     curl --fail --silent --show-error "$url/health" >/dev/null
@@ -22,5 +25,5 @@ case "${1:-}" in
     done
     echo "Staging health and web routes responded at $url; run the authenticated browser acceptance separately."
     ;;
-  *) echo "Usage: bash scripts/test unit|integration|ui|viewer|browser|staging" >&2; exit 2 ;;
+  *) echo "Usage: bash scripts/test unit|integration|ui|viewer|browser|remote|staging" >&2; exit 2 ;;
 esac
