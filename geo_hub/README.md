@@ -23,6 +23,40 @@ Useful environment overrides:
 - `GEO_HUB__DATABASE_URL=sqlite://geo_hub.db?mode=rwc`
 - `GEO_HUB__TERRAIN__COMPILER_PATH=/absolute/path/to/agbot_terrain_compile`
 
+## Database upgrades and sample data
+
+Startup applies SQLite schema migrations using `PRAGMA user_version`. The current
+schema baseline is version 1. Use the configured installation database for CLI
+commands as well as the server through `GEO_HUB__DATABASE_URL`.
+
+To apply the schema steps explicitly and print the resulting version:
+
+```bash
+cargo run -p geo_hub -- migrate
+```
+
+To add a labelled sample farm and California field to an existing local account:
+
+```bash
+cargo run -p geo_hub -- seed-demo
+```
+
+This uses the organization in `GEO_HUB__BOOTSTRAP__ORG_ID` (default `org-local`).
+It can be rerun and preserves existing records. The field ID is `field-demo`.
+Its boundary covers longitude -119.425 to -119.415 and latitude 36.775 to 36.785,
+matching the live Landsat browsing example. Crop is left unspecified. Satellite
+derivation requests can use `field_id: "field-demo"` and `season_id: "2025"` to
+make downloaded observations available in the farmer portal.
+
+`GEO_HUB__BOOTSTRAP__SEED_DEMO=true` also adds sample records during first-account
+bootstrap. For an existing installation, use the explicit command above.
+Sample seeding creates farm and field records. Imagery is populated by the
+satellite processing path and retains its actual source acquisition date.
+
+Use `geo_hub backup <file>` for a consistent database snapshot and keep the
+configured data directory with that snapshot. Run `geo_hub restore <file>` while
+the server is stopped when restoring a database.
+
 ## Elevation to simulator terrain
 
 Provider DEM/DSM files enter the same catalog and GIS path as satellite

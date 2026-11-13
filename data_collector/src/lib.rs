@@ -11,6 +11,7 @@ pub mod indexing;
 pub mod multispectral;
 pub mod rplidar;
 pub mod simulated_capture;
+pub mod sim_lidar_bridge;
 pub mod storage;
 
 pub use export::{DataExporter, ExportFormat};

@@ -204,6 +204,51 @@ plus raycast point-cloud evidence (`x`, `y`, `z`, `range_m`, direction, ring).
 The manifest records `lidar_config`, `lidar_config_hash`, `lidar_scan_count`,
 and `lidar_output_hash`.
 
+To pass these scans to the LiDAR mapper, export them into a new directory:
+
+```bash
+cargo run -p data_collector --bin sim_lidar_export -- \
+  --input flight_sim_cpp/out/sample.lidar.jsonl --output-dir /tmp/agbot-scans
+cargo run -p lidar_mapper -- \
+  --input-dir /tmp/agbot-scans --output-dir /tmp/agbot-map
+cargo run -p geo_hub -- catalog register /tmp/agbot-map
+```
+
+The exporter reports scans with no returns and fails on other sensor errors.
+It converts the collector's metre distances to the millimetres expected by the
+mapper's scan-file input.
+It refuses to overwrite scan files; use a fresh directory for each run. An
+error can leave earlier exported scans in that directory. The mapper's current
+polar scan format discards the simulator's 3D point coordinates and vehicle
+pose, so its output is a local 2D projection, not a georeferenced 3D map.
+Outlier removal uses a spatial index to avoid an all-pairs distance sort for
+each point in a full mission.
+The mapper emits L0 source-file sidecars and an L2 occupancy-grid sidecar with
+resolvable catalog inputs. Registration uses the Geo Hub database configured
+through `GEO_HUB__DATABASE_URL`. Keep the input scan directory with the map:
+source records retain absolute paths and byte checksums. This PNG product is
+cataloged but cannot use the GeoTIFF-only geographic tile endpoint.
+
+For geographic display, use the world-space LiDAR returns directly. Supply the
+latitude and longitude from the mission's `home` (do not use the aircraft's
+current position):
+
+```bash
+cargo run -p lidar_mapper --bin sim_world_map -- \
+  --input flight_sim_cpp/out/sample.lidar.jsonl --output-dir /tmp/agbot-world-map \
+  --origin-latitude=36.7783 --origin-longitude=-119.4179 --resolution=1
+cargo run -p geo_hub -- catalog register /tmp/agbot-world-map
+```
+
+These example coordinates match `samples/sample_field_loop.json`. This path
+uses FlightSim's world `x` east, `z` north, and `y` elevation rather than the
+polar adapter. It writes an EPSG:4326 floating-point mean-elevation GeoTIFF,
+leaves unobserved cells as nodata, and emits catalog sidecars for the source
+JSONL and derived raster. Retain both source and output directories. The origin,
+resolution, coordinate convention, and source checksum are part of provenance.
+Elevations retain simulator-local `y`; an absolute vertical datum is not
+asserted. Outputs are explicitly marked as simulation products.
+
 Tune the deterministic raycast:
 
 ```bash

@@ -28,6 +28,7 @@ function bootstrap() {
   const tree = document.getElementById("catalog-tree");
   const detail = document.getElementById("scene-detail");
   const layers = document.getElementById("layers-panel");
+  renderLayersPanel(layers, null);
   const annotations = document.getElementById("annotations-panel");
   const recommendations = document.getElementById("recommendations-panel");
   const findings = document.getElementById("findings-panel");

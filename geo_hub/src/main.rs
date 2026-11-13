@@ -52,6 +52,14 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("failed to connect database")?;
 
+    if args.as_slice() == ["migrate"] {
+        println!(
+            "Database schema version {}",
+            db::schema_version(&pool).await?
+        );
+        return Ok(());
+    }
+
     // First-run bootstrap: seed a default org/account/access code on a fresh
     // server so the farmer PWA is usable immediately. No-op once provisioned.
     geo_hub::bootstrap::ensure_bootstrap(&pool, &config.bootstrap)
@@ -61,6 +69,11 @@ async fn main() -> anyhow::Result<()> {
     // Subcommands: `geo_hub catalog register <dir>` walks product_record.json
     // sidecars and registers them; no args runs the server.
     match args.as_slice() {
+        [cmd] if cmd == "seed-demo" => {
+            geo_hub::bootstrap::seed_demo(&pool, &config.bootstrap.org_id).await?;
+            println!("Sample data available: farm-demo / field-demo");
+            Ok(())
+        }
         [] => {
             info!(
                 bind = %config.bind_address,

@@ -262,7 +262,7 @@ export function catalogProductsPath(query) {
 async function request(method, path, body) {
   if (!path.startsWith('/api/')) throw new Error('Request URL must be a local API path');
   const options = { method, headers: { Accept: "application/json" } };
-  const token = window.localStorage.getItem("agbot_portal_token");
+  const token = sessionToken();
   if (token) options.headers.Authorization = `Bearer ${token}`;
   if (body !== undefined) {
     options.headers["Content-Type"] = "application/json";
@@ -282,7 +282,7 @@ async function request(method, path, body) {
 /** Fetch a same-origin product tile with the portal session. */
 export async function apiTileBlob(path) {
   if (!path.startsWith('/api/')) throw new Error('Tile URL must be a local API path');
-  const token = window.localStorage.getItem('agbot_portal_token');
+  const token = sessionToken();
   const response = await fetch(path, {headers: token ? {Authorization: `Bearer ${token}`} : {}});
   if (!response.ok) throw new Error(`Tile request failed: ${response.status}`);
   return response.blob();
@@ -302,4 +302,8 @@ export function apiPut(path, body) {
 
 export function apiDelete(path) {
   return request("DELETE", path);
+}
+
+function sessionToken() {
+  try { return window.localStorage.getItem("agbot_portal_token"); } catch { return null; }
 }

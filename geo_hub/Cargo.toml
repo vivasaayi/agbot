@@ -48,6 +48,7 @@ raster_io = { path = "../raster_io", features = ["remote"] }
 url = "2"
 
 [dev-dependencies]
+lidar_mapper = { path = "../lidar_mapper" }
 tempfile = "3.10"
 raster_io = { path = "../raster_io", features = ["remote", "test-util"] }
 tower = { workspace = true, features = ["util"] }

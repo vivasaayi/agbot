@@ -29,9 +29,8 @@ fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-/// A minimal but valid GeoJSON polygon for the demo field boundary (a ~200 m
-/// square placed over farmland). Kept deterministic so seeded state is stable.
-const DEMO_FIELD_BOUNDARY: &str = r#"{"type":"Polygon","coordinates":[[[-93.640,41.990],[-93.638,41.990],[-93.638,41.992],[-93.640,41.992],[-93.640,41.990]]]}"#;
+/// Shared field-boundary shape for the sample California Landsat area.
+const DEMO_FIELD_BOUNDARY: &str = r#"{"crs":"EPSG:4326","coordinates":[{"longitude":-119.425,"latitude":36.775},{"longitude":-119.415,"latitude":36.775},{"longitude":-119.415,"latitude":36.785},{"longitude":-119.425,"latitude":36.785},{"longitude":-119.425,"latitude":36.775}]}"#;
 
 /// Seed a fresh server if appropriate. Idempotent and safe to call on every
 /// startup after migrations.
@@ -106,38 +105,45 @@ pub async fn ensure_bootstrap(pool: &DbPool, config: &BootstrapConfig) -> Result
     })
 }
 
+/// Add the labelled sample field to an existing local account. Existing rows
+/// remain intact and collisions belonging to another organization are rejected.
+pub async fn seed_demo(pool: &DbPool, org_id: &str) -> Result<()> {
+    seed_demo_farm_field(pool, org_id, &now_rfc3339()).await
+}
+
 async fn seed_demo_farm_field(pool: &DbPool, org_id: &str, now: &str) -> Result<()> {
-    let farm_id = "farm-demo";
-    let field_id = "field-demo";
-
-    sqlx::query(
-        r#"
-        INSERT OR IGNORE INTO farms
-            (farm_id, owner, name, notes, status, created_at, updated_at)
-        VALUES (?1, ?2, 'Home Farm', 'Seeded demo farm', 'active', ?3, ?3)
-        "#,
+    let boundary: shared::schemas::FieldBoundary = serde_json::from_str(DEMO_FIELD_BOUNDARY)?;
+    shared::schemas::validate_field_boundary(&boundary)?;
+    let mut tx = pool.begin().await?;
+    let accounts: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM marketplace_accounts WHERE org_id=? AND status='active'",
     )
-    .bind(farm_id)
     .bind(org_id)
-    .bind(now)
-    .execute(pool)
+    .fetch_one(&mut *tx)
     .await?;
-
-    sqlx::query(
-        r#"
-        INSERT OR IGNORE INTO fields
-            (field_id, farm_id, owner, name, crop, season, notes, boundary_json, status, created_at, updated_at)
-        VALUES (?1, ?2, ?3, 'North Field', 'corn', '2026', 'Seeded demo field', ?4, 'active', ?5, ?5)
-        "#,
-    )
-    .bind(field_id)
-    .bind(farm_id)
-    .bind(org_id)
-    .bind(DEMO_FIELD_BOUNDARY)
-    .bind(now)
-    .execute(pool)
-    .await?;
-
+    anyhow::ensure!(
+        accounts > 0,
+        "sample data requires an existing active account for organization {org_id}"
+    );
+    for (table, column, id) in [
+        ("farms", "farm_id", "farm-demo"),
+        ("fields", "field_id", "field-demo"),
+    ] {
+        let owner: Option<String> =
+            sqlx::query_scalar(&format!("SELECT owner FROM {table} WHERE {column}=?"))
+                .bind(id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        anyhow::ensure!(
+            owner.as_deref().is_none_or(|owner| owner == org_id),
+            "sample ID {id} belongs to another organization"
+        );
+    }
+    sqlx::query("INSERT OR IGNORE INTO farms (farm_id,owner,name,notes,status,created_at,updated_at) VALUES ('farm-demo',?,'Sample Landsat Farm','Sample area in California; satellite observations are real.','active',?,?)")
+        .bind(org_id).bind(now).bind(now).execute(&mut *tx).await?;
+    sqlx::query("INSERT OR IGNORE INTO fields (field_id,farm_id,owner,name,crop,season,notes,boundary_json,status,created_at,updated_at) VALUES ('field-demo','farm-demo',?,'Sample California Field',NULL,'2025','Sample boundary for exploring Landsat layers; crop unspecified.',?,'active',?,?)")
+        .bind(org_id).bind(DEMO_FIELD_BOUNDARY).bind(now).bind(now).execute(&mut *tx).await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -147,6 +153,52 @@ mod tests {
     use crate::config::HubConfig;
     use crate::db;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn demo_seed_supports_existing_accounts_and_is_repeatable() {
+        let (_tmp, pool) = fresh_pool().await;
+        let config = BootstrapConfig {
+            seed_demo: false,
+            ..Default::default()
+        };
+        ensure_bootstrap(&pool, &config).await.unwrap();
+        seed_demo(&pool, &config.org_id).await.unwrap();
+        sqlx::query("UPDATE fields SET name='My edited sample' WHERE field_id='field-demo'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        seed_demo(&pool, &config.org_id).await.unwrap();
+        let (name, boundary): (String, String) =
+            sqlx::query_as("SELECT name,boundary_json FROM fields WHERE field_id='field-demo'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(name, "My edited sample");
+        let boundary: shared::schemas::FieldBoundary = serde_json::from_str(&boundary).unwrap();
+        shared::schemas::validate_field_boundary(&boundary).unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM fields")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[tokio::test]
+    async fn demo_seed_rolls_back_on_foreign_field_collision() {
+        let (_tmp, pool) = fresh_pool().await;
+        let config = BootstrapConfig {
+            seed_demo: false,
+            ..Default::default()
+        };
+        ensure_bootstrap(&pool, &config).await.unwrap();
+        sqlx::query("INSERT INTO fields(field_id,owner,name,boundary_json,created_at) VALUES ('field-demo','other','Keep me','{}','now')").execute(&pool).await.unwrap();
+        assert!(seed_demo(&pool, &config.org_id).await.is_err());
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM farms")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+    }
 
     async fn fresh_pool() -> (TempDir, DbPool) {
         let tmp = TempDir::new().unwrap();

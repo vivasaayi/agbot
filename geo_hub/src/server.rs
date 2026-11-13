@@ -1272,6 +1272,7 @@ pub async fn serve(config: HubConfig, pool: crate::db::DbPool) -> Result<()> {
     };
 
     let listener = TcpListener::bind(addr).await?;
+    let addr = listener.local_addr()?;
     info!(%addr, "geo_hub listening");
 
     axum::serve(

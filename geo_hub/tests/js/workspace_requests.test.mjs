@@ -30,18 +30,28 @@ test('workspace map loads product tiles through the authenticated fetch path', a
   const mapSource = await readFile(new URL('../../web/js/map.js', import.meta.url), 'utf8');
   const mapModule = await import(dataModule(mapSource.replace('"./api.js"', JSON.stringify(dataModule(source)))));
   let layer;
+  let rectangles = 0, fittedBounds;
+  const map = {fitBounds: bounds => { fittedBounds = bounds; }, removeLayer() {}};
   class GridLayer {
     constructor(options) { this.options = options; layer = this; }
     addTo() { return this; }
     static extend(methods) { return class extends GridLayer { createTile(...args) { return methods.createTile(...args); } }; }
   }
-  globalThis.window = {localStorage:{getItem:()=> 'session'}, L:{GridLayer, map:()=>({}), rectangle:()=>({addTo(){}})}};
+  globalThis.window = {localStorage:{getItem:()=> 'session'}, L:{GridLayer, map:()=>map, rectangle:()=>{ rectangles++; return {addTo(){}}; }}};
   globalThis.document = {createElement:()=>({set src(_url) { this.onload(); }})};
   let fetched;
   globalThis.fetch = async (url, options) => { fetched={url, options}; return new Response('tile'); };
   mapModule.initMap({});
+  assert.equal(rectangles, 0, 'initial map must not add an opaque layer over imagery');
   mapModule.addProductLayer('scene', 'ndvi');
   await new Promise((resolve, reject) => layer.createTile({z:2,x:3,y:1}, error => error ? reject(error) : resolve()));
   assert.equal(fetched.url, '/api/scenes/scene/products/ndvi/tiles/2/3/1.png');
   assert.equal(fetched.options.headers.Authorization, 'Bearer session');
+  mapModule.addCatalogProductLayer('product:one');
+  await new Promise((resolve, reject) => layer.createTile({z:1,x:0,y:1}, error => error ? reject(error) : resolve()));
+  assert.equal(fetched.url, '/api/catalog/products/product%3Aone/tiles/1/0/1.png');
+  assert.equal(fetched.options.headers.Authorization, 'Bearer session');
+  mapModule.focusCatalogProduct({crs:'EPSG:4326',bbox:[-96,40,-95,41]});
+  assert.equal(rectangles, 1);
+  assert.deepEqual(fittedBounds, [[40,-96],[41,-95]]);
 });

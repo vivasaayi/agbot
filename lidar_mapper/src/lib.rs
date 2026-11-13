@@ -21,6 +21,7 @@ use tracing::{error, info};
 use uuid::Uuid;
 
 pub mod product_sidecar;
+pub mod sim_georef;
 
 #[derive(Parser, Debug)]
 #[command(name = "lidar_mapper")]
@@ -639,11 +640,38 @@ impl LidarMapper {
             algorithm_version: env!("CARGO_PKG_VERSION").to_string(),
             source_id: None,
         };
-        let sidecar_draft = crate::product_sidecar::draft_from_lidar_evidence(
+        let mut sidecar_draft = crate::product_sidecar::draft_from_lidar_evidence(
             &product_evidence,
             &sidecar_ctx,
             &occupancy_product_path,
         );
+        // Source scan UUIDs are not catalog product IDs. Emit L0 records and
+        // link the raster to their content-bearing catalog identities.
+        sidecar_draft.inputs.clear();
+        if let Some(artifact) = &mut sidecar_draft.artifact {
+            use sha2::{Digest, Sha256};
+            artifact.path = std::fs::canonicalize(&occupancy_product_path)?
+                .to_string_lossy()
+                .into_owned();
+            artifact.checksum_sha256 = Some(format!(
+                "{:x}",
+                Sha256::digest(std::fs::read(&occupancy_product_path)?,)
+            ));
+        }
+        for record in &ingest.summary.records {
+            let draft = crate::product_sidecar::draft_from_scan_file(record)?;
+            crate::product_sidecar::write_lidar_product_sidecar(
+                &output_dir.join(format!("scan_{}.json", record.scan_id)),
+                &draft,
+            )
+            .await?;
+            sidecar_draft
+                .inputs
+                .push(shared::product_graph::ProductInputRef {
+                    product_id: draft.product_id(),
+                    role: "lidar_scan".into(),
+                });
+        }
         crate::product_sidecar::write_lidar_product_sidecar(
             &occupancy_product_path,
             &sidecar_draft,
@@ -811,6 +839,14 @@ impl LidarMapper {
     ) -> AgroResult<CleanedLidarScans> {
         Self::validate_outlier_params(params)?;
         let indexed_points = Self::indexed_lidar_points(scans);
+        if indexed_points
+            .iter()
+            .any(|p| !p.x.is_finite() || !p.y.is_finite())
+        {
+            return Err(shared::error::AgroError::Processing(
+                "LiDAR outlier removal requires finite coordinates".into(),
+            ));
+        }
         let points_in = indexed_points.len();
 
         if points_in <= params.k_neighbors || points_in < 2 {
@@ -932,23 +968,46 @@ impl LidarMapper {
     }
 
     fn mean_neighbor_distances(points: &[IndexedLidarPoint], k_neighbors: usize) -> Vec<f64> {
+        use rstar::{primitives::GeomWithData, RTree};
+        let tree = RTree::bulk_load(
+            points
+                .iter()
+                .enumerate()
+                .map(|(index, p)| GeomWithData::new([p.x, p.y], index))
+                .collect(),
+        );
         points
             .iter()
             .enumerate()
             .map(|(index, point)| {
-                let mut distances: Vec<f64> = points
+                let position = [point.x, point.y];
+                tree.nearest_neighbor_iter(&position)
+                    .filter(|other| other.data != index)
+                    .take(k_neighbors)
+                    .map(|other| {
+                        let q = &points[other.data];
+                        (point.x - q.x).hypot(point.y - q.y)
+                    })
+                    .sum::<f64>()
+                    / k_neighbors as f64
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    fn neighbor_reference(points: &[IndexedLidarPoint], k: usize) -> Vec<f64> {
+        points
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let mut distances: Vec<_> = points
                     .iter()
                     .enumerate()
-                    .filter_map(|(other_index, other)| {
-                        (other_index != index).then(|| {
-                            let dx = point.x - other.x;
-                            let dy = point.y - other.y;
-                            dx.hypot(dy)
-                        })
-                    })
+                    .filter(|(j, _)| *j != i)
+                    .map(|(_, q)| (p.x - q.x).hypot(p.y - q.y))
                     .collect();
                 distances.sort_by(f64::total_cmp);
-                distances.iter().take(k_neighbors).sum::<f64>() / k_neighbors as f64
+                distances.iter().take(k).sum::<f64>() / k as f64
             })
             .collect()
     }
@@ -2484,6 +2543,34 @@ impl LidarMapper {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn outlier_removal_rejects_nonfinite_points() {
+        let scan = shared::schemas::LidarScan {
+            timestamp: chrono::Utc::now(),
+            scan_id: uuid::Uuid::new_v4(),
+            points: vec![point(0.0, f32::NAN)],
+        };
+        let error = test_mapper().clean_scans(&[scan]).unwrap_err();
+        assert!(error.to_string().contains("finite coordinates"));
+    }
+    #[test]
+    fn neighbors_match_brute_force_with_duplicate_coordinates() {
+        let points: Vec<_> = (0..80)
+            .map(|i| super::IndexedLidarPoint {
+                scan_index: i / 10,
+                point_index: i % 10,
+                x: (i % 9) as f64,
+                y: (i % 7) as f64,
+            })
+            .collect();
+        for k in [1, 4, 12, 79] {
+            let expected = super::LidarMapper::neighbor_reference(&points, k);
+            let actual = super::LidarMapper::mean_neighbor_distances(&points, k);
+            for (a, b) in actual.iter().zip(expected) {
+                assert!((a - b).abs() < 1e-12, "{a} != {b}");
+            }
+        }
+    }
     use super::*;
     use chrono::Utc;
     use shared::config::AgroConfig;
