@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+product_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+profile=${1:?Usage: scripts/deploy staging|production --image ref}
+shift
+case "$profile" in
+  staging|production) ;;
+  *) echo "Deployment profile must be staging or production" >&2; exit 2 ;;
+esac
+exec bash "$product_root/scripts/env" "$profile" deploy "$@"

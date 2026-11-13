@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root"
+case "${1:-}" in
+  unit) cargo test -p shared --lib ;;
+  integration) just gis-acceptance ;;
+  ui) node --test geo_hub/tests/js/*.test.mjs ;;
+  browser)
+    node scripts/test-farmer-browser.cjs
+    node scripts/test-workspace-browser.cjs
+    ;;
+  staging)
+    url=${AGBOT_TEST_URL:-http://127.0.0.1:20080}
+    curl --fail --silent --show-error "$url/health" >/dev/null
+    for path in /portal /workspace /browse; do
+      curl --fail --silent --show-error --location "$url$path" >/dev/null
+    done
+    echo "Staging health and web routes responded at $url; run the authenticated browser acceptance separately."
+    ;;
+  *) echo "Usage: bash scripts/test unit|integration|ui|browser|staging" >&2; exit 2 ;;
+esac

@@ -4,12 +4,31 @@
 import {
   productTilesUrlTemplate,
   catalogProductTilesUrlTemplate,
+  apiTileBlob,
 } from "./api.js";
 
 let map = null;
 let compareMap = null;
 const productLayers = new Map(); // "sceneId::kind" -> L.TileLayer
 const catalogLayers = new Map(); // "productId" -> L.TileLayer
+
+function authenticatedTileLayer(template, options) {
+  const Layer = window.L.GridLayer.extend({
+    createTile(coords, done) {
+      const image = document.createElement('img');
+      image.alt = '';
+      const path = template.replace('{z}', coords.z).replace('{x}', coords.x).replace('{y}', coords.y);
+      apiTileBlob(path).then(blob => {
+        const url = URL.createObjectURL(blob);
+        image.onload = () => { URL.revokeObjectURL(url); done(null, image); };
+        image.onerror = () => { URL.revokeObjectURL(url); done(new Error('Tile could not be decoded'), image); };
+        image.src = url;
+      }).catch(error => done(error, image));
+      return image;
+    },
+  });
+  return new Layer(options);
+}
 
 function backdrop(target) {
   window.L.rectangle(
@@ -74,7 +93,7 @@ export function addProductLayer(sceneId, kind, opacity = 1.0) {
     productLayers.get(key).setOpacity(opacity);
     return;
   }
-  const layer = window.L.tileLayer(productTilesUrlTemplate(sceneId, kind), {
+  const layer = authenticatedTileLayer(productTilesUrlTemplate(sceneId, kind), {
     opacity,
     tileSize: 256,
     minZoom: 0,
@@ -92,7 +111,7 @@ export function addCatalogProductLayer(productId, opacity = 1.0) {
     catalogLayers.get(productId).setOpacity(opacity);
     return;
   }
-  const layer = window.L.tileLayer(catalogProductTilesUrlTemplate(productId), {
+  const layer = authenticatedTileLayer(catalogProductTilesUrlTemplate(productId), {
     opacity,
     tileSize: 256,
     minZoom: 0,
@@ -149,7 +168,7 @@ export function setCompareProductLayer(sceneId, kind, opacity = 1.0) {
     compareMap.removeLayer(compareLayer);
     compareLayer = null;
   }
-  compareLayer = window.L.tileLayer(productTilesUrlTemplate(sceneId, kind), {
+  compareLayer = authenticatedTileLayer(productTilesUrlTemplate(sceneId, kind), {
     opacity,
     tileSize: 256,
     minZoom: 0,

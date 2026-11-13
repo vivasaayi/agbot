@@ -1,0 +1,12 @@
+{
+  "id": "agbot",
+  "default_branch": "main",
+  "app_service": "app",
+  "database_service": null,
+  "app_port": 8080,
+  "staging_port": 20080,
+  "production_port": 30080,
+  "staging_bind": "127.0.0.1",
+  "production_bind": "127.0.0.1",
+  "health_path": "/health"
+}

@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+product_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+org_root=${ORG_DEV_ROOT:-$HOME/work/.org}
+export AGBOT_SOURCE_COMMIT="$(git -C "$product_root" rev-parse HEAD)"
+if [[ -n "$(git -C "$product_root" status --porcelain)" ]]; then
+  AGBOT_SOURCE_COMMIT="${AGBOT_SOURCE_COMMIT}-dirty"
+fi
+exec python3 "$org_root/bin/product-env.py" --repo "$product_root" "$@"

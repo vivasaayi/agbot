@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+product_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+profile=${1:-worktree}
+if (( $# > 0 )); then shift; fi
+exec bash "$product_root/scripts/env" "$profile" build "$@"

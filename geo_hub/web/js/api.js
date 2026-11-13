@@ -8,6 +8,16 @@
 // Same-origin base URL: the workspace is served by geo_hub itself.
 const BASE_URL = "";
 
+// Never forward a portal session to third-party map or asset servers.
+export function apiAuthorization(url, origin, token) {
+  if (!token) return undefined;
+  try {
+    const target = new URL(url, origin);
+    if (target.origin === origin && target.pathname.startsWith('/api/')) return `Bearer ${token}`;
+  } catch (_) { /* Invalid URLs are handled by the caller. */ }
+  return undefined;
+}
+
 /**
  * Endpoints used by the workspace. Every backend path lives here as a string
  * literal so the route-manifest test can verify it against the router. Path
@@ -250,7 +260,10 @@ export function catalogProductsPath(query) {
 }
 
 async function request(method, path, body) {
+  if (!path.startsWith('/api/')) throw new Error('Request URL must be a local API path');
   const options = { method, headers: { Accept: "application/json" } };
+  const token = window.localStorage.getItem("agbot_portal_token");
+  if (token) options.headers.Authorization = `Bearer ${token}`;
   if (body !== undefined) {
     options.headers["Content-Type"] = "application/json";
     options.body = JSON.stringify(body);
@@ -264,6 +277,15 @@ async function request(method, path, body) {
   }
   const contentType = response.headers.get("content-type") ?? "";
   return contentType.includes("application/json") ? response.json() : response.text();
+}
+
+/** Fetch a same-origin product tile with the portal session. */
+export async function apiTileBlob(path) {
+  if (!path.startsWith('/api/')) throw new Error('Tile URL must be a local API path');
+  const token = window.localStorage.getItem('agbot_portal_token');
+  const response = await fetch(path, {headers: token ? {Authorization: `Bearer ${token}`} : {}});
+  if (!response.ok) throw new Error(`Tile request failed: ${response.status}`);
+  return response.blob();
 }
 
 export function apiGet(path) {

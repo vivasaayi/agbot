@@ -40,6 +40,8 @@
 //   positioned by the STAC item's WGS84 bbox (assuming a north-up raster:
 //   tile row y=0 is the max-latitude edge).
 
+import { apiAuthorization } from '/workspace/js/api.js';
+
 const STITCH_ZOOM = 2; // 2^2 x 2^2 tiles of 256px -> 1024x1024 stitched image
 const TILE_PX = 256;
 const SEARCH_LIMIT = 100;
@@ -59,7 +61,10 @@ function setStatus(text, isError = false) {
 async function fetchJson(url, options) {
   let response;
   try {
-    response = await fetch(url, options);
+    const headers = new Headers(options?.headers);
+    const authorization = apiAuthorization(url, location.origin, localStorage.getItem('agbot_portal_token'));
+    if (authorization) headers.set('Authorization', authorization);
+    response = await fetch(url, {...options, headers});
   } catch (err) {
     throw new Error(`network error fetching ${url}: ${err.message}`);
   }
@@ -82,6 +87,10 @@ async function fetchJson(url, options) {
 
 const map = new maplibregl.Map({
   container: "map",
+  transformRequest: (url) => {
+    const authorization = apiAuthorization(url, location.origin, localStorage.getItem('agbot_portal_token'));
+    return authorization ? {url, headers: {Authorization: authorization}} : {url};
+  },
   style: {
     version: 8,
     sources: {
@@ -604,12 +613,19 @@ async function stitchTiles(tileTemplate) {
   return canvas.toDataURL("image/png");
 }
 
-function loadImage(url) {
+async function loadImage(url) {
+  const authorization = apiAuthorization(url, location.origin, localStorage.getItem('agbot_portal_token'));
+  let objectUrl;
+  if (authorization) {
+    const response = await fetch(url, {headers: {Authorization: authorization}});
+    if (!response.ok) throw new Error(`tile request failed: ${response.status}`);
+    objectUrl = URL.createObjectURL(await response.blob());
+  }
   return new Promise((resolve, reject) => {
     const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error(`failed to load ${url}`));
-    img.src = url;
+    img.onload = () => { if (objectUrl) URL.revokeObjectURL(objectUrl); resolve(img); };
+    img.onerror = () => { if (objectUrl) URL.revokeObjectURL(objectUrl); reject(new Error(`failed to load ${url}`)); };
+    img.src = objectUrl || url;
   });
 }
 

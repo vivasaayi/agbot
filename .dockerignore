@@ -1,6 +1,7 @@
 .git
 .claude
 .codex
+.worktrees
 target
 data
 processed
