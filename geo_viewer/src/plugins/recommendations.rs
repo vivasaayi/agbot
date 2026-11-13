@@ -260,7 +260,7 @@ pub fn start_recommendation_fetch(
     );
     recommendation_fetch_task.0 = Some(IoTaskPool::get().spawn(async move {
         let response =
-            reqwest::blocking::get(&url).with_context(|| format!("request failed: {}", url))?;
+            crate::http::get(&url).with_context(|| format!("request failed: {}", url))?;
         if !response.status().is_success() {
             anyhow::bail!("geo_hub returned {} for {}", response.status(), url);
         }
@@ -289,9 +289,7 @@ pub fn start_recommendation_create(
         .context("failed to encode recommendation create payload")?;
 
     recommendation_create_task.0 = Some(IoTaskPool::get().spawn(async move {
-        let client = reqwest::blocking::Client::new();
-        let response = client
-            .post(&url)
+        let response = crate::http::request(reqwest::Method::POST, &url)
             .header("content-type", "application/json")
             .body(payload)
             .send()
@@ -337,9 +335,7 @@ pub fn start_recommendation_update(
     .to_string();
 
     recommendation_update_task.0 = Some(IoTaskPool::get().spawn(async move {
-        let client = reqwest::blocking::Client::new();
-        let response = client
-            .put(&url)
+        let response = crate::http::request(reqwest::Method::PUT, &url)
             .header("content-type", "application/json")
             .body(payload)
             .send()
@@ -371,9 +367,7 @@ pub fn start_recommendation_delete(
     let recommendation_id = recommendation_id.to_string();
 
     recommendation_delete_task.0 = Some(IoTaskPool::get().spawn(async move {
-        let client = reqwest::blocking::Client::new();
-        let response = client
-            .delete(&url)
+        let response = crate::http::request(reqwest::Method::DELETE, &url)
             .send()
             .with_context(|| format!("request failed: {}", url))?;
         if !response.status().is_success() {

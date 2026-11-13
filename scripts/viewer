@@ -1,0 +1,83 @@
+#!/usr/bin/env python3
+"""Launch the native viewer with a time-limited Geo Hub portal session."""
+import getpass
+import ipaddress
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+from urllib import error, parse, request
+
+
+def validate_base(base):
+    url = parse.urlsplit(base)
+    if url.scheme not in ('http', 'https') or not url.hostname or url.username or url.password:
+        raise ValueError('Geo Hub URL must be HTTP(S), without embedded credentials')
+    if url.path not in ('', '/') or url.query or url.fragment:
+        raise ValueError('Geo Hub URL must identify the server origin')
+    if url.scheme == 'http':
+        try:
+            local = ipaddress.ip_address(url.hostname).is_loopback
+        except ValueError:
+            local = url.hostname.lower() == 'localhost'
+        if not local:
+            raise ValueError('Remote Geo Hub connections require HTTPS')
+    return base.rstrip('/')
+
+
+class NoRedirect(request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise error.HTTPError(req.full_url, code, 'redirect refused', headers, fp)
+
+
+def post(base, path, body=None, token=None):
+    headers = {'Content-Type': 'application/json'}
+    if token:
+        headers['Authorization'] = 'Bearer ' + token
+    payload = None if body is None else json.dumps(body).encode('utf-8')
+    req = request.Request(validate_base(base) + path, data=payload, headers=headers, method='POST')
+    with request.build_opener(NoRedirect).open(req, timeout=15) as response:
+        data = response.read(65_537)
+    if len(data) > 65_536:
+        raise ValueError('Geo Hub response is too large')
+    return json.loads(data)
+
+
+def login(base, code):
+    response = post(base, '/api/portal/login', {'access_code': code})
+    token = response.get('token') if isinstance(response, dict) else None
+    if not isinstance(token, str) or not token or len(token) > 4096 or any(ord(c) < 33 or ord(c) > 126 for c in token):
+        raise ValueError('Geo Hub returned an invalid session token')
+    return token
+
+
+def logout(base, token):
+    post(base, '/api/portal/logout', token=token)
+
+
+def main():
+    root = Path(__file__).resolve().parent.parent
+    binary = Path(os.environ.get('AGBOT_VIEWER_BIN', root / 'target/release/geo_viewer'))
+    if not binary.is_file():
+        raise ValueError(f'Native viewer binary not found: {binary}; build it on this Mac first')
+    base = validate_base(os.environ.get('GEO_HUB_URL', 'http://127.0.0.1:20080'))
+    code = getpass.getpass('AGBot access code: ')
+    token = login(base, code)
+    del code
+    env = dict(os.environ, GEO_HUB_URL=base, GEO_VIEWER_SESSION_TOKEN=token)
+    try:
+        return subprocess.call([str(binary), *sys.argv[1:]], env=env)
+    finally:
+        try:
+            logout(base, token)
+        except (OSError, ValueError, KeyError):
+            print('Could not revoke the viewer session; it will expire.', file=sys.stderr)
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, KeyError) as exc:
+        print(f'viewer: {exc}', file=sys.stderr)
+        sys.exit(1)

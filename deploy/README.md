@@ -19,7 +19,7 @@ hardware needs; inventory and validate those as additional deployment slices.
 | Package boundary | Modules | Deployment status |
 | --- | --- | --- |
 | Geo Hub web appliance | `geo_hub`, `shared`, `imagery_processor`, `raster_io`, `post_processor`, `alerting`, `orthomosaic`, `crop_intelligence`, `copilot`, `compliance`, `fleet_health`, `soil_iot`, `timeseries`, `provenance`, `plugin_sdk`, `interop`, `mission_planner` | One server image with linked libraries, web assets, SQLite and artifact volumes; these libraries are not independently deployed services. |
-| Desktop GIS | `geo_viewer`, `sensor_overlay_engine` | Native Bevy application; currently lacks portal-session support and a verified release artifact. |
+| Desktop GIS | `geo_viewer`, `sensor_overlay_engine` | Native Bevy application with a portal-session launcher and separate Mac package; verify the target Mac and staging workflow before promotion. |
 | Edge and flight | `mission_control`, `sensor_collector`, `imagery_processor`, `lidar_mapper`, `ground_station_ui` | The existing Dockerfile has a separate edge target; this environment adapter does not deploy or validate it. Hardware, serial access and flight safety require their own tests. |
 | Mission UI and coordination | `mission_planner` frontend, `multi_drone_control`, `data_collector` | Outside this web appliance's deployed service boundary; identify the intended runtime and dependencies before adding them. |
 | Simulation | `flight_sim_cpp` | Native C++ simulator, separate from the web appliance. |
@@ -170,6 +170,6 @@ bootstrap code is seeded on first initialization; replacing the file later does
 not rotate the existing database's access code.
 
 The native viewer can be configured with `GEO_HUB_URL` as described in
-`geo_viewer/README.md`, but it does not yet send portal sessions and therefore
-cannot use the authenticated appliance API. A versioned native artifact and
-authenticated end-to-end workflow require additional work.
+`geo_viewer/README.md`. Its launcher obtains a portal session, and
+`scripts/package-viewer` produces a separate Mac archive. Build and test a
+clean staging archive on the target-compatible Mac before promoting it.

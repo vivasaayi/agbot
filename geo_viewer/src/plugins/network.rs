@@ -565,8 +565,7 @@ pub fn start_tile_fetch(
 }
 
 fn fetch_tile_from_url(url: &str, tile_id: TileId) -> Result<FetchedTile> {
-    let response =
-        reqwest::blocking::get(url).with_context(|| format!("request failed: {}", url))?;
+    let response = crate::http::get(url).with_context(|| format!("request failed: {}", url))?;
     if response.status() == reqwest::StatusCode::NOT_FOUND {
         return Ok(FetchedTile {
             tile_id,
@@ -593,7 +592,7 @@ pub fn start_field_list_fetch(
     let url = format!("{}/api/fields", config.base_url);
     field_list_task.0 = Some(IoTaskPool::get().spawn(async move {
         let response =
-            reqwest::blocking::get(&url).with_context(|| format!("request failed: {}", url))?;
+            crate::http::get(&url).with_context(|| format!("request failed: {}", url))?;
         if !response.status().is_success() {
             anyhow::bail!("geo_hub returned {} for {}", response.status(), url);
         }
@@ -613,7 +612,7 @@ pub fn start_farm_list_fetch(
     let url = format!("{}/api/farms", config.base_url);
     farm_list_task.0 = Some(IoTaskPool::get().spawn(async move {
         let response =
-            reqwest::blocking::get(&url).with_context(|| format!("request failed: {}", url))?;
+            crate::http::get(&url).with_context(|| format!("request failed: {}", url))?;
         if !response.status().is_success() {
             anyhow::bail!("geo_hub returned {} for {}", response.status(), url);
         }
@@ -646,7 +645,7 @@ pub fn start_farm_field_history_fetch(
     let url = format!("{}/api/farms/{}/fields/history", config.base_url, farm_id);
     farm_field_history_task.0 = Some(IoTaskPool::get().spawn(async move {
         let response =
-            reqwest::blocking::get(&url).with_context(|| format!("request failed: {}", url))?;
+            crate::http::get(&url).with_context(|| format!("request failed: {}", url))?;
         if !response.status().is_success() {
             anyhow::bail!("geo_hub returned {} for {}", response.status(), url);
         }
@@ -669,7 +668,7 @@ pub fn start_field_scenes_fetch(
     let url = format!("{}/api/fields/{}/scenes", config.base_url, field_id);
     field_scenes_task.0 = Some(IoTaskPool::get().spawn(async move {
         let response =
-            reqwest::blocking::get(&url).with_context(|| format!("request failed: {}", url))?;
+            crate::http::get(&url).with_context(|| format!("request failed: {}", url))?;
         if !response.status().is_success() {
             anyhow::bail!("geo_hub returned {} for {}", response.status(), url);
         }
@@ -691,9 +690,7 @@ pub fn start_field_import(
 ) -> Result<()> {
     let url = format!("{}/api/fields/import/shapefile", config.base_url);
     field_import_task.0 = Some(IoTaskPool::get().spawn(async move {
-        let client = reqwest::blocking::Client::new();
-        let response = client
-            .post(&url)
+        let response = crate::http::request(reqwest::Method::POST, &url)
             .json(&request)
             .send()
             .with_context(|| format!("request failed: {}", url))?;
@@ -749,7 +746,7 @@ pub fn start_manifest_fetch(
 
     manifest_task.0 = Some(IoTaskPool::get().spawn(async move {
         let response =
-            reqwest::blocking::get(&url).with_context(|| format!("request failed: {}", url))?;
+            crate::http::get(&url).with_context(|| format!("request failed: {}", url))?;
         if !response.status().is_success() {
             anyhow::bail!("geo_hub returned {} for {}", response.status(), url);
         }
