@@ -1,6 +1,7 @@
 # syntax=docker/dockerfile:1.7
 # Multi-stage Docker build for AgroDrone
 FROM rust:1.93.1-slim-bookworm AS builder
+ARG CARGO_BUILD_JOBS=2
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y \
