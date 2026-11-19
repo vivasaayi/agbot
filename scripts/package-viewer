@@ -3,25 +3,25 @@ set -euo pipefail
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 profile=${1:-worktree}
 case "$profile" in
-  worktree|staging) ;;
-  *) echo "Usage: bash scripts/package-viewer worktree|staging" >&2; exit 2 ;;
+  worktree|integration) ;;
+  *) echo "Usage: bash scripts/package-viewer worktree|integration" >&2; exit 2 ;;
 esac
 if [[ "$(uname -s)" != Darwin ]]; then
   echo "Build the native Mac viewer on the target-compatible Mac." >&2; exit 1
 fi
 revision="$(git -C "$root" rev-parse HEAD)"
 dirty="$(git -C "$root" status --porcelain)"
-if [[ "$profile" == staging ]]; then
+if [[ "$profile" == integration ]]; then
   [[ -z "$dirty" && "$revision" == "$(git -C "$root" rev-parse main)" ]] || {
-    echo "Staging viewer packages require a clean checkout at main." >&2; exit 1;
+    echo "Integration viewer packages require a clean checkout at main." >&2; exit 1;
   }
 elif [[ -n "$dirty" ]]; then
   revision="${revision}-dirty"
 fi
 cd "$root"
 cargo build --locked --release -p geo_viewer
-if [[ "$profile" == staging ]] && { [[ -n "$(git status --porcelain)" ]] || [[ "$revision" != "$(git rev-parse HEAD)" ]] || [[ "$revision" != "$(git rev-parse main)" ]]; }; then
-  echo "Source changed during the staging viewer build; no package was created." >&2
+if [[ "$profile" == integration ]] && { [[ -n "$(git status --porcelain)" ]] || [[ "$revision" != "$(git rev-parse HEAD)" ]] || [[ "$revision" != "$(git rev-parse main)" ]]; }; then
+  echo "Source changed during the integration viewer build; no package was created." >&2
   exit 1
 fi
 bundle="$(mktemp -d "${TMPDIR:-/tmp}/agbot-viewer.XXXXXXXX")"

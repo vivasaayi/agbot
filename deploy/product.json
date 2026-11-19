@@ -8,5 +8,9 @@
   "production_port": 30080,
   "staging_bind": "127.0.0.1",
   "production_bind": "127.0.0.1",
-  "health_path": "/health"
+  "health_path": "/health",
+  "integration_port": 20080,
+  "integration_bind": "127.0.0.1",
+  "integration_project": "agbot-staging",
+  "staging_project": "agbot-vps-staging"
 }

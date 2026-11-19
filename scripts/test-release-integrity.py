@@ -28,7 +28,13 @@ class ReleaseGuardTest(unittest.TestCase):
              mock.patch.object(guard, 'inspect_image', return_value=self.image):
             guard.record_build(Path('/repo'), self.state)
 
-    def test_default_staging_deploy_requires_a_matching_successful_build(self):
+    def test_mac_integration_preserves_legacy_project_but_vps_staging_is_separate(self):
+        config = json.loads((SCRIPT.parent.parent / 'deploy/product.json').read_text())
+        self.assertEqual(config['integration_project'], 'agbot-staging')
+        self.assertNotEqual(config['staging_project'], config['integration_project'])
+        self.assertNotEqual(config['staging_project'], 'agbot-production')
+
+    def test_default_integration_deploy_requires_a_matching_successful_build(self):
         with mock.patch.object(guard, 'main_revision', return_value='commit-a'), \
              mock.patch.object(guard, 'inspect_image', return_value=self.image):
             with self.assertRaises(ValueError):
@@ -87,6 +93,27 @@ class ReleaseGuardTest(unittest.TestCase):
             with self.subTest(image=image), self.assertRaises(ValueError):
                 guard.validate_production_image(image)
 
+    def test_vps_staging_rejects_tags_and_never_uses_legacy_mac_state(self):
+        org = self.state / 'org'
+        (org / 'bin').mkdir(parents=True)
+        marker = self.state / 'invoked'
+        (org / 'bin/product-env.py').write_text(
+            'import os, pathlib\n'
+            'pathlib.Path(os.environ["TEST_MARKER"]).write_text("called")\n'
+        )
+        legacy = self.state / 'agbot-staging'
+        legacy.mkdir()
+        (legacy / 'environment.env').write_text('APP_IMAGE=sha256:' + 'a' * 64 + '\n')
+        env = {**os.environ, 'ORG_DEV_ROOT': str(org), 'WORK_ENV_STATE_ROOT': str(self.state), 'TEST_MARKER': str(marker)}
+        script = str(Path(__file__).with_name('env'))
+        for args in (['staging', 'deploy'], ['staging', 'deploy', '--image', 'agbot:latest']):
+            result = subprocess.run(['bash', script, *args], env=env, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(marker.exists())
+        result = subprocess.run(['bash', script, 'staging', 'deploy', '--image', 'sha256:' + 'b' * 64], env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(marker.exists())
+
     def test_launcher_blocks_default_deploy_and_does_not_record_failed_build(self):
         org = self.state / 'org'
         (org / 'bin').mkdir(parents=True)
@@ -98,17 +125,17 @@ class ReleaseGuardTest(unittest.TestCase):
         )
         env = {**os.environ, 'ORG_DEV_ROOT': str(org), 'WORK_ENV_STATE_ROOT': str(self.state), 'TEST_MARKER': str(marker)}
         script = str(Path(__file__).with_name('env'))
-        denied = subprocess.run(['bash', script, 'staging', 'deploy'], env=env, capture_output=True, text=True)
+        denied = subprocess.run(['bash', script, 'integration', 'deploy'], env=env, capture_output=True, text=True)
         self.assertNotEqual(denied.returncode, 0)
         self.assertFalse(marker.exists())
-        explicit = subprocess.run(['bash', script, 'staging', 'deploy', '--image', 'example:explicit'], env=env, capture_output=True, text=True)
+        explicit = subprocess.run(['bash', script, 'integration', 'deploy', '--image', 'example:explicit'], env=env, capture_output=True, text=True)
         self.assertEqual(explicit.returncode, 0, explicit.stderr)
         self.assertTrue(marker.exists())
         marker.unlink()
         old_receipt = self.state / 'agbot-staging/build-receipt.json'
         old_receipt.parent.mkdir(parents=True, exist_ok=True)
         old_receipt.write_text('{"image_id":"sha256:old"}')
-        failed = subprocess.run(['bash', script, 'staging', 'build'], env=env, capture_output=True, text=True)
+        failed = subprocess.run(['bash', script, 'integration', 'build'], env=env, capture_output=True, text=True)
         self.assertEqual(failed.returncode, 7)
         self.assertTrue(marker.exists())
         self.assertFalse(old_receipt.exists())
@@ -175,11 +202,11 @@ class ReleaseGuardTest(unittest.TestCase):
         env = {**os.environ, 'PATH': str(fake_bin) + os.pathsep + os.environ['PATH'],
                'ORG_DEV_ROOT': str(org), 'WORK_ENV_STATE_ROOT': str(self.state), 'TEST_MARKER': str(marker)}
         script = str(Path(__file__).with_name('env'))
-        build = subprocess.run(['bash', script, 'staging', 'build'], env=env, capture_output=True, text=True)
+        build = subprocess.run(['bash', script, 'integration', 'build'], env=env, capture_output=True, text=True)
         self.assertEqual(build.returncode, 0, build.stderr)
         receipt = json.loads((self.state / 'agbot-staging/build-receipt.json').read_text())
         self.assertEqual(receipt['image_id'], 'sha256:good')
-        deploy = subprocess.run(['bash', script, 'staging', 'deploy'], env=env, capture_output=True, text=True)
+        deploy = subprocess.run(['bash', script, 'integration', 'deploy'], env=env, capture_output=True, text=True)
         self.assertEqual(deploy.returncode, 0, deploy.stderr)
         self.assertEqual(json.loads(marker.read_text())[-2:], ['--image', 'sha256:good'])
 
@@ -189,7 +216,7 @@ class ReleaseGuardTest(unittest.TestCase):
         (repo / 'deploy').mkdir()
         shutil.copyfile(SCRIPT, repo / 'scripts/release-guard.py')
         shutil.copyfile(SCRIPT.with_name('env'), repo / 'scripts/env')
-        (repo / 'deploy/product.json').write_text('{"default_branch":"main"}')
+        (repo / 'deploy/product.json').write_text('{"default_branch":"main","integration_project":"agbot-staging"}')
         (repo / 'source.txt').write_text('original')
 
         def git(*args):
@@ -224,17 +251,17 @@ class ReleaseGuardTest(unittest.TestCase):
         env = {**os.environ, 'PATH': str(fake_bin) + os.pathsep + os.environ['PATH'],
                'ORG_DEV_ROOT': str(self.state / 'org'), 'WORK_ENV_STATE_ROOT': str(self.state / 'state'), 'TEST_MARKER': str(marker)}
         script = str(repo / 'scripts/env')
-        build = subprocess.run(['bash', script, 'staging', 'build'], env=env, capture_output=True, text=True)
+        build = subprocess.run(['bash', script, 'integration', 'build'], env=env, capture_output=True, text=True)
         self.assertEqual(build.returncode, 0, build.stderr)
-        deploy = subprocess.run(['bash', script, 'staging', 'deploy'], env=env, capture_output=True, text=True)
+        deploy = subprocess.run(['bash', script, 'integration', 'deploy'], env=env, capture_output=True, text=True)
         self.assertEqual(deploy.returncode, 0, deploy.stderr)
         self.assertEqual(json.loads(marker.read_text())[-2:], ['--image', 'sha256:original'])
         marker.unlink()
-        replaced = subprocess.run(['bash', script, 'staging', 'deploy'], env={**env, 'TEST_IMAGE_ID': 'sha256:replaced'}, capture_output=True, text=True)
+        replaced = subprocess.run(['bash', script, 'integration', 'deploy'], env={**env, 'TEST_IMAGE_ID': 'sha256:replaced'}, capture_output=True, text=True)
         self.assertNotEqual(replaced.returncode, 0)
         self.assertFalse(marker.exists())
         git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-q', '--allow-empty', '-m', 'new main')
-        stale = subprocess.run(['bash', script, 'staging', 'deploy'], env=env, capture_output=True, text=True)
+        stale = subprocess.run(['bash', script, 'integration', 'deploy'], env=env, capture_output=True, text=True)
         self.assertNotEqual(stale.returncode, 0)
         self.assertFalse(marker.exists())
         receipt = self.state / 'state/agbot-staging/build-receipt.json'
@@ -243,7 +270,7 @@ class ReleaseGuardTest(unittest.TestCase):
             with self.subTest(scenario=scenario):
                 if scenario == 'advance':
                     git('checkout', '--', 'source.txt')
-                changed = subprocess.run(['bash', script, 'staging', 'build'], env={**env, 'TEST_CHANGE': scenario}, capture_output=True, text=True)
+                changed = subprocess.run(['bash', script, 'integration', 'build'], env={**env, 'TEST_CHANGE': scenario}, capture_output=True, text=True)
                 self.assertNotEqual(changed.returncode, 0)
                 self.assertFalse(receipt.exists())
 

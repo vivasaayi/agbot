@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Record a verified staging build and reject stale default deployments."""
+"""Record a verified integration build and reject stale default deployments."""
 import argparse
 import json
 import os
@@ -48,12 +48,12 @@ def inspect_image(image):
 def record_build(root, state):
     before = snapshot(root)
     if before[2] or before[0] != before[1]:
-        raise ValueError('staging build source is no longer a clean default-branch revision')
+        raise ValueError('integration build source is no longer a clean default-branch revision')
     image = inspect_image(selected_image(state))
     if image['revision'] != before[0]:
         raise ValueError('built image revision does not match the default branch')
     if snapshot(root) != before:
-        raise ValueError('source changed while recording the staging build')
+        raise ValueError('source changed while recording the integration build')
     receipt = {'source_revision': before[0], 'image_id': image['id'], 'platform': image['platform']}
     state.mkdir(mode=0o700, parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix='.build-receipt-', dir=state)
@@ -70,39 +70,41 @@ def record_build(root, state):
 def verify_deployment(root, state):
     receipt_path = state / 'build-receipt.json'
     if not receipt_path.exists():
-        raise ValueError('no verified staging build; run bash scripts/build staging')
+        raise ValueError('no verified integration build; run bash scripts/build integration')
     receipt = json.loads(receipt_path.read_text())
     revision = main_revision(root)
     image = inspect_image(selected_image(state))
     if (receipt.get('source_revision') != revision or image['revision'] != revision
             or receipt.get('image_id') != image['id'] or receipt.get('platform') != image['platform']
             or main_revision(root) != revision):
-        raise ValueError('selected staging image is stale or differs from the verified build; rebuild staging')
+        raise ValueError('selected integration image is stale or differs from the verified build; rebuild integration')
     return image['id']
 
 
 def validate_production_image(image):
     digest = r'sha256:[0-9a-f]{64}'
     if not (re.fullmatch(digest, image) or re.fullmatch(r'[^@\s]+@' + digest, image)):
-        raise ValueError('production requires a full image ID or registry digest, not a mutable tag')
+        raise ValueError('VPS staging and production require a full image ID or registry digest, not a mutable tag')
     return image
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('invalidate', 'record', 'verify', 'production'))
+    parser.add_argument('action', choices=('invalidate', 'record', 'verify', 'staging', 'production'))
     parser.add_argument('root', type=Path)
     parser.add_argument('--image')
     args = parser.parse_args()
     state_root = Path(os.environ.get('WORK_ENV_STATE_ROOT', str(Path.home() / '.local/share/work-environments'))).expanduser()
-    if args.action == 'production':
-        image = args.image if args.image is not None else selected_image(state_root / 'agbot-production')
+    config = json.loads((args.root / 'deploy/product.json').read_text())
+    if args.action in ('staging', 'production'):
+        project = config.get(args.action + '_project', 'agbot-' + args.action)
+        image = args.image if args.image is not None else selected_image(state_root / project)
         result = validate_production_image(image)
     elif args.action == 'invalidate':
-        (state_root / 'agbot-staging' / 'build-receipt.json').unlink(missing_ok=True)
+        (state_root / config.get('integration_project', 'agbot-integration') / 'build-receipt.json').unlink(missing_ok=True)
         result = None
     else:
-        state = state_root / 'agbot-staging'
+        state = state_root / config.get('integration_project', 'agbot-integration')
         result = (record_build if args.action == 'record' else verify_deployment)(args.root, state)
     if result:
         print(result)

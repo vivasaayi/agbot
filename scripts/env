@@ -12,8 +12,8 @@ if [[ "$profile" == --help && $# -eq 1 ]]; then
   exec python3 "$org_root/bin/product-env.py" --repo "$product_root" --help
 fi
 case "$profile" in
-  worktree|staging|production) ;;
-  *) echo "Usage: bash scripts/env worktree|staging|production ACTION [options]" >&2; exit 2 ;;
+  worktree|integration|staging|production) ;;
+  *) echo "Usage: bash scripts/env worktree|integration|staging|production ACTION [options]" >&2; exit 2 ;;
 esac
 if [[ "$action" == --help && $# -eq 2 ]]; then
   exec python3 "$org_root/bin/product-env.py" --repo "$product_root" "$profile" --help
@@ -30,18 +30,18 @@ for arg in "$@"; do
     --dry-run) dry_run=true ;;
   esac
 done
-if [[ "$profile" == staging && "$action" == build && "$dry_run" == false ]]; then
+if [[ "$profile" == integration && "$action" == build && "$dry_run" == false ]]; then
   python3 "$product_root/scripts/release-guard.py" invalidate "$product_root"
 fi
-if [[ "$profile" == staging && ( "$action" == up || "$action" == deploy ) && "$explicit_image" == false && "$dry_run" == false ]]; then
+if [[ "$profile" == integration && ( "$action" == up || "$action" == deploy ) && "$explicit_image" == false && "$dry_run" == false ]]; then
   verified_image="$(python3 "$product_root/scripts/release-guard.py" verify "$product_root")"
   set -- "$@" --image "$verified_image"
 fi
-if [[ "$profile" == production && ( "$action" == up || "$action" == deploy ) && "$dry_run" == false ]]; then
-  immutable_image="$(python3 "$product_root/scripts/release-guard.py" production "$product_root" "${@:3}")"
+if [[ ( "$profile" == staging || "$profile" == production ) && ( "$action" == up || "$action" == deploy ) && "$dry_run" == false ]]; then
+  immutable_image="$(python3 "$product_root/scripts/release-guard.py" "$profile" "$product_root" "${@:3}")"
   set -- "$@" --image "$immutable_image"
 fi
 python3 "$org_root/bin/product-env.py" --repo "$product_root" "$@"
-if [[ "$profile" == staging && "$action" == build && "$dry_run" == false ]]; then
+if [[ "$profile" == integration && "$action" == build && "$dry_run" == false ]]; then
   python3 "$product_root/scripts/release-guard.py" record "$product_root"
 fi

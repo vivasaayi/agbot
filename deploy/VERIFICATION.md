@@ -1,5 +1,27 @@
 # Environment adoption evidence
 
+## Four-environment adapter, 2026-11-19
+
+- `scripts/env integration status` selected the existing healthy Mac container
+  in the legacy `agbot-staging` project; its database and artifact volumes were
+  not recreated. The integration health and authenticated tailnet workspace and
+  browse checks passed.
+- Disposable integration and staging stacks used distinct project names,
+  credentials, database and artifact volumes. A field created in integration
+  was absent from staging and survived an integration redeploy; staging also
+  retained its credentials and data across redeployment. This was a local
+  isolation exercise with the existing image, not a deployment to the VPS.
+- `python3 scripts/test-release-integrity.py` passed ten tests, including the
+  legacy integration identity and staging's refusal to reuse its state or a
+  mutable tag. The workspace JavaScript tests passed six tests.
+- Actual VPS architecture, AGBot ingress, image transfer, persistent backups,
+  staging acceptance, and production promotion remain unverified. The native
+  viewer GUI and a second-device tailnet check remain unverified.
+
+Docker's internal disk filled during testing. Two unused validation images
+created for earlier AGBot checks were removed; approximately 6 GB remained free
+afterward. No unrelated project or retained release image was removed.
+
 Checked on the Mac Studio on 2026-11-12. These are disposable validation results,
 not a release or production deployment.
 

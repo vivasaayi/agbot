@@ -36,10 +36,10 @@ origin and does not follow authenticated redirects. External tile providers do
 not receive the session. If the session expires while the viewer is open,
 restart the launcher and sign in again. The native executable is separate from
 the Docker appliance and must be built for the target Mac; this does not change
-the staging image. Run `bash scripts/package-viewer worktree` to build a
+the integration image. Run `bash scripts/package-viewer worktree` to build a
 versioned archive under that worktree's `out/viewer/`. Extract it and run
-`./run-viewer`. For a release candidate, run `bash scripts/package-viewer staging`
-from a clean checkout of `main`, test that archive with staging, then transfer
+`./run-viewer`. For a release candidate, run `bash scripts/package-viewer integration`
+from a clean checkout of `main`, test that archive with integration, then transfer
 that same tested archive to the target Mac. The archive records source revision
 and architecture in `manifest.json` and the command prints its SHA-256 checksum.
 To verify authentication without opening a window, run

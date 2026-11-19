@@ -17,13 +17,16 @@ case "${1:-}" in
   remote)
     AGBOT_TEST_READ_ONLY=1 node scripts/test-workspace-browser.cjs
     ;;
-  staging)
+  integration-smoke|staging)
+    if [[ "$1" == staging && -z "${AGBOT_TEST_URL:-}" ]]; then
+      echo "Set AGBOT_TEST_URL explicitly to the VPS staging endpoint." >&2; exit 2
+    fi
     url=${AGBOT_TEST_URL:-http://127.0.0.1:20080}
     curl --fail --silent --show-error "$url/health" >/dev/null
     for path in /portal /workspace /browse; do
       curl --fail --silent --show-error --location "$url$path" >/dev/null
     done
-    echo "Staging health and web routes responded at $url; run the authenticated browser acceptance separately."
+    echo "$1 health and web routes responded at $url; run the authenticated browser acceptance separately."
     ;;
-  *) echo "Usage: bash scripts/test unit|integration|ui|viewer|browser|remote|staging" >&2; exit 2 ;;
+  *) echo "Usage: bash scripts/test unit|integration|integration-smoke|ui|viewer|browser|remote|staging" >&2; exit 2 ;;
 esac
