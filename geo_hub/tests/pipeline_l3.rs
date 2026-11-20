@@ -402,9 +402,19 @@ async fn composite_recompute_supersedes_previous() -> Result<()> {
     // (S-12), so a single tick may claim one of those instead of the composite
     // recompute. Drain the queue the way the real worker loop does so the
     // recompute actually runs before asserting supersede.
-    for _ in 0..64 {
-        if !run_one_tick(&ctx).await?.claimed {
+    for _ in 0..200 {
+        let outcome = run_one_tick(&ctx).await?;
+        let composites =
+            composite_rasters::list_composite_products(&ctx.pool, Some("field-1".to_string()))
+                .await?;
+        if composites
+            .iter()
+            .any(|product| product.product_id != first.product_id)
+        {
             break;
+        }
+        if !outcome.claimed {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
 

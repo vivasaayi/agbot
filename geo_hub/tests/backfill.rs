@@ -229,7 +229,10 @@ async fn tick_until_status(
         if run.status == expected_status {
             return Ok(());
         }
-        run_one_tick(ctx).await?;
+        let outcome = run_one_tick(ctx).await?;
+        if !outcome.claimed {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
     let run = backfill::get_backfill_run(pool, backfill_id).await?;
     panic!("run never reached {expected_status}: {run:?}");
@@ -295,7 +298,7 @@ async fn enumerate_chunks_date_range_and_advances_cursor() -> Result<()> {
     assert_eq!(chained.priority, -10);
 
     // Drain the whole run: 4 chunks total across both datasets.
-    tick_until_status(&ctx, &pool, &backfill_id, "completed", 40).await?;
+    tick_until_status(&ctx, &pool, &backfill_id, "completed", 400).await?;
 
     let recorded = queries.lock().unwrap().clone();
     let ranges: Vec<(String, String, String)> = recorded

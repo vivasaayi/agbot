@@ -38,6 +38,7 @@ pub fn is_public_path(path: &str) -> bool {
     const EXACT: &[&str] = &[
         "/",
         "/app",
+        "/api/explore/observation",
         "/browse",
         "/browse/app.js",
         "/browse/style.css",

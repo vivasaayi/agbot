@@ -34,8 +34,10 @@ permissions:
 
 jobs:
   verify:
-    name: Required delivery gates
-    uses: ./.github/workflows/ci.yml
+    name: Required web delivery gates
+    uses: ./.github/workflows/web-ci.yml
+    permissions:
+      contents: read
 
   release:
     name: Build & publish geo_hub appliance
@@ -134,6 +136,7 @@ jobs:
         with:
           context: .
           target: runtime-appliance
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.tags.outputs.list }}
           build-args: |

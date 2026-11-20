@@ -26,7 +26,12 @@ while read -r image; do
     if [[ "$image" =~ :(latest|stable|bookworm-slim|bullseye-slim|slim)$ ]]; then
         fail "base image uses a floating tag: $image"
     fi
-done < <(awk 'toupper($1) == "FROM" { print $2 }' "$dockerfile")
+done < <(awk '
+    toupper($1) == "FROM" {
+        if (!stages[tolower($2)]) print $2
+        if (toupper($3) == "AS") stages[tolower($4)] = 1
+    }
+' "$dockerfile")
 
 required_bins=()
 while IFS= read -r bin; do

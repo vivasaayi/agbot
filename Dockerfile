@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 # Multi-stage Docker build for AgroDrone
-FROM rust:1.93.1-slim-bookworm AS builder
+FROM rust:1.93.1-slim-bookworm AS builder-base
 ARG CARGO_BUILD_JOBS=2
 
 # Install system dependencies
@@ -14,15 +14,16 @@ RUN apt-get update && apt-get install -y \
 # Set working directory
 WORKDIR /app
 
-# Copy source and build the runtime binaries.
+# Copy source once for both build targets.
 COPY . .
+
+FROM builder-base AS builder
 RUN cargo build --locked --release \
     --bin mission_control \
     --bin sensor_collector \
     --bin imagery_processor \
     --bin lidar_mapper \
-    --bin ground_station_ui \
-    --bin geo_hub
+    --bin ground_station_ui
 
 # Edge runtime stage: the on-vehicle / ground-station binaries.
 FROM debian:12-slim AS runtime-edge
@@ -89,6 +90,9 @@ EXPOSE 3000 8080 8081
 # addressable through GEO_HUB__* environment overrides so nothing depends on
 # the current working directory.
 # ---------------------------------------------------------------------------
+FROM builder-base AS appliance-builder
+RUN cargo build --locked --release -p geo_hub --bin geo_hub
+
 FROM debian:12-slim AS runtime-appliance
 
 ARG AGRODRONE_COMMIT=unknown
@@ -112,7 +116,7 @@ RUN mkdir -p /opt/agbot/bin /opt/agbot/db /opt/agbot/data /opt/agbot/web
 
 # Server binary and the on-disk web assets (/workspace + /portal are served
 # from disk; /browse and the mobile client are compiled in).
-COPY --from=builder /app/target/release/geo_hub /opt/agbot/bin/
+COPY --from=appliance-builder /app/target/release/geo_hub /opt/agbot/bin/
 COPY --chown=agbot:agbot geo_hub/web /opt/agbot/web
 
 RUN chown -R agbot:agbot /opt/agbot

@@ -29,10 +29,20 @@ fail() {
 grep -Eq '^FROM .* AS runtime-appliance$' "$dockerfile" \
     || fail "missing 'runtime-appliance' build stage"
 
-grep -Eq -- '--bin[[:space:]]+geo_hub([[:space:]\\]|$)' "$dockerfile" \
-    || fail "builder does not build the geo_hub binary"
+grep -Eq '^FROM builder-base AS appliance-builder$' "$dockerfile" \
+    || fail "appliance-builder does not start from the common build tools stage"
 
-grep -Eq 'COPY --from=builder .*/geo_hub[[:space:]]+/opt/agbot/bin/' "$dockerfile" \
+appliance_builder="$(awk '
+    toupper($1) == "FROM" { in_builder = ($NF == "appliance-builder") }
+    in_builder { print }
+' "$dockerfile")"
+grep -Eq -- '^RUN[[:space:]]+cargo[[:space:]]+build[[:space:]].*--bin[[:space:]]+geo_hub([[:space:]]|$)' <<< "$appliance_builder" \
+    || fail "appliance-builder does not build the geo_hub binary"
+if grep -Eq 'mission_control|sensor_collector|ground_station_ui|geo_viewer|--workspace|--all-features' <<< "$appliance_builder"; then
+    fail "appliance-builder compiles additional workspace or desktop binaries"
+fi
+
+grep -Eq 'COPY --from=appliance-builder .*/geo_hub[[:space:]]+/opt/agbot/bin/' "$dockerfile" \
     || fail "geo_hub binary is not copied into /opt/agbot/bin/"
 
 grep -Eq 'COPY .*geo_hub/web[[:space:]]+/opt/agbot/web' "$dockerfile" \

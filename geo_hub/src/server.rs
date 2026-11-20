@@ -102,7 +102,8 @@ pub fn build_router(state: AppState) -> Router {
             "/portal",
             ServeDir::new(state.config.workspace_web_dir().join("portal")),
         )
-        .route("/", get(routes::mobile_app))
+        .route("/", get(routes::explorer_home))
+        .route("/api/explore/observation", get(routes::explore_observation))
         .route("/app", get(routes::mobile_app))
         .route("/browse", get(routes::browse_app))
         .route("/browse/app.js", get(routes::browse_app_js))

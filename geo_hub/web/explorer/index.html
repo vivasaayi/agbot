@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#193d33">
+  <link rel="icon" href="data:,">
+  <title>Satellite explorer · Aruvi Atlas</title>
+  <link rel="stylesheet" href="/workspace/vendor/leaflet/leaflet.css">
+  <link rel="stylesheet" href="/workspace/explorer/style.css">
+  <script defer src="/workspace/vendor/leaflet/leaflet.js"></script>
+  <script type="module" src="/workspace/explorer/app.js"></script>
+</head>
+<body>
+<header><a class="brand" href="/">Aruvi Atlas</a><nav aria-label="Tools"><a href="/browse">GIS layers</a><a href="/app">Field imagery</a><a class="portal" href="/portal/">Farmer portal ↗</a></nav></header>
+<main>
+  <h1>Satellite explorer</h1>
+  <p class="intro">Find a farm, pond or river and follow its changes through satellite imagery.</p>
+  <div class="explorer">
+    <aside>
+      <form id="location-form">
+        <label for="place">Find a location</label>
+        <div class="search"><input id="place" type="search" placeholder="Place or latitude, longitude" required><button type="submit">Find</button></div>
+        <div id="matches" aria-live="polite"></div>
+      </form>
+      <div class="selected"><span class="pin" aria-hidden="true">●</span><div><strong id="place-name">Chembarambakkam Lake</strong><div class="mono" id="coords"></div></div></div>
+      <form id="archive-form">
+        <label for="source">Satellite archive</label>
+        <select id="source"><option value="both">Landsat and Sentinel-2</option><option value="landsat-c2-l2">Landsat Collection 2</option><option value="sentinel-2-l2a">Sentinel-2 Level 2A</option></select>
+        <div class="dates"><label>From<input id="start" type="date" required></label><label>Through<input id="end" type="date" required></label></div>
+        <button class="primary" type="submit">Search archive</button>
+      </form>
+      <p class="hint">Click the map to move the pin. Each observation samples the pixel beneath it.</p>
+    </aside>
+    <section class="map-panel" aria-label="Satellite imagery map">
+      <div id="map" aria-label="Location picker"></div>
+      <div class="map-foot"><span id="map-caption">Location map</span><label>Map layer <select id="map-layer"><option value="rgb">Natural color</option><option value="index">Selected index</option><option value="base">Street map</option></select></label></div>
+      <div id="map-message" role="status"></div>
+    </section>
+  </div>
+  <section class="archive">
+    <div class="section-head"><div><h2>Observation history</h2><p id="status" role="status">Searching the satellite archive…</p></div>
+    <label for="metric">Index<select id="metric"><option value="ndwi">Surface water · NDWI</option><option value="mndwi">Open water · MNDWI</option><option value="ndvi">Vegetation · NDVI</option><option value="ndmi">Moisture · NDMI</option></select></label></div>
+    <div class="chart-head"><strong id="chart-label">NDWI at the pin</strong><span><i class="landsat"></i>Landsat <i class="sentinel"></i>Sentinel-2</span></div>
+    <div id="chart"></div>
+    <p class="hint" id="metric-note"></p>
+    <div class="table-wrap"><table><caption class="sr">Dated scenes and index values at the selected point</caption><thead><tr><th scope="col">Acquired (UTC)</th><th scope="col">Satellite</th><th scope="col">Tile</th><th scope="col">Scene cloud</th><th scope="col" id="value-head">NDWI</th><th scope="col">Imagery</th></tr></thead><tbody id="scenes"></tbody></table></div>
+    <div class="actions"><button type="button" id="more" hidden>Load older scenes</button><button type="button" id="all-pages" hidden>Load full interval</button><button type="button" id="retry" hidden>Retry unavailable readings</button></div>
+  </section>
+</main>
+<footer>Imagery from <a href="https://planetarycomputer.microsoft.com/catalog">Microsoft Planetary Computer</a> · Place search by <a href="https://photon.komoot.io">Photon</a> and OpenStreetMap contributors</footer>
+</body></html>

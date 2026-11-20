@@ -32,7 +32,7 @@ for target in aarch64-unknown-linux-gnu armv7-unknown-linux-gnueabihf; do
         || fail "CI workflow is missing target matrix entry: $target"
 done
 
-grep -q "docker/setup-qemu-action@v3" "$workflow" \
+grep -Eq '^[[:space:]]+- uses: docker/setup-qemu-action@(v[1-9][0-9]*|[[:xdigit:]]{40})[[:space:]]*(#.*)?$' "$workflow" \
     || fail "CI workflow does not install QEMU for target smoke checks"
 grep -q "cargo install cross --locked" "$workflow" \
     || fail "CI workflow does not install cross with a locked cargo install"
@@ -44,7 +44,7 @@ grep -q "scripts/smoke-arm-artifacts.sh" "$workflow" \
     || fail "CI workflow does not run ARM smoke boot checks"
 grep -q "scripts/package-arm-artifacts.sh" "$workflow" \
     || fail "CI workflow does not package ARM artifacts"
-grep -q "actions/upload-artifact@v4" "$workflow" \
+grep -Eq '^[[:space:]]+uses: actions/upload-artifact@(v[1-9][0-9]*|[[:xdigit:]]{40})[[:space:]]*(#.*)?$' "$workflow" \
     || fail "CI workflow does not publish ARM artifacts"
 
 grep -q "^arm64:" "$repo_root/justfile" || fail "justfile is missing arm64 recipe"
