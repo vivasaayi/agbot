@@ -17,6 +17,7 @@ pub mod earth_search;
 pub mod elevation_ingest;
 pub mod error;
 pub mod et_rasters;
+mod explorer_observation;
 pub mod field_activities;
 pub mod field_timeseries;
 pub mod hls;

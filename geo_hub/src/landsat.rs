@@ -11,9 +11,9 @@ use std::{
 };
 use tokio::fs as async_fs;
 
-const PLANETARY_COMPUTER_STAC_SEARCH: &str =
+pub(crate) const PLANETARY_COMPUTER_STAC_SEARCH: &str =
     "https://planetarycomputer.microsoft.com/api/stac/v1/search";
-const PLANETARY_COMPUTER_DATA_ITEM: &str =
+pub(crate) const PLANETARY_COMPUTER_DATA_ITEM: &str =
     "https://planetarycomputer.microsoft.com/api/data/v1/item";
 const USGS_M2M_JSON_API: &str = "https://m2m.cr.usgs.gov/api/api/json/stable";
 const USGS_LANDSAT_DATASET: &str = "landsat_ot_c2_l2";

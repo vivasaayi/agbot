@@ -6,6 +6,7 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$script_dir/.." && pwd)"
 ci_workflow="$repo_root/.github/workflows/ci.yml"
+web_workflow="$repo_root/.github/workflows/web-ci.yml"
 release_workflow="$repo_root/.github/workflows/release.yml"
 compose_file="$repo_root/docker-compose.prod.yml"
 cli="$repo_root/scripts/agbot"
@@ -23,7 +24,7 @@ require_pattern() {
     grep -Eq "$pattern" "$file" || fail "$description"
 }
 
-for file in "$ci_workflow" "$release_workflow" "$compose_file" "$cli"; do
+for file in "$ci_workflow" "$web_workflow" "$release_workflow" "$compose_file" "$cli"; do
     [[ -f "$file" ]] || { fail "required file missing: $file"; }
 done
 
@@ -31,27 +32,33 @@ if (( failures > 0 )); then
     exit 1
 fi
 
-require_pattern "$ci_workflow" 'workflow_call:' \
-    "CI is not reusable by the release workflow"
+require_pattern "$web_workflow" 'workflow_call:' \
+    "web CI is not reusable by the release workflow"
 require_pattern "$ci_workflow" 'name: Flight simulator regression' \
     "CI does not name a C++ flight simulator gate"
 require_pattern "$ci_workflow" 'ctest --test-dir flight_sim_cpp/build --output-on-failure' \
     "CI does not execute flight simulator tests"
-require_pattern "$ci_workflow" 'name: GIS acceptance' \
-    "CI does not include the GIS regression gate"
-require_pattern "$ci_workflow" 'cargo test --locked -p geo_hub acceptance_' \
-    "CI does not execute the GIS acceptance workflow"
+require_pattern "$web_workflow" 'cargo test --locked -p shared --lib' \
+    "web CI does not test the shared library"
+require_pattern "$web_workflow" 'cargo test --locked -p geo_hub --tests --lib' \
+    "web CI does not run the geo_hub regression suite"
+require_pattern "$web_workflow" 'cargo test --locked -p geo_hub acceptance_' \
+    "web CI does not execute the GIS acceptance workflow"
 require_pattern "$ci_workflow" 'name: Dependency security' \
     "CI does not audit Rust dependency advisories"
-require_pattern "$ci_workflow" 'target: runtime-appliance' \
-    "CI does not build the shipped appliance target"
-require_pattern "$ci_workflow" 'Smoke boot appliance health endpoint' \
-    "CI does not smoke-test the appliance health endpoint"
-require_pattern "$ci_workflow" 'Scan appliance vulnerabilities' \
-    "CI does not scan the shipped appliance image"
+require_pattern "$web_workflow" 'target: runtime-appliance' \
+    "web CI does not build the shipped appliance target"
+require_pattern "$web_workflow" 'Smoke test appliance and web routes' \
+    "web CI does not smoke-test the packaged web routes"
+require_pattern "$web_workflow" 'Scan appliance vulnerabilities' \
+    "web CI does not scan the shipped appliance image"
 
-require_pattern "$release_workflow" 'uses: \./\.github/workflows/ci\.yml' \
-    "release does not call the reusable CI gates"
+require_pattern "$release_workflow" 'uses: \./\.github/workflows/web-ci\.yml' \
+    "release does not call the reusable web CI gates"
+if grep -Eq 'geo_viewer|flight_sim_cpp|smoke-arm-artifacts|cargo (test|clippy|build).*--all-features' "$web_workflow" ||
+    grep -Eq 'uses: \./\.github/workflows/ci\.yml' "$web_workflow" "$release_workflow"; then
+    fail "web delivery includes full workspace, desktop, simulator, or ARM checks"
+fi
 require_pattern "$release_workflow" 'needs: verify' \
     "release publication is not gated on CI"
 require_pattern "$release_workflow" 'id-token: write' \
