@@ -20,6 +20,6 @@ nalgebra = { workspace = true }
 shared = { path = "../shared" }
 
 # Specific dependencies
-ndarray = "0.15"
+ndarray = "0.17"
 colorgrad = "0.6"
 tracing-subscriber = "0.3"
